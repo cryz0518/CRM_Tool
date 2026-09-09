@@ -22,6 +22,11 @@ STRUCTURED_EXTRA_FIELDS = (
     "duration_ms",
     "error_type",
     "error_traceback",
+    # 企业微信接入状态字段经过类型限制，不包含 SDK 原始帧、正文或凭据。
+    "accepted",
+    "attempt",
+    "duplicate",
+    "has_reason",
 )
 
 
