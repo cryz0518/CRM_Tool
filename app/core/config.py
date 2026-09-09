@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://crm:crm_local_only@postgres:5432/crm_lead"
     redis_url: str = "redis://redis:6379/0"
     smart_table_adapter: Literal["mock", "unconfigured"] = "unconfigured"
+    wecom_bot_id: str | None = None
+    wecom_bot_secret: str | None = None
 
 
 @lru_cache

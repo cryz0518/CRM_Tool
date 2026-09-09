@@ -93,5 +93,23 @@ services:
       retries: 12
     restart: unless-stopped
 
+  wecom-bot:
+    build: .
+    environment:
+      <<: *application_environment
+      WECOM_BOT_ID: "${WECOM_BOT_ID:-}"
+      WECOM_BOT_SECRET: "${WECOM_BOT_SECRET:-}"
+    command: ["python", "-m", "app.wecom_bot.runner"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/wecom-bot-ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+
 volumes:
   postgres_data:
