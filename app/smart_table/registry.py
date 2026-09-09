@@ -113,7 +113,8 @@ REQUIRED_SMART_TABLE_FIELDS = (
     RequiredSmartTableField("工艺", SmartTableFieldType.SINGLE_SELECT, PROCESS_OPTIONS),
     RequiredSmartTableField("下次联系时间", SmartTableFieldType.DATE),
     RequiredSmartTableField("附件", SmartTableFieldType.ATTACHMENT),
-    RequiredSmartTableField("备注", SmartTableFieldType.LONG_TEXT),
+    # 备注由 AI Prompt 生成固定文案，智能表格只保存文本，不承担格式模板职责。
+    RequiredSmartTableField("备注", SmartTableFieldType.TEXT),
     RequiredSmartTableField("地区定位", SmartTableFieldType.LOCATION),
     RequiredSmartTableField("AI待确认", SmartTableFieldType.MULTI_SELECT, CRM_BUSINESS_FIELD_NAMES),
     RequiredSmartTableField("创建人", SmartTableFieldType.MEMBER),
