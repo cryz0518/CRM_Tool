@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import logging
+from typing import Annotated
 from uuid import uuid4
 
-from fastapi import FastAPI, Request, Response
+from fastapi import Depends, FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import RequestResponseEndpoint
 
 from app.core.config import get_settings
 from app.core.logging import bind_log_context, configure_logging, reset_log_context
+from app.smart_table.adapter import SmartTableAdapter
+from app.smart_table.dependencies import get_smart_table_adapter
+from app.smart_table.readiness import SmartTableReadinessChecker
 
 settings = get_settings()
 configure_logging(settings.log_level, environment=settings.app_env, service="app")
@@ -48,3 +53,24 @@ async def request_id_middleware(request: Request, call_next: RequestResponseEndp
 async def health() -> dict[str, str]:
     """返回应用进程存活状态，供 Docker 与内部运维探针调用。"""
     return {"status": "ok", "service": "app"}
+
+
+@app.get("/health/ready")
+async def readiness(
+    adapter: Annotated[SmartTableAdapter, Depends(get_smart_table_adapter)],
+) -> JSONResponse:
+    """校验管理员预配置的智能表格结构与权限，并返回就绪状态。
+
+    参数：adapter 为依赖注入的智能表格适配器。
+    返回：配置正确时返回 200；缺失字段、权限或适配器时返回 503 与脱敏问题摘要。
+    副作用：调用适配器读取结构和权限，并写入结构化就绪检查日志。
+    """
+    report = SmartTableReadinessChecker().check(adapter)
+    if report.ready:
+        return JSONResponse({"status": "ok", "service": "app", "issues": []})
+
+    # 配置错误需要阻止服务接收业务流量，同时保留可操作的中文排障信息。
+    return JSONResponse(
+        {"status": "error", "service": "app", "issues": list(report.issues)},
+        status_code=503,
+    )

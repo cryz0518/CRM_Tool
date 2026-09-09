@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -16,6 +17,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     database_url: str = "postgresql+psycopg://crm:crm_local_only@postgres:5432/crm_lead"
     redis_url: str = "redis://redis:6379/0"
+    smart_table_adapter: Literal["mock", "unconfigured"] = "unconfigured"
 
 
 @lru_cache

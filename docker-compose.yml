@@ -35,6 +35,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-crm}:${POSTGRES_PASSWORD:-crm_local_only}@postgres:5432/${POSTGRES_DB:-crm_lead}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      SMART_TABLE_ADAPTER: ${SMART_TABLE_ADAPTER:-mock}
       TZ: Asia/Shanghai
     command: ["alembic", "upgrade", "head"]
     depends_on:

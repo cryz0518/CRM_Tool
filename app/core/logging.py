@@ -11,6 +11,18 @@ from typing import Any
 
 LOG_CONTEXT: ContextVar[dict[str, str]] = ContextVar("log_context", default={})
 CONTEXT_FIELDS = ("request_id", "message_id", "lead_id", "record_id", "wecom_user_id")
+STRUCTURED_EXTRA_FIELDS = (
+    "path",
+    "method",
+    "status_code",
+    "target",
+    "smart_table_adapter",
+    "readiness_status",
+    "readiness_issue_count",
+    "duration_ms",
+    "error_type",
+    "error_traceback",
+)
 
 
 class ContextFilter(logging.Filter):
@@ -51,6 +63,11 @@ class JsonFormatter(logging.Formatter):
         }
         for field in CONTEXT_FIELDS:
             payload[field] = getattr(record, field, None)
+        # 仅白名单化输出业务观测字段，避免将外部响应或敏感 Payload 自动写入日志。
+        for field in STRUCTURED_EXTRA_FIELDS:
+            value = getattr(record, field, None)
+            if value is not None:
+                payload[field] = value
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False, default=str)
