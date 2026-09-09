@@ -27,11 +27,25 @@ class ContextFilter(logging.Filter):
 class JsonFormatter(logging.Formatter):
     """将日志记录序列化为 stdout/stderr 可直接采集的 JSON。"""
 
+    def __init__(self, environment: str = "development", service: str = "app") -> None:
+        """保存每条日志共用的运行环境与服务名称。
+
+        参数：environment 为部署环境，service 为当前进程服务名称。
+        返回值：无。
+        异常：无。
+        副作用：后续格式化日志会包含稳定的环境和服务字段。
+        """
+        super().__init__()
+        self._environment = environment
+        self._service = service
+
     def format(self, record: logging.LogRecord) -> str:
         """保留安全的日志元数据与链路字段，避免自动输出敏感配置。"""
         payload: dict[str, Any] = {
             "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
+            "environment": self._environment,
+            "service": self._service,
             "logger": record.name,
             "message": record.getMessage(),
         }
@@ -54,8 +68,14 @@ def reset_log_context(token: Token[dict[str, str]]) -> None:
     LOG_CONTEXT.reset(token)
 
 
-def configure_logging(level: str) -> None:
-    """配置进程根日志为单一 JSON stdout Handler，且允许重复调用。"""
+def configure_logging(level: str, environment: str = "development", service: str = "app") -> None:
+    """配置进程根日志为包含环境和服务字段的 JSON Handler。
+
+    参数：level 为日志等级，environment 为部署环境，service 为进程服务名称。
+    返回值：无。
+    异常：无。
+    副作用：首次调用替换根日志 Handler，重复调用复用既有 Handler。
+    """
     root_logger = logging.getLogger()
     root_logger.setLevel(level.upper())
 
@@ -66,6 +86,6 @@ def configure_logging(level: str) -> None:
     handler = logging.StreamHandler(sys.stdout)
     handler._crm_json_handler = True  # type: ignore[attr-defined]
     handler.addFilter(ContextFilter())
-    handler.setFormatter(JsonFormatter())
+    handler.setFormatter(JsonFormatter(environment=environment, service=service))
     root_logger.handlers.clear()
     root_logger.addHandler(handler)

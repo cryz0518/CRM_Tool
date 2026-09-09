@@ -19,3 +19,5 @@ def test_json_log_includes_bound_trace_fields() -> None:
     assert payload["request_id"] == "request-1"
     assert payload["message_id"] == "message-1"
     assert payload["lead_id"] is None
+    assert payload["environment"] == "development"
+    assert payload["service"] == "app"
