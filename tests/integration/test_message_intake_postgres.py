@@ -8,7 +8,7 @@ from threading import Barrier
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.schema import CreateSchema, DropSchema
@@ -61,6 +61,54 @@ def authorize_salesperson(session_factory: sessionmaker[Session], user_id: str) 
     """
     with session_factory.begin() as session:
         session.add(SalesAuthorization(wecom_user_id=user_id, is_authorized=True, is_active=True))
+
+
+def test_notification_record_schema_includes_retry_columns() -> None:
+    """验证已升级的 T02 数据库具备通知重试元数据列。
+
+    参数：无。
+    返回值：无。
+    异常：数据库不可达时由 SQLAlchemy 抛出，断言失败由 pytest 报告。
+    副作用：只读取当前数据库的 information_schema，不修改业务表。
+    """
+    engine = create_engine(get_settings().database_url)
+    try:
+        with engine.connect() as connection:
+            # 以当前数据库 schema 为准，避免将临时测试 schema 或其他表误判为生产目标。
+            rows = connection.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = 'notification_records'"
+                )
+            )
+            column_names = {row[0] for row in rows}
+    finally:
+        engine.dispose()
+
+    assert {"attempts", "provider_message_id", "sent_at"} <= column_names
+
+
+def test_business_audit_event_schema_exists() -> None:
+    """验证已升级的 T02 数据库具备可靠接收所需的审计事件表。
+
+    参数：无。
+    返回值：无。
+    异常：数据库不可达时由 SQLAlchemy 抛出，断言失败由 pytest 报告。
+    副作用：只读取当前数据库的 metadata，不修改业务表。
+    """
+    engine = create_engine(get_settings().database_url)
+    try:
+        # 审计事件与原始消息、Outbox 位于同一事务，缺表会使真实入站消息整体回滚。
+        inspector = inspect(engine)
+        assert "business_audit_events" in inspector.get_table_names()
+        column_names = {
+            column["name"] for column in inspector.get_columns("business_audit_events")
+        }
+    finally:
+        engine.dispose()
+
+    assert {"id", "message_id", "sales_user_id", "event_type", "created_at"} <= column_names
 
 
 def receive_at_the_same_time(
