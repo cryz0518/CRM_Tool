@@ -14,8 +14,12 @@ from app.core.logging import configure_logging
 
 
 def check_app() -> None:
-    """调用本容器的健康端点，并在非成功响应时抛出异常。"""
-    with urlopen("http://127.0.0.1:8000/health", timeout=2) as response:  # noqa: S310
+    """调用本容器 readiness 端点，确保业务依赖配置可用。
+
+    异常：HTTP 状态不是 200 或网络请求失败时抛出异常。
+    副作用：向本机应用发起健康探针请求。
+    """
+    with urlopen("http://127.0.0.1:8000/health/ready", timeout=2) as response:  # noqa: S310
         if response.status != 200:
             raise RuntimeError(f"应用健康检查返回异常状态：{response.status}")
 
