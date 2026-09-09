@@ -66,7 +66,8 @@ class SmartTableReadinessChecker:
                 continue
 
             # 仅要求项目依赖的选项存在，允许管理员保留不影响业务的额外选项。
-            configured_option_names = {option.name for option in field.options}
+            # AI待确认的选项复用管理员字段展示名；必填字段的 `*` 前缀不参与匹配。
+            configured_option_names = {option.name.removeprefix("*") for option in field.options}
             for option in requirement.required_options:
                 if option not in configured_option_names:
                     issues.append(f"字段枚举选项缺失：{requirement.name}，缺少 {option}")

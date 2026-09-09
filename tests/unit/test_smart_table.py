@@ -185,6 +185,33 @@ def test_readiness_reports_missing_ai_confirmation_option() -> None:
     assert "字段枚举选项缺失：AI待确认，缺少 备注" in report.issues
 
 
+def test_readiness_ignores_required_prefix_on_ai_confirmation_options() -> None:
+    """验证 AI待确认 复用必填字段展示名时仍能匹配业务字段。
+
+    参数：无。返回：无。异常：断言失败时由 pytest 报告。副作用：构造仅用于测试的字段快照。
+    """
+    fields = tuple(
+        SmartTableField(
+            field_id=field.field_id,
+            name=field.name,
+            field_type=field.field_type,
+            options=tuple(
+                SmartTableOption(option_id=option.option_id, name=f"*{option.name}")
+                for option in field.options
+            ),
+        )
+        if field.name == "AI待确认"
+        else field
+        for field in build_required_smart_table_schema().fields
+    )
+
+    report = SmartTableReadinessChecker().check(
+        MockSmartTableAdapter(schema=SmartTableSchema(fields=fields))
+    )
+
+    assert report.ready is True
+
+
 def test_readiness_endpoint_returns_configuration_issues() -> None:
     """验证 readiness 接口将智能表格配置问题以 503 和中文详情返回。"""
     from app.main import app
