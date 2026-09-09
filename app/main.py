@@ -12,7 +12,7 @@ from app.core.config import get_settings
 from app.core.logging import bind_log_context, configure_logging, reset_log_context
 
 settings = get_settings()
-configure_logging(settings.log_level)
+configure_logging(settings.log_level, environment=settings.app_env, service="app")
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="CRM 线索自动录入", version="0.1.0")

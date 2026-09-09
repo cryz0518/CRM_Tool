@@ -30,7 +30,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("target", choices=("app", "broker"))
     target = parser.parse_args().target
-    configure_logging(get_settings().log_level)
+    settings = get_settings()
+    configure_logging(settings.log_level, environment=settings.app_env, service="healthcheck")
 
     try:
         if target == "app":
