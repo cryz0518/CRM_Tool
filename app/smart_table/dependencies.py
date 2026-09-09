@@ -9,6 +9,7 @@ from app.smart_table.adapter import SmartTableAdapter
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.registry import build_required_smart_table_schema
 from app.smart_table.unconfigured import UnconfiguredSmartTableAdapter
+from app.smart_table.wecom_cli import WecomCliSmartTableAdapter
 
 
 @lru_cache
@@ -21,4 +22,16 @@ def get_smart_table_adapter() -> SmartTableAdapter:
     if get_settings().smart_table_adapter == "mock":
         # Mock 只能由本地 Docker 或测试环境显式启用，不能掩盖生产配置缺失。
         return MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    if get_settings().smart_table_adapter == "wecom_cli":
+        # 真实适配器仅接收部署注入的配置，任何缺失均由构造器转换为 readiness 配置错误。
+        settings = get_settings()
+        return WecomCliSmartTableAdapter(
+            doc_id=settings.wecom_smart_table_doc_id or "",
+            sheet_id=settings.wecom_smart_table_sheet_id or "",
+            sales_can_create_records=settings.wecom_smart_table_sales_can_create_records,
+            sales_can_delete_records=settings.wecom_smart_table_sales_can_delete_records,
+            command=settings.wecom_cli_command,
+            timeout_seconds=settings.wecom_cli_timeout_seconds,
+            retry_count=settings.wecom_cli_retry_count,
+        )
     return UnconfiguredSmartTableAdapter()
