@@ -24,6 +24,9 @@ STRUCTURED_EXTRA_FIELDS = (
     "error_traceback",
     "ai_trace_id",
     "ai_status",
+    "ai_call_count",
+    "ai_input_tokens",
+    "ai_output_tokens",
     # 企业微信接入状态字段经过类型限制，不包含 SDK 原始帧、正文或凭据。
     "accepted",
     "attempt",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -9,7 +10,7 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from app.ai.models import ExtractedLeadPatch, LeadAnalysis, LLMRequest
+from app.ai.models import ExtractedLeadPatch, LeadAnalysis, LLMRequest, LLMResponse
 from app.ai.provider import LLMProvider, LLMProviderError
 from app.smart_table.registry import (
     BUSINESS_LINE_OPTIONS,
@@ -33,7 +34,10 @@ _ENUM_OPTIONS = {
 }
 _PHONE_PATTERN = re.compile(r"^\+?[0-9][0-9 -]{5,24}$")
 _EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
-_SENSITIVE_PATTERN = re.compile(r"\b(?:\d{15,18}[0-9Xx]?|\d{16,19})\b")
+_SENSITIVE_PATTERN = re.compile(
+    r"(?i)(?:(?<!\d)(?:\d{17}[\dXx]|\d{16,19}|\d{15})(?!\d)|"
+    r"(?:密码|口令|验证码|password|token)\s*[:：]?\s*[^\s；;，,]+)"
+)
 
 
 class AIGatewayError(RuntimeError):
@@ -42,6 +46,24 @@ class AIGatewayError(RuntimeError):
 
 class BusinessValidationError(AIGatewayError):
     """表示结构合法但不满足 CRM 字段业务规则的候选。"""
+
+
+class FailedStructuredOutputError(AIGatewayError):
+    """承载待人工审查所需的两次模型输出和结构校验摘要。"""
+
+    def __init__(self, original_output: str, repaired_output: str, error_summary: str) -> None:
+        """保存失败事实，供任务层以 failed_pending_review 状态持久化审计。
+
+        参数：original_output 与 repaired_output 为两次原始结果；error_summary 为校验摘要。
+        返回：无。
+        异常：无。
+        副作用：异常对象保留待持久化的失败事实，日志不输出原文。
+        """
+        super().__init__("ai_structured_output_failed_pending_review")
+        self.original_output = original_output
+        self.repaired_output = repaired_output
+        self.error_summary = error_summary
+        self.task_status = "failed_pending_review"
 
 
 class AIGateway:
@@ -81,23 +103,39 @@ class AIGateway:
         副作用：调用 Provider，输出不含原文和联系方式的结构化日志。
         """
         trace_id = str(uuid4())
+        # 只将字段提取所需文本交给模型，并在发送前移除无关的高敏感信息。
         safe_text = _SENSITIVE_PATTERN.sub("[已遮蔽敏感号码]", text)
+        json_schema = LeadAnalysis.model_json_schema()
         request = LLMRequest(
-            messages=self._messages(safe_text), json_schema=LeadAnalysis.model_json_schema()
+            messages=self._messages(safe_text, json_schema), json_schema=json_schema
         )
         started_at = time.monotonic()
         try:
-            raw_output = self._call_with_transport_retry(request)
-            analysis = self._parse_schema_or_repair(request, raw_output)
+            # 先取得可观测响应，确保 repair 与传输重试也计入调用量。
+            response, attempts = self._call_with_transport_retry(request, trace_id)
+            analysis, repair_response, repair_attempts = self._parse_schema_or_repair(
+                request, response, trace_id
+            )
             self._validate_business(analysis)
             fields, pending, low_candidates = self._apply_confidence(analysis)
         except AIGatewayError as error:
             self._log(trace_id, started_at, "failed", error_type=type(error).__name__)
             raise
-        self._log(trace_id, started_at, "succeeded")
+        # 只写统计量，既可定位成本和重试，又不会把客户文本写入日志。
+        all_responses = (response,) + ((repair_response,) if repair_response is not None else ())
+        self._log(
+            trace_id,
+            started_at,
+            "succeeded",
+            call_count=attempts + repair_attempts,
+            input_tokens=sum(item.input_tokens or 0 for item in all_responses),
+            output_tokens=sum(item.output_tokens or 0 for item in all_responses),
+        )
         return ExtractedLeadPatch(trace_id, analysis, fields, pending, low_candidates)
 
-    def _call_with_transport_retry(self, request: LLMRequest) -> str:
+    def _call_with_transport_retry(
+        self, request: LLMRequest, trace_id: str
+    ) -> tuple[LLMResponse, int]:
         """仅针对 Provider 传输故障执行配置次数的重试。
 
         参数：request 为单次模型请求。
@@ -105,42 +143,72 @@ class AIGateway:
         异常：重试耗尽时抛出 AIGatewayError。
         副作用：最多调用 Provider `retry_count + 1` 次。
         """
-        for attempt in range(self._retry_count + 1):
+        for attempt in range(1, self._retry_count + 2):
             try:
-                response = self._provider.complete(request, timeout_seconds=self._timeout_seconds)
-                return response.content
+                # Provider 是唯一外部调用点，超时由 Provider 使用网关传入的统一配置。
+                return (
+                    self._provider.complete(request, timeout_seconds=self._timeout_seconds),
+                    attempt,
+                )
             except LLMProviderError as error:
-                if attempt == self._retry_count:
+                # 记录每次失败的白名单元数据，避免重试过程成为不可观测黑盒。
+                logger.warning(
+                    "ai_gateway_retry",
+                    extra={
+                        "ai_trace_id": trace_id,
+                        "target": type(self._provider).__name__,
+                        "attempt": attempt,
+                        "error_type": type(error).__name__,
+                    },
+                )
+                if attempt > self._retry_count:
                     raise AIGatewayError("ai_transport_failed") from error
         raise AssertionError("不可达：循环在成功或耗尽时结束")
 
-    def _parse_schema_or_repair(self, request: LLMRequest, raw_output: str) -> LeadAnalysis:
+    def _parse_schema_or_repair(
+        self, request: LLMRequest, response: LLMResponse, trace_id: str
+    ) -> tuple[LeadAnalysis, LLMResponse | None, int]:
         """解析并验证模型结构，且仅为 JSON/Schema 失败进行一次受约束修复。
 
-        参数：request 为原请求；raw_output 为初始模型输出。
+        参数：request 为原请求；response 为初始模型响应。
         返回：经 Pydantic 验证的结构化分析。
         异常：第二次结构失败时抛出 AIGatewayError。
         副作用：结构失败时额外调用 Provider 一次，业务校验永不在此发生。
         """
         try:
-            return LeadAnalysis.model_validate_json(raw_output)
+            return LeadAnalysis.model_validate_json(response.content), None, 0
         except ValidationError:
-            repair_messages = request.messages + (
+            # 修复请求仅保留脱敏原输入、明确 Schema 与受限修复规则。
+            repair_messages = (
                 {
                     "role": "system",
-                    "content": "只修复以下输出的 JSON 结构，不得新增、删除或改写任何事实值。",
+                    "content": (
+                        "只修复随后的输出 JSON 结构，不得新增、删除或改写任何事实值。"
+                        "必须符合此 JSON Schema："
+                        f"{json.dumps(request.json_schema, ensure_ascii=False)}"
+                    ),
                 },
+                request.messages[-1],
             )
             repair_request = LLMRequest(
                 messages=repair_messages,
                 json_schema=request.json_schema,
-                repair_source=raw_output,
+                repair_source=response.content,
             )
             try:
-                repaired_output = self._call_with_transport_retry(repair_request)
-                return LeadAnalysis.model_validate_json(repaired_output)
+                # 结构修复只携带模型原输出和 Schema，不重新向模型索取业务事实。
+                repaired_response, attempts = self._call_with_transport_retry(
+                    repair_request, trace_id
+                )
+                return (
+                    LeadAnalysis.model_validate_json(repaired_response.content),
+                    repaired_response,
+                    attempts,
+                )
             except ValidationError as error:
-                raise AIGatewayError("ai_structured_output_failed_pending_review") from error
+                raise FailedStructuredOutputError(
+                    response.content, repaired_response.content, str(error)
+                ) from error
 
     def _validate_business(self, analysis: LeadAnalysis) -> None:
         """以确定性规则校验字段名、枚举、格式及置信度完整性。
@@ -151,14 +219,18 @@ class AIGateway:
         副作用：无；禁止在业务校验失败后重试模型。
         """
         for field_name, value in analysis.crm_fields.items():
+            # CRM 注册表是字段白名单，禁止模型引入权限或提交等业务控制字段。
             if field_name not in CRM_BUSINESS_FIELD_NAMES:
                 raise BusinessValidationError(f"未知 CRM 字段：{field_name}")
+            # 枚举字段必须使用管理员配置的合法选项，失败后不再调用模型修正。
             if field_name in _ENUM_OPTIONS and value not in _ENUM_OPTIONS[field_name]:
                 raise BusinessValidationError(f"枚举值不合法：{field_name}")
+            # 联系方式格式由确定性规则校验，避免模型用猜测值绕过约束。
             if field_name in {"手机", "电话"} and not _PHONE_PATTERN.fullmatch(value):
                 raise BusinessValidationError(f"联系方式格式不合法：{field_name}")
             if field_name == "邮箱" and not _EMAIL_PATTERN.fullmatch(value):
                 raise BusinessValidationError("邮箱格式不合法")
+            # 每个建议字段都必须提供区间内置信度，才能进入后续分级。
             confidence = analysis.confidence_by_field.get(field_name)
             if confidence is None or not 0 <= confidence <= 1:
                 raise BusinessValidationError(f"置信度缺失或不合法：{field_name}")
@@ -178,6 +250,7 @@ class AIGateway:
         low_candidates: dict[str, str] = {}
         for field_name, value in analysis.crm_fields.items():
             confidence = analysis.confidence_by_field[field_name]
+            # 高置信度可直接预填；中置信度保留待确认元数据；低置信度只后台留存。
             if confidence >= self._high_confidence_threshold:
                 fields[field_name] = value
             elif confidence >= self._medium_confidence_threshold:
@@ -187,10 +260,12 @@ class AIGateway:
                 low_candidates[field_name] = value
         return fields, tuple(pending), low_candidates
 
-    def _messages(self, safe_text: str) -> tuple[dict[str, str], ...]:
+    def _messages(
+        self, safe_text: str, json_schema: dict[str, object]
+    ) -> tuple[dict[str, str], ...]:
         """构造仅包含当前文本和受控输出规则的最小化提取提示。
 
-        参数：safe_text 为已移除无关高敏感号码的当前消息文本。
+        参数：safe_text 为已移除无关高敏感号码的当前消息文本；json_schema 为输出约束。
         返回：供应商无关的聊天消息序列。
         异常：无。
         副作用：无。
@@ -201,6 +276,7 @@ class AIGateway:
                 "content": (
                     "仅提取线索建议 JSON；不得决定提交、删除、负责人、"
                     "CRM 合并或覆盖人工值。"
+                    f"必须符合此 JSON Schema：{json.dumps(json_schema, ensure_ascii=False)}"
                 ),
             },
             {"role": "user", "content": safe_text},
@@ -213,11 +289,14 @@ class AIGateway:
         status: str,
         *,
         error_type: str | None = None,
+        call_count: int | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
     ) -> None:
         """写入不含输入、输出或密钥的调用观测日志。
 
         参数：trace_id 为调用追踪标识；started_at 为单调起点；status 为受控结果；
-        error_type 为可选错误分类。
+        error_type 为可选错误分类；call_count 为本追踪中的实际模型调用次数。
         返回：无。
         异常：无。
         副作用：向结构化日志写入脱敏运行元数据。
@@ -227,6 +306,10 @@ class AIGateway:
             extra={
                 "ai_trace_id": trace_id,
                 "ai_status": status,
+                "target": type(self._provider).__name__,
+                "ai_call_count": call_count,
+                "ai_input_tokens": input_tokens,
+                "ai_output_tokens": output_tokens,
                 "duration_ms": round((time.monotonic() - started_at) * 1000),
                 "error_type": error_type,
             },

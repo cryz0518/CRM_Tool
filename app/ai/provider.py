@@ -84,10 +84,10 @@ class QwenLLMProvider:
 class MockLLMProvider:
     """按预设响应顺序返回结果的测试 Provider，不访问外部服务。"""
 
-    def __init__(self, responses: Sequence[str]) -> None:
+    def __init__(self, responses: Sequence[str | LLMResponse | LLMProviderError]) -> None:
         """保存待消费响应。
 
-        参数：responses 为每次 complete 依次返回的 JSON 或异常文本。
+        参数：responses 为每次 complete 依次返回的 JSON、响应对象或传输异常。
         返回：无。
         异常：无。
         副作用：初始化可供测试检查的请求记录。
@@ -99,12 +99,18 @@ class MockLLMProvider:
         """消费下一个预设响应，模拟一次成功模型调用。
 
         参数：request 为网关请求；timeout_seconds 仅保持契约一致。
-        返回：预设模型文本。
-        异常：响应耗尽时抛出 LLMProviderError。
+        返回：预设模型文本或响应对象。
+        异常：响应耗尽时或预设传输异常时抛出 LLMProviderError。
         副作用：记录请求并移除一个预设响应。
         """
         del timeout_seconds
         self.requests.append(request)
         if not self._responses:
             raise LLMProviderError("mock_responses_exhausted")
-        return LLMResponse(content=self._responses.pop(0))
+        # 测试可用预设异常驱动网关重试，无需模拟真实网络。
+        response = self._responses.pop(0)
+        if isinstance(response, LLMProviderError):
+            raise response
+        if isinstance(response, LLMResponse):
+            return response
+        return LLMResponse(content=response)
