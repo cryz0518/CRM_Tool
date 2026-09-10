@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     wecom_cli_command: str = "wecom-cli"
     wecom_cli_timeout_seconds: float = 20.0
     wecom_cli_retry_count: int = 1
+    lead_context_ttl_minutes: int = 30
+    lead_message_retry_count: int = 1
+    lead_outbox_poll_seconds: int = 10
+    lead_processing_timeout_seconds: int = 300
 
     @field_validator(
         "wecom_smart_table_sales_can_create_records",
@@ -45,6 +49,62 @@ class Settings(BaseSettings):
         """
         # 当前 CLI 不能读取权限，空值必须保留为 None 而不是错误地视作 false。
         return None if value == "" else value
+
+    @field_validator("lead_context_ttl_minutes")
+    @classmethod
+    def lead_context_ttl_must_be_positive(cls, value: int) -> int:
+        """拒绝非正的当前客户上下文有效期配置。
+
+        参数：value 为环境变量解析后的分钟数。
+        返回值：通过校验的正整数分钟数。
+        异常：分钟数不为正时抛出 ValueError，阻止服务以不安全配置启动。
+        副作用：无。
+        """
+        if value <= 0:
+            raise ValueError("LEAD_CONTEXT_TTL_MINUTES 必须大于 0")
+        return value
+
+    @field_validator("lead_message_retry_count")
+    @classmethod
+    def lead_message_retry_count_must_not_be_negative(cls, value: int) -> int:
+        """拒绝小于零的消息处理重试次数配置。
+
+        参数：value 为环境变量解析后的可额外重试次数。
+        返回值：通过校验的非负整数。
+        异常：值为负数时抛出 ValueError，阻止错误的失败检查点语义。
+        副作用：无。
+        """
+        if value < 0:
+            raise ValueError("LEAD_MESSAGE_RETRY_COUNT 不能小于 0")
+        return value
+
+    @field_validator("lead_outbox_poll_seconds")
+    @classmethod
+    def lead_outbox_poll_seconds_must_be_positive(cls, value: int) -> int:
+        """拒绝非正的 Outbox 扫描间隔配置。
+
+        参数：value 为环境变量解析后的秒数。
+        返回值：通过校验的正整数秒数。
+        异常：秒数不为正时抛出 ValueError，阻止 Worker 高频空转或停止扫描。
+        副作用：无。
+        """
+        if value <= 0:
+            raise ValueError("LEAD_OUTBOX_POLL_SECONDS 必须大于 0")
+        return value
+
+    @field_validator("lead_processing_timeout_seconds")
+    @classmethod
+    def lead_processing_timeout_seconds_must_be_positive(cls, value: int) -> int:
+        """拒绝非正的 processing 租约超时配置。
+
+        参数：value 为环境变量解析后的秒数。
+        返回值：通过校验的正整数秒数。
+        异常：秒数不为正时抛出 ValueError，阻止失联任务永久占用顺序检查点。
+        副作用：无。
+        """
+        if value <= 0:
+            raise ValueError("LEAD_PROCESSING_TIMEOUT_SECONDS 必须大于 0")
+        return value
 
 
 @lru_cache
