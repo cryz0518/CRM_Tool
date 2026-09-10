@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     wecom_cli_command: str = "wecom-cli"
     wecom_cli_timeout_seconds: float = 20.0
     wecom_cli_retry_count: int = 1
+    lead_context_ttl_minutes: int = 30
 
     @field_validator(
         "wecom_smart_table_sales_can_create_records",
@@ -45,6 +46,20 @@ class Settings(BaseSettings):
         """
         # 当前 CLI 不能读取权限，空值必须保留为 None 而不是错误地视作 false。
         return None if value == "" else value
+
+    @field_validator("lead_context_ttl_minutes")
+    @classmethod
+    def lead_context_ttl_must_be_positive(cls, value: int) -> int:
+        """拒绝非正的当前客户上下文有效期配置。
+
+        参数：value 为环境变量解析后的分钟数。
+        返回值：通过校验的正整数分钟数。
+        异常：分钟数不为正时抛出 ValueError，阻止服务以不安全配置启动。
+        副作用：无。
+        """
+        if value <= 0:
+            raise ValueError("LEAD_CONTEXT_TTL_MINUTES 必须大于 0")
+        return value
 
 
 @lru_cache

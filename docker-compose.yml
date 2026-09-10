@@ -43,6 +43,7 @@ services:
       WECOM_CLI_COMMAND: ${WECOM_CLI_COMMAND:-wecom-cli}
       WECOM_CLI_TIMEOUT_SECONDS: ${WECOM_CLI_TIMEOUT_SECONDS:-20}
       WECOM_CLI_RETRY_COUNT: ${WECOM_CLI_RETRY_COUNT:-1}
+      LEAD_CONTEXT_TTL_MINUTES: ${LEAD_CONTEXT_TTL_MINUTES:-30}
       TZ: Asia/Shanghai
     command: ["alembic", "upgrade", "head"]
     depends_on:

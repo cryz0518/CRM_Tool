@@ -64,6 +64,38 @@ class LeadFieldProvenance(Base):
     )
 
 
+class SalesLeadContext(Base):
+    """保存一名销售最近一次可安全补充的线索上下文。"""
+
+    __tablename__ = "sales_lead_contexts"
+
+    sales_user_id: Mapped[str] = mapped_column(
+        ForeignKey("sales_authorizations.wecom_user_id"), primary_key=True
+    )
+    lead_id: Mapped[str] = mapped_column(ForeignKey("leads.id"), nullable=False, index=True)
+    last_message_received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class LeadMessageResolution(Base):
+    """保存消息是否已归属线索，供待归属审核与后续人工处理使用。"""
+
+    __tablename__ = "lead_message_resolutions"
+
+    message_id: Mapped[str] = mapped_column(
+        ForeignKey("incoming_messages.message_id"), primary_key=True
+    )
+    lead_id: Mapped[str | None] = mapped_column(ForeignKey("leads.id"), index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
 class SmartTableSync(Base):
     """记录线索创建时的智能表格写入结果，外部失败不伪装为已同步。"""
 
