@@ -10,9 +10,9 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.leads.models import LeadMessageResolution
+from app.leads.models import LeadMessageResolution, SalesLeadContext
 from app.leads.service import FirstTextLeadWorkspaceService, LeadProcessingStatus
-from app.messaging.models import Base, IncomingMessage, OutboxEvent, SalesAuthorization
+from app.messaging.models import Base, IncomingMessage, OutboxEvent, SalesAuthorization, utc_now
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.registry import build_required_smart_table_schema
 
@@ -240,7 +240,13 @@ def test_failed_retries_automatically_continue_to_the_next_sales_message(
     with pytest.MonkeyPatch.context() as monkeypatch:
 
         def raise_table_error(*_: object, **__: object) -> object:
-            """模拟智能表格不可用，强制触发消息处理重试。"""
+            """模拟智能表格不可用，强制触发消息处理重试。
+
+            参数：位置和关键字参数用于兼容适配器调用。
+            返回值：无正常返回。
+            异常：始终抛出 RuntimeError。
+            副作用：无。
+            """
             raise RuntimeError("temporary")
 
         monkeypatch.setattr(adapter, "create_record", raise_table_error)
@@ -254,6 +260,43 @@ def test_failed_retries_automatically_continue_to_the_next_sales_message(
     assert first_event is not None
     assert first_event.status == "failed_pending_review"
     assert first_event.attempts == 2
+    assert second_event is not None
+    assert second_event.status == "ignored"
+
+
+def test_expired_processing_lease_becomes_a_checkpoint_for_the_next_message(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证失联 processing 任务超时后不会永久阻塞同一销售后续消息。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：租约超时未进入失败检查点或后续消息未继续时由 pytest 报告断言失败。
+    副作用：将首条事件模拟为六分钟前开始 processing，再消费它以触发租约恢复。
+    """
+    first_event_id, second_event_id = persist_outbox_texts(
+        session_factory,
+        "sales-1",
+        ["客户：失联客户", "你好，机器人"],
+    )
+    with session_factory.begin() as session:
+        first_event = session.get(OutboxEvent, first_event_id)
+        assert first_event is not None
+        first_event.status = "processing"
+        first_event.processing_started_at = utc_now() - timedelta(minutes=6)
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        MockSmartTableAdapter(schema=build_required_smart_table_schema()),
+    )
+
+    result = service.consume(first_event_id)
+
+    assert result.status is LeadProcessingStatus.ALREADY_PROCESSED
+    with session_factory() as session:
+        first_event = session.get(OutboxEvent, first_event_id)
+        second_event = session.get(OutboxEvent, second_event_id)
+    assert first_event is not None
+    assert first_event.status == "failed_pending_review"
     assert second_event is not None
     assert second_event.status == "ignored"
 
@@ -338,3 +381,45 @@ def test_expired_context_uses_unique_phone_as_strong_identity(
     record = adapter.get_record(created.smart_table_record_id)
     assert record is not None
     assert record.fields["工艺"] == "码垛"
+
+
+def test_strong_identity_beats_an_active_context_from_another_lead(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证历史客户的唯一手机号优先于仍有效的另一条当前客户上下文。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：手机号补充被串入当前上下文线索时由 pytest 报告断言失败。
+    副作用：创建两条销售私有线索，手动恢复首条上下文后消费第二条的手机号补充。
+    """
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+    first_event_id = persist_outbox_texts(
+        session_factory,
+        "sales-1",
+        ["客户：客户甲；手机号：13800000001"],
+    )[0]
+    first = service.consume(first_event_id)
+    second_event_id = persist_outbox_texts(
+        session_factory,
+        "sales-1",
+        ["客户：客户乙；手机号：13800000002"],
+    )[0]
+    second = service.consume(second_event_id)
+    assert first.lead_id is not None
+    assert second.lead_id is not None
+    with session_factory.begin() as session:
+        context = session.get(SalesLeadContext, "sales-1")
+        assert context is not None
+        context.lead_id = first.lead_id
+    third_event_id = persist_outbox_texts(
+        session_factory,
+        "sales-1",
+        ["手机号：13800000002；需求：码垛机器人"],
+    )[0]
+
+    updated = service.consume(third_event_id)
+
+    assert updated.status is LeadProcessingStatus.UPDATED
+    assert updated.lead_id == second.lead_id

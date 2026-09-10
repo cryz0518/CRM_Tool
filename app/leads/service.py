@@ -168,6 +168,7 @@ class FirstTextLeadWorkspaceService:
             raise ValueError("当前客户上下文有效期必须大于 0")
         self._lead_context_ttl = timedelta(minutes=configured_ttl_minutes)
         self._lead_message_retry_count = settings.lead_message_retry_count
+        self._lead_processing_timeout = timedelta(seconds=settings.lead_processing_timeout_seconds)
 
     def consume(self, outbox_event_id: int) -> LeadProcessingResult:
         """消费一条 Outbox 事件，并在其成为检查点后继续同销售的下一条消息。
@@ -206,6 +207,12 @@ class FirstTextLeadWorkspaceService:
                     return LeadProcessingResult(LeadProcessingStatus.INVALID_EVENT)
                 self._lock_sales_processing_stream(session, message.sales_user_id)
                 terminal_or_unknown_statuses = COMPLETED_CHECKPOINT_STATUSES | {"processing"}
+                if self._processing_lease_expired(event):
+                    # 失联 Worker 不得永久占住该销售队列；未知外部结果保留给人工核验而不重放。
+                    event.status = "failed_pending_review"
+                    self._record_audit(session, event, "lead_outbox_processing_lease_expired")
+                    logger.error("lead_outbox_processing_lease_expired")
+                    return self._processed_result(session, event)
                 if event.status in terminal_or_unknown_statuses:
                     # ponytail: Adapter 无创建幂等键；未知结果待人工核验，接口提供键后再安全重试。
                     return self._processed_result(session, event)
@@ -223,10 +230,10 @@ class FirstTextLeadWorkspaceService:
 
                 extractor = DeterministicFirstTextLeadExtractor()
                 extracted_patch = extractor.extract_patch(message.normalized_text)
-                context_lead = self._get_active_context_lead(session, message)
+                # 强身份优先于当前上下文，避免销售补充历史客户时把字段串到最近客户。
+                context_lead = self._get_strong_identity_lead(session, message, extracted_patch)
                 if context_lead is None:
-                    # 上下文过期后只允许明确公司、手机或邮箱精确命中已有本人线索。
-                    context_lead = self._get_strong_identity_lead(session, message, extracted_patch)
+                    context_lead = self._get_active_context_lead(session, message)
                 same_context_company = context_lead is not None and extracted_patch.get(
                     "线索名称"
                 ) == context_lead.field_values.get("线索名称")
@@ -244,11 +251,7 @@ class FirstTextLeadWorkspaceService:
                         return LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
 
                     # 既有非空值不允许被碎片消息静默覆盖，只向当前线索补充空字段。
-                    safe_patch = {
-                        field_name: value
-                        for field_name, value in context_patch.items()
-                        if not context_lead.field_values.get(field_name)
-                    }
+                    safe_patch = self._only_empty_fields(context_lead, context_patch)
                     if not safe_patch:
                         bind_log_context(lead_id=context_lead.id)
                         self._mark_assigned(session, event, context_lead.id)
@@ -262,6 +265,7 @@ class FirstTextLeadWorkspaceService:
                     if context_lead.smart_table_record_id is None:
                         raise ValueError(f"当前线索缺少智能表格记录：{context_lead.id}")
                     event.status = "processing"
+                    event.processing_started_at = utc_now()
                     bind_log_context(lead_id=context_lead.id)
                     # 外部表格调用必须等本事务提交后执行，避免在销售顺序锁内等待网络。
                     context_update = ContextUpdateRequest(
@@ -316,6 +320,7 @@ class FirstTextLeadWorkspaceService:
                         lead = existing_lead
                         fields = dict(lead.field_values)
                     event.status = "processing"
+                    event.processing_started_at = utc_now()
                     bind_log_context(lead_id=lead.id)
                     # 会话提交后 ORM 对象会脱离；只将下一步需要的不可变标识带出事务。
                     sales_user_id = message.sales_user_id
@@ -354,6 +359,21 @@ class FirstTextLeadWorkspaceService:
             )
         if next_event_id is not None:
             self.consume(next_event_id)
+
+    def _processing_lease_expired(self, event: OutboxEvent) -> bool:
+        """判断 processing 事件是否已超过可配置租约且应停止自动重放。
+
+        参数：event 为待检查的 Outbox 事件。
+        返回值：仅当事件处于 processing 且开始时间超过租约时返回 True。
+        异常：无。
+        副作用：无。
+        """
+        if event.status != "processing" or event.processing_started_at is None:
+            return False
+        return (
+            self._as_utc(utc_now())
+            > self._as_utc(event.processing_started_at) + self._lead_processing_timeout
+        )
 
     def _get_active_context_lead(self, session: Session, message: IncomingMessage) -> Lead | None:
         """读取尚未过期且属于当前销售的当前客户线索。
@@ -466,6 +486,22 @@ class FirstTextLeadWorkspaceService:
             )
         event.status = "succeeded"
         self._record_audit(session, event, "lead_message_assigned")
+        logger.info("lead_message_assigned")
+
+    def _only_empty_fields(self, lead: Lead, fields: dict[str, str]) -> dict[str, str]:
+        """从字段补丁中保留当前线索尚无值的字段，避免覆盖既有或人工数据。
+
+        参数：lead 为归属线索；fields 为本次确定性字段补丁。
+        返回值：只包含 lead.field_values 中为空的字段补丁。
+        异常：无。
+        副作用：无。
+        """
+        # 所有上下文补充都复用同一保护规则，不能因同步前后两个阶段出现行为漂移。
+        return {
+            field_name: value
+            for field_name, value in fields.items()
+            if not lead.field_values.get(field_name)
+        }
 
     def _refresh_context(self, session: Session, message: IncomingMessage, lead_id: str) -> None:
         """将一条成功处理消息设为该销售当前线索上下文的最新时间点。
@@ -525,11 +561,7 @@ class FirstTextLeadWorkspaceService:
             if lead is None:
                 raise ValueError(f"上下文更新线索不存在：{request.lead_id}")
             # 再次只追加空字段，避免未来并发路径把较新业务事实或人工修改覆盖回去。
-            safe_fields = {
-                field_name: value
-                for field_name, value in request.fields.items()
-                if not lead.field_values.get(field_name)
-            }
+            safe_fields = self._only_empty_fields(lead, request.fields)
             if safe_fields:
                 lead.field_values = {**lead.field_values, **safe_fields}
                 for field_name, value in safe_fields.items():
