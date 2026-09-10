@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     ai_gateway_retry_count: int = 1
     ai_high_confidence_threshold: float = 0.85
     ai_medium_confidence_threshold: float = 0.60
+    robot_submission_confirmation_available: bool = True
 
     @field_validator(
         "wecom_smart_table_sales_can_create_records",

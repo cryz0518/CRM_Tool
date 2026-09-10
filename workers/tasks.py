@@ -5,7 +5,9 @@ from __future__ import annotations
 from sqlalchemy import Engine, create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.ai.models import ExtractedLeadPatch, LeadAnalysis
 from app.core.config import get_settings
+from app.leads.review import LeadReviewService
 from app.leads.service import FirstTextLeadWorkspaceService
 from app.messaging.models import OutboxEvent
 from app.smart_table.dependencies import get_smart_table_adapter
@@ -40,6 +42,45 @@ def consume_lead_outbox_event(outbox_event_id: int) -> str:
         return service.consume(outbox_event_id).status.value
     finally:
         # 每个短任务释放独立连接池，避免 Beat 持续扫描时堆积空闲连接。
+        engine.dispose()
+
+
+@celery_app.task(name="workers.sync_ai_lead_patch")  # type: ignore[untyped-decorator]
+def sync_ai_lead_patch(
+    lead_id: str,
+    source_message_id: str,
+    trace_id: str,
+    analysis: dict[str, object],
+    fields: dict[str, str],
+    pending_confirmation_fields: list[str],
+    low_confidence_candidates: dict[str, str],
+) -> dict[str, list[str]]:
+    """消费 T08 已校验补丁并调用 T09 审核服务安全同步智能表格。
+
+    参数：前三项定位 AI 处理事实；其余参数为 Celery JSON 序列化后的 ExtractedLeadPatch 内容。
+    返回值：实际写入和人工保护字段，供调用方记录可观测任务结果。
+    异常：Pydantic、数据库或表格异常向 Celery 传播，保留任务失败事实。
+    副作用：重读智能表格并可能更新字段来源、审核元数据和业务审计。
+    """
+    # Worker 只反序列化 T08 已产生的结果；不在此处重新调用模型或解释业务字段。
+    patch = ExtractedLeadPatch(
+        trace_id=trace_id,
+        analysis=LeadAnalysis.model_validate(analysis),
+        fields=fields,
+        pending_confirmation_fields=tuple(pending_confirmation_fields),
+        low_confidence_candidates=low_confidence_candidates,
+    )
+    engine, factory = _session_factory()
+    try:
+        result = LeadReviewService(factory, get_smart_table_adapter()).sync_ai_patch(
+            lead_id, source_message_id, patch
+        )
+        return {
+            "updated_fields": list(result.updated_fields),
+            "protected_fields": list(result.protected_fields),
+        }
+    finally:
+        # 独立 Worker 任务完成后释放连接池，避免高频 AI 补丁同步积累空闲连接。
         engine.dispose()
 
 
