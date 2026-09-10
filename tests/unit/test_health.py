@@ -42,7 +42,8 @@ def test_container_healthcheck_calls_readiness_endpoint(monkeypatch: object) -> 
     def fake_urlopen(url: str, *, timeout: int) -> SuccessfulResponse:
         """记录探针 URL 并返回成功响应，避免发起真实网络请求。"""
         requested_urls.append(url)
-        assert timeout == 2
+        # 真实 Adapter 的 schema 读取可能超过普通进程探针时长，需覆盖完整调用。
+        assert timeout == 5
         return SuccessfulResponse()
 
     monkeypatch.setattr(healthcheck, "urlopen", fake_urlopen)  # type: ignore[attr-defined]
