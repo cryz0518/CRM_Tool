@@ -6,10 +6,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 # 安装时区数据，确保容器内时间与项目部署时区一致。
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y tzdata \
+    && apt-get install --no-install-recommends -y nodejs npm tzdata \
     && ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime \
     && echo "${TZ}" > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
+
+# Worker 的真实智能表格适配器通过 CLI 调用企业微信；凭据仅在运行时注入。
+RUN npm install --global @wecom/cli
 
 WORKDIR /app
 

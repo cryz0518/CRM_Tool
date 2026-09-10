@@ -49,11 +49,13 @@ class SmartTableSchema:
         """按展示名称取得字段，避免适配器泄露底层查询细节。
 
         参数：name 为管理员配置的字段展示名称。
-        返回：匹配的字段快照；找不到时返回 None。
+        返回：匹配的字段快照；找不到时返回 None。管理员必填前缀 `*` 不参与匹配。
         """
+        # 管理员用前缀标识表格必填项，不应改变本项目固定的业务字段名称。
+        expected_name = name.removeprefix("*")
         for field in self.fields:
             # 字段名是启动时绑定的稳定业务键，不能按数组顺序或底层 ID 推断。
-            if field.name == name:
+            if field.name.removeprefix("*") == expected_name:
                 return field
         return None
 
