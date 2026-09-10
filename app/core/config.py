@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     lead_message_retry_count: int = 1
     lead_outbox_poll_seconds: int = 10
     lead_processing_timeout_seconds: int = 300
+    llm_provider: Literal["mock", "qwen"] = "qwen"
+    qwen_api_key: str | None = None
+    qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    qwen_model: str = "qwen3.7-flash"
+    ai_gateway_timeout_seconds: float = 20.0
+    ai_gateway_retry_count: int = 1
+    ai_high_confidence_threshold: float = 0.85
+    ai_medium_confidence_threshold: float = 0.60
 
     @field_validator(
         "wecom_smart_table_sales_can_create_records",
