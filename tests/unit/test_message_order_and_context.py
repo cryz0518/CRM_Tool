@@ -50,9 +50,16 @@ def persist_outbox_texts(
     副作用：新增授权、来源消息和待消费 Outbox 事件。
     """
     with session_factory.begin() as session:
-        session.add(SalesAuthorization(wecom_user_id=sales_user_id, is_authorized=True))
+        if session.get(SalesAuthorization, sales_user_id) is None:
+            session.add(SalesAuthorization(wecom_user_id=sales_user_id, is_authorized=True))
+        last_sequence = session.scalar(
+            select(OutboxEvent.sequence)
+            .where(OutboxEvent.sales_user_id == sales_user_id)
+            .order_by(OutboxEvent.sequence.desc())
+            .limit(1)
+        )
         event_ids: list[int] = []
-        for sequence, text in enumerate(texts, start=1):
+        for sequence, text in enumerate(texts, start=(last_sequence or 0) + 1):
             message_id = f"{sales_user_id}-message-{sequence}"
             session.add(
                 IncomingMessage(
@@ -110,15 +117,16 @@ def test_fragment_within_current_context_safely_updates_the_same_lead(
     异常：归属错误或整行覆盖时由 pytest 报告断言失败。
     副作用：依次消费两条 Outbox，并向 Mock 智能表格写入一个字段补丁。
     """
-    first_event_id, second_event_id = persist_outbox_texts(
+    first_event_id = persist_outbox_texts(
         session_factory,
         "sales-1",
-        ["客户：长广溪智造", "需求：码垛机器人"],
-    )
+        ["客户：长广溪智造"],
+    )[0]
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     service = FirstTextLeadWorkspaceService(session_factory, adapter)
 
     created = service.consume(first_event_id)
+    second_event_id = persist_outbox_texts(session_factory, "sales-1", ["需求：码垛机器人"])[0]
     updated = service.consume(second_event_id)
 
     assert created.status is LeadProcessingStatus.CREATED
@@ -129,6 +137,33 @@ def test_fragment_within_current_context_safely_updates_the_same_lead(
     assert record is not None
     assert record.fields["线索名称"] == "长广溪智造"
     assert record.fields["工艺"] == "码垛"
+
+
+def test_repeated_current_company_name_updates_instead_of_creating_a_second_lead(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证上下文内重复公司名仍合并字段补丁，不会创建第二条表格记录。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：同公司消息新建第二条线索时由 pytest 报告断言失败。
+    副作用：先创建当前线索，再消费重复公司名和工艺的后续消息。
+    """
+    first_event_id = persist_outbox_texts(session_factory, "sales-1", ["客户：长广溪智造"])[0]
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+    created = service.consume(first_event_id)
+    second_event_id = persist_outbox_texts(
+        session_factory,
+        "sales-1",
+        ["公司：长广溪智造；需求：码垛机器人"],
+    )[0]
+
+    updated = service.consume(second_event_id)
+
+    assert updated.status is LeadProcessingStatus.UPDATED
+    assert updated.lead_id == created.lead_id
+    assert len(adapter.get_records()) == 1
 
 
 def test_failed_pending_review_event_is_a_checkpoint_for_later_same_sales_message(
@@ -184,6 +219,45 @@ def test_pending_message_from_another_salesperson_does_not_block_consumption(
     assert result.status is LeadProcessingStatus.CREATED
 
 
+def test_failed_retries_automatically_continue_to_the_next_sales_message(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证重试耗尽的失败消息自动让同销售下一条消息继续处理。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：失败终态仍未推进后续消息时由 pytest 报告断言失败。
+    副作用：使首条表格创建连续失败两次，并检查第二条普通消息已被自动消费。
+    """
+    first_event_id, second_event_id = persist_outbox_texts(
+        session_factory,
+        "sales-1",
+        ["客户：失败客户", "你好，机器人"],
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+
+        def raise_table_error(*_: object, **__: object) -> object:
+            """模拟智能表格不可用，强制触发消息处理重试。"""
+            raise RuntimeError("temporary")
+
+        monkeypatch.setattr(adapter, "create_record", raise_table_error)
+        service.consume(first_event_id)
+        service.consume(first_event_id)
+
+    with session_factory() as session:
+        first_event = session.get(OutboxEvent, first_event_id)
+        second_event = session.get(OutboxEvent, second_event_id)
+
+    assert first_event is not None
+    assert first_event.status == "failed_pending_review"
+    assert first_event.attempts == 2
+    assert second_event is not None
+    assert second_event.status == "ignored"
+
+
 def test_expired_current_context_keeps_weak_fragment_unassigned(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -194,15 +268,16 @@ def test_expired_current_context_keeps_weak_fragment_unassigned(
     异常：过期消息被归属到历史线索时由 pytest 报告断言失败。
     副作用：创建首条线索后将第二条消息时间推进三十一分钟并消费。
     """
-    first_event_id, second_event_id = persist_outbox_texts(
+    first_event_id = persist_outbox_texts(
         session_factory,
         "sales-1",
-        ["客户：长广溪智造", "预算约 20 万"],
-    )
+        ["客户：长广溪智造"],
+    )[0]
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     service = FirstTextLeadWorkspaceService(session_factory, adapter, lead_context_ttl_minutes=30)
     created = service.consume(first_event_id)
     assert created.lead_id is not None
+    second_event_id = persist_outbox_texts(session_factory, "sales-1", ["预算约 20 万"])[0]
     with session_factory.begin() as session:
         first_message = session.get(IncomingMessage, "sales-1-message-1")
         second_message = session.get(IncomingMessage, "sales-1-message-2")
@@ -223,3 +298,43 @@ def test_expired_current_context_keeps_weak_fragment_unassigned(
     assert resolution is not None
     assert resolution.status == "unassigned"
     assert resolution.lead_id is None
+
+
+def test_expired_context_uses_unique_phone_as_strong_identity(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证过期上下文后的唯一手机号仍可安全定位当前销售自己的既有线索。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：强身份消息未补充到既有线索时由 pytest 报告断言失败。
+    副作用：创建带手机号的线索，推进后续消息时间并消费手机号补充。
+    """
+    first_event_id = persist_outbox_texts(
+        session_factory,
+        "sales-1",
+        ["客户：长广溪智造；手机号：13800000000"],
+    )[0]
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter, lead_context_ttl_minutes=30)
+    created = service.consume(first_event_id)
+    second_event_id = persist_outbox_texts(
+        session_factory,
+        "sales-1",
+        ["手机号：13800000000；需求：码垛机器人"],
+    )[0]
+    with session_factory.begin() as session:
+        first_message = session.get(IncomingMessage, "sales-1-message-1")
+        second_message = session.get(IncomingMessage, "sales-1-message-2")
+        assert first_message is not None
+        assert second_message is not None
+        second_message.received_at = first_message.received_at + timedelta(minutes=31)
+
+    updated = service.consume(second_event_id)
+
+    assert updated.status is LeadProcessingStatus.UPDATED
+    assert updated.lead_id == created.lead_id
+    assert created.smart_table_record_id is not None
+    record = adapter.get_record(created.smart_table_record_id)
+    assert record is not None
+    assert record.fields["工艺"] == "码垛"

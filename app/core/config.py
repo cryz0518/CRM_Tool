@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     wecom_cli_timeout_seconds: float = 20.0
     wecom_cli_retry_count: int = 1
     lead_context_ttl_minutes: int = 30
+    lead_message_retry_count: int = 1
 
     @field_validator(
         "wecom_smart_table_sales_can_create_records",
@@ -59,6 +60,20 @@ class Settings(BaseSettings):
         """
         if value <= 0:
             raise ValueError("LEAD_CONTEXT_TTL_MINUTES 必须大于 0")
+        return value
+
+    @field_validator("lead_message_retry_count")
+    @classmethod
+    def lead_message_retry_count_must_not_be_negative(cls, value: int) -> int:
+        """拒绝小于零的消息处理重试次数配置。
+
+        参数：value 为环境变量解析后的可额外重试次数。
+        返回值：通过校验的非负整数。
+        异常：值为负数时抛出 ValueError，阻止错误的失败检查点语义。
+        副作用：无。
+        """
+        if value < 0:
+            raise ValueError("LEAD_MESSAGE_RETRY_COUNT 不能小于 0")
         return value
 
 

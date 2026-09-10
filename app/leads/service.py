@@ -32,6 +32,10 @@ from app.smart_table.adapter import SmartTableActor, SmartTableAdapter
 
 logger = logging.getLogger(__name__)
 
+COMPLETED_CHECKPOINT_STATUSES = frozenset(
+    {"succeeded", "ignored", "unauthorized", "invalid", "failed_pending_review"}
+)
+
 
 class LeadProcessingStatus(StrEnum):
     """描述一次 T02 Outbox 文本消费的可观察业务结论。"""
@@ -56,10 +60,29 @@ class LeadProcessingResult:
     smart_table_record_id: str | None = None
 
 
+@dataclass(frozen=True)
+class ContextUpdateRequest:
+    """描述提交事务后可安全执行的一次既有智能表格字段补丁。"""
+
+    source_message_id: str
+    lead_id: str
+    record_id: str
+    fields: dict[str, str]
+    outbox_event_id: int
+
+
 class DeterministicFirstTextLeadExtractor:
     """仅识别显式标签文本，作为 T05 不调用 LLM 的临时确定性提取器。"""
 
-    _label_to_field = {"客户": "线索名称", "公司": "线索名称", "联系人": "联系人"}
+    _label_to_field = {
+        "客户": "线索名称",
+        "公司": "线索名称",
+        "联系人": "联系人",
+        "手机": "手机",
+        "手机号": "手机",
+        "电话": "电话",
+        "邮箱": "邮箱",
+    }
     _process_values = ("装配", "码垛", "视觉检测", "贴标", "开箱机", "自助加油/充电", "商业应用")
 
     def extract(self, text: str | None) -> dict[str, str] | None:
@@ -134,16 +157,32 @@ class FirstTextLeadWorkspaceService:
         self._session_factory = session_factory
         self._smart_table_adapter = smart_table_adapter
         self._sales_identity_provider = sales_identity_provider or DatabaseSalesIdentityProvider()
+        settings = get_settings()
         configured_ttl_minutes = (
-            get_settings().lead_context_ttl_minutes
+            settings.lead_context_ttl_minutes
             if lead_context_ttl_minutes is None
             else lead_context_ttl_minutes
         )
+        # 上下文有效期与失败重试次数均由部署配置决定，避免业务逻辑内硬编码阈值。
         if configured_ttl_minutes <= 0:
             raise ValueError("当前客户上下文有效期必须大于 0")
         self._lead_context_ttl = timedelta(minutes=configured_ttl_minutes)
+        self._lead_message_retry_count = settings.lead_message_retry_count
 
     def consume(self, outbox_event_id: int) -> LeadProcessingResult:
+        """消费一条 Outbox 事件，并在其成为检查点后继续同销售的下一条消息。
+
+        参数：outbox_event_id 为 T02 已提交的待处理事件标识。
+        返回值：返回本次指定事件的确定性处理结论。
+        异常：事件或来源消息丢失时抛出 ValueError；数据库异常向调用方传播。
+        副作用：本事件成功、忽略、拒绝或失败耗尽后，会串行触发同销售的下一条待处理事件。
+        """
+        result = self._consume_once(outbox_event_id)
+        # 只在本事件已越过首次消费检查点后继续，防止 retrying/processing 事件被错误跳过。
+        self._consume_next_after_checkpoint(outbox_event_id)
+        return result
+
+    def _consume_once(self, outbox_event_id: int) -> LeadProcessingResult:
         """消费一条 T02 Outbox 文本事件并将首次有效线索同步到共享审核表。
 
         参数：outbox_event_id 为 T02 已提交的待处理事件标识。
@@ -152,7 +191,7 @@ class FirstTextLeadWorkspaceService:
         副作用：可能创建 Lead、字段来源、同步结果、审计事件及智能表格记录。
         """
         log_token = None
-        context_update: tuple[str, str, str, dict[str, str], int] | None = None
+        context_update: ContextUpdateRequest | None = None
         try:
             with self._session_factory.begin() as session:
                 event, message = self._load_event_and_message(session, outbox_event_id)
@@ -166,14 +205,7 @@ class FirstTextLeadWorkspaceService:
                     logger.error("outbox_sales_identity_mismatch")
                     return LeadProcessingResult(LeadProcessingStatus.INVALID_EVENT)
                 self._lock_sales_processing_stream(session, message.sales_user_id)
-                terminal_or_unknown_statuses = {
-                    "succeeded",
-                    "ignored",
-                    "unauthorized",
-                    "invalid",
-                    "processing",
-                    "failed_pending_review",
-                }
+                terminal_or_unknown_statuses = COMPLETED_CHECKPOINT_STATUSES | {"processing"}
                 if event.status in terminal_or_unknown_statuses:
                     # ponytail: Adapter 无创建幂等键；未知结果待人工核验，接口提供键后再安全重试。
                     return self._processed_result(session, event)
@@ -192,20 +224,36 @@ class FirstTextLeadWorkspaceService:
                 extractor = DeterministicFirstTextLeadExtractor()
                 extracted_patch = extractor.extract_patch(message.normalized_text)
                 context_lead = self._get_active_context_lead(session, message)
-                if context_lead is not None and "线索名称" not in extracted_patch:
-                    if not extracted_patch:
+                if context_lead is None:
+                    # 上下文过期后只允许明确公司、手机或邮箱精确命中已有本人线索。
+                    context_lead = self._get_strong_identity_lead(session, message, extracted_patch)
+                same_context_company = context_lead is not None and extracted_patch.get(
+                    "线索名称"
+                ) == context_lead.field_values.get("线索名称")
+                if context_lead is not None and (
+                    "线索名称" not in extracted_patch or same_context_company
+                ):
+                    # 重复报出同一公司名仍属于当前线索，不可因标签重复而新建表格记录。
+                    context_patch = {
+                        field_name: value
+                        for field_name, value in extracted_patch.items()
+                        if field_name != "线索名称"
+                    }
+                    if not context_patch and not same_context_company:
                         self._mark_unassigned(session, event)
                         return LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
 
                     # 既有非空值不允许被碎片消息静默覆盖，只向当前线索补充空字段。
                     safe_patch = {
                         field_name: value
-                        for field_name, value in extracted_patch.items()
+                        for field_name, value in context_patch.items()
                         if not context_lead.field_values.get(field_name)
                     }
                     if not safe_patch:
+                        bind_log_context(lead_id=context_lead.id)
                         self._mark_assigned(session, event, context_lead.id)
                         self._refresh_context(session, message, context_lead.id)
+                        logger.info("lead_message_assigned_to_current_context")
                         return LeadProcessingResult(
                             LeadProcessingStatus.UPDATED,
                             lead_id=context_lead.id,
@@ -216,12 +264,12 @@ class FirstTextLeadWorkspaceService:
                     event.status = "processing"
                     bind_log_context(lead_id=context_lead.id)
                     # 外部表格调用必须等本事务提交后执行，避免在销售顺序锁内等待网络。
-                    context_update = (
-                        message.message_id,
-                        context_lead.id,
-                        context_lead.smart_table_record_id,
-                        safe_patch,
-                        outbox_event_id,
+                    context_update = ContextUpdateRequest(
+                        source_message_id=message.message_id,
+                        lead_id=context_lead.id,
+                        record_id=context_lead.smart_table_record_id,
+                        fields=safe_patch,
+                        outbox_event_id=outbox_event_id,
                     )
 
                 if context_update is None:
@@ -274,12 +322,38 @@ class FirstTextLeadWorkspaceService:
                     lead_id = lead.id
 
             if context_update is not None:
-                return self._update_smart_table_record(*context_update)
+                return self._update_smart_table_record(context_update)
             assert fields is not None
             return self._create_smart_table_record(sales_user_id, fields, lead_id, outbox_event_id)
         finally:
             if log_token is not None:
                 reset_log_context(log_token)
+
+    def _consume_next_after_checkpoint(self, outbox_event_id: int) -> None:
+        """在本事件成为检查点后串行消费同一销售的下一条待处理消息。
+
+        参数：outbox_event_id 为刚完成或失败耗尽的来源 Outbox 事件。
+        返回值：无。
+        异常：数据库读取失败时由 SQLAlchemy 抛出；下一条消费的异常按其真实类型传播。
+        副作用：可能递归消费同一销售按 sequence 排序的后续 pending 或 retrying 事件。
+        """
+        with self._session_factory() as session:
+            event = session.get(OutboxEvent, outbox_event_id)
+            if event is None or event.status not in COMPLETED_CHECKPOINT_STATUSES:
+                return
+            # 只挑选最早的后续事件，递归调用会在每个新检查点后继续推进该销售的队列。
+            next_event_id = session.scalar(
+                select(OutboxEvent.id)
+                .where(
+                    OutboxEvent.sales_user_id == event.sales_user_id,
+                    OutboxEvent.sequence > event.sequence,
+                    OutboxEvent.status.in_(("pending", "retrying")),
+                )
+                .order_by(OutboxEvent.sequence)
+                .limit(1)
+            )
+        if next_event_id is not None:
+            self.consume(next_event_id)
 
     def _get_active_context_lead(self, session: Session, message: IncomingMessage) -> Lead | None:
         """读取尚未过期且属于当前销售的当前客户线索。
@@ -295,11 +369,47 @@ class FirstTextLeadWorkspaceService:
         received_at = self._as_utc(message.received_at)
         context_at = self._as_utc(context.last_message_received_at)
         if received_at > context_at + self._lead_context_ttl:
+            # 过期上下文不得作为弱身份消息的默认归属依据。
             return None
         lead = session.get(Lead, context.lead_id)
         if lead is None or lead.smart_table_owner_user_id != message.sales_user_id:
+            # 上下文只能指向当前销售仍拥有的有效线索，异常事实一律不复用。
             return None
         return lead
+
+    def _get_strong_identity_lead(
+        self, session: Session, message: IncomingMessage, fields: dict[str, str]
+    ) -> Lead | None:
+        """在当前销售范围内以唯一明确身份字段定位过期上下文后的既有线索。
+
+        参数：session 为当前事务；message 为待归属消息；fields 为确定性提取的候选字段。
+        返回值：公司、手机或邮箱恰好唯一命中时返回 Lead，否则返回 None。
+        异常：数据库读取失败时由 SQLAlchemy 抛出。
+        副作用：仅读取当前销售的线索草稿，不访问其他销售数据。
+        """
+        strong_fields = {"线索名称", "手机", "邮箱"}
+        candidate_values = {
+            field_name: value for field_name, value in fields.items() if field_name in strong_fields
+        }
+        if not candidate_values:
+            return None
+        # ponytail: 当前按销售读取后比较 JSON；线索量成为瓶颈时改为已验证字段的索引列。
+        candidates = session.scalars(
+            select(Lead).where(
+                Lead.smart_table_owner_user_id == message.sales_user_id,
+                Lead.smart_table_record_id.is_not(None),
+            )
+        ).all()
+        matches = [
+            lead
+            for lead in candidates
+            if any(
+                lead.field_values.get(field_name) == value
+                for field_name, value in candidate_values.items()
+            )
+        ]
+        # 多条记录命中时宁可保留待归属，也不能猜测应补充给哪一条线索。
+        return matches[0] if len(matches) == 1 else None
 
     def _as_utc(self, value: datetime) -> datetime:
         """将 SQLite 等驱动返回的朴素时间统一视为 UTC 时间。
@@ -367,6 +477,7 @@ class FirstTextLeadWorkspaceService:
         """
         context = session.get(SalesLeadContext, message.sales_user_id)
         if context is None:
+            # 首条成功归属消息为该销售创建独立上下文，不与其他销售共享。
             session.add(
                 SalesLeadContext(
                     sales_user_id=message.sales_user_id,
@@ -375,51 +486,48 @@ class FirstTextLeadWorkspaceService:
                 )
             )
             return
+        # 同一销售的后续成功消息才推进上下文，保留其当前线索和接收时间。
         context.lead_id = lead_id
         context.last_message_received_at = message.received_at
 
-    def _update_smart_table_record(
-        self,
-        source_message_id: str,
-        lead_id: str,
-        record_id: str,
-        fields: dict[str, str],
-        outbox_event_id: int,
-    ) -> LeadProcessingResult:
+    def _update_smart_table_record(self, request: ContextUpdateRequest) -> LeadProcessingResult:
         """将当前客户上下文中的安全字段补丁增量写入既有智能表格记录。
 
-        参数：source_message_id 为来源消息；lead_id 和 record_id 定位既有记录；fields 为补丁；
-        outbox_event_id 用于持久化任务结果。
+        参数：request 为提交后可执行的上下文更新请求。
         返回值：成功时返回 UPDATED，外部失败时返回 SYNC_FAILED。
         异常：关键持久化事实缺失时抛出 ValueError；数据库错误向调用方传播。
         副作用：调用 SmartTableAdapter，成功后保存字段来源、消息归属、上下文和审计。
         """
         logger.info("smart_table_context_update_started")
         try:
-            self._smart_table_adapter.update_record(record_id, fields)
+            self._smart_table_adapter.update_record(request.record_id, request.fields)
         except Exception as error:
             # 失败只留下可重试任务状态，当前销售的后续消息会等待或在失败终态后继续。
             with self._session_factory.begin() as session:
-                event, _ = self._load_event_and_message(session, outbox_event_id)
-                event.status = "retrying"
-                self._record_audit(session, event, "smart_table_context_update_retrying")
+                event, _ = self._load_event_and_message(session, request.outbox_event_id)
+                self._record_sync_failure(
+                    session,
+                    event,
+                    retrying_event_type="smart_table_context_update_retrying",
+                    failed_event_type="smart_table_context_update_failed_pending_review",
+                )
             logger.exception(
                 "smart_table_context_update_failed",
                 extra={"error_type": type(error).__name__},
             )
-            return LeadProcessingResult(LeadProcessingStatus.SYNC_FAILED, lead_id=lead_id)
+            return LeadProcessingResult(LeadProcessingStatus.SYNC_FAILED, lead_id=request.lead_id)
 
         with self._session_factory.begin() as session:
-            event, message = self._load_event_and_message(session, outbox_event_id)
-            if message.message_id != source_message_id:
-                raise ValueError(f"上下文更新来源消息不一致：{outbox_event_id}")
-            lead = session.get(Lead, lead_id)
+            event, message = self._load_event_and_message(session, request.outbox_event_id)
+            if message.message_id != request.source_message_id:
+                raise ValueError(f"上下文更新来源消息不一致：{request.outbox_event_id}")
+            lead = session.get(Lead, request.lead_id)
             if lead is None:
-                raise ValueError(f"上下文更新线索不存在：{lead_id}")
+                raise ValueError(f"上下文更新线索不存在：{request.lead_id}")
             # 再次只追加空字段，避免未来并发路径把较新业务事实或人工修改覆盖回去。
             safe_fields = {
                 field_name: value
-                for field_name, value in fields.items()
+                for field_name, value in request.fields.items()
                 if not lead.field_values.get(field_name)
             }
             if safe_fields:
@@ -427,20 +535,20 @@ class FirstTextLeadWorkspaceService:
                 for field_name, value in safe_fields.items():
                     session.add(
                         LeadFieldProvenance(
-                            lead_id=lead_id,
-                            source_message_id=source_message_id,
+                            lead_id=request.lead_id,
+                            source_message_id=request.source_message_id,
                             field_name=field_name,
                             value=value,
                         )
                     )
-            self._mark_assigned(session, event, lead_id)
-            self._refresh_context(session, message, lead_id)
+            self._mark_assigned(session, event, request.lead_id)
+            self._refresh_context(session, message, request.lead_id)
             self._record_audit(session, event, "smart_table_context_updated")
         logger.info("smart_table_context_updated")
         return LeadProcessingResult(
             LeadProcessingStatus.UPDATED,
-            lead_id=lead_id,
-            smart_table_record_id=record_id,
+            lead_id=request.lead_id,
+            smart_table_record_id=request.record_id,
         )
 
     def _lock_sales_processing_stream(self, session: Session, sales_user_id: str) -> None:
@@ -467,20 +575,13 @@ class FirstTextLeadWorkspaceService:
         异常：数据库查询失败时由 SQLAlchemy 抛出。
         副作用：仅读取同一销售且 sequence 更小的 Outbox 事件。
         """
-        completed_checkpoint_statuses = {
-            "succeeded",
-            "ignored",
-            "unauthorized",
-            "invalid",
-            "failed_pending_review",
-        }
         # failed_pending_review 是失败重试耗尽后的顺序检查点，后续消息不能被它永久阻塞。
         previous_event_id = session.scalar(
             select(OutboxEvent.id)
             .where(
                 OutboxEvent.sales_user_id == event.sales_user_id,
                 OutboxEvent.sequence < event.sequence,
-                OutboxEvent.status.not_in(completed_checkpoint_statuses),
+                OutboxEvent.status.not_in(COMPLETED_CHECKPOINT_STATUSES),
             )
             .order_by(OutboxEvent.sequence)
             .limit(1)
@@ -550,10 +651,15 @@ class FirstTextLeadWorkspaceService:
                     select(SmartTableSync).where(SmartTableSync.lead_id == lead_id)
                 )
                 if sync is not None:
-                    sync.status = "retrying"
                     sync.error_summary = type(error).__name__
-                event.status = "retrying"
-                self._record_audit(session, event, "smart_table_sync_retrying")
+                failed_pending_review = self._record_sync_failure(
+                    session,
+                    event,
+                    retrying_event_type="smart_table_sync_retrying",
+                    failed_event_type="smart_table_sync_failed_pending_review",
+                )
+                if sync is not None:
+                    sync.status = "failed_pending_review" if failed_pending_review else "retrying"
             logger.exception(
                 "smart_table_first_lead_sync_failed",
                 extra={"error_type": type(error).__name__},
@@ -581,6 +687,33 @@ class FirstTextLeadWorkspaceService:
             lead_id=lead_id,
             smart_table_record_id=record.record_id,
         )
+
+    def _record_sync_failure(
+        self,
+        session: Session,
+        event: OutboxEvent,
+        *,
+        retrying_event_type: str,
+        failed_event_type: str,
+    ) -> bool:
+        """记录一次外部同步失败，并在重试耗尽时将其变为顺序检查点。
+
+        参数：session 为当前事务；event 为失败来源事件；两个 event_type 分别记录可重试和耗尽结论。
+        返回值：本次失败是否使事件进入 failed_pending_review。
+        异常：数据库写入失败时由 SQLAlchemy 抛出。
+        副作用：增加尝试次数，更新任务状态并写入对应业务审计事件。
+        """
+        event.attempts += 1
+        # 配置值表示额外重试次数：首次失败可重试，超过上限后才允许后续消息越过。
+        if event.attempts > self._lead_message_retry_count:
+            event.status = "failed_pending_review"
+            self._record_audit(session, event, failed_event_type)
+            logger.error("lead_outbox_failed_pending_review")
+            return True
+        event.status = "retrying"
+        self._record_audit(session, event, retrying_event_type)
+        logger.warning("lead_outbox_retrying")
+        return False
 
     def _record_audit(self, session: Session, event: OutboxEvent, event_type: str) -> None:
         """为当前 Outbox 处理阶段添加唯一且可查询的业务审计事件。
