@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.messaging.models import Base, utc_now
@@ -62,7 +62,28 @@ class LeadFieldProvenance(Base):
     )
     field_name: Mapped[str] = mapped_column(String(64), nullable=False)
     value: Mapped[str] = mapped_column(String(512), nullable=False)
+    last_ai_synced_value: Mapped[str | None] = mapped_column(String(512))
+    is_user_modified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_user_confirmed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class UserConfirmationEvent(Base):
+    """保存销售经机器人显式确认 AI 待确认字段的不可变审计事实。"""
+
+    __tablename__ = "user_confirmation_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    lead_id: Mapped[str] = mapped_column(ForeignKey("leads.id"), nullable=False, index=True)
+    field_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    confirmed_value: Mapped[str] = mapped_column(String(512), nullable=False)
+    operator_sales_user_id: Mapped[str] = mapped_column(
+        ForeignKey("sales_authorizations.wecom_user_id"), nullable=False
+    )
+    confirmation_source: Mapped[str] = mapped_column(String(32), default="robot", nullable=False)
+    confirmed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
 
