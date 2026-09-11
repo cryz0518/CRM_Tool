@@ -11,6 +11,8 @@ from enum import StrEnum
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.ai.gateway import AIGateway, AIGatewayError
+from app.ai.models import ExtractedLeadPatch
 from app.core.config import get_settings
 from app.core.logging import bind_log_context, reset_log_context
 from app.leads.identity import DatabaseSalesIdentityProvider, SalesIdentityProvider
@@ -22,6 +24,7 @@ from app.leads.models import (
     SalesLeadContext,
     SmartTableSync,
 )
+from app.leads.review import LeadReviewService
 from app.messaging.models import (
     BusinessAuditEvent,
     IncomingMessage,
@@ -83,6 +86,18 @@ class MultiLeadSyncRequest:
     segment_index: int
     fields: dict[str, str]
     outbox_event_id: int
+
+
+@dataclass(frozen=True)
+class AIReviewRequest:
+    """描述一条已经可靠归属、待经 T09 安全写入的 AI 字段补丁。"""
+
+    source_message_id: str
+    sales_user_id: str
+    lead_id: str
+    outbox_event_id: int
+    patch: ExtractedLeadPatch
+    creates_lead: bool
 
 
 @dataclass(frozen=True)
@@ -202,11 +217,12 @@ class FirstTextLeadWorkspaceService:
         smart_table_adapter: SmartTableAdapter,
         sales_identity_provider: SalesIdentityProvider | None = None,
         lead_context_ttl_minutes: int | None = None,
+        ai_gateway: AIGateway | None = None,
     ) -> None:
         """注入数据库、表格和销售身份边界，避免业务层依赖真实 CLI 或 Qwen。
 
         参数：session_factory 创建事务；smart_table_adapter 写销售审核表；身份提供器可替换测试实现；
-        lead_context_ttl_minutes 可覆盖环境中的上下文有效期。
+        lead_context_ttl_minutes 可覆盖环境中的上下文有效期；ai_gateway 为可替换的 T08 网关。
         返回值：无。
         异常：无；依赖错误在消费时按其真实类型处理。
         副作用：仅保存依赖引用，不读写数据库或智能表格。
@@ -214,6 +230,7 @@ class FirstTextLeadWorkspaceService:
         self._session_factory = session_factory
         self._smart_table_adapter = smart_table_adapter
         self._sales_identity_provider = sales_identity_provider or DatabaseSalesIdentityProvider()
+        self._ai_gateway = ai_gateway
         settings = get_settings()
         configured_ttl_minutes = (
             settings.lead_context_ttl_minutes
@@ -250,6 +267,7 @@ class FirstTextLeadWorkspaceService:
         """
         log_token = None
         context_update: ContextUpdateRequest | None = None
+        ai_review: AIReviewRequest | None = None
         try:
             with self._session_factory.begin() as session:
                 event, message = self._load_event_and_message(session, outbox_event_id)
@@ -314,11 +332,24 @@ class FirstTextLeadWorkspaceService:
                 )
                 if context_lead is None and multi_request is None:
                     context_lead = self._get_active_context_lead(session, message)
+                if (
+                    multi_request is None
+                    and not extracted_patch
+                    and message.normalized_text
+                    and self._ai_gateway is not None
+                ):
+                    # 显式标签和多客户仍走既有确定性路径；仅自由文本在归属判定后进入 T08。
+                    ai_review, ai_result = self._prepare_ai_review(
+                        session, event, message, context_lead
+                    )
+                    if ai_result is not None:
+                        return ai_result
                 same_context_company = context_lead is not None and extracted_patch.get(
                     "线索名称"
                 ) == context_lead.field_values.get("线索名称")
                 if (
                     multi_request is None
+                    and ai_review is None
                     and context_lead is not None
                     and ("线索名称" not in extracted_patch or same_context_company)
                 ):
@@ -358,7 +389,7 @@ class FirstTextLeadWorkspaceService:
                         outbox_event_id=outbox_event_id,
                     )
 
-                if multi_request is None and context_update is None:
+                if multi_request is None and context_update is None and ai_review is None:
                     existing_lead = session.scalar(
                         select(Lead).where(Lead.source_message_id == message.message_id)
                     )
@@ -410,6 +441,8 @@ class FirstTextLeadWorkspaceService:
 
             if multi_request is not None:
                 return self._create_multi_smart_table_records(multi_request)
+            if ai_review is not None:
+                return self._sync_ai_review(ai_review)
             if context_update is not None:
                 return self._update_smart_table_record(context_update)
             assert fields is not None
@@ -417,6 +450,204 @@ class FirstTextLeadWorkspaceService:
         finally:
             if log_token is not None:
                 reset_log_context(log_token)
+
+    def _prepare_ai_review(
+        self,
+        session: Session,
+        event: OutboxEvent,
+        message: IncomingMessage,
+        context_lead: Lead | None,
+    ) -> tuple[AIReviewRequest | None, LeadProcessingResult | None]:
+        """调用 T08 并以确定性规则决定安全的新增、更新或待归属结论。
+
+        参数：session、event 和 message 为当前有序消费事实；
+        context_lead 为 T07 已可靠定位的当前线索。
+        返回值：可在提交后执行的 T09 请求，或已完成的消费结果；两者不会同时存在。
+        异常：无；T08 失败被转换为明确的失败待审事实。
+        副作用：可能创建最小 Lead 草稿、登记审计并将事件置为 processing 或 failed_pending_review。
+        """
+        assert self._ai_gateway is not None
+        try:
+            patch = self._ai_gateway.extract_fields(message.normalized_text or "")
+        except AIGatewayError as error:
+            # 网关已完成自身传输重试；此处绝不伪造建档成功，也不能阻塞该销售的后续消息。
+            event.status = "failed_pending_review"
+            self._record_audit(session, event, "ai_gateway_failed_pending_review")
+            logger.exception(
+                "ai_gateway_first_text_failed", extra={"error_type": type(error).__name__}
+            )
+            return None, LeadProcessingResult(LeadProcessingStatus.SYNC_FAILED)
+
+        if patch.analysis.intent == "IGNORE":
+            event.status = "ignored"
+            self._record_audit(session, event, "lead_text_ignored")
+            logger.info("lead_text_ignored")
+            return None, LeadProcessingResult(LeadProcessingStatus.IGNORED)
+        if patch.analysis.intent == "MULTI_LEAD":
+            # T07 只支持明确标签切分；模型声称多客户时不猜测边界或创建多条线索。
+            self._mark_unassigned(session, event)
+            return None, LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
+
+        fields = patch.fields
+        same_context_company = context_lead is not None and fields.get(
+            "线索名称"
+        ) == context_lead.field_values.get("线索名称")
+        if patch.analysis.intent == "UPDATE_LEAD" or same_context_company:
+            if context_lead is None:
+                # UPDATE 缺少 T07 已可靠的目标时必须进入待归属，不能由模型指定或猜测线索。
+                self._mark_unassigned(session, event)
+                return None, LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
+            event.status = "processing"
+            event.processing_started_at = utc_now()
+            bind_log_context(lead_id=context_lead.id)
+            return (
+                AIReviewRequest(
+                    source_message_id=message.message_id,
+                    sales_user_id=message.sales_user_id,
+                    lead_id=context_lead.id,
+                    outbox_event_id=event.id,
+                    patch=patch,
+                    creates_lead=False,
+                ),
+                None,
+            )
+
+        if not fields.get("线索名称"):
+            # NEW_LEAD 也必须有已通过 T08 校验且非低置信度的公司名，才允许正式创建草稿。
+            self._mark_unassigned(session, event)
+            return None, LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
+
+        lead = session.scalar(select(Lead).where(Lead.source_message_id == message.message_id))
+        if lead is None:
+            # 身份与负责人完全取自当前已授权销售；模型字段只会交给 T09 作为业务字段补丁。
+            lead = Lead(
+                source_message_id=message.message_id,
+                original_capturing_sales_user_id=message.sales_user_id,
+                smart_table_owner_user_id=message.sales_user_id,
+                field_values={"线索来源": "展会"},
+            )
+            session.add(lead)
+            session.flush()
+            session.add(SmartTableSync(lead_id=lead.id, source_message_id=message.message_id))
+            self._record_audit(session, event, "ai_lead_created")
+        event.status = "processing"
+        event.processing_started_at = utc_now()
+        bind_log_context(lead_id=lead.id)
+        return (
+            AIReviewRequest(
+                source_message_id=message.message_id,
+                sales_user_id=message.sales_user_id,
+                lead_id=lead.id,
+                outbox_event_id=event.id,
+                patch=patch,
+                creates_lead=True,
+            ),
+            None,
+        )
+
+    def _sync_ai_review(self, request: AIReviewRequest) -> LeadProcessingResult:
+        """为 AI 已安全决定的目标创建审核记录（如需）并经 T09 写入字段补丁。
+
+        参数：request 为事务提交后可执行的 AI 结果及真实销售身份。
+        返回值：首次建档返回 CREATED，既有上下文补充返回 UPDATED，外部失败返回 SYNC_FAILED。
+        异常：关键数据库事实缺失时抛出 ValueError；其他外部失败转为失败待审事实。
+        副作用：可能创建智能表格记录、调用 T09，并完成消息归属和当前客户上下文。
+        """
+        record_id = self._ensure_ai_review_record(request)
+        if record_id is None:
+            return LeadProcessingResult(LeadProcessingStatus.SYNC_FAILED, lead_id=request.lead_id)
+        try:
+            # T09 负责人工编辑保护、中置信度 AI待确认与增量写入；不得由本层直接写模型字段。
+            LeadReviewService(self._session_factory, self._smart_table_adapter).sync_ai_patch(
+                request.lead_id, request.source_message_id, request.patch
+            )
+        except Exception as error:
+            self._mark_ai_review_failed(request, error)
+            return LeadProcessingResult(LeadProcessingStatus.SYNC_FAILED, lead_id=request.lead_id)
+
+        with self._session_factory.begin() as session:
+            event, message = self._load_event_and_message(session, request.outbox_event_id)
+            lead = session.get(Lead, request.lead_id)
+            if lead is None:
+                raise ValueError(f"AI 审核线索不存在：{request.lead_id}")
+            if request.creates_lead:
+                sync = session.scalar(
+                    select(SmartTableSync).where(SmartTableSync.lead_id == lead.id)
+                )
+                if sync is None:
+                    raise ValueError(f"AI 审核同步事实不存在：{lead.id}")
+                sync.status = "succeeded"
+                sync.completed_at = utc_now()
+                sync.error_summary = None
+            self._mark_assigned(session, event, lead.id)
+            self._refresh_context(session, message, lead.id)
+            self._record_audit(session, event, "ai_review_fields_synced")
+        return LeadProcessingResult(
+            LeadProcessingStatus.CREATED if request.creates_lead else LeadProcessingStatus.UPDATED,
+            lead_id=request.lead_id,
+            smart_table_record_id=record_id,
+        )
+
+    def _ensure_ai_review_record(self, request: AIReviewRequest) -> str | None:
+        """为新 AI 草稿建立最小审核记录，避免模型字段绕过 T09 直接写入。
+
+        参数：request 为目标 Lead、真实销售身份和待审核字段补丁。
+        返回值：可供 T09 重读的表格记录标识；创建失败时返回 None。
+        异常：数据库事实缺失时抛出 ValueError。
+        副作用：首次新建记录并保存可审计的表格定位信息。
+        """
+        with self._session_factory() as session:
+            lead = session.get(Lead, request.lead_id)
+            if lead is None:
+                raise ValueError(f"AI 审核线索不存在：{request.lead_id}")
+            if lead.smart_table_record_id is not None:
+                return lead.smart_table_record_id
+        try:
+            # 创建人和负责人只使用接入层已授权的销售身份，模型无法影响权限关键字段。
+            record = self._smart_table_adapter.create_record(
+                {
+                    "线索来源": "展会",
+                    "创建人": request.sales_user_id,
+                    "负责人": request.sales_user_id,
+                },
+                actor=SmartTableActor.ROBOT,
+            )
+        except Exception as error:
+            self._mark_ai_review_failed(request, error)
+            return None
+
+        with self._session_factory.begin() as session:
+            lead = session.get(Lead, request.lead_id)
+            sync = session.scalar(
+                select(SmartTableSync).where(SmartTableSync.lead_id == request.lead_id)
+            )
+            if lead is None or sync is None:
+                raise ValueError(f"AI 审核表格同步事实不存在：{request.lead_id}")
+            lead.smart_table_record_id = record.record_id
+            sync.smart_table_record_id = record.record_id
+            sync.status = "processing"
+        return record.record_id
+
+    def _mark_ai_review_failed(self, request: AIReviewRequest, error: Exception) -> None:
+        """把 AI 或审核表格失败固定为失败待审，避免重放模型结果或伪造成功。
+
+        参数：request 定位来源事件和线索；error 为已捕获的外部异常。
+        返回值：无。
+        异常：数据库写入失败时由 SQLAlchemy 抛出。
+        副作用：事件进入 failed_pending_review，并在新线索时更新同步失败事实。
+        """
+        with self._session_factory.begin() as session:
+            event, _ = self._load_event_and_message(session, request.outbox_event_id)
+            event.status = "failed_pending_review"
+            if request.creates_lead:
+                sync = session.scalar(
+                    select(SmartTableSync).where(SmartTableSync.lead_id == request.lead_id)
+                )
+                if sync is not None:
+                    sync.status = "failed_pending_review"
+                    sync.error_summary = type(error).__name__
+            self._record_audit(session, event, "ai_review_failed_pending_review")
+        logger.exception("ai_review_sync_failed", extra={"error_type": type(error).__name__})
 
     def _prepare_multi_leads(
         self,
@@ -999,6 +1230,7 @@ class FirstTextLeadWorkspaceService:
                     event_type=event_type,
                 )
             )
+
 
 class LeadReassignmentService:
     """以销售权限和字段来源约束执行消息分段的人工重新归属。"""

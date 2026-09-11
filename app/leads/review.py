@@ -152,8 +152,11 @@ class LeadReviewService:
         with self._session_factory.begin() as session:
             lead = self._require_lead(session, lead_id)
             provenance = self._latest_provenance_by_field(session, lead_id)
+            synced_values: dict[str, str] = {}
             for field_name in written_names:
                 value = patch.fields[field_name]
+                # 后台草稿与审核表必须同步保存 T08 已实际写入的值，供后续 T06/T07 归属读取。
+                synced_values[field_name] = value
                 source = provenance.get(field_name)
                 if source is None:
                     session.add(
@@ -168,6 +171,9 @@ class LeadReviewService:
                 else:
                     source.value = value
                     source.last_ai_synced_value = value
+            if synced_values:
+                # 仅合并本次 T09 实际写入字段；被人工保护或低置信度候选绝不进入正式后台快照。
+                lead.field_values = {**lead.field_values, **synced_values}
             if protected:
                 self._record_audit(
                     session,

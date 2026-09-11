@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Generator
 from unittest.mock import patch
 
@@ -10,6 +11,8 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.ai.gateway import AIGateway
+from app.ai.provider import LLMProviderError, MockLLMProvider
 from app.leads.models import Lead, LeadFieldProvenance, SmartTableSync
 from app.leads.service import FirstTextLeadWorkspaceService, LeadProcessingStatus
 from app.messaging.models import (
@@ -377,3 +380,189 @@ def test_unknown_processing_result_is_not_replayed_into_a_duplicate_table_record
     assert result.status is LeadProcessingStatus.ALREADY_PROCESSED
     assert result.lead_id == lead_id
     assert adapter.get_records() == []
+
+
+def test_free_text_uses_t08_then_t09_with_real_sales_identity(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证自由文本经 T08 校验后由 T09 写入审核表，权限字段始终来自真实销售。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：网关接入、置信度分流或销售身份断言失败时由 pytest 报告。
+    副作用：消费一条自由文本并创建一条带 AI待确认 的 Mock 表格记录。
+    """
+    event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-ai-first",
+        sales_user_id="sales-1",
+        text="刚和长广溪智造聊过，他们想做协作机器人装配。",
+    )
+    provider = MockLLMProvider(
+        [
+            json.dumps(
+                {
+                    "intent": "NEW_LEAD",
+                    "customer_reference": {},
+                    "crm_fields": {
+                        "线索名称": "长广溪智造",
+                        "业务线": "协作机器人",
+                        "工艺": "装配",
+                    },
+                    "enrichment": {},
+                    "confidence_by_field": {"线索名称": 0.95, "业务线": 0.9, "工艺": 0.7},
+                    "conflicts": [],
+                    "warnings": [],
+                }
+            )
+        ]
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+
+    result = FirstTextLeadWorkspaceService(
+        session_factory, adapter, ai_gateway=AIGateway(provider)
+    ).consume(event_id)
+
+    assert result.status is LeadProcessingStatus.CREATED
+    assert len(provider.requests) == 1
+    assert result.smart_table_record_id is not None
+    record = adapter.get_record(result.smart_table_record_id)
+    assert record is not None
+    assert record.fields["线索名称"] == "长广溪智造"
+    assert record.fields["业务线"] == "协作机器人"
+    assert record.fields["工艺"] == "装配"
+    assert record.fields["AI待确认"] == ["工艺"]
+    assert record.fields["创建人"] == "sales-1"
+    assert record.fields["负责人"] == "sales-1"
+    with session_factory() as session:
+        lead = session.get(Lead, result.lead_id)
+    assert lead is not None
+    assert lead.original_capturing_sales_user_id == "sales-1"
+    assert lead.smart_table_owner_user_id == "sales-1"
+    assert lead.field_values["线索名称"] == "长广溪智造"
+    assert lead.field_values["工艺"] == "装配"
+
+
+def test_free_text_ai_failure_is_a_checkpoint_without_creating_a_lead(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 AI 传输失败不会伪装建档成功，并允许同销售后续消息继续消费。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：失败状态、审计或后续消费断言失败时由 pytest 报告。
+    副作用：消费失败自由文本后自动消费同销售的确定性后续消息。
+    """
+    first_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-ai-failure",
+        sales_user_id="sales-1",
+        text="这是无法送达模型的自由文本。",
+    )
+    with session_factory.begin() as session:
+        session.add(
+            IncomingMessage(
+                message_id="message-ai-after",
+                sales_user_id="sales-1",
+                sequence=2,
+                raw_payload={"text": "客户：后续客户"},
+                normalized_text="客户：后续客户",
+            )
+        )
+        session.add(OutboxEvent(message_id="message-ai-after", sales_user_id="sales-1", sequence=2))
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        ai_gateway=AIGateway(MockLLMProvider([LLMProviderError("network")])),
+    )
+
+    result = service.consume(first_event_id)
+
+    assert result.status is LeadProcessingStatus.SYNC_FAILED
+    with session_factory() as session:
+        first_event = session.get(OutboxEvent, first_event_id)
+        follow_up = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.message_id == "message-ai-after")
+        )
+        failed_audit = session.scalar(
+            select(BusinessAuditEvent).where(
+                BusinessAuditEvent.message_id == "message-ai-failure",
+                BusinessAuditEvent.event_type == "ai_gateway_failed_pending_review",
+            )
+        )
+        failed_lead = session.scalar(
+            select(Lead).where(Lead.source_message_id == "message-ai-failure")
+        )
+    assert first_event is not None
+    assert first_event.status == "failed_pending_review"
+    assert failed_audit is not None
+    assert failed_lead is None
+    assert follow_up is not None
+    assert follow_up.status == "succeeded"
+    assert len(adapter.get_records()) == 1
+
+
+def test_free_text_ai_update_uses_current_context_without_creating_a_second_lead(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 T07 已确定的当前客户上下文可接收 T08/T09 的自由文本增量补充。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：上下文串线、重复建档或审核字段断言失败时由 pytest 报告。
+    副作用：先创建确定性首条线索，再消费一条自由文本更新。
+    """
+    first_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-ai-context-first",
+        sales_user_id="sales-1",
+        text="客户：长广溪智造",
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    created = FirstTextLeadWorkspaceService(session_factory, adapter).consume(first_event_id)
+    with session_factory.begin() as session:
+        session.add(
+            IncomingMessage(
+                message_id="message-ai-context-update",
+                sales_user_id="sales-1",
+                sequence=2,
+                raw_payload={"text": "他们现在计划做装配项目。"},
+                normalized_text="他们现在计划做装配项目。",
+            )
+        )
+        event = OutboxEvent(
+            message_id="message-ai-context-update", sales_user_id="sales-1", sequence=2
+        )
+        session.add(event)
+        session.flush()
+        update_event_id = event.id
+    gateway = AIGateway(
+        MockLLMProvider(
+            [
+                json.dumps(
+                    {
+                        "intent": "UPDATE_LEAD",
+                        "customer_reference": {},
+                        "crm_fields": {"工艺": "装配"},
+                        "enrichment": {},
+                        "confidence_by_field": {"工艺": 0.9},
+                        "conflicts": [],
+                        "warnings": [],
+                    }
+                )
+            ]
+        )
+    )
+
+    updated = FirstTextLeadWorkspaceService(session_factory, adapter, ai_gateway=gateway).consume(
+        update_event_id
+    )
+
+    assert updated.status is LeadProcessingStatus.UPDATED
+    assert updated.lead_id == created.lead_id
+    assert len(adapter.get_records()) == 1
+    assert created.smart_table_record_id is not None
+    record = adapter.get_record(created.smart_table_record_id)
+    assert record is not None
+    assert record.fields["工艺"] == "装配"
