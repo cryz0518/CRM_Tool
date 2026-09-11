@@ -25,6 +25,7 @@ from app.leads.models import (
 from app.messaging.models import (
     BusinessAuditEvent,
     IncomingMessage,
+    MessageAttachment,
     OutboxEvent,
     SalesAuthorization,
     utc_now,
@@ -283,6 +284,11 @@ class FirstTextLeadWorkspaceService:
                     self._record_audit(session, event, "lead_unauthorized")
                     logger.warning("lead_outbox_unauthorized")
                     return LeadProcessingResult(LeadProcessingStatus.UNAUTHORIZED)
+
+                if self._media_enrichment_is_pending(session, message):
+                    # 附件下载和识别独立失败；仅在尚未取得其终态时保持 Outbox pending。
+                    logger.info("lead_outbox_waiting_for_media_enrichment")
+                    return LeadProcessingResult(LeadProcessingStatus.WAITING_FOR_PREVIOUS)
 
                 extractor = DeterministicFirstTextLeadExtractor()
                 multi_fields = extractor.extract_many(message.normalized_text)
@@ -621,6 +627,25 @@ class FirstTextLeadWorkspaceService:
         """
         weak_keywords = ("预算", "需求", "报价", "项目", "采购")
         return bool(text and any(keyword in text for keyword in weak_keywords))
+
+    @staticmethod
+    def _media_enrichment_is_pending(session: Session, message: IncomingMessage) -> bool:
+        """判断媒体消息是否仍在下载或 OCR/ASR 处理中。
+
+        参数：session 为当前事务，message 为待消费来源消息。
+        返回值：媒体标记存在且无附件或存在 pending 附件时返回 True。
+        异常：数据库读取异常由 SQLAlchemy 抛出。
+        副作用：无；调用方据此保留 Outbox 的 pending 状态。
+        """
+        if not message.requires_media_enrichment:
+            return False
+        statuses = session.scalars(
+            select(MessageAttachment.processing_status).where(
+                MessageAttachment.message_id == message.message_id
+            )
+        ).all()
+        # 下载尚未创建附件元数据同样必须等待，避免媒体消息被错误提前忽略。
+        return not statuses or "pending" in statuses
 
     def _mark_unassigned(self, session: Session, event: OutboxEvent) -> None:
         """将无法可靠归属的消息持久化为待归属，并越过首次消费检查点。

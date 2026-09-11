@@ -16,8 +16,10 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
+from app.media.dependencies import get_media_attachment_service
+from app.media.service import MediaAttachmentService
 from app.messaging.service import MessageIntakeService
-from app.wecom_bot.adapter import WecomTextMessageAdapter
+from app.wecom_bot.adapter import WecomMediaMessageAdapter, WecomTextMessageAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +79,7 @@ class WecomBotRuntime:
         self,
         engine: Engine,
         message_intake_service: MessageIntakeService,
+        media_attachment_service: MediaAttachmentService,
         bot_id: str,
         bot_secret: str,
     ) -> None:
@@ -90,6 +93,8 @@ class WecomBotRuntime:
         """
         self._engine = engine
         self._text_adapter = WecomTextMessageAdapter(message_intake_service)
+        self._media_adapter = WecomMediaMessageAdapter(message_intake_service)
+        self._media_attachment_service = media_attachment_service
         self._ready_file = Path("/tmp/wecom-bot-ready")
         self._shutdown_event: asyncio.Event | None = None
         self._fatal_intake_error: Exception | None = None
@@ -119,6 +124,8 @@ class WecomBotRuntime:
         self._client.on("reconnecting", self._handle_reconnecting)
         self._client.on("error", self._handle_sdk_error)
         self._client.on("message.text", self._receive_text_frame)
+        self._client.on("message.image", self._receive_media_frame)
+        self._client.on("message.voice", self._receive_media_frame)
 
     def _handle_connected(self) -> None:
         """记录 WebSocket 已建立但尚未完成认证的状态。
@@ -211,6 +218,37 @@ class WecomBotRuntime:
             if self._shutdown_event is not None:
                 self._shutdown_event.set()
 
+    async def _receive_media_frame(self, frame: dict[str, Any]) -> None:
+        """可靠保存媒体来源消息后下载工件；下载失败不终止机器人会话。"""
+        receipt = None
+        try:
+            receipt = await asyncio.to_thread(self._media_adapter.receive_media_frame, frame)
+            if receipt is None or receipt.result.duplicate or not receipt.result.accepted:
+                return
+            if receipt.download_url is None:
+                self._media_attachment_service.record_download_failure(
+                    receipt.message_id, media_kind=receipt.media_kind
+                )
+                return
+            # URL 与 AES key 只在 SDK 调用栈内存中流动，禁止进入日志或数据库媒体元数据。
+            content, _ = await self._client.download_file(receipt.download_url, receipt.aes_key)
+            await asyncio.to_thread(
+                self._media_attachment_service.ingest,
+                receipt.message_id,
+                content,
+                media_kind=receipt.media_kind,
+                declared_mime_type=receipt.declared_mime_type,
+            )
+            logger.info("wecom_bot_media_forwarded", extra={"accepted": receipt.result.accepted})
+        except Exception:
+            # 媒体失败已可由独立附件任务处理；不能让单条工件中断同销售后续消息。
+            if receipt is not None:
+                self._media_attachment_service.record_download_failure(
+                    receipt.message_id, media_kind=receipt.media_kind
+                )
+            # 下载器异常可能带短期 URL 或 AES key，日志仅保留固定事件名。
+            logger.error("wecom_bot_media_intake_failed")
+
     async def run(self) -> None:
         """建立 SDK 长连接并等待进程终止信号。
 
@@ -275,6 +313,7 @@ def create_runtime(settings: Settings) -> WecomBotRuntime:
     return WecomBotRuntime(
         engine=engine,
         message_intake_service=MessageIntakeService(session_factory),
+        media_attachment_service=get_media_attachment_service(session_factory),
         bot_id=settings.wecom_bot_id,
         bot_secret=settings.wecom_bot_secret,
     )

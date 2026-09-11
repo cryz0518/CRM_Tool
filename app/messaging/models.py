@@ -75,6 +75,7 @@ class IncomingMessage(Base):
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     normalized_text: Mapped[str | None] = mapped_column(String)
+    requires_media_enrichment: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -154,3 +155,47 @@ class BusinessAuditEvent(Base):
     )
 
     __table_args__ = (UniqueConstraint("message_id", "event_type"),)
+
+
+class MessageAttachment(Base):
+    """保存仅归属来源消息的二进制工件元数据，不直接关联线索。"""
+
+    __tablename__ = "message_attachments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    message_id: Mapped[str] = mapped_column(
+        ForeignKey("incoming_messages.message_id"), nullable=False, index=True
+    )
+    media_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    declared_mime_type: Mapped[str | None] = mapped_column(String(128))
+    detected_mime_type: Mapped[str | None] = mapped_column(String(128))
+    size_bytes: Mapped[int | None] = mapped_column(Integer)
+    sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    storage_key: Mapped[str | None] = mapped_column(String(256), unique=True)
+    scan_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    processing_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    recognized_text: Mapped[str | None] = mapped_column(String)
+    error_summary: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MediaProcessingTask(Base):
+    """保存一次 OCR 或 ASR 的独立异步处理状态，失败不改变消息会话状态。"""
+
+    __tablename__ = "media_processing_tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    attachment_id: Mapped[str] = mapped_column(ForeignKey("message_attachments.id"), nullable=False)
+    task_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_summary: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (UniqueConstraint("attachment_id", "task_type"),)

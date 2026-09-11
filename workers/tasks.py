@@ -9,6 +9,7 @@ from app.ai.models import ExtractedLeadPatch, LeadAnalysis
 from app.core.config import get_settings
 from app.leads.review import LeadReviewService
 from app.leads.service import FirstTextLeadWorkspaceService
+from app.media.dependencies import get_media_attachment_service
 from app.messaging.models import OutboxEvent
 from app.smart_table.dependencies import get_smart_table_adapter
 from workers.celery_app import celery_app
@@ -38,6 +39,10 @@ def consume_lead_outbox_event(outbox_event_id: int) -> str:
     # 适配器始终经依赖边界构造，Worker 不直接执行 wecom-cli 或操作表格字段。
     engine, factory = _session_factory()
     try:
+        # 媒体识别先补充同一来源消息的标准化文本；失败被任务内消化，不阻塞线索顺序。
+        get_media_attachment_service(factory).process_pending_for_message(
+            _message_id(factory, outbox_event_id)
+        )
         service = FirstTextLeadWorkspaceService(factory, get_smart_table_adapter())
         return service.consume(outbox_event_id).status.value
     finally:
@@ -82,6 +87,15 @@ def sync_ai_lead_patch(
     finally:
         # 独立 Worker 任务完成后释放连接池，避免高频 AI 补丁同步积累空闲连接。
         engine.dispose()
+
+
+def _message_id(session_factory: sessionmaker[Session], outbox_event_id: int) -> str:
+    """读取 Outbox 的来源消息标识，缺失事实由 Worker 明确失败。"""
+    with session_factory() as session:
+        event = session.get(OutboxEvent, outbox_event_id)
+        if event is None:
+            raise ValueError(f"Outbox 事件不存在：{outbox_event_id}")
+        return event.message_id
 
 
 @celery_app.task(  # type: ignore[untyped-decorator]

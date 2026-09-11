@@ -67,11 +67,12 @@ services:
     environment: *application_environment
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     # 真实 Adapter 只读挂载本机 CLI 凭据；镜像、代码仓库和容器环境变量均不保存密钥。
-    volumes: &wecom_cli_credentials
+    volumes: &application_volumes
       - type: bind
         source: ${WECOM_CLI_CREDENTIALS_PATH:-./.wecom-cli-credentials}
         target: /home/appuser/.config/wecom
         read_only: true
+      - media_data:/var/lib/crm-lead/media
     ports:
       - "${APP_PORT:-8000}:8000"
     depends_on:
@@ -92,7 +93,7 @@ services:
     environment: *application_environment
     command: ["celery", "-A", "workers.celery_app:celery_app", "worker", "--loglevel=INFO", "--hostname=worker@%h"]
     # Worker 与应用共用同一只读凭据挂载，确保后台同步走真实 CLI 时也可授权。
-    volumes: *wecom_cli_credentials
+    volumes: *application_volumes
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -128,6 +129,7 @@ services:
       WECOM_BOT_ID: "${WECOM_BOT_ID:-}"
       WECOM_BOT_SECRET: "${WECOM_BOT_SECRET:-}"
     command: ["python", "-m", "app.wecom_bot.runner"]
+    volumes: *application_volumes
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -141,3 +143,4 @@ services:
 
 volumes:
   postgres_data:
+  media_data:

@@ -41,6 +41,16 @@ class Settings(BaseSettings):
     ai_high_confidence_threshold: float = 0.85
     ai_medium_confidence_threshold: float = 0.60
     robot_submission_confirmation_available: bool = True
+    media_storage_path: str = "/var/lib/crm-lead/media"
+    media_image_mime_types: tuple[str, ...] = ("image/png", "image/jpeg", "image/webp")
+    media_audio_mime_types: tuple[str, ...] = ("audio/mpeg", "audio/wav", "audio/mp4")
+    media_max_image_bytes: int = 10 * 1024 * 1024
+    media_max_audio_bytes: int = 20 * 1024 * 1024
+    media_processing_timeout_seconds: float = 20.0
+    ocr_provider: Literal["mock", "qwen"] = "qwen"
+    asr_provider: Literal["mock", "qwen"] = "qwen"
+    qwen_ocr_model: str = "qwen3.5-ocr"
+    qwen_asr_model: str = "qwen3-asr-flash"
 
     @field_validator(
         "wecom_smart_table_sales_can_create_records",

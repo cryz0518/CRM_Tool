@@ -3,11 +3,25 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from app.messaging.service import IncomingMessageCommand, MessageIntakeResult, MessageIntakeService
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class MediaFrameReceipt:
+    """保存已持久化媒体消息及仅在内存使用的 SDK 下载信息。"""
+
+    result: MessageIntakeResult
+    message_id: str
+    media_kind: Literal["image", "audio"]
+    download_url: str | None
+    aes_key: str | None
+    declared_mime_type: str | None
 
 
 class WecomTextMessageAdapter:
@@ -64,3 +78,66 @@ class WecomTextMessageAdapter:
                 normalized_text=normalized_text,
             )
         )
+
+
+class WecomMediaMessageAdapter:
+    """将图片或语音帧可靠落库，并提取不持久化的 SDK 下载参数。"""
+
+    def __init__(self, message_intake_service: MessageIntakeService) -> None:
+        """保存与文本共享的可靠消息接收边界。"""
+        self._message_intake_service = message_intake_service
+
+    def receive_media_frame(self, frame: dict[str, Any]) -> MediaFrameReceipt | None:
+        """接收官方图片或语音帧；无身份字段时拒绝，媒体下载稍后异步完成。"""
+        body = frame.get("body")
+        if not isinstance(body, dict) or body.get("msgtype") not in {"image", "voice"}:
+            logger.warning("wecom_bot_invalid_media_frame")
+            return None
+        message_id = body.get("msgid")
+        sender = body.get("from")
+        sales_user_id = sender.get("userid") if isinstance(sender, dict) else None
+        media_kind = body["msgtype"]
+        media = body.get(media_kind)
+        if not isinstance(message_id, str) or not isinstance(sales_user_id, str):
+            logger.warning("wecom_bot_media_frame_missing_identity")
+            return None
+        media = media if isinstance(media, dict) else {}
+        download_url = media.get("url")
+        aes_key = media.get("aeskey")
+        declared_mime_type = media.get("mime_type")
+        return MediaFrameReceipt(
+            result=self._message_intake_service.receive(
+                IncomingMessageCommand(
+                    message_id=message_id,
+                    sales_user_id=sales_user_id,
+                    raw_payload=self._redact_download_credentials(frame, media_kind),
+                    requires_media_enrichment=True,
+                )
+            ),
+            message_id=message_id,
+            media_kind="audio" if media_kind == "voice" else "image",
+            download_url=download_url if isinstance(download_url, str) else None,
+            aes_key=aes_key if isinstance(aes_key, str) else None,
+            declared_mime_type=(
+                declared_mime_type if isinstance(declared_mime_type, str) else None
+            ),
+        )
+
+    @staticmethod
+    def _redact_download_credentials(frame: dict[str, Any], media_kind: str) -> dict[str, Any]:
+        """移除下载 URL 与 AES 密钥后再持久化媒体来源帧。
+
+        参数：frame 为 SDK 原始帧，media_kind 为 image 或 voice 的协议消息类型。
+        返回值：保留非敏感可审计字段、移除短期下载凭据的新字典。
+        异常：无。
+        副作用：无；原始帧仅供当前调用栈下载媒体，不进入数据库。
+        """
+        sanitized = deepcopy(frame)
+        body = sanitized.get("body")
+        if isinstance(body, dict):
+            media = body.get(media_kind)
+            if isinstance(media, dict):
+                # URL 和 AES key 只能存活在 SDK 下载调用栈，不能进入数据库或日志。
+                media.pop("url", None)
+                media.pop("aeskey", None)
+        return sanitized
