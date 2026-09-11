@@ -36,6 +36,7 @@ class IncomingMessageCommand:
     sales_user_id: str
     raw_payload: dict[str, Any]
     normalized_text: str | None = None
+    requires_media_enrichment: bool = False
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,7 @@ class MessageIntakeService:
                     sequence=authorization.next_message_sequence,
                     raw_payload=command.raw_payload,
                     normalized_text=command.normalized_text,
+                    requires_media_enrichment=command.requires_media_enrichment,
                 )
                 session.add(message)
                 session.add(

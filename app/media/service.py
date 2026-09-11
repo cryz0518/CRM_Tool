@@ -197,7 +197,12 @@ class MediaAttachmentService:
                 or attachment.detected_mime_type is None
             ):
                 return
-            content = self._storage.get(attachment.storage_key)
+            try:
+                # 存储读取失败也必须停留在该附件任务内，不能阻断来源消息的后续消费。
+                content = self._storage.get(attachment.storage_key)
+            except (OSError, ValueError):
+                self._record_processing_failure(attachment_id, "storage_read_failed")
+                return
             media_kind = attachment.media_kind
             mime_type = attachment.detected_mime_type
         try:

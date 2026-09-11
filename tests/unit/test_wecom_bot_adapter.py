@@ -11,7 +11,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.messaging.models import Base, IncomingMessage, OutboxEvent, SalesAuthorization
 from app.messaging.service import MessageIntakeService
-from app.wecom_bot.adapter import WecomTextMessageAdapter
+from app.wecom_bot.adapter import WecomMediaMessageAdapter, WecomTextMessageAdapter
 
 
 @pytest.fixture
@@ -95,3 +95,36 @@ def test_text_frame_without_official_identity_fields_is_not_forwarded(
     with session_factory() as session:
         assert session.scalars(select(IncomingMessage)).all() == []
         assert session.scalars(select(OutboxEvent)).all() == []
+
+
+def test_media_frame_persists_auditable_payload_without_download_credentials(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证媒体 URL 和 AES key 仅留在内存收据，绝不写入原始消息载荷。"""
+    with session_factory.begin() as session:
+        session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
+    frame = {
+        "body": {
+            "msgid": "image-1",
+            "from": {"userid": "sales-1"},
+            "msgtype": "image",
+            "image": {
+                "url": "https://temporary.example/download",
+                "aeskey": "secret",
+                "mime_type": "image/png",
+            },
+        }
+    }
+
+    receipt = WecomMediaMessageAdapter(MessageIntakeService(session_factory)).receive_media_frame(
+        frame
+    )
+
+    assert receipt is not None
+    assert receipt.download_url == "https://temporary.example/download"
+    with session_factory() as session:
+        message = session.get(IncomingMessage, "image-1")
+        assert message is not None
+        assert message.requires_media_enrichment is True
+        assert "url" not in message.raw_payload["body"]["image"]
+        assert "aeskey" not in message.raw_payload["body"]["image"]

@@ -14,6 +14,16 @@ depends_on = None
 
 def upgrade() -> None:
     """创建消息附件元数据及 OCR/ASR 失败可审计任务表。"""
+    # 媒体消息必须等待附件终态，防止 Worker 在下载尚未完成时提前忽略其补充文本。
+    op.add_column(
+        "incoming_messages",
+        sa.Column(
+            "requires_media_enrichment",
+            sa.Boolean(),
+            nullable=False,
+            server_default=sa.false(),
+        ),
+    )
     op.create_table(
         "message_attachments",
         sa.Column("id", sa.String(length=36), primary_key=True),
@@ -55,3 +65,4 @@ def downgrade() -> None:
     op.drop_table("media_processing_tasks")
     op.drop_index("ix_message_attachments_message_id", table_name="message_attachments")
     op.drop_table("message_attachments")
+    op.drop_column("incoming_messages", "requires_media_enrichment")

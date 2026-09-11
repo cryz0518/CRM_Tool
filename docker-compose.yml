@@ -129,6 +129,7 @@ services:
       WECOM_BOT_ID: "${WECOM_BOT_ID:-}"
       WECOM_BOT_SECRET: "${WECOM_BOT_SECRET:-}"
     command: ["python", "-m", "app.wecom_bot.runner"]
+    volumes: *application_volumes
     depends_on:
       migrate:
         condition: service_completed_successfully

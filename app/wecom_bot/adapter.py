@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -109,7 +110,8 @@ class WecomMediaMessageAdapter:
                 IncomingMessageCommand(
                     message_id=message_id,
                     sales_user_id=sales_user_id,
-                    raw_payload=frame,
+                    raw_payload=self._redact_download_credentials(frame, media_kind),
+                    requires_media_enrichment=True,
                 )
             ),
             message_id=message_id,
@@ -120,3 +122,22 @@ class WecomMediaMessageAdapter:
                 declared_mime_type if isinstance(declared_mime_type, str) else None
             ),
         )
+
+    @staticmethod
+    def _redact_download_credentials(frame: dict[str, Any], media_kind: str) -> dict[str, Any]:
+        """移除下载 URL 与 AES 密钥后再持久化媒体来源帧。
+
+        参数：frame 为 SDK 原始帧，media_kind 为 image 或 voice 的协议消息类型。
+        返回值：保留非敏感可审计字段、移除短期下载凭据的新字典。
+        异常：无。
+        副作用：无；原始帧仅供当前调用栈下载媒体，不进入数据库。
+        """
+        sanitized = deepcopy(frame)
+        body = sanitized.get("body")
+        if isinstance(body, dict):
+            media = body.get(media_kind)
+            if isinstance(media, dict):
+                # URL 和 AES key 只能存活在 SDK 下载调用栈，不能进入数据库或日志。
+                media.pop("url", None)
+                media.pop("aeskey", None)
+        return sanitized
