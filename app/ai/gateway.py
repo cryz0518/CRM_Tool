@@ -184,6 +184,7 @@ class AIGateway:
                     "role": "system",
                     "content": (
                         "只修复随后的输出 JSON 结构，不得新增、删除或改写任何事实值。"
+                        f"{self._field_contract_instructions()}"
                         "必须符合此 JSON Schema："
                         f"{json.dumps(request.json_schema, ensure_ascii=False)}"
                     ),
@@ -276,10 +277,35 @@ class AIGateway:
                 "content": (
                     "仅提取线索建议 JSON；不得决定提交、删除、负责人、"
                     "CRM 合并或覆盖人工值。"
+                    f"{self._field_contract_instructions()}"
                     f"必须符合此 JSON Schema：{json.dumps(json_schema, ensure_ascii=False)}"
                 ),
             },
             {"role": "user", "content": safe_text},
+        )
+
+    @staticmethod
+    def _field_contract_instructions() -> str:
+        """返回初始提取与结构修复共用的冻结 CRM 字段输出约束。
+
+        参数：无。
+        返回：要求模型遵循字段名、值类型、置信度与枚举注册表的提示文本。
+        异常：无。
+        副作用：无；仅基于冻结注册表拼装提示，不改变任何确定性校验。
+        """
+        allowed_names = "、".join(CRM_BUSINESS_FIELD_NAMES)
+        enum_options = "；".join(
+            f"{field_name}：{'、'.join(options)}" for field_name, options in _ENUM_OPTIONS.items()
+        )
+        return (
+            "crm_fields 的 key 只能是以下 CRM 注册表中的中文原名："
+            f"{allowed_names}。"
+            "禁止使用英文或其他别名（例如 phone），不得映射或自造字段名。"
+            "crm_fields 的每个 value 必须是单个字符串；多值信息不得使用数组塞入 CRM 字段。"
+            "没有可靠信息的字段必须直接省略，不得返回 null、空字符串或空数组。"
+            "confidence_by_field 的 key 必须与 crm_fields 的 key 完全一一对应，"
+            "并使用相同中文字段名。"
+            f"枚举字段只能使用以下注册表选项：{enum_options}。"
         )
 
     def _log(
