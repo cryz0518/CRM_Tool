@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import JSON, DateTime, ForeignKey, String
+from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.messaging.models import Base, utc_now
@@ -28,8 +28,9 @@ class Lead(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_lead_id)
     source_message_id: Mapped[str] = mapped_column(
-        ForeignKey("incoming_messages.message_id"), nullable=False, unique=True
+        ForeignKey("incoming_messages.message_id"), nullable=False
     )
+    source_segment_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     original_capturing_sales_user_id: Mapped[str] = mapped_column(
         ForeignKey("sales_authorizations.wecom_user_id"), nullable=False, index=True
     )
@@ -45,6 +46,8 @@ class Lead(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )
+
+    __table_args__ = (UniqueConstraint("source_message_id", "source_segment_index"),)
 
 
 class LeadFieldProvenance(Base):
@@ -86,11 +89,39 @@ class LeadMessageResolution(Base):
 
     __tablename__ = "lead_message_resolutions"
 
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     message_id: Mapped[str] = mapped_column(
-        ForeignKey("incoming_messages.message_id"), primary_key=True
+        ForeignKey("incoming_messages.message_id"), nullable=False, index=True
     )
+    segment_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     lead_id: Mapped[str | None] = mapped_column(ForeignKey("leads.id"), index=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+    __table_args__ = (UniqueConstraint("message_id", "segment_index"),)
+
+
+class MessageReassignmentAudit(Base):
+    """保存人工重新归属的原目标、新目标、操作人角色和原因。"""
+
+    __tablename__ = "message_reassignment_audits"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    message_id: Mapped[str] = mapped_column(
+        ForeignKey("incoming_messages.message_id"), nullable=False
+    )
+    segment_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    previous_lead_id: Mapped[str | None] = mapped_column(ForeignKey("leads.id"))
+    new_lead_id: Mapped[str] = mapped_column(ForeignKey("leads.id"), nullable=False)
+    operator_user_id: Mapped[str] = mapped_column(
+        ForeignKey("sales_authorizations.wecom_user_id"), nullable=False
+    )
+    operator_role: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="processing", nullable=False)
+    error_summary: Mapped[str | None] = mapped_column(String(256))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -104,8 +135,9 @@ class SmartTableSync(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     lead_id: Mapped[str] = mapped_column(ForeignKey("leads.id"), nullable=False, unique=True)
     source_message_id: Mapped[str] = mapped_column(
-        ForeignKey("incoming_messages.message_id"), nullable=False, unique=True
+        ForeignKey("incoming_messages.message_id"), nullable=False
     )
+    source_segment_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     smart_table_record_id: Mapped[str | None] = mapped_column(String(128), unique=True)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     error_summary: Mapped[str | None] = mapped_column(String(256))
@@ -113,3 +145,5 @@ class SmartTableSync(Base):
         DateTime(timezone=True), default=utc_now, nullable=False
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (UniqueConstraint("source_message_id", "source_segment_index"),)
