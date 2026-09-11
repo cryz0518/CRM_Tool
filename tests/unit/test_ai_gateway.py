@@ -10,6 +10,7 @@ import pytest
 from app.ai.gateway import AIGateway, BusinessValidationError, FailedStructuredOutputError
 from app.ai.models import LLMResponse
 from app.ai.provider import LLMProviderError, MockLLMProvider
+from app.smart_table.registry import CRM_BUSINESS_FIELD_NAMES
 
 
 def valid_analysis(**changes: object) -> str:
@@ -67,6 +68,105 @@ def test_gateway_never_repairs_a_business_invalid_enum_value() -> None:
         AIGateway(provider).extract_fields("业务线：未知机器人")
 
     assert len(provider.requests) == 1
+
+
+def test_gateway_prompt_requires_registered_chinese_fields_and_scalar_values() -> None:
+    """验证初始提示明确要求注册表中文字段名、标量值及枚举选项。
+
+    参数：无。
+    返回：无。
+    异常：断言失败时由 pytest 报告。
+    副作用：Mock Provider 记录一次字段提取请求。
+    """
+    provider = MockLLMProvider(responses=[valid_analysis()])
+
+    AIGateway(provider).extract_fields("客户：长广溪智造")
+
+    prompt = provider.requests[0].messages[0]["content"]
+    assert all(field_name in prompt for field_name in CRM_BUSINESS_FIELD_NAMES)
+    assert "禁止使用英文或其他别名（例如 phone）" in prompt
+    assert "每个 value 必须是单个字符串" in prompt
+    assert "不得使用数组塞入 CRM 字段" in prompt
+    assert "confidence_by_field 的 key 必须与 crm_fields 的 key 完全一一对应" in prompt
+    assert "业务线：协作机器人、车载机器人" in prompt
+
+
+def test_gateway_rejects_array_crm_field_values_without_conversion() -> None:
+    """验证数组 CRM 值经一次结构修复后仍被拒绝，不能静默拼接为字符串。
+
+    参数：无。
+    返回：无。
+    异常：FailedStructuredOutputError 为受控的结构失败结论。
+    副作用：Mock Provider 完成一次初始提取和一次结构修复请求。
+    """
+    invalid = valid_analysis(
+        crm_fields={"手机": ["13800138000", "13900139000"]},
+        confidence_by_field={"手机": 0.9},
+    )
+    provider = MockLLMProvider(responses=[invalid, invalid])
+
+    with pytest.raises(FailedStructuredOutputError):
+        AIGateway(provider).extract_fields("客户电话已提供")
+
+    assert len(provider.requests) == 2
+
+
+def test_gateway_keeps_english_phone_alias_as_business_validation_failure() -> None:
+    """验证英文 phone 别名仍由业务白名单拒绝，禁止自动映射为手机。
+
+    参数：无。
+    返回：无。
+    异常：BusinessValidationError 为受控的字段白名单失败结论。
+    副作用：Mock Provider 只收到初始请求，不触发结构修复。
+    """
+    response = valid_analysis(
+        crm_fields={"phone": "13800138000"}, confidence_by_field={"phone": 0.9}
+    )
+    provider = MockLLMProvider(responses=[response])
+
+    with pytest.raises(BusinessValidationError, match="phone"):
+        AIGateway(provider).extract_fields("客户电话已提供")
+
+    assert len(provider.requests) == 1
+
+
+def test_gateway_accepts_registered_chinese_phone_field() -> None:
+    """验证合法中文注册表字段及其标量值可通过既有确定性校验。
+
+    参数：无。
+    返回：无。
+    异常：断言失败时由 pytest 报告。
+    副作用：Mock Provider 记录一次字段提取请求。
+    """
+    response = valid_analysis(
+        crm_fields={"手机": "13800138000"}, confidence_by_field={"手机": 0.9}
+    )
+    provider = MockLLMProvider(responses=[response])
+
+    result = AIGateway(provider).extract_fields("客户电话已提供")
+
+    assert result.fields == {"手机": "13800138000"}
+
+
+def test_gateway_repair_prompt_keeps_crm_field_and_value_type_constraints() -> None:
+    """验证结构修复提示重复字段白名单、标量值和置信度键集约束。
+
+    参数：无。
+    返回：无。
+    异常：断言失败时由 pytest 报告。
+    副作用：Mock Provider 记录初始请求与一次结构修复请求。
+    """
+    provider = MockLLMProvider(responses=["not-json", valid_analysis()])
+
+    AIGateway(provider).extract_fields("客户：长广溪智造")
+
+    repair_prompt = provider.requests[1].messages[0]["content"]
+    assert all(field_name in repair_prompt for field_name in CRM_BUSINESS_FIELD_NAMES)
+    assert "禁止使用英文或其他别名（例如 phone）" in repair_prompt
+    assert "每个 value 必须是单个字符串" in repair_prompt
+    assert "不得使用数组塞入 CRM 字段" in repair_prompt
+    assert "confidence_by_field 的 key 必须与 crm_fields 的 key 完全一一对应" in repair_prompt
+    assert "业务线：协作机器人、车载机器人" in repair_prompt
 
 
 def test_gateway_keeps_low_confidence_value_out_of_formal_fields() -> None:
