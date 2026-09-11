@@ -244,23 +244,41 @@ class FirstTextLeadWorkspaceService:
         self._lead_message_retry_count = settings.lead_message_retry_count
         self._lead_processing_timeout = timedelta(seconds=settings.lead_processing_timeout_seconds)
 
-    def consume(self, outbox_event_id: int) -> LeadProcessingResult:
+    def consume(
+        self,
+        outbox_event_id: int,
+        *,
+        claimed_for_processing: bool = False,
+        recover_expired_lease: bool = False,
+    ) -> LeadProcessingResult:
         """消费一条 Outbox 事件，并在其成为检查点后继续同销售的下一条消息。
 
-        参数：outbox_event_id 为 T02 已提交的待处理事件标识。
+        参数：outbox_event_id 为 T02 已提交的待处理事件标识；claimed_for_processing 表示
+        Worker 已原子接管调度认领；recover_expired_lease 表示仅执行既有失联租约恢复。
         返回值：返回本次指定事件的确定性处理结论。
         异常：事件或来源消息丢失时抛出 ValueError；数据库异常向调用方传播。
         副作用：本事件成功、忽略、拒绝或失败耗尽后，会串行触发同销售的下一条待处理事件。
         """
-        result = self._consume_once(outbox_event_id)
+        result = self._consume_once(
+            outbox_event_id,
+            claimed_for_processing=claimed_for_processing,
+            recover_expired_lease=recover_expired_lease,
+        )
         # 只在本事件已越过首次消费检查点后继续，防止 retrying/processing 事件被错误跳过。
         self._consume_next_after_checkpoint(outbox_event_id)
         return result
 
-    def _consume_once(self, outbox_event_id: int) -> LeadProcessingResult:
+    def _consume_once(
+        self,
+        outbox_event_id: int,
+        *,
+        claimed_for_processing: bool = False,
+        recover_expired_lease: bool = False,
+    ) -> LeadProcessingResult:
         """消费一条 T02 Outbox 文本事件并将首次有效线索同步到共享审核表。
 
-        参数：outbox_event_id 为 T02 已提交的待处理事件标识。
+        参数：outbox_event_id 为 T02 已提交的待处理事件标识；claimed_for_processing 表示
+        当前 Worker 已唯一接管 processing；recover_expired_lease 表示只进入失联恢复。
         返回值：返回创建、忽略、拒绝、重复或表格同步失败等确定性结论。
         异常：事件或来源消息丢失时抛出 ValueError；数据库异常向调用方传播。
         副作用：可能创建 Lead、字段来源、同步结果、审计事件及智能表格记录。
@@ -281,14 +299,24 @@ class FirstTextLeadWorkspaceService:
                     logger.error("outbox_sales_identity_mismatch")
                     return LeadProcessingResult(LeadProcessingStatus.INVALID_EVENT)
                 self._lock_sales_processing_stream(session, message.sales_user_id)
+                # 销售顺序锁等待期间，其他事务可能已改变本事件状态，必须重读后再决策。
+                session.refresh(event)
                 terminal_or_unknown_statuses = COMPLETED_CHECKPOINT_STATUSES | {"processing"}
-                if self._processing_lease_expired(event):
+                if recover_expired_lease:
+                    if event.status != "processing":
+                        return self._processed_result(session, event)
+                    # 调度器已唯一认领失联租约；保留既有人工复核语义而不重放外部调用。
+                    event.status = "failed_pending_review"
+                    self._record_audit(session, event, "lead_outbox_processing_lease_expired")
+                    logger.error("lead_outbox_processing_lease_expired")
+                    return self._processed_result(session, event)
+                if not claimed_for_processing and self._processing_lease_expired(event):
                     # 失联 Worker 不得永久占住该销售队列；未知外部结果保留给人工核验而不重放。
                     event.status = "failed_pending_review"
                     self._record_audit(session, event, "lead_outbox_processing_lease_expired")
                     logger.error("lead_outbox_processing_lease_expired")
                     return self._processed_result(session, event)
-                if event.status in terminal_or_unknown_statuses:
+                if not claimed_for_processing and event.status in terminal_or_unknown_statuses:
                     # ponytail: Adapter 无创建幂等键；未知结果待人工核验，接口提供键后再安全重试。
                     return self._processed_result(session, event)
                 if self._has_unfinished_previous_event(session, event):
