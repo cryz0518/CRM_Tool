@@ -18,6 +18,7 @@ from app.leads.models import (
     Lead,
     LeadFieldProvenance,
     LeadMessageResolution,
+    MessageReassignmentAudit,
     SalesLeadContext,
     SmartTableSync,
 )
@@ -58,6 +59,7 @@ class LeadProcessingResult:
     status: LeadProcessingStatus
     lead_id: str | None = None
     smart_table_record_id: str | None = None
+    lead_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -69,6 +71,28 @@ class ContextUpdateRequest:
     record_id: str
     fields: dict[str, str]
     outbox_event_id: int
+
+
+@dataclass(frozen=True)
+class MultiLeadSyncRequest:
+    """描述已持久化的多客户分段表格同步请求。"""
+
+    sales_user_id: str
+    lead_id: str
+    segment_index: int
+    fields: dict[str, str]
+    outbox_event_id: int
+
+
+@dataclass(frozen=True)
+class ReassignmentRequest:
+    """描述完成权限校验后可安全写入新目标表格的人工重归属请求。"""
+
+    audit_id: int
+    message_id: str
+    segment_index: int
+    new_lead_id: str
+    safe_fields: dict[str, str]
 
 
 class DeterministicFirstTextLeadExtractor:
@@ -109,7 +133,7 @@ class DeterministicFirstTextLeadExtractor:
 
         fields: dict[str, str] = {}
         # 仅接受人工可读的“标签：值”片段，避免将普通聊天猜测为客户信息。
-        for segment in re.split(r"[；;]", text):
+        for segment in re.split(r"[；;，,、]", text):
             label, separator, value = segment.partition("：")
             if not separator:
                 label, separator, value = segment.partition(":")
@@ -122,7 +146,7 @@ class DeterministicFirstTextLeadExtractor:
         demand = next(
             (
                 value.strip()
-                for segment in re.split(r"[；;]", text)
+                for segment in re.split(r"[；;，,、]", text)
                 for label, separator, value in [segment.partition("：")]
                 if separator and label.strip() == "需求"
             ),
@@ -134,6 +158,38 @@ class DeterministicFirstTextLeadExtractor:
                 break
 
         return fields
+
+    def extract_many(self, text: str | None) -> list[dict[str, str]]:
+        """从明确客户标签分段中提取一条或多条独立字段补丁。
+
+        参数：text 为已标准化文本。
+        返回值：按原消息顺序返回含线索名称的字段补丁；普通文本返回空列表。
+        异常：无；不调用外部服务。
+        副作用：无。
+        """
+        if text is None:
+            return []
+        # 仅在明确字段标签前切分，兼容销售常用的换行、分号和逗号而不猜测自由文本边界。
+        segments = re.split(r"(?:\r?\n|[；;，,、]\s*(?=(?:客户|公司)\s*[:：]))", text)
+        return [fields for segment in segments if (fields := self.extract(segment)) is not None]
+
+    def has_ambiguous_multiple_companies(self, text: str | None) -> bool:
+        """判断一条文本是否出现多个不同公司候选却未能可靠拆分。
+
+        参数：text 为已标准化文本。
+        返回值：存在至少两个不同显式公司候选时返回 True。
+        异常：无。
+        副作用：无。
+        """
+        if text is None:
+            return False
+        # 只以显式标签值判断歧义；相同名称的客户/公司重复表述不视作多客户。
+        candidates = {
+            match.group(1).strip()
+            for match in re.finditer(r"(?:客户|公司)\s*[:：]\s*([^；;，,、\n]+)", text)
+            if match.group(1).strip()
+        }
+        return len(candidates) > 1
 
 
 class FirstTextLeadWorkspaceService:
@@ -229,16 +285,36 @@ class FirstTextLeadWorkspaceService:
                     return LeadProcessingResult(LeadProcessingStatus.UNAUTHORIZED)
 
                 extractor = DeterministicFirstTextLeadExtractor()
+                multi_fields = extractor.extract_many(message.normalized_text)
+                if len(multi_fields) <= 1 and extractor.has_ambiguous_multiple_companies(
+                    message.normalized_text
+                ):
+                    # 多个公司候选未能按明确边界拆开时，宁可待归属也不能以最后字段覆盖前段事实。
+                    self._mark_unassigned(session, event)
+                    return LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
+                if len(multi_fields) > 1:
+                    # 多客户消息先在同一事务内固定所有分段事实，再按既有失败检查点逐条同步。
+                    multi_request = self._prepare_multi_leads(
+                        session, event, message, multi_fields, outbox_event_id
+                    )
+                else:
+                    multi_request = None
                 extracted_patch = extractor.extract_patch(message.normalized_text)
                 # 强身份优先于当前上下文，避免销售补充历史客户时把字段串到最近客户。
-                context_lead = self._get_strong_identity_lead(session, message, extracted_patch)
-                if context_lead is None:
+                context_lead = (
+                    None
+                    if multi_request is not None
+                    else self._get_strong_identity_lead(session, message, extracted_patch)
+                )
+                if context_lead is None and multi_request is None:
                     context_lead = self._get_active_context_lead(session, message)
                 same_context_company = context_lead is not None and extracted_patch.get(
                     "线索名称"
                 ) == context_lead.field_values.get("线索名称")
-                if context_lead is not None and (
-                    "线索名称" not in extracted_patch or same_context_company
+                if (
+                    multi_request is None
+                    and context_lead is not None
+                    and ("线索名称" not in extracted_patch or same_context_company)
                 ):
                     # 重复报出同一公司名仍属于当前线索，不可因标签重复而新建表格记录。
                     context_patch = {
@@ -276,7 +352,7 @@ class FirstTextLeadWorkspaceService:
                         outbox_event_id=outbox_event_id,
                     )
 
-                if context_update is None:
+                if multi_request is None and context_update is None:
                     existing_lead = session.scalar(
                         select(Lead).where(Lead.source_message_id == message.message_id)
                     )
@@ -326,6 +402,8 @@ class FirstTextLeadWorkspaceService:
                     sales_user_id = message.sales_user_id
                     lead_id = lead.id
 
+            if multi_request is not None:
+                return self._create_multi_smart_table_records(multi_request)
             if context_update is not None:
                 return self._update_smart_table_record(context_update)
             assert fields is not None
@@ -333,6 +411,98 @@ class FirstTextLeadWorkspaceService:
         finally:
             if log_token is not None:
                 reset_log_context(log_token)
+
+    def _prepare_multi_leads(
+        self,
+        session: Session,
+        event: OutboxEvent,
+        message: IncomingMessage,
+        fields_by_segment: list[dict[str, str]],
+        outbox_event_id: int,
+    ) -> tuple[MultiLeadSyncRequest, ...]:
+        """为同一消息的多个客户分段创建或恢复独立线索同步请求。
+
+        参数：session、event 和 message 是当前有序消费事实；fields_by_segment 为按消息顺序的字段。
+        返回值：每个分段的销售、线索、序号和持久化字段快照。
+        异常：数据库写入失败时由 SQLAlchemy 抛出。
+        副作用：创建独立 Lead、同步事实、来源记录和多分段审计，事件转为 processing。
+        """
+        requests: list[MultiLeadSyncRequest] = []
+        for segment_index, fields in enumerate(fields_by_segment):
+            lead = session.scalar(
+                select(Lead).where(
+                    Lead.source_message_id == message.message_id,
+                    Lead.source_segment_index == segment_index,
+                )
+            )
+            if lead is None:
+                # 每个分段都有独立 Lead 和字段来源，禁止让一个客户继承另一个分段的字段。
+                lead = Lead(
+                    source_message_id=message.message_id,
+                    source_segment_index=segment_index,
+                    original_capturing_sales_user_id=message.sales_user_id,
+                    smart_table_owner_user_id=message.sales_user_id,
+                    field_values={**fields, "线索来源": "展会"},
+                )
+                session.add(lead)
+                session.flush()
+                for field_name, value in fields.items():
+                    session.add(
+                        LeadFieldProvenance(
+                            lead_id=lead.id,
+                            source_message_id=message.message_id,
+                            field_name=field_name,
+                            value=value,
+                        )
+                    )
+                session.add(
+                    SmartTableSync(
+                        lead_id=lead.id,
+                        source_message_id=message.message_id,
+                        source_segment_index=segment_index,
+                    )
+                )
+                self._record_audit(session, event, "multi_lead_segment_created")
+            requests.append(
+                MultiLeadSyncRequest(
+                    sales_user_id=message.sales_user_id,
+                    lead_id=lead.id,
+                    segment_index=segment_index,
+                    fields=dict(lead.field_values),
+                    outbox_event_id=outbox_event_id,
+                )
+            )
+        event.status = "processing"
+        event.processing_started_at = utc_now()
+        return tuple(requests)
+
+    def _create_multi_smart_table_records(
+        self, requests: tuple[MultiLeadSyncRequest, ...]
+    ) -> LeadProcessingResult:
+        """按消息分段顺序创建独立表格记录，并沿用既有失败检查点语义。
+
+        参数：requests 为已提交的多个分段同步请求。
+        返回值：成功时返回所有 Lead 标识；任一外部失败时返回同步失败。
+        异常：数据库错误向调用方传播。
+        副作用：逐个调用智能表格适配器，失败时保留同一 Outbox 的可重试状态。
+        """
+        lead_ids: list[str] = []
+        for request in requests:
+            result = self._create_smart_table_record(
+                request.sales_user_id,
+                request.fields,
+                request.lead_id,
+                request.outbox_event_id,
+                request.segment_index,
+            )
+            if result.status is LeadProcessingStatus.SYNC_FAILED:
+                return LeadProcessingResult(
+                    LeadProcessingStatus.SYNC_FAILED, lead_ids=tuple(lead_ids)
+                )
+            lead_ids.append(request.lead_id)
+        return LeadProcessingResult(
+            LeadProcessingStatus.CREATED, lead_id=lead_ids[0], lead_ids=tuple(lead_ids)
+        )
 
     def _consume_next_after_checkpoint(self, outbox_event_id: int) -> None:
         """在本事件成为检查点后串行消费同一销售的下一条待处理消息。
@@ -460,28 +630,48 @@ class FirstTextLeadWorkspaceService:
         异常：数据库写入失败时由 SQLAlchemy 抛出。
         副作用：新增待归属结论、审计事件并将任务标记为 succeeded。
         """
-        resolution = session.get(LeadMessageResolution, event.message_id)
+        resolution = session.scalar(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id == event.message_id,
+                LeadMessageResolution.segment_index == 0,
+            )
+        )
         if resolution is None:
-            session.add(LeadMessageResolution(message_id=event.message_id, status="unassigned"))
+            session.add(
+                LeadMessageResolution(
+                    message_id=event.message_id,
+                    segment_index=0,
+                    status="unassigned",
+                )
+            )
         event.status = "succeeded"
         self._record_audit(session, event, "lead_message_unassigned")
         logger.info("lead_message_unassigned")
 
-    def _mark_assigned(self, session: Session, event: OutboxEvent, lead_id: str) -> None:
+    def _mark_assigned(
+        self, session: Session, event: OutboxEvent, lead_id: str, segment_index: int = 0
+    ) -> None:
         """保存消息已归属的结论，并完成无需表格写入的消费。
 
-        参数：session 为当前事务；event 为来源 Outbox；lead_id 为归属线索。
+        参数：session 为当前事务；event 为来源 Outbox；lead_id 为归属线索；
+        segment_index 为消息分段。
         返回值：无。
         异常：数据库写入失败时由 SQLAlchemy 抛出。
         副作用：新增或更新归属结论并将任务标记为 succeeded。
         """
-        resolution = session.get(LeadMessageResolution, event.message_id)
+        resolution = session.scalar(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id == event.message_id,
+                LeadMessageResolution.segment_index == segment_index,
+            )
+        )
         if resolution is None:
             session.add(
                 LeadMessageResolution(
                     message_id=event.message_id,
                     lead_id=lead_id,
                     status="assigned",
+                    segment_index=segment_index,
                 )
             )
         event.status = "succeeded"
@@ -654,15 +844,30 @@ class FirstTextLeadWorkspaceService:
         )
 
     def _create_smart_table_record(
-        self, sales_user_id: str, fields: dict[str, str], lead_id: str, outbox_event_id: int
+        self,
+        sales_user_id: str,
+        fields: dict[str, str],
+        lead_id: str,
+        outbox_event_id: int,
+        segment_index: int = 0,
     ) -> LeadProcessingResult:
         """以机器人身份新建销售可见表格记录，并持久化同步成功或失败事实。
 
-        参数：sales_user_id 为当前授权销售；fields 为确定性提取字段；lead_id 和事件标识用于回写。
+        参数：sales_user_id 为当前授权销售；fields 为确定性提取字段；
+        lead_id、事件和分段标识用于回写。
         返回值：包含表格记录标识的创建结果，或表格失败结论。
         异常：数据库回写错误向调用方传播；表格适配器错误转换为可审计失败结果。
         副作用：调用 SmartTableAdapter，并更新 Lead、同步结果、Outbox 与审计。
         """
+        with self._session_factory() as session:
+            existing_lead = session.get(Lead, lead_id)
+            if existing_lead is not None and existing_lead.smart_table_record_id is not None:
+                # 同一消息的另一分段失败后重试时，已成功分段不得再次调用无幂等键的表格创建。
+                return LeadProcessingResult(
+                    LeadProcessingStatus.CREATED,
+                    lead_id=lead_id,
+                    smart_table_record_id=existing_lead.smart_table_record_id,
+                )
         # 创建人和负责人共同写为当前销售，绝不使用机器人、管理员或公共账号。
         record_fields: dict[str, object] = {
             **fields,
@@ -709,7 +914,7 @@ class FirstTextLeadWorkspaceService:
             sync.smart_table_record_id = record.record_id
             sync.status = "succeeded"
             sync.completed_at = utc_now()
-            self._mark_assigned(session, event, lead_id)
+            self._mark_assigned(session, event, lead_id, segment_index)
             self._refresh_context(session, message, lead_id)
             self._record_audit(session, event, "smart_table_record_created")
         bind_log_context(record_id=record.record_id)
@@ -767,5 +972,204 @@ class FirstTextLeadWorkspaceService:
                     message_id=event.message_id,
                     sales_user_id=event.sales_user_id,
                     event_type=event_type,
+                )
+            )
+
+class LeadReassignmentService:
+    """以销售权限和字段来源约束执行消息分段的人工重新归属。"""
+
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        """注入人工重归属需要的事务边界。
+
+        参数：session_factory 创建数据库事务。
+        返回值：无。
+        异常：无。
+        副作用：仅保存会话工厂。
+        """
+        self._session_factory = session_factory
+
+    def reassign(
+        self,
+        message_id: str,
+        segment_index: int,
+        new_lead_id: str,
+        operator_user_id: str,
+        reason: str,
+    ) -> None:
+        """将销售自己的消息分段重新归属，并只安全补充来源字段。
+
+        参数：message_id 和 segment_index 定位来源；new_lead_id 为新目标；
+        operator_user_id 为操作销售；reason 为原因。
+        返回值：无。
+        异常：消息、归属或目标不存在时抛出 ValueError；
+        越权或空原因时抛出 PermissionError/ValueError。
+        副作用：创建重归属审计，成功后更新归属和安全来源记录。
+        """
+        if not reason.strip():
+            raise ValueError("人工重归属必须填写原因")
+        request = self._prepare_reassignment(
+            message_id, segment_index, new_lead_id, operator_user_id, reason.strip()
+        )
+        with self._session_factory.begin() as session:
+            # T07 尚未读取表格人工编辑状态，因此重归属绝不直接写入表格字段。
+            resolution = self._get_resolution(session, request.message_id, request.segment_index)
+            target = session.get(Lead, request.new_lead_id)
+            audit = session.get(MessageReassignmentAudit, request.audit_id)
+            if resolution is None or target is None or audit is None:
+                raise ValueError("重归属完成时缺少归属结论、目标线索或审计事实")
+            safe_fields = {
+                field_name: value
+                for field_name, value in request.safe_fields.items()
+                if not target.field_values.get(field_name)
+            }
+            resolution.lead_id = request.new_lead_id
+            resolution.status = "assigned"
+            if safe_fields:
+                # 第二次校验后仍为空的字段才进入后台事实，防止覆盖同期新增值。
+                target.field_values = {**target.field_values, **safe_fields}
+                for field_name, value in safe_fields.items():
+                    session.add(
+                        LeadFieldProvenance(
+                            lead_id=target.id,
+                            source_message_id=request.message_id,
+                            field_name=field_name,
+                            value=value,
+                        )
+                    )
+            audit.status = "succeeded"
+            audit.error_summary = None
+            self._record_reassignment_audit(session, request.message_id)
+        logger.info(
+            "lead_message_reassigned",
+            extra={"message_id": request.message_id, "lead_id": request.new_lead_id},
+        )
+
+    def _prepare_reassignment(
+        self,
+        message_id: str,
+        segment_index: int,
+        new_lead_id: str,
+        operator_user_id: str,
+        reason: str,
+    ) -> ReassignmentRequest:
+        """校验权限并持久化一条可恢复的人工重归属请求。
+
+        参数：各参数共同定位来源分段、新目标、操作人和受审计原因。
+        返回值：完成外部表格增量写入所需的不可变请求。
+        异常：事实缺失或权限不足时抛出 ValueError 或 PermissionError。
+        副作用：新增 processing 状态的重归属审计，不改变当前归属。
+        """
+        with self._session_factory.begin() as session:
+            message = session.get(IncomingMessage, message_id)
+            resolution = self._get_resolution(session, message_id, segment_index)
+            target = session.get(Lead, new_lead_id)
+            operator = session.get(SalesAuthorization, operator_user_id)
+            if message is None or resolution is None or target is None or operator is None:
+                raise ValueError("消息分段、归属结论、新目标线索或操作人不存在")
+            if not operator.is_active or not (operator.is_authorized or operator.is_administrator):
+                raise PermissionError("操作人没有可用的重归属权限")
+            previous = (
+                session.get(Lead, resolution.lead_id) if resolution.lead_id is not None else None
+            )
+            if resolution.lead_id is not None and previous is None:
+                raise ValueError("原目标线索不存在")
+            if not operator.is_administrator and (
+                message.sales_user_id != operator_user_id
+                or target.smart_table_owner_user_id != operator_user_id
+                or (previous is not None and previous.smart_table_owner_user_id != operator_user_id)
+            ):
+                # 普通销售必须同时拥有来源消息、原目标和新目标；管理员由授权目录显式放行。
+                raise PermissionError("销售只能重新归属自己的消息和线索")
+            safe_fields = self._safe_provenance_fields(
+                session, message_id, resolution.lead_id, target
+            )
+            audit = MessageReassignmentAudit(
+                message_id=message_id,
+                segment_index=segment_index,
+                previous_lead_id=resolution.lead_id,
+                new_lead_id=new_lead_id,
+                operator_user_id=operator_user_id,
+                operator_role="administrator" if operator.is_administrator else "sales",
+                reason=reason,
+            )
+            session.add(audit)
+            session.flush()
+            return ReassignmentRequest(
+                audit_id=audit.id,
+                message_id=message_id,
+                segment_index=segment_index,
+                new_lead_id=new_lead_id,
+                safe_fields=safe_fields,
+            )
+
+    def _get_resolution(
+        self, session: Session, message_id: str, segment_index: int
+    ) -> LeadMessageResolution | None:
+        """按消息和分段读取唯一的当前归属结论。
+
+        参数：session 为事务；message_id 和 segment_index 定位分段。
+        返回值：存在时返回归属结论，否则返回 None。
+        异常：数据库读取失败时由 SQLAlchemy 抛出。
+        副作用：无。
+        """
+        return session.scalar(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id == message_id,
+                LeadMessageResolution.segment_index == segment_index,
+            )
+        )
+
+    def _safe_provenance_fields(
+        self,
+        session: Session,
+        message_id: str,
+        previous_lead_id: str | None,
+        target: Lead,
+    ) -> dict[str, str]:
+        """计算可从原归属消息安全补充到新目标的字段来源。
+
+        参数：session 为事务；message_id 为来源；previous_lead_id 为原目标；target 为新目标。
+        返回值：仅包含新目标为空且由该消息确实贡献的字段。
+        异常：数据库读取失败时由 SQLAlchemy 抛出。
+        副作用：无。
+        """
+        if previous_lead_id is None:
+            return {}
+        provenances = session.scalars(
+            select(LeadFieldProvenance).where(
+                LeadFieldProvenance.lead_id == previous_lead_id,
+                LeadFieldProvenance.source_message_id == message_id,
+            )
+        ).all()
+        # 字段来源是唯一可移动的事实；没有来源记录的当前值不能因人工操作被猜测搬运。
+        return {
+            item.field_name: item.value
+            for item in provenances
+            if not target.field_values.get(item.field_name)
+        }
+
+    def _record_reassignment_audit(self, session: Session, message_id: str) -> None:
+        """为人工重归属保存一次独立于自动处理阶段的业务审计。
+
+        参数：session 为当前事务；message_id 为来源消息标识。
+        返回值：无。
+        异常：数据库写入失败时由 SQLAlchemy 抛出。
+        副作用：首次操作时新增业务审计事件。
+        """
+        event = session.scalar(select(OutboxEvent).where(OutboxEvent.message_id == message_id))
+        if event is None:
+            return
+        exists = session.scalar(
+            select(BusinessAuditEvent).where(
+                BusinessAuditEvent.message_id == event.message_id,
+                BusinessAuditEvent.event_type == "lead_message_reassigned",
+            )
+        )
+        if exists is None:
+            session.add(
+                BusinessAuditEvent(
+                    message_id=event.message_id,
+                    sales_user_id=event.sales_user_id,
+                    event_type="lead_message_reassigned",
                 )
             )

@@ -47,6 +47,7 @@ class SalesAuthorization(Base):
     crm_user_id: Mapped[str | None] = mapped_column(String(128))
     is_authorized: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_administrator: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     next_message_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
