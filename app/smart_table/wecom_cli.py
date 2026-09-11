@@ -85,6 +85,7 @@ class WecomCliSmartTableAdapter:
         self._timeout_seconds = timeout_seconds
         self._retry_count = retry_count
         self._runner = runner or self._run_subprocess
+        self._schema: SmartTableSchema | None = None
 
     def get_schema(self) -> SmartTableSchema:
         """分页读取真实字段、类型和枚举选项。
@@ -93,10 +94,14 @@ class WecomCliSmartTableAdapter:
         异常：字段类型不受冻结契约支持或 CLI 调用失败时抛出异常。
         副作用：调用 wecom-cli 的 fields list 接口。
         """
+        if self._schema is not None:
+            # 字段绑定在进程生命周期内保持同一快照，避免一次读写的显示名映射发生漂移。
+            return self._schema
         fields: list[SmartTableField] = []
         for item in self._list_pages("fields"):
             fields.append(self._parse_field(item))
-        return SmartTableSchema(fields=tuple(fields))
+        self._schema = SmartTableSchema(fields=tuple(fields))
+        return self._schema
 
     def get_permissions(self) -> SmartTablePermissions:
         """返回管理员已核验并通过环境变量注入的销售权限快照。
@@ -149,7 +154,8 @@ class WecomCliSmartTableAdapter:
         异常：记录响应缺少标识或字段值时抛出异常。
         副作用：调用 wecom-cli 的 records list 接口。
         """
-        return [self._parse_record(item) for item in self._list_pages("records")]
+        schema = self.get_schema()
+        return [self._parse_record(item, schema) for item in self._list_pages("records")]
 
     def create_record(
         self,
@@ -157,9 +163,9 @@ class WecomCliSmartTableAdapter:
         *,
         actor: SmartTableActor,
     ) -> SmartTableRecord:
-        """以机器人身份创建一条记录，并原样传递字段补丁的 CLI 原生值。
+        """以机器人身份创建一条记录，并转换规范字段名和成员字段值。
 
-        参数：fields 的键为真实字段名、值遵循 CLI schema；actor 为调用主体。
+        参数：fields 的键为规范字段名；actor 为调用主体。
         返回：CLI 返回的创建记录快照。
         异常：销售主体、机器人缺少负责人或 CLI 写入失败时抛出异常。
         副作用：在目标智能表格新增一条记录。
@@ -169,8 +175,11 @@ class WecomCliSmartTableAdapter:
         if actor is SmartTableActor.ROBOT and not fields.get("负责人"):
             raise ValueError("机器人新增智能表格记录时必须写入负责人")
 
-        response = self._call("records", "add", {"records": [{"values": dict(fields)}]})
-        return self._parse_written_record(response)
+        schema = self.get_schema()
+        response = self._call(
+            "records", "add", {"records": [{"values": self._to_cli_fields(fields, schema)}]}
+        )
+        return self._parse_written_record(response, schema)
 
     def update_record(self, record_id: str, fields: Mapping[str, object]) -> SmartTableRecord:
         """对指定记录执行单次字段补丁更新。
@@ -183,12 +192,17 @@ class WecomCliSmartTableAdapter:
         if self.get_record(record_id) is None:
             raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
 
+        schema = self.get_schema()
         response = self._call(
             "records",
             "update",
-            {"records": [{"record_id": record_id, "values": dict(fields)}]},
+            {
+                "records": [
+                    {"record_id": record_id, "values": self._to_cli_fields(fields, schema)}
+                ]
+            },
         )
-        return self._parse_written_record(response)
+        return self._parse_written_record(response, schema)
 
     def _list_pages(self, resource: ReadResource) -> list[Mapping[str, object]]:
         """按 CLI next_cursor 读取 fields 或 records 的所有分页响应。
@@ -404,11 +418,60 @@ class WecomCliSmartTableAdapter:
             options.append(SmartTableOption(option_id=option_id, name=name))
         return tuple(options)
 
-    def _parse_record(self, item: Mapping[str, object]) -> SmartTableRecord:
+    def _to_cli_fields(
+        self, fields: Mapping[str, object], schema: SmartTableSchema
+    ) -> dict[str, object]:
+        """把业务规范字段和值转换为真实字段标题及 CLI 原生值。
+
+        参数：fields 为业务层字段补丁；schema 为当前真实字段快照。
+        返回：可直接传给 wecom-cli 的字段标题和值。
+        异常：字段未配置、成员身份或 AI待确认选项不合法时抛出异常。
+        副作用：无。
+        """
+        converted: dict[str, object] = {}
+        for canonical_name, value in fields.items():
+            field = schema.get_field(canonical_name)
+            if field is None:
+                raise WecomCliSmartTableAdapterError(f"智能表格未配置字段：{canonical_name}")
+            # 字段名称唯一由 schema 解析，业务层绝不拼接管理员维护的必填前缀。
+            converted[field.name] = self._to_cli_value(canonical_name, field, value)
+        return converted
+
+    def _to_cli_value(
+        self, canonical_name: str, field: SmartTableField, value: object
+    ) -> object:
+        """按字段类型转换成员和 AI待确认的 CLI 值，其余字段保持既有契约。
+
+        参数：canonical_name 为业务规范字段名；field 为真实字段定义；value 为业务层值。
+        返回：匹配 CLI 字段类型的原生值。
+        异常：成员身份或 AI待确认选项格式不合法时抛出异常。
+        副作用：无。
+        """
+        if field.field_type is SmartTableFieldType.MEMBER:
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"MEMBER 字段必须传入非空 sales_user_id：{canonical_name}")
+            # CLI 的 CellUserValue 写入格式为数组；业务层只保留企业微信销售身份字符串。
+            return [{"userId": value}]
+        if canonical_name == "AI待确认":
+            if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
+                raise ValueError("AI待确认必须传入规范字段名列表")
+            # 管理员可为业务字段选项增加必填前缀；写入必须使用 schema 中真实 option ID。
+            options = {option.name.removeprefix("*"): option for option in field.options}
+            try:
+                return [
+                    {"id": options[name].option_id, "text": options[name].name} for name in value
+                ]
+            except KeyError as error:
+                raise ValueError(f"AI待确认缺少字段选项：{error.args[0]}") from error
+        return value
+
+    def _parse_record(
+        self, item: Mapping[str, object], schema: SmartTableSchema
+    ) -> SmartTableRecord:
         """把 CLI 行记录转换为保留原始字段值的领域快照。
 
         参数：item 为 records list 或写入接口返回的单条记录。
-        返回：记录标识和字段名到 CLI 原生值的映射。
+        返回：记录标识和规范字段名到业务层值的映射。
         异常：记录标识或 values 对象缺失时抛出异常。
         副作用：无。
         """
@@ -416,12 +479,52 @@ class WecomCliSmartTableAdapter:
         fields = item.get("values")
         if not isinstance(record_id, str) or not isinstance(fields, Mapping):
             raise WecomCliSmartTableAdapterError("wecom-cli 记录缺少 record_id 或 values")
-        return SmartTableRecord(
-            record_id=record_id,
-            fields=dict(self._as_mapping(fields, "记录 values")),
-        )
+        normalized: dict[str, object] = {}
+        for display_name, value in self._as_mapping(fields, "记录 values").items():
+            # 真实记录可能包含管理员后续新增字段；未知字段保留原名以避免读数据丢失。
+            field = schema.get_field(display_name)
+            canonical_name = field.name.removeprefix("*") if field is not None else display_name
+            normalized[canonical_name] = self._from_cli_value(canonical_name, field, value)
+        return SmartTableRecord(record_id=record_id, fields=normalized)
 
-    def _parse_written_record(self, response: Mapping[str, object]) -> SmartTableRecord:
+    @staticmethod
+    def _from_cli_value(
+        canonical_name: str, field: SmartTableField | None, value: object
+    ) -> object:
+        """将成员与 AI待确认的真实返回值恢复为业务层规范值。
+
+        参数：canonical_name 为规范字段名；field 为可选真实字段定义；value 为 CLI 返回值。
+        返回：业务层可直接比较和持久化的值。
+        异常：成员或 AI待确认返回结构不符合 CLI 契约时抛出异常。
+        副作用：无。
+        """
+        if field is not None and field.field_type is SmartTableFieldType.MEMBER:
+            # 创建人和负责人属于权限关键字段，业务层只接受唯一且可审计的销售身份。
+            if (
+                not isinstance(value, list)
+                or len(value) != 1
+                or not isinstance(value[0], Mapping)
+                or not isinstance(value[0].get("userId"), str)
+            ):
+                raise WecomCliSmartTableAdapterError("MEMBER 字段返回值不符合单成员 CLI 契约")
+            return value[0]["userId"]
+        if canonical_name == "AI待确认":
+            if not isinstance(value, list):
+                raise WecomCliSmartTableAdapterError("AI待确认返回值不是选项列表")
+            names: list[str] = []
+            for option_value in value:
+                # 读回选项文本同样去除管理员必填前缀，使 T09 永远与规范字段名比较。
+                if not isinstance(option_value, Mapping) or not isinstance(
+                    option_value.get("text"), str
+                ):
+                    raise WecomCliSmartTableAdapterError("AI待确认选项返回值无效")
+                names.append(option_value["text"].removeprefix("*"))
+            return names
+        return value
+
+    def _parse_written_record(
+        self, response: Mapping[str, object], schema: SmartTableSchema
+    ) -> SmartTableRecord:
         """从 records add 或 update 响应中取得唯一写入后的记录。
 
         参数：response 为已验证成功的 CLI 写入响应。
@@ -433,7 +536,7 @@ class WecomCliSmartTableAdapter:
         if not isinstance(records, list) or len(records) != 1:
             # 单条写入必须返回唯一结果，批量或空结果会导致调用方无法确定真实记录。
             raise WecomCliSmartTableAdapterError("wecom-cli 写入响应未返回唯一记录")
-        return self._parse_record(self._as_mapping(records[0], "写入记录"))
+        return self._parse_record(self._as_mapping(records[0], "写入记录"), schema)
 
     @staticmethod
     def _log_retry(resource: str, action: str, attempt: int, error_type: str) -> None:

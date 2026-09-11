@@ -143,6 +143,38 @@ def test_sync_rechecks_user_edit_and_only_writes_safe_medium_confidence_field(
     assert business_line.is_user_confirmed is True
 
 
+def test_t09_does_not_treat_a_canonical_reread_as_a_user_edit(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证适配器归一化显示名后，T09 不会把相同 AI 值误判为人工编辑。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：字段保护或来源状态断言失败时由 pytest 报告。
+    副作用：模拟真实适配器已将带星显示名恢复为规范名后的 T09 重读。
+    """
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead_with_record(session_factory, adapter)
+
+    result = LeadReviewService(session_factory, adapter).sync_ai_patch(
+        lead_id,
+        "message-9",
+        _patch(fields={"业务线": "协作机器人"}),
+    )
+
+    assert result.protected_fields == ()
+    with session_factory() as session:
+        business_line = session.scalar(
+            select(LeadFieldProvenance).where(
+                LeadFieldProvenance.lead_id == lead_id,
+                LeadFieldProvenance.field_name == "业务线",
+            )
+        )
+
+    assert business_line is not None
+    assert business_line.is_user_modified is False
+
+
 def test_required_pending_field_blocks_until_owner_explicitly_confirms(
     session_factory: sessionmaker[Session],
 ) -> None:
