@@ -26,6 +26,18 @@ class MediaValidationError(ValueError):
     """表示媒体未通过白名单、大小或真实格式校验。"""
 
 
+SAFE_INGEST_FAILURE_CODES = frozenset(
+    {
+        "media_download_failed",
+        "media_empty",
+        "media_too_large",
+        "media_format_unsupported",
+        "mime_type_mismatch",
+        "media_mime_not_allowed",
+    }
+)
+
+
 @dataclass(frozen=True)
 class ValidatedMedia:
     """保存校验完成后可供存储和识别使用的安全媒体事实。"""
@@ -247,6 +259,8 @@ class MediaAttachmentService:
     ) -> str:
         """记录校验或扫描失败工件，保证来源消息可审计且不进入模型。"""
         attachment_id = str(uuid4())
+        # 外部扫描器异常可能包含下载地址或媒体片段，只持久化受控失败码。
+        summary = self._safe_ingest_failure_summary(error)
         with self._session_factory.begin() as session:
             session.add(
                 MessageAttachment(
@@ -256,7 +270,7 @@ class MediaAttachmentService:
                     declared_mime_type=declared_mime_type,
                     scan_status="failed",
                     processing_status="failed_pending_review",
-                    error_summary=str(error)[:128],
+                    error_summary=summary,
                     completed_at=utc_now(),
                 )
             )
@@ -266,13 +280,21 @@ class MediaAttachmentService:
                     task_type=media_kind,
                     status="failed_pending_review",
                     attempts=1,
-                    error_summary=str(error)[:128],
+                    error_summary=summary,
                     completed_at=utc_now(),
                 )
             )
             self._audit(session, message_id, "media_validation_failed")
             self._notice(session, message_id)
         return attachment_id
+
+    @staticmethod
+    def _safe_ingest_failure_summary(error: Exception) -> str:
+        """将媒体接入失败归一为可审计且不含外部敏感信息的错误码。"""
+        detail = str(error)
+        if isinstance(error, MediaValidationError) and detail in SAFE_INGEST_FAILURE_CODES:
+            return detail
+        return "media_scan_failed"
 
     def _record_processing_failure(self, attachment_id: str, summary: str) -> None:
         """登记识别失败和幂等文字补充提示，不向调用方传播媒体失败。"""

@@ -7,8 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from app.media.service import MediaValidationError, MediaValidator
+from app.media.service import MediaAttachmentService, MediaValidationError, MediaValidator
 from app.media.storage import LocalVolumeStorageProvider
+from app.messaging.models import MessageAttachment
 
 
 def test_validator_accepts_png_with_matching_declared_type_and_digest() -> None:
@@ -29,6 +30,18 @@ def test_validator_rejects_declared_type_that_disagrees_with_real_content() -> N
         MediaValidator(image_mime_types=("image/png",), audio_mime_types=()).validate(
             b"ID3audio-content", declared_mime_type="image/png", media_kind="image"
         )
+
+
+def test_ingest_failure_summary_redacts_external_exception_details() -> None:
+    """验证外部失败文本中的下载凭据不会进入持久化错误摘要。"""
+    error = RuntimeError("https://temporary.example/download?key=secret")
+
+    assert MediaAttachmentService._safe_ingest_failure_summary(error) == "media_scan_failed"
+
+
+def test_media_digest_is_not_globally_unique() -> None:
+    """验证相同媒体可分别归属不同来源消息，哈希仅用于审计与检索。"""
+    assert not MessageAttachment.__table__.c.sha256.unique
 
 
 def test_local_volume_storage_uses_opaque_key_and_round_trips_content(tmp_path: Path) -> None:

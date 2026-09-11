@@ -246,7 +246,8 @@ class WecomBotRuntime:
                 self._media_attachment_service.record_download_failure(
                     receipt.message_id, media_kind=receipt.media_kind
                 )
-            logger.exception("wecom_bot_media_intake_failed")
+            # 下载器异常可能带短期 URL 或 AES key，日志仅保留固定事件名。
+            logger.error("wecom_bot_media_intake_failed")
 
     async def run(self) -> None:
         """建立 SDK 长连接并等待进程终止信号。

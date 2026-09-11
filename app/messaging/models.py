@@ -170,7 +170,7 @@ class MessageAttachment(Base):
     declared_mime_type: Mapped[str | None] = mapped_column(String(128))
     detected_mime_type: Mapped[str | None] = mapped_column(String(128))
     size_bytes: Mapped[int | None] = mapped_column(Integer)
-    sha256: Mapped[str | None] = mapped_column(String(64), unique=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), index=True)
     storage_key: Mapped[str | None] = mapped_column(String(256), unique=True)
     scan_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     processing_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)

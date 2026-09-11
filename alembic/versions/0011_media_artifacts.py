@@ -32,7 +32,7 @@ def upgrade() -> None:
         sa.Column("declared_mime_type", sa.String(length=128)),
         sa.Column("detected_mime_type", sa.String(length=128)),
         sa.Column("size_bytes", sa.Integer()),
-        sa.Column("sha256", sa.String(length=64), unique=True),
+        sa.Column("sha256", sa.String(length=64)),
         sa.Column("storage_key", sa.String(length=256), unique=True),
         sa.Column("scan_status", sa.String(length=32), nullable=False, server_default="pending"),
         sa.Column(
@@ -45,6 +45,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["message_id"], ["incoming_messages.message_id"]),
     )
     op.create_index("ix_message_attachments_message_id", "message_attachments", ["message_id"])
+    op.create_index("ix_message_attachments_sha256", "message_attachments", ["sha256"])
     op.create_table(
         "media_processing_tasks",
         sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
@@ -63,6 +64,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     """按依赖逆序删除媒体任务和消息附件表。"""
     op.drop_table("media_processing_tasks")
+    op.drop_index("ix_message_attachments_sha256", table_name="message_attachments")
     op.drop_index("ix_message_attachments_message_id", table_name="message_attachments")
     op.drop_table("message_attachments")
     op.drop_column("incoming_messages", "requires_media_enrichment")
