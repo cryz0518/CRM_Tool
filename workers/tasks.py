@@ -5,6 +5,7 @@ from __future__ import annotations
 from sqlalchemy import Engine, create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.ai.dependencies import get_ai_gateway
 from app.ai.models import ExtractedLeadPatch, LeadAnalysis
 from app.core.config import get_settings
 from app.leads.review import LeadReviewService
@@ -43,7 +44,9 @@ def consume_lead_outbox_event(outbox_event_id: int) -> str:
         get_media_attachment_service(factory).process_pending_for_message(
             _message_id(factory, outbox_event_id)
         )
-        service = FirstTextLeadWorkspaceService(factory, get_smart_table_adapter())
+        service = FirstTextLeadWorkspaceService(
+            factory, get_smart_table_adapter(), ai_gateway=get_ai_gateway()
+        )
         return service.consume(outbox_event_id).status.value
     finally:
         # 每个短任务释放独立连接池，避免 Beat 持续扫描时堆积空闲连接。
