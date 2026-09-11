@@ -174,13 +174,6 @@ class LeadReviewService:
             if synced_values:
                 # 仅合并本次 T09 实际写入字段；被人工保护或低置信度候选绝不进入正式后台快照。
                 lead.field_values = {**lead.field_values, **synced_values}
-            if protected:
-                self._record_audit(
-                    session,
-                    source_message_id,
-                    lead.smart_table_owner_user_id,
-                    "user_edit_detected",
-                )
             if written_names:
                 self._record_audit(
                     session,

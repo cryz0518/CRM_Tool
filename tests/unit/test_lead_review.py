@@ -12,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 from app.ai.models import ExtractedLeadPatch, LeadAnalysis
 from app.leads.models import Lead, LeadFieldProvenance, UserConfirmationEvent
 from app.leads.review import LeadReviewService
-from app.messaging.models import Base, IncomingMessage, SalesAuthorization
+from app.messaging.models import Base, BusinessAuditEvent, IncomingMessage, SalesAuthorization
 from app.smart_table.adapter import SmartTableActor
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.registry import build_required_smart_table_schema
@@ -141,6 +141,71 @@ def test_sync_rechecks_user_edit_and_only_writes_safe_medium_confidence_field(
     assert business_line is not None
     assert business_line.is_user_modified is True
     assert business_line.is_user_confirmed is True
+    with session_factory() as session:
+        user_edit_events = session.scalars(
+            select(BusinessAuditEvent).where(BusinessAuditEvent.event_type == "user_edit_detected")
+        ).all()
+
+    assert len(user_edit_events) == 1
+
+
+def test_system_prefilled_lead_source_matching_ai_suggestion_is_not_a_user_edit(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证首次建档的系统线索来源不会被误审计为销售编辑。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：保护字段或审计事件断言失败时由 pytest 报告。
+    副作用：模拟首次记录已有系统预填值后的 T09 同步。
+    """
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead_with_record(session_factory, adapter)
+    record_id = next(iter(adapter.get_records())).record_id
+    adapter.update_record(record_id, {"线索来源": "展会"})
+
+    result = LeadReviewService(session_factory, adapter).sync_ai_patch(
+        lead_id, "message-9", _patch(fields={"线索来源": "展会"})
+    )
+
+    assert result.protected_fields == ("线索来源",)
+    with session_factory() as session:
+        user_edit_events = session.scalars(
+            select(BusinessAuditEvent).where(BusinessAuditEvent.event_type == "user_edit_detected")
+        ).all()
+
+    assert user_edit_events == []
+
+
+def test_protected_existing_system_field_without_user_edit_has_no_user_edit_audit(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证已有合法系统字段被保护时不产生人工编辑审计。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：保护字段、表格值或审计事件断言失败时由 pytest 报告。
+    副作用：模拟 AI 提议覆盖系统预填字段的 T09 同步。
+    """
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead_with_record(session_factory, adapter)
+    record_id = next(iter(adapter.get_records())).record_id
+    adapter.update_record(record_id, {"线索来源": "展会"})
+
+    result = LeadReviewService(session_factory, adapter).sync_ai_patch(
+        lead_id, "message-9", _patch(fields={"线索来源": "促销"})
+    )
+
+    record = adapter.get_record(record_id)
+    assert record is not None
+    assert result.protected_fields == ("线索来源",)
+    assert record.fields["线索来源"] == "展会"
+    with session_factory() as session:
+        user_edit_events = session.scalars(
+            select(BusinessAuditEvent).where(BusinessAuditEvent.event_type == "user_edit_detected")
+        ).all()
+
+    assert user_edit_events == []
 
 
 def test_t09_does_not_treat_a_canonical_reread_as_a_user_edit(
