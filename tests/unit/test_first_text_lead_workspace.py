@@ -7,12 +7,14 @@ from collections.abc import Generator
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.ai.gateway import AIGateway
 from app.ai.provider import LLMProviderError, MockLLMProvider
+from app.companies.models import QCCCandidate, QCCLookupResult
+from app.companies.service import CompanyLeadService, MockQCCAdapter
 from app.leads.models import Lead, LeadFieldProvenance, SmartTableSync
 from app.leads.service import FirstTextLeadWorkspaceService, LeadProcessingStatus
 from app.messaging.models import (
@@ -65,18 +67,28 @@ def persist_outbox_text(
     """
     with session_factory.begin() as session:
         # 测试故意直接准备 T02 之后的事实，不重复测试 T02 的接收事务。
-        session.add(
-            SalesAuthorization(
-                wecom_user_id=sales_user_id,
-                is_authorized=authorized,
-                is_active=True,
+        authorization = session.get(SalesAuthorization, sales_user_id)
+        if authorization is None:
+            session.add(
+                SalesAuthorization(
+                    wecom_user_id=sales_user_id,
+                    is_authorized=authorized,
+                    is_active=True,
+                )
             )
-        )
+        sequence = (
+            session.scalar(
+                select(func.max(IncomingMessage.sequence)).where(
+                    IncomingMessage.sales_user_id == sales_user_id
+                )
+            )
+            or 0
+        ) + 1
         session.add(
             IncomingMessage(
                 message_id=message_id,
                 sales_user_id=sales_user_id,
-                sequence=1,
+                sequence=sequence,
                 raw_payload={"text": text},
                 normalized_text=text,
             )
@@ -84,7 +96,7 @@ def persist_outbox_text(
         event = OutboxEvent(
             message_id=message_id,
             sales_user_id=sales_user_id,
-            sequence=1,
+            sequence=sequence,
         )
         session.add(event)
         session.flush()
@@ -167,6 +179,60 @@ def test_authorized_sales_text_creates_a_personal_review_record(
     assert event is not None
     assert event.status == "succeeded"
     assert set(audits) >= {"lead_created", "smart_table_record_created"}
+
+
+def test_consumer_upgrades_temporary_lead_when_later_message_names_the_company(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 T10 已接入消费者，联系人临时线索可由后续公司名升级。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：未升级同一草稿、未采用 QCC 标准名或表格未增量更新时由 pytest 报告。
+    副作用：连续消费同销售两条消息并调用 Mock QCC。
+    """
+    temporary_event_id = persist_outbox_text(
+        session_factory,
+        message_id="temporary-contact",
+        sales_user_id="sales-1",
+        text="联系人：张三；手机：13800000001",
+    )
+    company_event_id = persist_outbox_text(
+        session_factory,
+        message_id="temporary-company",
+        sales_user_id="sales-1",
+        text="公司：长广溪；电话：0510-12345678",
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    company_service = CompanyLeadService(
+        session_factory,
+        adapter,
+        MockQCCAdapter(
+            {
+                "长广溪": QCCLookupResult.matched(
+                    QCCCandidate("无锡长广溪智能制造有限公司", "qcc-1")
+                )
+            }
+        ),
+    )
+    service = FirstTextLeadWorkspaceService(
+        session_factory, adapter, company_lead_service=company_service
+    )
+
+    temporary = service.consume(temporary_event_id)
+
+    assert temporary.status is LeadProcessingStatus.CREATED
+    with session_factory() as session:
+        lead = session.get(Lead, temporary.lead_id)
+        company_event = session.get(OutboxEvent, company_event_id)
+    assert lead is not None
+    assert company_event is not None
+    assert company_event.status == "succeeded"
+    assert lead.standard_company_name == "无锡长广溪智能制造有限公司"
+    assert lead.field_values["电话"] == "0510-12345678"
+    record = adapter.get_record(lead.smart_table_record_id or "")
+    assert record is not None
+    assert record.fields["线索名称"] == "无锡长广溪智能制造有限公司"
 
 
 def test_non_lead_text_is_ignored_without_polluting_the_review_workspace(

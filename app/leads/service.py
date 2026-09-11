@@ -13,6 +13,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.ai.gateway import AIGateway, AIGatewayError
 from app.ai.models import ExtractedLeadPatch, LeadAnalysis
+from app.companies.models import CompanyRegionEvidence, CompanyUpsertCommand
+from app.companies.service import CompanyLeadService
 from app.core.config import get_settings
 from app.core.logging import bind_log_context, reset_log_context
 from app.leads.identity import DatabaseSalesIdentityProvider, SalesIdentityProvider
@@ -218,11 +220,13 @@ class FirstTextLeadWorkspaceService:
         sales_identity_provider: SalesIdentityProvider | None = None,
         lead_context_ttl_minutes: int | None = None,
         ai_gateway: AIGateway | None = None,
+        company_lead_service: CompanyLeadService | None = None,
     ) -> None:
         """注入数据库、表格和销售身份边界，避免业务层依赖真实 CLI 或 Qwen。
 
         参数：session_factory 创建事务；smart_table_adapter 写销售审核表；身份提供器可替换测试实现；
-        lead_context_ttl_minutes 可覆盖环境中的上下文有效期；ai_gateway 为可替换的 T08 网关。
+        lead_context_ttl_minutes 可覆盖环境中的上下文有效期；
+        ai_gateway 为可替换的 T08 网关；company_lead_service 负责 T10 公司核验与销售内去重。
         返回值：无。
         异常：无；依赖错误在消费时按其真实类型处理。
         副作用：仅保存依赖引用，不读写数据库或智能表格。
@@ -231,6 +235,7 @@ class FirstTextLeadWorkspaceService:
         self._smart_table_adapter = smart_table_adapter
         self._sales_identity_provider = sales_identity_provider or DatabaseSalesIdentityProvider()
         self._ai_gateway = ai_gateway
+        self._company_lead_service = company_lead_service
         settings = get_settings()
         configured_ttl_minutes = (
             settings.lead_context_ttl_minutes
@@ -264,9 +269,96 @@ class FirstTextLeadWorkspaceService:
             claimed_for_processing=claimed_for_processing,
             recover_expired_lease=recover_expired_lease,
         )
+        # 表格首次同步成功后才应用公司核验和销售内去重，避免失败重试中重放外部写入。
+        result = self._apply_company_resolution(outbox_event_id, result)
         # 只在本事件已越过首次消费检查点后继续，防止 retrying/processing 事件被错误跳过。
         self._consume_next_after_checkpoint(outbox_event_id)
         return result
+
+    def _apply_company_resolution(
+        self, outbox_event_id: int, result: LeadProcessingResult
+    ) -> LeadProcessingResult:
+        """将已同步的本消息线索交给 T10 公司服务进行保守升级或销售内合并。
+
+        参数：outbox_event_id 用于读取当前消息事实；result 为首次消费的成功结果。
+        返回值：公司服务完成后指向最终线索的处理结果。
+        异常：公司服务的权限、数据库或表格异常向调用方传播。
+        副作用：可能升级临时线索、合并当前销售同公司线索并修正消息归属和当前上下文。
+        """
+        if self._company_lead_service is None or result.status not in {
+            LeadProcessingStatus.CREATED,
+            LeadProcessingStatus.UPDATED,
+        }:
+            return result
+        lead_ids = result.lead_ids or ((result.lead_id,) if result.lead_id is not None else ())
+        if not lead_ids:
+            return result
+        with self._session_factory() as session:
+            _, message = self._load_event_and_message(session, outbox_event_id)
+            message_id = message.message_id
+            sales_user_id = message.sales_user_id
+            commands: list[tuple[str, CompanyUpsertCommand]] = []
+            for lead_id in lead_ids:
+                lead = session.get(Lead, lead_id)
+                if lead is None:
+                    raise ValueError(f"线索不存在：{lead_id}")
+                # 当前 Outbox 消息是本轮补充的来源，不能把旧首条消息误记为公司核验来源。
+                commands.append(
+                    (
+                        lead_id,
+                        CompanyUpsertCommand(
+                            source_message_id=message.message_id,
+                            sales_user_id=message.sales_user_id,
+                            fields=dict(lead.field_values),
+                            existing_lead_id=lead.id,
+                            region_evidence=CompanyRegionEvidence(
+                                message_text=message.normalized_text,
+                                company_name=lead.field_values.get("线索名称"),
+                                email=lead.field_values.get("邮箱"),
+                                phone=lead.field_values.get("手机")
+                                or lead.field_values.get("电话"),
+                            ),
+                        ),
+                    )
+                )
+
+        resolved = [
+            (source_lead_id, self._company_lead_service.upsert(command))
+            for source_lead_id, command in commands
+        ]
+        with self._session_factory.begin() as session:
+            for source_lead_id, company_result in resolved:
+                if source_lead_id == company_result.lead_id:
+                    continue
+                # 临时线索被合并后，消息审计与当前上下文都必须指向同销售的最终目标。
+                for resolution in session.scalars(
+                    select(LeadMessageResolution).where(
+                        LeadMessageResolution.message_id == message_id,
+                        LeadMessageResolution.lead_id == source_lead_id,
+                    )
+                ).all():
+                    resolution.lead_id = company_result.lead_id
+                for context in session.scalars(
+                    select(SalesLeadContext).where(
+                        SalesLeadContext.sales_user_id == sales_user_id,
+                        SalesLeadContext.lead_id == source_lead_id,
+                    )
+                ).all():
+                    context.lead_id = company_result.lead_id
+        logger.info(
+            "lead_company_resolution_completed",
+            extra={
+                "outbox_event_id": outbox_event_id,
+                "resolved_lead_count": len(resolved),
+            },
+        )
+        final_ids = tuple(company_result.lead_id for _, company_result in resolved)
+        return LeadProcessingResult(
+            result.status,
+            lead_id=final_ids[0],
+            smart_table_record_id=resolved[0][1].smart_table_record_id,
+            lead_ids=final_ids if len(final_ids) > 1 else (),
+        )
 
     def _consume_once(
         self,
@@ -375,19 +467,29 @@ class FirstTextLeadWorkspaceService:
                 same_context_company = context_lead is not None and extracted_patch.get(
                     "线索名称"
                 ) == context_lead.field_values.get("线索名称")
+                temporary_context = (
+                    self._company_lead_service is not None
+                    and context_lead is not None
+                    and context_lead.lifecycle_state == "temporary"
+                    and context_lead.standard_company_name is None
+                )
                 if (
                     multi_request is None
                     and ai_review is None
                     and context_lead is not None
-                    and ("线索名称" not in extracted_patch or same_context_company)
+                    and (
+                        "线索名称" not in extracted_patch
+                        or same_context_company
+                        or temporary_context
+                    )
                 ):
-                    # 重复报出同一公司名仍属于当前线索，不可因标签重复而新建表格记录。
+                    # 临时线索首次获得公司名时升级当前草稿；正式线索只接受相同公司名的补充。
                     context_patch = {
                         field_name: value
                         for field_name, value in extracted_patch.items()
-                        if field_name != "线索名称"
+                        if field_name != "线索名称" or temporary_context
                     }
-                    if not context_patch and not same_context_company:
+                    if not context_patch and not same_context_company and not temporary_context:
                         self._mark_unassigned(session, event)
                         return LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
 
@@ -424,15 +526,17 @@ class FirstTextLeadWorkspaceService:
                     if existing_lead is None:
                         fields = extractor.extract(message.normalized_text)
                         if fields is None:
-                            if extracted_patch or self._is_weak_identity_fragment(
-                                message.normalized_text
-                            ):
+                            if extracted_patch:
+                                # 联系人与联系方式同样是可审核客户事实，先保存为不能提交的临时线索。
+                                fields = extracted_patch
+                            elif self._is_weak_identity_fragment(message.normalized_text):
                                 self._mark_unassigned(session, event)
                                 return LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
-                            event.status = "ignored"
-                            self._record_audit(session, event, "lead_text_ignored")
-                            logger.info("lead_text_ignored")
-                            return LeadProcessingResult(LeadProcessingStatus.IGNORED)
+                            else:
+                                event.status = "ignored"
+                                self._record_audit(session, event, "lead_text_ignored")
+                                logger.info("lead_text_ignored")
+                                return LeadProcessingResult(LeadProcessingStatus.IGNORED)
 
                         # 首次创建的两类销售归属同时固定为当前授权销售，后续转交不在 T05 范围内。
                         lead = Lead(
