@@ -322,6 +322,38 @@ class AIGateway:
         for field_name, value in analysis.enrichment.items():
             if value not in source_text:
                 raise BusinessValidationError(f"补充信息缺少原文证据：{field_name}")
+            if field_name == "年销售额" and not AIGateway._has_enrichment_category_evidence(
+                source_text, value, ("收入", "营收", "销售额")
+            ):
+                # 金额本身不表示经营规模，避免预算被错误写入年销售额事实。
+                raise BusinessValidationError("年销售额缺少明确经营规模表达")
+            if field_name == "预算" and not AIGateway._has_enrichment_category_evidence(
+                source_text, value, ("预算", "投入金额", "项目金额")
+            ):
+                # 金额本身不表示项目预算，避免经营规模被错误写入预算事实。
+                raise BusinessValidationError("预算缺少明确预算表达")
+
+    @staticmethod
+    def _has_enrichment_category_evidence(
+        source_text: str, value: str, keywords: tuple[str, ...]
+    ) -> bool:
+        """判断补充信息值是否与其类别词构成同一条明确原文表达。
+
+        参数：source_text 为当前原文；value 为模型保留的连续事实片段；keywords 为字段类别关键词。
+        返回值：类别词紧邻值并通过明确连接词关联时返回 True。
+        异常：无。
+        副作用：无；金额大小或金额本身不会作为分类依据。
+        """
+        if any(keyword in value for keyword in keywords):
+            # 模型保留完整“预算50万元”等原文片段时，字段类别已在值内明确出现。
+            return True
+        category_pattern = "|".join(re.escape(keyword) for keyword in keywords)
+        connector_pattern = r"(?:为|是|约|大约|预计(?:为|达到)?|可达|达到|在|:|：)?"
+        # 类别词与金额之间只允许明确连接词或空白，不能跨越另一条金额事实进行匹配。
+        return re.search(
+            rf"(?:{category_pattern})\s*{connector_pattern}\s*{re.escape(value)}",
+            source_text,
+        ) is not None
 
     @staticmethod
     def _has_explicit_communication_evidence(text: str, value: str) -> bool:
@@ -399,6 +431,9 @@ class AIGateway:
             f"枚举字段只能使用以下注册表选项：{enum_options}。"
             "enrichment 的 key 只能是城市/地区、主营产品、年销售额、客户需求/痛点、预算、特殊要求；"
             "每个 value 必须是当前原文中连续出现的单个字符串片段，没有证据时省略。"
+            "年销售额仅提取含收入、营收或销售额等明确经营规模表达的原文片段；"
+            "预算仅提取含预算、投入金额或项目金额等明确预算表达的原文片段；"
+            "不得仅根据金额大小或金额本身猜测分类。"
         )
 
     def _log(

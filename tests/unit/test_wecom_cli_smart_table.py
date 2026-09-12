@@ -219,6 +219,43 @@ def test_get_record_restores_canonical_names_before_t09_compares_ai_values() -> 
     assert "*线索名称" not in record.fields
 
 
+def test_get_record_converts_cli_cell_values_to_canonical_domain_values() -> None:
+    """验证文本、单选和多选 CellValue 均不泄露给领域层。
+
+    参数：无。返回值：无。异常：断言失败时由 pytest 报告。副作用：消费 FakeCli 字段和记录读取响应。
+    """
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "records": [
+                    {
+                        "record_id": "record-1",
+                        "values": {
+                            "*联系人": [{"text": "张三"}],
+                            "*业务线": [{"text": "协作机器人"}],
+                            "AI待确认": [
+                                {"id": "pending-business-line", "text": "*业务线"},
+                                {"id": "pending-contact", "text": "*联系人"},
+                            ],
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+
+    record = _adapter(fake_cli).get_record("record-1")
+
+    assert record is not None
+    assert record.fields == {
+        "联系人": "张三",
+        "业务线": "协作机器人",
+        "AI待确认": ["业务线", "联系人"],
+    }
+
+
 def test_schema_reads_pages_and_preserves_real_option_identifiers() -> None:
     """验证字段分页读取保留字段类型和服务端 option ID。
 

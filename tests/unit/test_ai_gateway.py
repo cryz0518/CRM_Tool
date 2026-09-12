@@ -341,6 +341,81 @@ def test_gateway_rejects_enrichment_without_verbatim_source_evidence() -> None:
     assert len(provider.requests) == 1
 
 
+def test_gateway_classifies_budget_without_generating_annual_sales() -> None:
+    """验证预算金额不会仅因金额本身被归类为年销售额。
+
+    参数：无。返回值：无。异常：断言失败时由 pytest 报告。副作用：Mock Provider 记录一次提取请求。
+    """
+    provider = MockLLMProvider(responses=[valid_analysis(enrichment={"预算": "50万元"})])
+
+    result = AIGateway(provider).extract_fields("预算50万元")
+
+    assert result.enrichment == {"预算": "50万元"}
+    assert "年销售额" not in result.enrichment
+
+
+def test_gateway_classifies_annual_sales_only_with_explicit_scale_expression() -> None:
+    """验证明确年销售额表达才进入年销售额补充信息。
+
+    参数：无。返回值：无。异常：断言失败时由 pytest 报告。副作用：Mock Provider 记录一次提取请求。
+    """
+    provider = MockLLMProvider(responses=[valid_analysis(enrichment={"年销售额": "50万元"})])
+
+    result = AIGateway(provider).extract_fields("年销售额50万元")
+
+    assert result.enrichment == {"年销售额": "50万元"}
+
+
+def test_gateway_keeps_budget_and_annual_sales_as_separate_facts() -> None:
+    """验证同一消息中的预算与年销售额按各自明确表达分别保留。
+
+    参数：无。返回值：无。异常：断言失败时由 pytest 报告。副作用：Mock Provider 记录一次提取请求。
+    """
+    provider = MockLLMProvider(
+        responses=[valid_analysis(enrichment={"预算": "50万元", "年销售额": "100万元"})]
+    )
+
+    result = AIGateway(provider).extract_fields("预算50万元，年销售额100万元")
+
+    assert result.enrichment == {"预算": "50万元", "年销售额": "100万元"}
+
+
+def test_gateway_rejects_budget_amount_misclassified_as_annual_sales() -> None:
+    """验证金额没有经营规模表达时不能进入年销售额。
+
+    参数：无。返回值：无。异常：BusinessValidationError 为受控的分类校验结论。
+    副作用：Mock Provider 记录一次提取请求。
+    """
+    provider = MockLLMProvider(responses=[valid_analysis(enrichment={"年销售额": "50万元"})])
+
+    with pytest.raises(BusinessValidationError, match="年销售额缺少明确经营规模表达"):
+        AIGateway(provider).extract_fields("预算50万元")
+
+
+def test_gateway_rejects_adjacent_budget_amount_misclassified_as_annual_sales() -> None:
+    """验证无标点相邻事实中的预算金额不能被年销售额关键词错误绑定。
+
+    参数：无。返回值：无。异常：BusinessValidationError 为受控的分类校验结论。
+    副作用：Mock Provider 记录一次提取请求。
+    """
+    provider = MockLLMProvider(responses=[valid_analysis(enrichment={"年销售额": "50万元"})])
+
+    with pytest.raises(BusinessValidationError, match="年销售额缺少明确经营规模表达"):
+        AIGateway(provider).extract_fields("预算50万元 年销售额100万元")
+
+
+def test_gateway_rejects_adjacent_annual_sales_misclassified_as_budget() -> None:
+    """验证无标点相邻事实中的年销售额不能被预算关键词错误绑定。
+
+    参数：无。返回值：无。异常：BusinessValidationError 为受控的分类校验结论。
+    副作用：Mock Provider 记录一次提取请求。
+    """
+    provider = MockLLMProvider(responses=[valid_analysis(enrichment={"预算": "100万元"})])
+
+    with pytest.raises(BusinessValidationError, match="预算缺少明确预算表达"):
+        AIGateway(provider).extract_fields("预算50万元 年销售额100万元")
+
+
 def test_gateway_keeps_two_failed_outputs_for_pending_review() -> None:
     """验证两次结构失败可被任务层以失败待处理状态完整审计。
 
