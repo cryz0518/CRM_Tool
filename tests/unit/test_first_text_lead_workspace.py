@@ -123,6 +123,12 @@ def test_authorized_sales_text_creates_a_personal_review_record(
         "线索来源": "展会",
         "创建人": "sales-1",
         "负责人": "sales-1",
+        "备注": (
+            "基本信息：长广溪智造；城市、主要产品、年销售额、所属行业未提供。\n"
+            "线索需求：未提供。\n"
+            "预算情况：未提供。\n"
+            "特殊要求：未提供。"
+        ),
     }
     with session_factory() as session:
         lead = session.get(Lead, result.lead_id)
@@ -147,8 +153,14 @@ def test_authorized_sales_text_creates_a_personal_review_record(
         "联系人": "张三",
         "工艺": "码垛",
         "线索来源": "展会",
+        "备注": (
+            "基本信息：长广溪智造；城市、主要产品、年销售额、所属行业未提供。\n"
+            "线索需求：未提供。\n"
+            "预算情况：未提供。\n"
+            "特殊要求：未提供。"
+        ),
     }
-    assert {source.field_name for source in provenance} == {"线索名称", "联系人", "工艺"}
+    assert {source.field_name for source in provenance} == {"线索名称", "联系人", "工艺", "备注"}
     assert sync is not None
     assert sync.status == "succeeded"
     assert sync.smart_table_record_id == result.smart_table_record_id

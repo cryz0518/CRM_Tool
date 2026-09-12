@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.ai.models import ExtractedLeadPatch, LeadAnalysis
+from app.leads.completeness import LeadCompletenessService
 from app.leads.models import Lead, LeadFieldProvenance, UserConfirmationEvent
 from app.leads.review import LeadReviewService
 from app.messaging.models import Base, BusinessAuditEvent, IncomingMessage, SalesAuthorization
@@ -40,7 +41,12 @@ def session_factory() -> Generator[sessionmaker[Session], None, None]:
         engine.dispose()
 
 
-def _patch(*, fields: dict[str, str], pending: tuple[str, ...] = ()) -> ExtractedLeadPatch:
+def _patch(
+    *,
+    fields: dict[str, str],
+    pending: tuple[str, ...] = (),
+    enrichment: dict[str, str] | None = None,
+) -> ExtractedLeadPatch:
     """构造已由 T08 完成结构和业务校验的 AI 字段补丁。
 
     参数：fields 为正式候选字段；pending 为其中中置信度待确认字段。
@@ -54,6 +60,7 @@ def _patch(*, fields: dict[str, str], pending: tuple[str, ...] = ()) -> Extracte
         fields=fields,
         pending_confirmation_fields=pending,
         low_confidence_candidates={},
+        enrichment=enrichment or {},
     )
 
 
@@ -126,7 +133,7 @@ def test_sync_rechecks_user_edit_and_only_writes_safe_medium_confidence_field(
     record = adapter.get_record(record_id)
     assert record is not None
     assert result.protected_fields == ("业务线",)
-    assert result.updated_fields == ("客户行业",)
+    assert result.updated_fields == ("客户行业", "备注")
     assert record.fields["业务线"] == "车载机器人"
     assert record.fields["客户行业"] == "机械加工"
     assert record.fields["AI待确认"] == ["客户行业"]
@@ -371,6 +378,110 @@ def test_card_unavailable_does_not_prefill_required_medium_confidence_field(
 
     record = adapter.get_record(record_id)
     assert record is not None
-    assert result.updated_fields == ()
+    assert result.updated_fields == ("备注",)
     assert record.fields["业务线"] == ""
     assert "AI待确认" not in record.fields
+
+
+def test_t09_generates_remark_with_provenance_and_completeness_after_sync(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 T09 只在安全写入后生成备注、保存来源并解除备注缺失。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead_with_record(session_factory, adapter)
+    record_id = next(iter(adapter.get_records())).record_id
+
+    LeadReviewService(session_factory, adapter).sync_ai_patch(
+        lead_id,
+        "message-9",
+        _patch(
+            fields={
+                "线索来源": "展会",
+                "联系人": "张三",
+                "职务": "采购经理",
+                "沟通方式": "微信",
+                "手机": "13800138000",
+                "客户行业": "机械加工",
+                "工艺": "装配",
+            },
+            enrichment={"客户需求/痛点": "客户希望使用协作机器人完成装配"},
+        ),
+    )
+
+    record = adapter.get_record(record_id)
+    assert record is not None
+    assert record.fields["备注"] == (
+        "基本信息：长广溪智造，所属行业为机械加工；城市、主要产品、年销售额未提供。\n"
+        "线索需求：客户希望使用协作机器人完成装配。\n"
+        "预算情况：未提供。\n"
+        "特殊要求：未提供。"
+    )
+    assert LeadCompletenessService().evaluate(record.fields).missing_required_fields == ()
+    with session_factory() as session:
+        remark = session.scalar(
+            select(LeadFieldProvenance).where(
+                LeadFieldProvenance.lead_id == lead_id,
+                LeadFieldProvenance.field_name == "备注",
+            )
+        )
+
+    assert remark is not None
+    assert remark.last_ai_synced_value == record.fields["备注"]
+
+
+def test_t09_never_overwrites_sales_edited_remark(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证销售修改备注后，后续可靠补充也不会静默覆盖该备注。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead_with_record(session_factory, adapter)
+    record_id = next(iter(adapter.get_records())).record_id
+    service = LeadReviewService(session_factory, adapter)
+    service.sync_ai_patch(
+        lead_id,
+        "message-9",
+        _patch(fields={"客户行业": "机械加工"}, enrichment={"预算": "50 万元"}),
+    )
+    adapter.update_record(record_id, {"备注": "销售已确认的备注"})
+
+    result = service.sync_ai_patch(
+        lead_id,
+        "message-9",
+        _patch(fields={}, enrichment={"特殊要求": "现场验收"}),
+    )
+
+    record = adapter.get_record(record_id)
+    assert record is not None
+    assert record.fields["备注"] == "销售已确认的备注"
+    assert "备注" in result.protected_fields
+    with session_factory() as session:
+        remark = session.scalar(
+            select(LeadFieldProvenance).where(
+                LeadFieldProvenance.lead_id == lead_id,
+                LeadFieldProvenance.field_name == "备注",
+            )
+        )
+
+    assert remark is not None
+    assert remark.is_user_modified is True
+
+
+def test_t09_excludes_pending_confirmation_fields_from_generated_remark(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证待人工确认的中置信度业务线和工艺不会提前组成需求。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead_with_record(session_factory, adapter)
+
+    LeadReviewService(session_factory, adapter).sync_ai_patch(
+        lead_id,
+        "message-9",
+        _patch(
+            fields={"工艺": "装配"},
+            pending=("工艺",),
+        ),
+    )
+
+    record = adapter.get_record(next(iter(adapter.get_records())).record_id)
+    assert record is not None
+    assert "线索需求：未提供。" in str(record.fields["备注"])

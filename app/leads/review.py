@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.ai.models import ExtractedLeadPatch
 from app.core.config import get_settings
 from app.leads.models import Lead, LeadFieldProvenance, UserConfirmationEvent
+from app.leads.remarks import RemarksBuilder
 from app.messaging.models import BusinessAuditEvent, IncomingMessage
 from app.smart_table.adapter import SmartTableAdapter
 from app.smart_table.models import SmartTableRecord
@@ -108,8 +109,12 @@ class LeadReviewService:
             pending.difference_update(protected)
             fields_to_write: dict[str, object] = {}
             written_names: list[str] = []
+            synced_values: dict[str, str] = {}
             # T08 已完成结构和业务校验；本层仅决定是否可安全写入，不重新解释 AI 内容。
             for field_name, value in patch.fields.items():
+                if field_name == "备注":
+                    # 备注只由本关口在正式字段保护完成后按冻结模板生成。
+                    continue
                 field_provenance = provenance.get(field_name)
                 current_value = current_fields.get(field_name)
                 is_pending = field_name in patch.pending_confirmation_fields
@@ -135,6 +140,7 @@ class LeadReviewService:
                     continue
                 fields_to_write[field_name] = value
                 written_names.append(field_name)
+                synced_values[field_name] = value
                 if is_pending:
                     pending.add(field_name)
                 else:
@@ -145,6 +151,29 @@ class LeadReviewService:
             if existing_pending != pending:
                 fields_to_write[AI_CONFIRMATION_FIELD] = new_pending
 
+            # 当前表格、已审核草稿与本轮安全补丁共同构成备注生成的唯一事实来源。
+            all_reviewed_fields = {**lead.field_values, **current_fields, **synced_values}
+            reviewed_fields = {
+                field_name: value
+                for field_name, value in all_reviewed_fields.items()
+                if field_name not in pending
+            }
+            enrichment = {**lead.enrichment_values, **patch.enrichment}
+            remark_value = RemarksBuilder().build(reviewed_fields, enrichment)
+            remark_source = provenance.get("备注")
+            current_remark = current_fields.get("备注")
+            if remark_source is not None and remark_source.is_user_modified:
+                protected.add("备注")
+            elif current_remark not in (None, "") and (
+                remark_source is None or current_remark != remark_source.last_ai_synced_value
+            ):
+                # 已有非 AI 备注或销售改写后的备注均永久优先于后续自动生成内容。
+                protected.add("备注")
+            elif current_remark != remark_value:
+                fields_to_write["备注"] = remark_value
+                written_names.append("备注")
+                synced_values["备注"] = remark_value
+
         # 数据库事务不包裹外部调用；Adapter 只收到确有变化的字段补丁。
         if fields_to_write:
             self._smart_table_adapter.update_record(record_id, fields_to_write)
@@ -152,9 +181,8 @@ class LeadReviewService:
         with self._session_factory.begin() as session:
             lead = self._require_lead(session, lead_id)
             provenance = self._latest_provenance_by_field(session, lead_id)
-            synced_values: dict[str, str] = {}
             for field_name in written_names:
-                value = patch.fields[field_name]
+                value = synced_values[field_name]
                 # 后台草稿与审核表必须同步保存 T08 已实际写入的值，供后续 T06/T07 归属读取。
                 synced_values[field_name] = value
                 source = provenance.get(field_name)
@@ -174,6 +202,9 @@ class LeadReviewService:
             if synced_values:
                 # 仅合并本次 T09 实际写入字段；被人工保护或低置信度候选绝不进入正式后台快照。
                 lead.field_values = {**lead.field_values, **synced_values}
+            if patch.enrichment:
+                # 原文有证据的补充信息保留在后台，供下一条可靠补充重新生成备注。
+                lead.enrichment_values = {**lead.enrichment_values, **patch.enrichment}
             if written_names:
                 self._record_audit(
                     session,

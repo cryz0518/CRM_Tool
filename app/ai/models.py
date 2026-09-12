@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -49,3 +49,4 @@ class ExtractedLeadPatch:
     fields: dict[str, str]
     pending_confirmation_fields: tuple[str, ...]
     low_confidence_candidates: dict[str, str]
+    enrichment: dict[str, str] = field(default_factory=dict)
