@@ -14,7 +14,7 @@ from app.smart_table.adapter import (
     SmartTablePermissionError,
 )
 from app.smart_table.models import SmartTableFieldType
-from app.smart_table.wecom_cli import WecomCliSmartTableAdapter
+from app.smart_table.wecom_cli import WecomCliSmartTableAdapter, WecomCliSmartTableAdapterError
 
 
 class FakeCli:
@@ -94,6 +94,7 @@ def _field_response() -> Mapping[str, object]:
             {"field_id": "contact", "field_title": "*联系人", "field_type": "text"},
             {"field_id": "phone", "field_title": "*手机", "field_type": "phone_number"},
             {"field_id": "lead-name", "field_title": "*线索名称", "field_type": "text"},
+            {"field_id": "remarks", "field_title": "备注", "field_type": "text"},
             {"field_id": "industry", "field_title": "客户行业", "field_type": "single_select"},
             {"field_id": "process", "field_title": "工艺", "field_type": "single_select"},
             {
@@ -254,6 +255,143 @@ def test_get_record_converts_cli_cell_values_to_canonical_domain_values() -> Non
         "业务线": "协作机器人",
         "AI待确认": ["业务线", "联系人"],
     }
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("*联系人", []),
+        ("*业务线", []),
+    ],
+)
+def test_get_record_normalizes_empty_text_and_single_select_cells_to_none(
+    field_name: str, value: object
+) -> None:
+    """验证文本和单选的空 CLI CellValue 数组回读为领域空值。
+
+    参数：field_name 为真实字段标题；value 为 CLI 返回的空数组。
+    返回：无。
+    异常：断言失败时由 pytest 报告。
+    副作用：消费 FakeCli 的字段和记录读取响应。
+    """
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "records": [{"record_id": "record-1", "values": {field_name: value}}],
+            },
+        ]
+    )
+
+    record = _adapter(fake_cli).get_record("record-1")
+
+    assert record is not None
+    assert record.fields[field_name.removeprefix("*")] is None
+
+
+def test_get_record_rejects_multiple_text_cells_without_selecting_or_joining() -> None:
+    """验证文本字段的多个 CLI CellValue 仍被拒绝，避免猜测领域事实。
+
+    参数：无。
+    返回：无。
+    异常：WecomCliSmartTableAdapterError 为受控外部协议失败。
+    副作用：消费 FakeCli 的字段和记录读取响应。
+    """
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "records": [
+                    {
+                        "record_id": "record-1",
+                        "values": {"*联系人": [{"text": "A"}, {"text": "B"}]},
+                    }
+                ],
+            },
+        ]
+    )
+
+    with pytest.raises(
+        WecomCliSmartTableAdapterError, match="文本或单选字段返回值不是唯一单元格"
+    ):
+        _adapter(fake_cli).get_record("record-1")
+
+
+def test_get_record_ignores_historical_multi_cell_text_when_target_is_valid() -> None:
+    """验证历史多片段文本不会阻断目标记录的单条回读。
+
+    参数：无。
+    返回：无。
+    异常：断言失败时由 pytest 报告。
+    副作用：消费 FakeCli 的字段和记录读取响应。
+    """
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "records": [
+                    {
+                        "record_id": "historical-record",
+                        "values": {
+                            "备注": [
+                                {"text": "片段一", "type": "text"},
+                                {"text": "片段二", "type": "text"},
+                                {"text": "片段三", "type": "text"},
+                                {"text": "片段四", "type": "text"},
+                            ]
+                        },
+                    },
+                    {"record_id": "target-record", "values": {"备注": [{"text": "正常备注"}]}},
+                ],
+            },
+        ]
+    )
+
+    record = _adapter(fake_cli).get_record("target-record")
+
+    assert record is not None
+    assert record.record_id == "target-record"
+    assert record.fields == {"备注": "正常备注"}
+
+
+def test_get_records_keeps_rejecting_historical_multi_cell_text() -> None:
+    """验证全量回读仍严格拒绝多片段文本，不能静默丢失历史数据。
+
+    参数：无。
+    返回：无。
+    异常：WecomCliSmartTableAdapterError 为受控外部协议失败。
+    副作用：消费 FakeCli 的字段和记录读取响应。
+    """
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "records": [
+                    {
+                        "record_id": "historical-record",
+                        "values": {
+                            "备注": [
+                                {"text": "片段一", "type": "text"},
+                                {"text": "片段二", "type": "text"},
+                                {"text": "片段三", "type": "text"},
+                                {"text": "片段四", "type": "text"},
+                            ]
+                        },
+                    },
+                    {"record_id": "target-record", "values": {"备注": [{"text": "正常备注"}]}},
+                ],
+            },
+        ]
+    )
+
+    with pytest.raises(
+        WecomCliSmartTableAdapterError, match="文本或单选字段返回值不是唯一单元格"
+    ):
+        _adapter(fake_cli).get_records()
 
 
 def test_schema_reads_pages_and_preserves_real_option_identifiers() -> None:

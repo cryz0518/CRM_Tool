@@ -127,10 +127,12 @@ class WecomCliSmartTableAdapter:
         异常：CLI 调用或响应结构异常时抛出异常。
         副作用：调用 wecom-cli 的 records list 接口。
         """
-        for record in self.get_records():
-            # records list 没有按记录标识读取的独立接口，只能在分页结果中精确定位。
-            if record.record_id == record_id:
-                return record
+        schema = self.get_schema()
+        for item in self._list_pages("records"):
+            # records list 没有按记录标识读取的独立接口，先按原始标识定位。
+            # 这样历史异常行不会阻断目标行回读。
+            if item.get("record_id") == record_id:
+                return self._parse_record(item, schema)
         return None
 
     def find_records(self, filters: Mapping[str, object]) -> list[SmartTableRecord]:
@@ -523,8 +525,14 @@ class WecomCliSmartTableAdapter:
             SmartTableFieldType.EMAIL,
             SmartTableFieldType.SINGLE_SELECT,
         }:
+            # CLI 对未填文本或单选字段可能返回 null 或空 CellValue 数组；两者都表示领域空值。
+            if value is None:
+                return None
             if isinstance(value, list):
+                if not value:
+                    return None
                 if len(value) != 1:
+                    # 多个候选无法无损收敛为单一领域值，禁止拼接、任选或猜测。
                     raise WecomCliSmartTableAdapterError("文本或单选字段返回值不是唯一单元格")
                 value = value[0]
             return WecomCliSmartTableAdapter._cell_text(value)

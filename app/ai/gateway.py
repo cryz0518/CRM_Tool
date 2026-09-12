@@ -197,9 +197,35 @@ class AIGateway:
             value_type = "number" if field_name == "confidence_by_field" else "string"
             properties[field_name] = {
                 "type": "object",
-                "properties": {name: {"type": value_type} for name in allowed_names},
+                "properties": {
+                    name: {
+                        "type": value_type,
+                        # 仅 CRM 枚举字段附加当前注册表选项，其他字段维持字符串契约。
+                        **(
+                            {"enum": list(_ENUM_OPTIONS[name])}
+                            if field_name == "crm_fields" and name in _ENUM_OPTIONS
+                            else {}
+                        ),
+                    }
+                    for name in allowed_names
+                },
                 "additionalProperties": False,
             }
+        # JSON Schema 不能用一个通用动态规则比较两个对象的键集合；CRM 白名单有限，
+        # 因此为每个字段生成“建议字段出现时必须携带同名置信度”的静态条件。
+        schema["allOf"] = [
+            {
+                "if": {
+                    "required": ["crm_fields"],
+                    "properties": {"crm_fields": {"required": [field_name]}},
+                },
+                "then": {
+                    "required": ["confidence_by_field"],
+                    "properties": {"confidence_by_field": {"required": [field_name]}},
+                },
+            }
+            for field_name in allowed_crm_fields
+        ]
         return schema
 
     def _parse_schema_or_repair(
