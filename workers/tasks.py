@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.ai.dependencies import get_ai_gateway
 from app.ai.models import ExtractedLeadPatch, LeadAnalysis
+from app.companies.service import CompanyLeadService, MockQCCAdapter
 from app.core.config import get_settings
 from app.leads.review import LeadReviewService
 from app.leads.service import COMPLETED_CHECKPOINT_STATUSES, FirstTextLeadWorkspaceService
@@ -53,8 +54,15 @@ def consume_lead_outbox_event(
         # Celery 可能重复投递同一消息；只有首个任务可接管本次持久化认领。
         if claimed_at is None or not _take_lead_outbox_claim(factory, outbox_event_id, claimed_at):
             return "already_processed"
+        smart_table_adapter = get_smart_table_adapter()
+        # T10 首期明确只接入 Mock QCC；真实企查查 API 留给 T21 的专用适配器。
         service = FirstTextLeadWorkspaceService(
-            factory, get_smart_table_adapter(), ai_gateway=get_ai_gateway()
+            factory,
+            smart_table_adapter,
+            ai_gateway=get_ai_gateway(),
+            company_lead_service=CompanyLeadService(
+                factory, smart_table_adapter, MockQCCAdapter()
+            ),
         )
         if recover_expired_lease:
             # 失联处理只进入既有人工复核路径，绝不重放媒体、模型或智能表格调用。

@@ -41,6 +41,14 @@ class Lead(Base):
     lifecycle_state: Mapped[str] = mapped_column(String(64), default="temporary", nullable=False)
     field_values: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False)
     enrichment_values: Mapped[dict[str, str]] = mapped_column(JSON, default=dict, nullable=False)
+    standard_company_name: Mapped[str | None] = mapped_column(String(512), index=True)
+    company_region: Mapped[str] = mapped_column(String(32), default="unknown", nullable=False)
+    company_verification_status: Mapped[str] = mapped_column(
+        String(64), default="incomplete_company", nullable=False
+    )
+    qcc_company_id: Mapped[str | None] = mapped_column(String(128))
+    qcc_candidates: Mapped[list[dict[str, str]]] = mapped_column(JSON, default=list, nullable=False)
+    company_confirmed_by_user: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -48,7 +56,10 @@ class Lead(Base):
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )
 
-    __table_args__ = (UniqueConstraint("source_message_id", "source_segment_index"),)
+    __table_args__ = (
+        UniqueConstraint("source_message_id", "source_segment_index"),
+        UniqueConstraint("smart_table_owner_user_id", "standard_company_name"),
+    )
 
 
 class LeadFieldProvenance(Base):
