@@ -10,7 +10,7 @@ import pytest
 from app.ai.gateway import AIGateway, BusinessValidationError, FailedStructuredOutputError
 from app.ai.models import LLMResponse
 from app.ai.provider import LLMProviderError, MockLLMProvider
-from app.smart_table.registry import CRM_BUSINESS_FIELD_NAMES
+from app.smart_table.registry import COMMUNICATION_METHOD_OPTIONS, CRM_BUSINESS_FIELD_NAMES
 
 
 def valid_analysis(**changes: object) -> str:
@@ -70,6 +70,51 @@ def test_gateway_never_repairs_a_business_invalid_enum_value() -> None:
     assert len(provider.requests) == 1
 
 
+def test_gateway_accepts_registered_communication_method() -> None:
+    """验证有明确原文证据的注册沟通方式可通过 Gateway。
+
+    参数：无。
+    返回：无。
+    异常：断言失败时由 pytest 报告。
+    副作用：Mock Provider 记录一次字段提取请求。
+    """
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"沟通方式": "微信"},
+                confidence_by_field={"沟通方式": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("后续通过微信联系客户")
+
+    assert result.fields == {"沟通方式": "微信"}
+
+
+def test_gateway_rejects_unregistered_communication_method_without_alias_conversion() -> None:
+    """验证未注册沟通描述被严格拒绝，不能静默映射为任一枚举值。
+
+    参数：无。
+    返回：无。
+    异常：BusinessValidationError 为受控业务校验结论。
+    副作用：Mock Provider 仅收到初始提取请求，不触发模型重试或别名转换。
+    """
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"沟通方式": "后续沟通"},
+                confidence_by_field={"沟通方式": 0.95},
+            )
+        ]
+    )
+
+    with pytest.raises(BusinessValidationError, match="枚举值不合法：沟通方式"):
+        AIGateway(provider).extract_fields("后续沟通")
+
+    assert len(provider.requests) == 1
+
+
 def test_gateway_prompt_requires_registered_chinese_fields_and_scalar_values() -> None:
     """验证初始提示明确要求注册表中文字段名、标量值及枚举选项。
 
@@ -122,9 +167,25 @@ def test_gateway_schema_restricts_model_output_keys_to_extractable_fields() -> N
 
     schema = provider.requests[0].json_schema
     crm_fields = schema["properties"]["crm_fields"]  # type: ignore[index]
+    confidence_by_field = schema["properties"]["confidence_by_field"]  # type: ignore[index]
     enrichment = schema["properties"]["enrichment"]  # type: ignore[index]
     assert crm_fields["additionalProperties"] is False  # type: ignore[index]
     assert "备注" not in crm_fields["properties"]  # type: ignore[index]
+    assert crm_fields["properties"]["沟通方式"]["enum"] == list(  # type: ignore[index]
+        COMMUNICATION_METHOD_OPTIONS
+    )
+    assert confidence_by_field["additionalProperties"] is False  # type: ignore[index]
+    for field_name in crm_fields["properties"]:  # type: ignore[index]
+        assert {  # type: ignore[comparison-overlap]
+            "if": {
+                "required": ["crm_fields"],
+                "properties": {"crm_fields": {"required": [field_name]}},
+            },
+            "then": {
+                "required": ["confidence_by_field"],
+                "properties": {"confidence_by_field": {"required": [field_name]}},
+            },
+        } in schema["allOf"]  # type: ignore[index]
     assert enrichment["additionalProperties"] is False  # type: ignore[index]
     assert set(enrichment["properties"]) == {  # type: ignore[index]
         "城市/地区",
@@ -134,6 +195,52 @@ def test_gateway_schema_restricts_model_output_keys_to_extractable_fields() -> N
         "预算",
         "特殊要求",
     }
+
+
+def test_gateway_accepts_crm_field_with_matching_confidence() -> None:
+    """验证 CRM 建议字段与同名合法置信度可共同通过 Gateway 校验。
+
+    参数：无。
+    返回：无。
+    异常：断言失败时由 pytest 报告。
+    副作用：Mock Provider 记录一次字段提取请求。
+    """
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "星海验收科技有限公司"},
+                confidence_by_field={"线索名称": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("客户：星海验收科技有限公司")
+
+    assert result.fields == {"线索名称": "星海验收科技有限公司"}
+    assert result.pending_confirmation_fields == ()
+
+
+def test_gateway_rejects_crm_field_without_matching_confidence() -> None:
+    """验证缺少同名置信度的 CRM 建议字段仍会被严格拒绝。
+
+    参数：无。
+    返回：无。
+    异常：BusinessValidationError 为受控业务校验结论。
+    副作用：Mock Provider 仅收到初始提取请求，不触发模型重试。
+    """
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "星海验收科技有限公司"},
+                confidence_by_field={},
+            )
+        ]
+    )
+
+    with pytest.raises(BusinessValidationError, match="置信度缺失或不合法：线索名称"):
+        AIGateway(provider).extract_fields("客户：星海验收科技有限公司")
+
+    assert len(provider.requests) == 1
 
 
 def test_gateway_accepts_company_and_contact_in_canonical_fields() -> None:
