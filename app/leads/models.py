@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.messaging.models import Base, utc_now
@@ -40,6 +40,7 @@ class Lead(Base):
     smart_table_record_id: Mapped[str | None] = mapped_column(String(128), unique=True)
     lifecycle_state: Mapped[str] = mapped_column(String(64), default="temporary", nullable=False)
     field_values: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False)
+    enrichment_values: Mapped[dict[str, str]] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -61,8 +62,8 @@ class LeadFieldProvenance(Base):
         ForeignKey("incoming_messages.message_id"), nullable=False
     )
     field_name: Mapped[str] = mapped_column(String(64), nullable=False)
-    value: Mapped[str] = mapped_column(String(512), nullable=False)
-    last_ai_synced_value: Mapped[str | None] = mapped_column(String(512))
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    last_ai_synced_value: Mapped[str | None] = mapped_column(Text)
     is_user_modified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_user_confirmed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(

@@ -10,7 +10,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.leads.models import LeadMessageResolution, SalesLeadContext
+from app.leads.models import LeadFieldProvenance, LeadMessageResolution, SalesLeadContext
 from app.leads.service import FirstTextLeadWorkspaceService, LeadProcessingStatus
 from app.messaging.models import Base, IncomingMessage, OutboxEvent, SalesAuthorization, utc_now
 from app.smart_table.mock import MockSmartTableAdapter
@@ -137,6 +137,17 @@ def test_fragment_within_current_context_safely_updates_the_same_lead(
     assert record is not None
     assert record.fields["线索名称"] == "长广溪智造"
     assert record.fields["工艺"] == "码垛"
+    assert "备注" in record.fields
+    with session_factory() as session:
+        process_source = session.scalar(
+            select(LeadFieldProvenance).where(
+                LeadFieldProvenance.lead_id == created.lead_id,
+                LeadFieldProvenance.field_name == "工艺",
+            )
+        )
+
+    assert process_source is not None
+    assert process_source.last_ai_synced_value == "码垛"
 
 
 def test_repeated_current_company_name_updates_instead_of_creating_a_second_lead(

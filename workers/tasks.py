@@ -82,6 +82,7 @@ def sync_ai_lead_patch(
     fields: dict[str, str],
     pending_confirmation_fields: list[str],
     low_confidence_candidates: dict[str, str],
+    enrichment: dict[str, str] | None = None,
 ) -> dict[str, list[str]]:
     """消费 T08 已校验补丁并调用 T09 审核服务安全同步智能表格。
 
@@ -97,6 +98,7 @@ def sync_ai_lead_patch(
         fields=fields,
         pending_confirmation_fields=tuple(pending_confirmation_fields),
         low_confidence_candidates=low_confidence_candidates,
+        enrichment=enrichment or {},
     )
     engine, factory = _session_factory()
     try:

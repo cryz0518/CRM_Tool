@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.ai.gateway import AIGateway, AIGatewayError
-from app.ai.models import ExtractedLeadPatch
+from app.ai.models import ExtractedLeadPatch, LeadAnalysis
 from app.core.config import get_settings
 from app.core.logging import bind_log_context, reset_log_context
 from app.leads.identity import DatabaseSalesIdentityProvider, SalesIdentityProvider
@@ -447,9 +447,11 @@ class FirstTextLeadWorkspaceService:
                             session.add(
                                 LeadFieldProvenance(
                                     lead_id=lead.id,
-                                    source_message_id=message.message_id,
-                                    field_name=field_name,
-                                    value=value,
+                                source_message_id=message.message_id,
+                                field_name=field_name,
+                                value=value,
+                                # 确定性首录同样由系统写表，保存基线以便 T09 正确识别后续人工编辑。
+                                last_ai_synced_value=value,
                                 )
                             )
                         session.add(
@@ -715,9 +717,11 @@ class FirstTextLeadWorkspaceService:
                     session.add(
                         LeadFieldProvenance(
                             lead_id=lead.id,
-                            source_message_id=message.message_id,
-                            field_name=field_name,
-                            value=value,
+                                source_message_id=message.message_id,
+                                field_name=field_name,
+                                value=value,
+                                # 多客户的确定性首录也需要同一份人工编辑比较基线。
+                                last_ai_synced_value=value,
                         )
                     )
                 session.add(
@@ -1010,7 +1014,18 @@ class FirstTextLeadWorkspaceService:
         """
         logger.info("smart_table_context_update_started")
         try:
-            self._smart_table_adapter.update_record(request.record_id, request.fields)
+            # 确定性补充也必须复用 T09：它负责人工保护、字段来源和基于安全快照的备注重建。
+            LeadReviewService(self._session_factory, self._smart_table_adapter).sync_ai_patch(
+                request.lead_id,
+                request.source_message_id,
+                ExtractedLeadPatch(
+                    trace_id=f"deterministic-{request.outbox_event_id}",
+                    analysis=LeadAnalysis(intent="UPDATE_LEAD"),
+                    fields=request.fields,
+                    pending_confirmation_fields=(),
+                    low_confidence_candidates={},
+                ),
+            )
         except Exception as error:
             # 失败只留下可重试任务状态，当前销售的后续消息会等待或在失败终态后继续。
             with self._session_factory.begin() as session:
@@ -1034,19 +1049,6 @@ class FirstTextLeadWorkspaceService:
             lead = session.get(Lead, request.lead_id)
             if lead is None:
                 raise ValueError(f"上下文更新线索不存在：{request.lead_id}")
-            # 再次只追加空字段，避免未来并发路径把较新业务事实或人工修改覆盖回去。
-            safe_fields = self._only_empty_fields(lead, request.fields)
-            if safe_fields:
-                lead.field_values = {**lead.field_values, **safe_fields}
-                for field_name, value in safe_fields.items():
-                    session.add(
-                        LeadFieldProvenance(
-                            lead_id=request.lead_id,
-                            source_message_id=request.source_message_id,
-                            field_name=field_name,
-                            value=value,
-                        )
-                    )
             self._mark_assigned(session, event, request.lead_id)
             self._refresh_context(session, message, request.lead_id)
             self._record_audit(session, event, "smart_table_context_updated")
@@ -1188,7 +1190,6 @@ class FirstTextLeadWorkspaceService:
             return LeadProcessingResult(LeadProcessingStatus.SYNC_FAILED, lead_id=lead_id)
 
         with self._session_factory.begin() as session:
-            event, message = self._load_event_and_message(session, outbox_event_id)
             lead = session.get(Lead, lead_id)
             sync = session.scalar(select(SmartTableSync).where(SmartTableSync.lead_id == lead_id))
             if lead is None or sync is None:
@@ -1196,6 +1197,43 @@ class FirstTextLeadWorkspaceService:
             # 表格成功结果是后续审核和 CRM 提交唯一可用的表格定位信息。
             lead.smart_table_record_id = record.record_id
             sync.smart_table_record_id = record.record_id
+            sync.status = "processing"
+        try:
+            # 显式标签路径不调用 Qwen，仍必须经 T09 生成受人工保护的冻结备注和字段来源。
+            LeadReviewService(self._session_factory, self._smart_table_adapter).sync_ai_patch(
+                lead_id,
+                self._source_message_id(outbox_event_id),
+                ExtractedLeadPatch(
+                    trace_id=f"deterministic-{outbox_event_id}",
+                    analysis=LeadAnalysis(intent="NEW_LEAD"),
+                    fields={},
+                    pending_confirmation_fields=(),
+                    low_confidence_candidates={},
+                ),
+            )
+        except Exception as error:
+            with self._session_factory.begin() as session:
+                event, _ = self._load_event_and_message(session, outbox_event_id)
+                sync = session.scalar(
+                    select(SmartTableSync).where(SmartTableSync.lead_id == lead_id)
+                )
+                if sync is not None:
+                    sync.error_summary = type(error).__name__
+                    sync.status = "failed_pending_review"
+                self._record_sync_failure(
+                    session,
+                    event,
+                    retrying_event_type="smart_table_sync_retrying",
+                    failed_event_type="smart_table_sync_failed_pending_review",
+                )
+            logger.exception("smart_table_first_lead_remark_failed")
+            return LeadProcessingResult(LeadProcessingStatus.SYNC_FAILED, lead_id=lead_id)
+
+        with self._session_factory.begin() as session:
+            event, message = self._load_event_and_message(session, outbox_event_id)
+            sync = session.scalar(select(SmartTableSync).where(SmartTableSync.lead_id == lead_id))
+            if sync is None:
+                raise ValueError(f"线索同步事实不存在：{lead_id}")
             sync.status = "succeeded"
             sync.completed_at = utc_now()
             self._mark_assigned(session, event, lead_id, segment_index)
@@ -1208,6 +1246,20 @@ class FirstTextLeadWorkspaceService:
             lead_id=lead_id,
             smart_table_record_id=record.record_id,
         )
+
+    def _source_message_id(self, outbox_event_id: int) -> str:
+        """读取审核同步所需的已持久化来源消息标识。
+
+        参数：outbox_event_id 为当前 Outbox 事件标识。
+        返回值：该事件关联的来源消息标识。
+        异常：事件或消息缺失时抛出 ValueError。
+        副作用：仅读取数据库，不执行外部调用。
+        """
+        with self._session_factory() as session:
+            event, message = self._load_event_and_message(session, outbox_event_id)
+            if event.message_id != message.message_id:
+                raise ValueError(f"Outbox 来源消息不一致：{outbox_event_id}")
+            return message.message_id
 
     def _record_sync_failure(
         self,
