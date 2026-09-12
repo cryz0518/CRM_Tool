@@ -468,7 +468,7 @@ class WecomCliSmartTableAdapter:
     def _parse_record(
         self, item: Mapping[str, object], schema: SmartTableSchema
     ) -> SmartTableRecord:
-        """把 CLI 行记录转换为保留原始字段值的领域快照。
+        """把 CLI 行记录转换为使用规范字段和值的领域快照。
 
         参数：item 为 records list 或写入接口返回的单条记录。
         返回：记录标识和规范字段名到业务层值的映射。
@@ -491,11 +491,11 @@ class WecomCliSmartTableAdapter:
     def _from_cli_value(
         canonical_name: str, field: SmartTableField | None, value: object
     ) -> object:
-        """将成员与 AI待确认的真实返回值恢复为业务层规范值。
+        """将成员、文本和选择字段的真实返回值恢复为业务层规范值。
 
         参数：canonical_name 为规范字段名；field 为可选真实字段定义；value 为 CLI 返回值。
         返回：业务层可直接比较和持久化的值。
-        异常：成员或 AI待确认返回结构不符合 CLI 契约时抛出异常。
+        异常：成员、文本或选择字段返回结构不符合 CLI 契约时抛出异常。
         副作用：无。
         """
         if field is not None and field.field_type is SmartTableFieldType.MEMBER:
@@ -508,19 +508,44 @@ class WecomCliSmartTableAdapter:
             ):
                 raise WecomCliSmartTableAdapterError("MEMBER 字段返回值不符合单成员 CLI 契约")
             return value[0]["userId"]
-        if canonical_name == "AI待确认":
+        if field is not None and field.field_type is SmartTableFieldType.MULTI_SELECT:
             if not isinstance(value, list):
-                raise WecomCliSmartTableAdapterError("AI待确认返回值不是选项列表")
-            names: list[str] = []
-            for option_value in value:
-                # 读回选项文本同样去除管理员必填前缀，使 T09 永远与规范字段名比较。
-                if not isinstance(option_value, Mapping) or not isinstance(
-                    option_value.get("text"), str
-                ):
-                    raise WecomCliSmartTableAdapterError("AI待确认选项返回值无效")
-                names.append(option_value["text"].removeprefix("*"))
-            return names
+                raise WecomCliSmartTableAdapterError("多选字段返回值不是选项列表")
+            values = [WecomCliSmartTableAdapter._cell_text(item) for item in value]
+            # 读回选项文本同样去除管理员必填前缀，使 T09 永远与规范字段名比较。
+            return (
+                [item.removeprefix("*") for item in values]
+                if canonical_name == "AI待确认"
+                else values
+            )
+        if field is not None and field.field_type in {
+            SmartTableFieldType.TEXT,
+            SmartTableFieldType.EMAIL,
+            SmartTableFieldType.SINGLE_SELECT,
+        }:
+            if isinstance(value, list):
+                if len(value) != 1:
+                    raise WecomCliSmartTableAdapterError("文本或单选字段返回值不是唯一单元格")
+                value = value[0]
+            return WecomCliSmartTableAdapter._cell_text(value)
         return value
+
+    @staticmethod
+    def _cell_text(value: object) -> str:
+        """提取 CLI CellValue 中唯一的文本，隔离原始 `{text: ...}` 结构。
+
+        参数：value 为 CLI 返回的单元格值或已规范化文本。
+        返回值：领域层可直接比较的文本值。
+        异常：CellValue 缺少文本时抛出 WecomCliSmartTableAdapterError。
+        副作用：无。
+        """
+        if isinstance(value, str):
+            return value
+        if isinstance(value, Mapping):
+            text = value.get("text")
+            if isinstance(text, str):
+                return text
+        raise WecomCliSmartTableAdapterError("CLI CellValue 缺少文本")
 
     def _parse_written_record(
         self, response: Mapping[str, object], schema: SmartTableSchema
