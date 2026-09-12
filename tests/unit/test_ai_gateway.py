@@ -91,6 +91,107 @@ def test_gateway_prompt_requires_registered_chinese_fields_and_scalar_values() -
     assert "业务线：协作机器人、车载机器人" in prompt
 
 
+def test_gateway_prompt_maps_input_labels_to_canonical_crm_field_names() -> None:
+    """验证提示将公司和个人自然语言标签约束为冻结 CRM 字段名。
+
+    参数：无。
+    返回：无。
+    异常：断言失败时由 pytest 报告。
+    副作用：Mock Provider 记录一次字段提取请求。
+    """
+    provider = MockLLMProvider(responses=[valid_analysis()])
+
+    AIGateway(provider).extract_fields("星海验收科技有限公司，联系人王验收")
+
+    prompt = provider.requests[0].messages[0]["content"]
+    assert "公司名称/企业名称 -> 线索名称" in prompt
+    assert "客户名称（个人语境）-> 联系人" in prompt
+    assert "联系人姓名 -> 联系人" in prompt
+    assert "手机号 -> 手机" in prompt
+    assert "禁止输出 JSON key：客户名称、公司名称、企业名称、联系人姓名、手机号" in prompt
+    assert "禁止输出 JSON key：备注、comment、remark、notes、description" in prompt
+    assert "AI待确认、缺失字段、审核状态、provenance 或其他系统计算字段" in prompt
+    assert prompt.rfind("禁止输出 JSON key") > prompt.rfind("必须符合此 JSON Schema")
+
+
+def test_gateway_schema_restricts_model_output_keys_to_extractable_fields() -> None:
+    """验证 Gateway 交给 Provider 的 schema 排除备注和未注册字段。"""
+    provider = MockLLMProvider(responses=[valid_analysis()])
+
+    AIGateway(provider).extract_fields("客户：长广溪智造")
+
+    schema = provider.requests[0].json_schema
+    crm_fields = schema["properties"]["crm_fields"]  # type: ignore[index]
+    enrichment = schema["properties"]["enrichment"]  # type: ignore[index]
+    assert crm_fields["additionalProperties"] is False  # type: ignore[index]
+    assert "备注" not in crm_fields["properties"]  # type: ignore[index]
+    assert enrichment["additionalProperties"] is False  # type: ignore[index]
+    assert set(enrichment["properties"]) == {  # type: ignore[index]
+        "城市/地区",
+        "主营产品",
+        "年销售额",
+        "客户需求/痛点",
+        "预算",
+        "特殊要求",
+    }
+
+
+def test_gateway_accepts_company_and_contact_in_canonical_fields() -> None:
+    """验证公司主体和联系人分别使用线索名称、联系人两个规范字段。
+
+    参数：无。
+    返回：无。
+    异常：断言失败时由 pytest 报告。
+    副作用：Mock Provider 记录一次字段提取请求。
+    """
+    response = valid_analysis(
+        crm_fields={"线索名称": "星海验收科技有限公司", "联系人": "王验收"},
+        enrichment={"客户需求/痛点": "需要协作机器人完成装配"},
+        confidence_by_field={"线索名称": 0.9, "联系人": 0.9},
+    )
+    provider = MockLLMProvider(responses=[response])
+
+    result = AIGateway(provider).extract_fields(
+        "星海验收科技有限公司，联系人王验收，需要协作机器人完成装配"
+    )
+
+    assert result.fields == {"线索名称": "星海验收科技有限公司", "联系人": "王验收"}
+    assert result.enrichment == {"客户需求/痛点": "需要协作机器人完成装配"}
+    assert len(provider.requests) == 1
+
+
+def test_gateway_rejects_customer_name_without_alias_conversion() -> None:
+    """验证未注册的客户名称不静默转换为联系人或线索名称。
+
+    参数：无。
+    返回：无。
+    异常：BusinessValidationError 为受控的字段白名单失败结论。
+    副作用：Mock Provider 仅收到初始提取请求。
+    """
+    response = valid_analysis(
+        crm_fields={"客户名称": "王验收"}, confidence_by_field={"客户名称": 0.9}
+    )
+    provider = MockLLMProvider(responses=[response])
+
+    with pytest.raises(BusinessValidationError, match="未知 CRM 字段：客户名称"):
+        AIGateway(provider).extract_fields("客户名称王验收")
+
+    assert len(provider.requests) == 1
+
+
+def test_gateway_rejects_remarks_without_alias_conversion() -> None:
+    """验证模型备注既不能绕过 T09，也不会被转换为补充信息。"""
+    response = valid_analysis(
+        crm_fields={"备注": "客户预算充足"}, confidence_by_field={"备注": 0.9}
+    )
+    provider = MockLLMProvider(responses=[response])
+
+    with pytest.raises(BusinessValidationError, match="AI 禁止输出字段：备注"):
+        AIGateway(provider).extract_fields("客户预算充足")
+
+    assert len(provider.requests) == 1
+
+
 def test_gateway_rejects_array_crm_field_values_without_conversion() -> None:
     """验证数组 CRM 值经一次结构修复后仍被拒绝，不能静默拼接为字符串。
 
@@ -191,6 +292,53 @@ def test_gateway_keeps_low_confidence_value_out_of_formal_fields() -> None:
     assert result.fields == {"线索名称": "长广溪智造"}
     assert result.pending_confirmation_fields == ()
     assert result.low_confidence_candidates == {"联系人": "张三"}
+
+
+def test_gateway_keeps_ambiguous_follow_up_communication_out_of_formal_fields() -> None:
+    """验证“后续沟通”不构成沟通方式枚举的明确证据。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"沟通方式": "微信"}, confidence_by_field={"沟通方式": 0.9}
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("展会认识，之后详细沟通")
+
+    assert result.fields == {}
+    assert len(provider.requests) == 1
+
+
+def test_gateway_accepts_explicit_communication_and_evidence_enrichment_in_one_call() -> None:
+    """验证明确沟通方式和限定补充信息均在首次提取调用中返回。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"沟通方式": "打电话"},
+                enrichment={"预算": "50 万元", "客户需求/痛点": "需要完成装配"},
+                confidence_by_field={"沟通方式": 0.9},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("电话沟通，预算 50 万元，需要完成装配")
+
+    assert result.fields == {"沟通方式": "打电话"}
+    assert result.enrichment == {"预算": "50 万元", "客户需求/痛点": "需要完成装配"}
+    assert len(provider.requests) == 1
+
+
+def test_gateway_rejects_enrichment_without_verbatim_source_evidence() -> None:
+    """验证补充信息不是原文片段时不能进入备注生成链路。"""
+    provider = MockLLMProvider(
+        responses=[valid_analysis(enrichment={"预算": "预算充足"})]
+    )
+
+    with pytest.raises(BusinessValidationError, match="补充信息缺少原文证据"):
+        AIGateway(provider).extract_fields("客户希望后续沟通")
+
+    assert len(provider.requests) == 1
 
 
 def test_gateway_keeps_two_failed_outputs_for_pending_review() -> None:

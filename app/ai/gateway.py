@@ -38,6 +38,10 @@ _SENSITIVE_PATTERN = re.compile(
     r"(?i)(?:(?<!\d)(?:\d{17}[\dXx]|\d{16,19}|\d{15})(?!\d)|"
     r"(?:密码|口令|验证码|password|token)\s*[:：]?\s*[^\s；;，,]+)"
 )
+_ENRICHMENT_FIELD_NAMES = frozenset(
+    {"城市/地区", "主营产品", "年销售额", "客户需求/痛点", "预算", "特殊要求"}
+)
+_FORBIDDEN_AI_CRM_FIELD_NAMES = frozenset({"备注"})
 
 
 class AIGatewayError(RuntimeError):
@@ -105,7 +109,7 @@ class AIGateway:
         trace_id = str(uuid4())
         # 只将字段提取所需文本交给模型，并在发送前移除无关的高敏感信息。
         safe_text = _SENSITIVE_PATTERN.sub("[已遮蔽敏感号码]", text)
-        json_schema = LeadAnalysis.model_json_schema()
+        json_schema = self._output_json_schema()
         request = LLMRequest(
             messages=self._messages(safe_text, json_schema), json_schema=json_schema
         )
@@ -117,7 +121,8 @@ class AIGateway:
                 request, response, trace_id
             )
             self._validate_business(analysis)
-            fields, pending, low_candidates = self._apply_confidence(analysis)
+            self._validate_enrichment_evidence(analysis, safe_text)
+            fields, pending, low_candidates = self._apply_confidence(analysis, safe_text)
         except AIGatewayError as error:
             self._log(trace_id, started_at, "failed", error_type=type(error).__name__)
             raise
@@ -131,7 +136,9 @@ class AIGateway:
             input_tokens=sum(item.input_tokens or 0 for item in all_responses),
             output_tokens=sum(item.output_tokens or 0 for item in all_responses),
         )
-        return ExtractedLeadPatch(trace_id, analysis, fields, pending, low_candidates)
+        return ExtractedLeadPatch(
+            trace_id, analysis, fields, pending, low_candidates, analysis.enrichment
+        )
 
     def _call_with_transport_retry(
         self, request: LLMRequest, trace_id: str
@@ -165,6 +172,36 @@ class AIGateway:
                     raise AIGatewayError("ai_transport_failed") from error
         raise AssertionError("不可达：循环在成功或耗尽时结束")
 
+    @staticmethod
+    def _output_json_schema() -> dict[str, object]:
+        """构造仅供模型输出使用的受限 schema，不改变领域模型或业务校验。
+
+        参数：无。
+        返回：禁止系统字段、未知 CRM 字段和未知补充信息键的 JSON Schema 副本。
+        异常：无。
+        副作用：无；仅改变发送给 Provider 的结构化输出约束。
+        """
+        schema = LeadAnalysis.model_json_schema()
+        properties = schema["properties"]
+        allowed_crm_fields = tuple(
+            field_name
+            for field_name in CRM_BUSINESS_FIELD_NAMES
+            if field_name not in _FORBIDDEN_AI_CRM_FIELD_NAMES
+        )
+        # 结构化输出只能生成明确列出的键，避免通用 dict schema 放行备注或自然语言别名。
+        for field_name, allowed_names in (
+            ("crm_fields", allowed_crm_fields),
+            ("confidence_by_field", allowed_crm_fields),
+            ("enrichment", tuple(_ENRICHMENT_FIELD_NAMES)),
+        ):
+            value_type = "number" if field_name == "confidence_by_field" else "string"
+            properties[field_name] = {
+                "type": "object",
+                "properties": {name: {"type": value_type} for name in allowed_names},
+                "additionalProperties": False,
+            }
+        return schema
+
     def _parse_schema_or_repair(
         self, request: LLMRequest, response: LLMResponse, trace_id: str
     ) -> tuple[LeadAnalysis, LLMResponse | None, int]:
@@ -184,9 +221,9 @@ class AIGateway:
                     "role": "system",
                     "content": (
                         "只修复随后的输出 JSON 结构，不得新增、删除或改写任何事实值。"
-                        f"{self._field_contract_instructions()}"
                         "必须符合此 JSON Schema："
                         f"{json.dumps(request.json_schema, ensure_ascii=False)}"
+                        f"{self._field_contract_instructions()}"
                     ),
                 },
                 request.messages[-1],
@@ -223,6 +260,9 @@ class AIGateway:
             # CRM 注册表是字段白名单，禁止模型引入权限或提交等业务控制字段。
             if field_name not in CRM_BUSINESS_FIELD_NAMES:
                 raise BusinessValidationError(f"未知 CRM 字段：{field_name}")
+            # 备注只能由 T09 后的确定性生成器写入，模型不得直接提供或绕过人工保护。
+            if field_name in _FORBIDDEN_AI_CRM_FIELD_NAMES:
+                raise BusinessValidationError(f"AI 禁止输出字段：{field_name}")
             # 枚举字段必须使用管理员配置的合法选项，失败后不再调用模型修正。
             if field_name in _ENUM_OPTIONS and value not in _ENUM_OPTIONS[field_name]:
                 raise BusinessValidationError(f"枚举值不合法：{field_name}")
@@ -235,13 +275,17 @@ class AIGateway:
             confidence = analysis.confidence_by_field.get(field_name)
             if confidence is None or not 0 <= confidence <= 1:
                 raise BusinessValidationError(f"置信度缺失或不合法：{field_name}")
+        for field_name in analysis.enrichment:
+            # 补充信息只能是冻结备注模板可消费、且要求模型保留原文证据的键。
+            if field_name not in _ENRICHMENT_FIELD_NAMES:
+                raise BusinessValidationError(f"未知补充信息字段：{field_name}")
 
     def _apply_confidence(
-        self, analysis: LeadAnalysis
+        self, analysis: LeadAnalysis, source_text: str
     ) -> tuple[dict[str, str], tuple[str, ...], dict[str, str]]:
         """按阈值将合法候选分为正式字段、待确认或后台低置信度候选。
 
-        参数：analysis 为已完成业务校验的分析结果。
+        参数：analysis 为已完成业务校验的分析结果；source_text 为当前脱敏原文。
         返回：正式字段、稳定排序待确认字段与低置信度候选。
         异常：无。
         副作用：无；T08 只返回待确认元数据，不实现 T09 人工确认流程。
@@ -250,6 +294,11 @@ class AIGateway:
         pending: list[str] = []
         low_candidates: dict[str, str] = {}
         for field_name, value in analysis.crm_fields.items():
+            if field_name == "沟通方式" and not self._has_explicit_communication_evidence(
+                source_text, value
+            ):
+                # “后续沟通”等弱描述不足以选择枚举，必须保留正式字段为空。
+                continue
             confidence = analysis.confidence_by_field[field_name]
             # 高置信度可直接预填；中置信度保留待确认元数据；低置信度只后台留存。
             if confidence >= self._high_confidence_threshold:
@@ -260,6 +309,38 @@ class AIGateway:
             else:
                 low_candidates[field_name] = value
         return fields, tuple(pending), low_candidates
+
+    @staticmethod
+    def _validate_enrichment_evidence(analysis: LeadAnalysis, source_text: str) -> None:
+        """确认每项补充信息均为当前原文中可逐字定位的事实片段。
+
+        参数：analysis 为已通过字段业务校验的模型建议；source_text 为当前脱敏原文。
+        返回值：无。
+        异常：补充信息不是原文连续片段时抛出 BusinessValidationError。
+        副作用：无；禁止由模型摘要、扩写或猜测补充备注事实。
+        """
+        for field_name, value in analysis.enrichment.items():
+            if value not in source_text:
+                raise BusinessValidationError(f"补充信息缺少原文证据：{field_name}")
+
+    @staticmethod
+    def _has_explicit_communication_evidence(text: str, value: str) -> bool:
+        """判断沟通方式枚举是否由当前文本中的明确词语直接支持。
+
+        参数：text 为当前消息文本；value 为模型建议的冻结枚举值。
+        返回值：文本含对应明确证据且枚举映射一致时返回 True。
+        异常：无。
+        副作用：无。
+        """
+        evidence = (
+            ("线上会议", "线上会议"),
+            ("电话", "打电话"),
+            ("邮件", "发邮件"),
+            ("微信", "微信"),
+            ("拜访", "见面拜访"),
+            ("现场", "见面拜访"),
+        )
+        return any(keyword in text and value == expected for keyword, expected in evidence)
 
     def _messages(
         self, safe_text: str, json_schema: dict[str, object]
@@ -277,8 +358,8 @@ class AIGateway:
                 "content": (
                     "仅提取线索建议 JSON；不得决定提交、删除、负责人、"
                     "CRM 合并或覆盖人工值。"
-                    f"{self._field_contract_instructions()}"
                     f"必须符合此 JSON Schema：{json.dumps(json_schema, ensure_ascii=False)}"
+                    f"{self._field_contract_instructions()}"
                 ),
             },
             {"role": "user", "content": safe_text},
@@ -301,11 +382,23 @@ class AIGateway:
             "crm_fields 的 key 只能是以下 CRM 注册表中的中文原名："
             f"{allowed_names}。"
             "禁止使用英文或其他别名（例如 phone），不得映射或自造字段名。"
+            "禁止输出 JSON key：客户名称、公司名称、企业名称、联系人姓名、手机号；"
+            "它们仅是输入标签，不是 CRM 字段。"
+            "公司名称/企业名称 -> 线索名称；"
+            "客户名称（个人语境）-> 联系人；"
+            "联系人姓名 -> 联系人；手机号 -> 手机。"
+            "公司或个人语义不明确时省略字段，不得猜测或输出未注册字段。"
+            "允许输出的只有 CRM 注册业务字段（不含备注）及 enrichment 冻结字段。"
+            "禁止输出 JSON key：备注、comment、remark、notes、description；"
+            "也禁止输出 AI待确认、缺失字段、审核状态、provenance 或其他系统计算字段。"
+            "备注由已审核正式字段和 enrichment 在 T09 后通过 RemarksBuilder 确定性生成。"
             "crm_fields 的每个 value 必须是单个字符串；多值信息不得使用数组塞入 CRM 字段。"
             "没有可靠信息的字段必须直接省略，不得返回 null、空字符串或空数组。"
             "confidence_by_field 的 key 必须与 crm_fields 的 key 完全一一对应，"
             "并使用相同中文字段名。"
             f"枚举字段只能使用以下注册表选项：{enum_options}。"
+            "enrichment 的 key 只能是城市/地区、主营产品、年销售额、客户需求/痛点、预算、特殊要求；"
+            "每个 value 必须是当前原文中连续出现的单个字符串片段，没有证据时省略。"
         )
 
     def _log(

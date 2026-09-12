@@ -57,7 +57,14 @@ class QwenLLMProvider:
         payload: dict[str, object] = {
             "model": self._model,
             "messages": messages,
-            "response_format": {"type": "json_object"},
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "lead_analysis",
+                    "schema": request.json_schema,
+                    "strict": True,
+                },
+            },
         }
         try:
             response = httpx.post(
