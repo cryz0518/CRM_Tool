@@ -21,7 +21,14 @@ from app.companies.models import (
     QCCLookupResult,
 )
 from app.leads.identity import DatabaseSalesIdentityProvider, SalesIdentityProvider
-from app.leads.models import Lead, LeadFieldProvenance
+from app.leads.models import (
+    Lead,
+    LeadFieldProvenance,
+    LeadMessageResolution,
+    SalesLeadContext,
+    SmartTableSync,
+    UserConfirmationEvent,
+)
 from app.messaging.models import BusinessAuditEvent, IncomingMessage
 from app.smart_table.adapter import SmartTableActor, SmartTableAdapter
 
@@ -181,6 +188,40 @@ class CompanyLeadService:
         resolution = self._resolve_company(command, company_name, region)
         return self._persist_resolution(command, company_name, region, resolution)
 
+    def confirm_temporary_company(
+        self, lead_id: str, sales_user_id: str, company_name: str
+    ) -> CompanyUpsertResult:
+        """由当前销售明确确认自己的 temporary Lead 公司名称，不调用 LLM。
+
+        参数：lead_id 为待确认 temporary Lead；sales_user_id 为操作销售；
+        company_name 为人工输入名称。
+        返回值：保存确认事实后的公司处理结果。
+        异常：线索不存在、非本人、非 temporary 或名称为空时抛出 ValueError 或 PermissionError。
+        副作用：写入 company_confirmed_by_user 与 user_confirmed_unverified，
+        并在需要时首次创建表格记录。
+        """
+        normalized_company_name = company_name.strip()
+        if not normalized_company_name:
+            raise ValueError("销售确认公司名称不能为空")
+        with self._session_factory() as session:
+            lead = session.get(Lead, lead_id)
+            if lead is None:
+                raise ValueError(f"线索不存在：{lead_id}")
+            self._ensure_sales_boundary(lead, sales_user_id)
+            if lead.lifecycle_state != "temporary":
+                raise ValueError("仅 temporary Lead 可以进行公司确认")
+            fields = {**lead.field_values, "线索名称": normalized_company_name}
+            source_message_id = lead.source_message_id
+        return self.upsert(
+            CompanyUpsertCommand(
+                source_message_id=source_message_id,
+                sales_user_id=sales_user_id,
+                fields=fields,
+                existing_lead_id=lead_id,
+                user_confirmed_company=True,
+            )
+        )
+
     def _resolve_company(
         self, command: CompanyUpsertCommand, company_name: str, region: CompanyRegion
     ) -> CompanyResolution:
@@ -278,13 +319,27 @@ class CompanyLeadService:
                 session, lead, command.sales_user_id, standard_name
             )
             if merge_target is not None and lead is not None:
-                # 临时草稿升级前先转入当前销售已有的同标准名目标，避免违反销售内唯一约束。
-                transferred_fields = {**lead.field_values, **command.fields}
-                table_patch = self._merge_patch(
-                    session, merge_target, transferred_fields, command.source_message_id
-                )
+                if lead.smart_table_record_id is None:
+                    # A' temporary 尚无表格副作用，因此保留它作为生命周期主体并迁移既有正式目标。
+                    self._transfer_existing_lead_to_temporary(session, merge_target, lead)
+                    transferred_fields = {
+                        **merge_target.field_values,
+                        **lead.field_values,
+                        **command.fields,
+                    }
+                    table_patch = self._merge_patch(
+                        session, lead, transferred_fields, command.source_message_id
+                    )
+                    target = lead
+                else:
+                    # 兼容历史已入表 temporary：不能静默留下第二条 record，沿用原有保守合并行为。
+                    transferred_fields = {**lead.field_values, **command.fields}
+                    table_patch = self._merge_patch(
+                        session, merge_target, transferred_fields, command.source_message_id
+                    )
+                    target = merge_target
                 self._apply_company_state(
-                    merge_target,
+                    target,
                     company_name,
                     standard_name,
                     region,
@@ -294,13 +349,13 @@ class CompanyLeadService:
                     command.user_confirmed_company,
                     table_patch,
                 )
-                lead.lifecycle_state = "merged"
+                merge_target.lifecycle_state = "merged"
                 self._record_audit(session, command, "temporary_lead_merged")
                 logger.info(
                     "temporary_lead_merged",
-                    extra={"message_id": command.source_message_id, "lead_id": merge_target.id},
+                    extra={"message_id": command.source_message_id, "lead_id": target.id},
                 )
-                lead = merge_target
+                lead = target
                 created = False
             if lead is None:
                 lead = self._create_lead(
@@ -362,9 +417,15 @@ class CompanyLeadService:
                     )
                 self._record_audit(session, command, "company_lead_updated")
                 created = False
+            if command.user_confirmed_company:
+                # 确认是受控命令事实，不得由 QCC 或后续模型输出替代或推断。
+                self._record_audit(session, command, "company_user_confirmation_recorded")
             session.flush()
             lead_id = lead.id
 
+        if command.defer_smart_table_sync:
+            # 首次文本消费者会在公司唯一性决策后统一走 T09 创建或更新审核表。
+            return self._result_for_id(lead_id, table_patch)
         return self._sync_smart_table(lead_id, table_patch, created)
 
     def _get_requested_or_matching_lead(
@@ -415,6 +476,50 @@ class CompanyLeadService:
                 Lead.lifecycle_state != "merged",
             )
         )
+
+    @staticmethod
+    def _transfer_existing_lead_to_temporary(
+        session: Session, existing_lead: Lead, temporary_lead: Lead
+    ) -> None:
+        """将同销售既有正式 Lead 的后台与表格关联迁移到尚未入表的 temporary Lead。
+
+        参数：session 为当前事务；existing_lead 为旧正式目标；temporary_lead 为必须保留的原 Lead。
+        返回值：无。
+        异常：数据库约束冲突时由 SQLAlchemy 抛出。
+        副作用：迁移 record、同步、消息、上下文、来源与确认事实，并将旧目标标记 merged。
+        """
+        record_id = existing_lead.smart_table_record_id
+        existing_lead.smart_table_record_id = None
+        existing_lead.standard_company_name = None
+        existing_lead.lifecycle_state = "merged"
+        # 先释放唯一 record_id，避免同一 flush 的更新顺序依赖数据库实现。
+        session.flush()
+        temporary_lead.smart_table_record_id = record_id
+        temporary_lead.enrichment_values = {
+            **existing_lead.enrichment_values,
+            **temporary_lead.enrichment_values,
+        }
+        for provenance in session.scalars(
+            select(LeadFieldProvenance).where(LeadFieldProvenance.lead_id == existing_lead.id)
+        ).all():
+            provenance.lead_id = temporary_lead.id
+        for confirmation in session.scalars(
+            select(UserConfirmationEvent).where(UserConfirmationEvent.lead_id == existing_lead.id)
+        ).all():
+            confirmation.lead_id = temporary_lead.id
+        for context in session.scalars(
+            select(SalesLeadContext).where(SalesLeadContext.lead_id == existing_lead.id)
+        ).all():
+            context.lead_id = temporary_lead.id
+        for resolution in session.scalars(
+            select(LeadMessageResolution).where(LeadMessageResolution.lead_id == existing_lead.id)
+        ).all():
+            resolution.lead_id = temporary_lead.id
+        sync = session.scalar(
+            select(SmartTableSync).where(SmartTableSync.lead_id == existing_lead.id)
+        )
+        if sync is not None:
+            sync.lead_id = temporary_lead.id
 
     def _create_lead(
         self,
@@ -576,7 +681,8 @@ class CompanyLeadService:
             record_id = lead.smart_table_record_id
             fields = dict(lead.field_values)
             owner = lead.smart_table_owner_user_id
-        if created:
+            has_standard_company_name = lead.standard_company_name is not None
+        if record_id is None and has_standard_company_name:
             logger.info("company_smart_table_create_started", extra={"lead_id": lead_id})
             try:
                 record = self._smart_table_adapter.create_record(
@@ -759,7 +865,9 @@ class CompanyLeadService:
             )
 
     @staticmethod
-    def _result(lead: Lead) -> CompanyUpsertResult:
+    def _result(
+        lead: Lead, smart_table_patch: Mapping[str, str] | None = None
+    ) -> CompanyUpsertResult:
         """将 ORM 线索转换为可在会话外使用的应用服务结果。
 
         参数：lead 为已持久化线索。
@@ -773,6 +881,7 @@ class CompanyLeadService:
             lead.lifecycle_state,
             lead.standard_company_name,
             CompanyVerificationStatus(lead.company_verification_status),
+            dict(smart_table_patch or {}),
         )
 
     def _mark_user_protected_fields(self, lead_id: str, field_names: set[str]) -> None:
@@ -844,7 +953,9 @@ class CompanyLeadService:
                     provenance.last_ai_synced_value = patch[provenance.field_name]
                     updated_fields.add(provenance.field_name)
 
-    def _result_for_id(self, lead_id: str) -> CompanyUpsertResult:
+    def _result_for_id(
+        self, lead_id: str, smart_table_patch: Mapping[str, str] | None = None
+    ) -> CompanyUpsertResult:
         """读取并返回指定线索的会话外稳定结果。
 
         参数：lead_id 为目标线索标识。
@@ -856,4 +967,4 @@ class CompanyLeadService:
             lead = session.get(Lead, lead_id)
             if lead is None:
                 raise ValueError(f"线索不存在：{lead_id}")
-            return self._result(lead)
+            return self._result(lead, smart_table_patch)

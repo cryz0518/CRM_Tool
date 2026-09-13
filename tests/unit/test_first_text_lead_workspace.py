@@ -222,6 +222,7 @@ def test_consumer_upgrades_temporary_lead_when_later_message_names_the_company(
     temporary = service.consume(temporary_event_id)
 
     assert temporary.status is LeadProcessingStatus.CREATED
+    assert temporary.smart_table_record_id is None
     with session_factory() as session:
         lead = session.get(Lead, temporary.lead_id)
         company_event = session.get(OutboxEvent, company_event_id)
@@ -233,6 +234,109 @@ def test_consumer_upgrades_temporary_lead_when_later_message_names_the_company(
     record = adapter.get_record(lead.smart_table_record_id or "")
     assert record is not None
     assert record.fields["线索名称"] == "无锡长广溪智能制造有限公司"
+
+
+def test_consumer_deduplicates_same_sales_company_before_creating_smart_table_record(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证同销售重复公司在首个 Smart Table 副作用前定位既有 Lead。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：产生第二个有效 Lead 或第二条表格记录时由 pytest 报告。
+    副作用：连续消费同销售两条可由 Mock QCC 唯一核验的公司消息。
+    """
+    first_event_id = persist_outbox_text(
+        session_factory,
+        message_id="same-sales-company-first",
+        sales_user_id="sales-1",
+        text="公司：长广溪；联系人：张三；手机：13800000001",
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        company_lead_service=CompanyLeadService(
+            session_factory,
+            adapter,
+            MockQCCAdapter(
+                {
+                    "长广溪": QCCLookupResult.matched(
+                        QCCCandidate("无锡长广溪智能制造有限公司", "qcc-1")
+                    )
+                }
+            ),
+        ),
+    )
+
+    first = service.consume(first_event_id)
+    second_event_id = persist_outbox_text(
+        session_factory,
+        message_id="same-sales-company-second",
+        sales_user_id="sales-1",
+        text="公司：长广溪；电话：0510-12345678",
+    )
+    second = service.consume(second_event_id)
+
+    assert first.smart_table_record_id is not None
+    assert second.lead_id == first.lead_id
+    assert second.smart_table_record_id == first.smart_table_record_id
+    assert [record.record_id for record in adapter.get_records()] == ["mock-record-1"]
+    with session_factory() as session:
+        leads = session.scalars(
+            select(Lead).where(Lead.smart_table_owner_user_id == "sales-1")
+        ).all()
+    assert len(leads) == 1
+    assert leads[0].standard_company_name == "无锡长广溪智能制造有限公司"
+    assert leads[0].field_values["电话"] == "0510-12345678"
+
+
+def test_consumer_keeps_same_company_isolated_between_salespeople(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证不同销售的相同标准公司名不查询、不合并且各自拥有表格记录。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：跨销售复用 Lead 或 Smart Table record 时由 pytest 报告。
+    副作用：消费两名销售各自的同公司消息。
+    """
+    first_event_id = persist_outbox_text(
+        session_factory,
+        message_id="cross-sales-company-first",
+        sales_user_id="sales-1",
+        text="公司：长广溪；联系人：张三",
+    )
+    second_event_id = persist_outbox_text(
+        session_factory,
+        message_id="cross-sales-company-second",
+        sales_user_id="sales-2",
+        text="公司：长广溪；联系人：李四",
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    company_service = CompanyLeadService(
+        session_factory,
+        adapter,
+        MockQCCAdapter(
+            {
+                "长广溪": QCCLookupResult.matched(
+                    QCCCandidate("无锡长广溪智能制造有限公司", "qcc-1")
+                )
+            }
+        ),
+    )
+    service = FirstTextLeadWorkspaceService(
+        session_factory, adapter, company_lead_service=company_service
+    )
+
+    first = service.consume(first_event_id)
+    second = service.consume(second_event_id)
+
+    assert first.lead_id != second.lead_id
+    assert first.smart_table_record_id != second.smart_table_record_id
+    assert len(adapter.get_records()) == 2
+    with session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(Lead)) == 2
 
 
 def test_non_lead_text_is_ignored_without_polluting_the_review_workspace(
