@@ -116,8 +116,8 @@ def test_missing_company_creates_temporary_lead_until_a_verified_name_is_availab
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
-    异常：临时状态、字段或表格所有者不正确时由 pytest 报告断言失败。
-    副作用：创建一条没有公司名称的销售审核记录。
+    异常：临时状态、字段或延迟表格副作用不正确时由 pytest 报告断言失败。
+    副作用：创建一条没有公司名称的后台 temporary Lead。
     """
     persist_source_message(session_factory, "temporary-message", "sales-1")
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
@@ -133,13 +133,8 @@ def test_missing_company_creates_temporary_lead_until_a_verified_name_is_availab
 
     assert result.lifecycle_state == "temporary"
     assert result.standard_company_name is None
-    assert adapter.get_record(result.smart_table_record_id or "").fields == {
-        "联系人": "张三",
-        "手机": "13800000001",
-        "线索来源": "展会",
-        "创建人": "sales-1",
-        "负责人": "sales-1",
-    }
+    assert result.smart_table_record_id is None
+    assert adapter.get_records() == []
 
 
 def test_unauthorized_salesperson_cannot_use_company_lead_service(
@@ -170,6 +165,104 @@ def test_unauthorized_salesperson_cannot_use_company_lead_service(
         )
 
     assert adapter.get_records() == []
+
+
+def test_salesperson_can_confirm_only_own_temporary_lead_without_llm(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证受控公司确认只允许原销售升级自己的 temporary Lead。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：确认绕过销售边界或未留下未核验审计状态时由 pytest 报告。
+    副作用：创建 temporary Lead 后执行一次确定性人工公司确认。
+    """
+    persist_source_message(session_factory, "confirm-temporary", "sales-1")
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = CompanyLeadService(session_factory, adapter, MockQCCAdapter())
+    temporary = service.upsert(
+        CompanyUpsertCommand(
+            source_message_id="confirm-temporary",
+            sales_user_id="sales-1",
+            fields={"联系人": "张三", "手机": "13800000001"},
+        )
+    )
+
+    with pytest.raises(PermissionError, match="禁止跨销售"):
+        service.confirm_temporary_company(temporary.lead_id, "sales-2", "上海智造")
+    confirmed = service.confirm_temporary_company(temporary.lead_id, "sales-1", "上海智造")
+
+    assert confirmed.lead_id == temporary.lead_id
+    assert confirmed.standard_company_name == "上海智造"
+    assert confirmed.verification_status.value == "user_confirmed_unverified"
+    # 公司服务只完成决策；首次入表必须由工作区服务统一走 T09 边界。
+    assert confirmed.smart_table_record_id is None
+    with session_factory() as session:
+        lead = session.get(Lead, confirmed.lead_id)
+        provenance = session.scalar(
+            select(LeadFieldProvenance).where(
+                LeadFieldProvenance.lead_id == confirmed.lead_id,
+                LeadFieldProvenance.field_name == "线索名称",
+                LeadFieldProvenance.is_user_confirmed.is_(True),
+            )
+        )
+    assert lead is not None
+    assert lead.company_confirmed_by_user is True
+    assert provenance is not None
+
+
+def test_temporary_confirmation_keeps_original_lead_when_same_sales_company_exists(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 temporary 确认命中同销售公司时保留原 Lead 并迁移唯一表格记录。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：temporary 被替换、产生第二条 record 或丢失既有字段时由 pytest 报告。
+    副作用：创建正式 Lead、temporary Lead 并执行确认升级。
+    """
+    persist_source_message(session_factory, "existing-company", "sales-1")
+    persist_source_message(session_factory, "later-temporary", "sales-1")
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = CompanyLeadService(
+        session_factory,
+        adapter,
+        MockQCCAdapter(
+            {
+                "长广溪": QCCLookupResult.matched(
+                    QCCCandidate("无锡长广溪智能制造有限公司", "qcc-1")
+                )
+            }
+        ),
+    )
+    existing = service.upsert(
+        CompanyUpsertCommand(
+            source_message_id="existing-company",
+            sales_user_id="sales-1",
+            fields={"线索名称": "长广溪", "联系人": "张三"},
+        )
+    )
+    temporary = service.upsert(
+        CompanyUpsertCommand(
+            source_message_id="later-temporary",
+            sales_user_id="sales-1",
+            fields={"电话": "0510-12345678"},
+        )
+    )
+
+    upgraded = service.confirm_temporary_company(temporary.lead_id, "sales-1", "长广溪")
+
+    assert upgraded.lead_id == temporary.lead_id
+    assert upgraded.smart_table_record_id == existing.smart_table_record_id
+    assert len(adapter.get_records()) == 1
+    with session_factory() as session:
+        survivor = session.get(Lead, temporary.lead_id)
+        merged = session.get(Lead, existing.lead_id)
+    assert survivor is not None
+    assert merged is not None
+    assert survivor.field_values["联系人"] == "张三"
+    assert survivor.field_values["电话"] == "0510-12345678"
+    assert merged.lifecycle_state == "merged"
 
 
 def test_verified_company_only_deduplicates_within_the_same_salesperson(
@@ -391,12 +484,12 @@ def test_synced_company_name_change_requires_identity_review(
 def test_temporary_lead_upgrades_by_merging_only_its_salespersons_existing_company(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证临时线索获得标准名后只可合并当前销售的同公司目标。
+    """验证临时线索获得标准名后保留自身并只迁移当前销售的同公司目标。
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
-    异常：临时字段未补入目标或临时状态未标记合并时由 pytest 报告。
-    副作用：创建正式线索、临时线索，并将后者升级至前者。
+    异常：临时字段未保留、表格关联未迁移或旧目标未标记合并时由 pytest 报告。
+    副作用：创建正式线索、临时线索，并将正式目标迁移至后者。
     """
     for message_id in ("formal", "temporary", "temporary-upgrade"):
         persist_source_message(session_factory, message_id, "sales-1")
@@ -429,15 +522,16 @@ def test_temporary_lead_upgrades_by_merging_only_its_salespersons_existing_compa
         )
     )
 
-    assert merged.lead_id == formal.lead_id
+    assert merged.lead_id == temporary.lead_id
     with session_factory() as session:
         original_temporary = session.get(Lead, temporary.lead_id)
         target = session.get(Lead, formal.lead_id)
     assert original_temporary is not None
     assert target is not None
-    assert original_temporary.lifecycle_state == "merged"
-    assert target.field_values["手机"] == "13800000001"
-    assert target.field_values["电话"] == "0510-12345678"
+    assert original_temporary.lifecycle_state != "merged"
+    assert target.lifecycle_state == "merged"
+    assert original_temporary.field_values["手机"] == "13800000001"
+    assert original_temporary.field_values["电话"] == "0510-12345678"
 
 
 def test_qcc_timeout_keeps_a_company_unverified_without_blocking_temporary_capture(
@@ -541,7 +635,7 @@ def test_table_company_name_changed_by_salesperson_is_not_overwritten_during_qcc
     参数：session_factory 提供隔离数据库。
     返回值：无。
     异常：表格中的人工名称被覆盖或来源未受保护时由 pytest 报告断言失败。
-    副作用：先创建未核验线索、模拟销售改表，再使用 Mock QCC 升级后台公司事实。
+    副作用：先创建可入表的国外线索、模拟销售改表，再使用 Mock QCC 升级后台公司事实。
     """
     persist_source_message(session_factory, "manual-company", "sales-1")
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
@@ -550,6 +644,7 @@ def test_table_company_name_changed_by_salesperson_is_not_overwritten_during_qcc
             source_message_id="manual-company",
             sales_user_id="sales-1",
             fields={"线索名称": "原始名称"},
+            region_evidence=CompanyRegionEvidence(explicit_foreign=True),
         )
     )
     adapter.update_record(original.smart_table_record_id or "", {"线索名称": "销售手工名称"})

@@ -13,7 +13,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.ai.gateway import AIGateway
 from app.ai.provider import LLMProviderError, MockLLMProvider
-from app.companies.models import QCCCandidate, QCCLookupResult
+from app.companies.models import CompanyUpsertCommand, QCCCandidate, QCCLookupResult
 from app.companies.service import CompanyLeadService, MockQCCAdapter
 from app.leads.models import Lead, LeadFieldProvenance, SmartTableSync
 from app.leads.service import FirstTextLeadWorkspaceService, LeadProcessingStatus
@@ -222,6 +222,7 @@ def test_consumer_upgrades_temporary_lead_when_later_message_names_the_company(
     temporary = service.consume(temporary_event_id)
 
     assert temporary.status is LeadProcessingStatus.CREATED
+    assert temporary.smart_table_record_id is None
     with session_factory() as session:
         lead = session.get(Lead, temporary.lead_id)
         company_event = session.get(OutboxEvent, company_event_id)
@@ -233,6 +234,109 @@ def test_consumer_upgrades_temporary_lead_when_later_message_names_the_company(
     record = adapter.get_record(lead.smart_table_record_id or "")
     assert record is not None
     assert record.fields["线索名称"] == "无锡长广溪智能制造有限公司"
+
+
+def test_consumer_deduplicates_same_sales_company_before_creating_smart_table_record(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证同销售重复公司在首个 Smart Table 副作用前定位既有 Lead。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：产生第二个有效 Lead 或第二条表格记录时由 pytest 报告。
+    副作用：连续消费同销售两条可由 Mock QCC 唯一核验的公司消息。
+    """
+    first_event_id = persist_outbox_text(
+        session_factory,
+        message_id="same-sales-company-first",
+        sales_user_id="sales-1",
+        text="公司：长广溪；联系人：张三；手机：13800000001",
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        company_lead_service=CompanyLeadService(
+            session_factory,
+            adapter,
+            MockQCCAdapter(
+                {
+                    "长广溪": QCCLookupResult.matched(
+                        QCCCandidate("无锡长广溪智能制造有限公司", "qcc-1")
+                    )
+                }
+            ),
+        ),
+    )
+
+    first = service.consume(first_event_id)
+    second_event_id = persist_outbox_text(
+        session_factory,
+        message_id="same-sales-company-second",
+        sales_user_id="sales-1",
+        text="公司：长广溪；电话：0510-12345678",
+    )
+    second = service.consume(second_event_id)
+
+    assert first.smart_table_record_id is not None
+    assert second.lead_id == first.lead_id
+    assert second.smart_table_record_id == first.smart_table_record_id
+    assert [record.record_id for record in adapter.get_records()] == ["mock-record-1"]
+    with session_factory() as session:
+        leads = session.scalars(
+            select(Lead).where(Lead.smart_table_owner_user_id == "sales-1")
+        ).all()
+    assert len(leads) == 1
+    assert leads[0].standard_company_name == "无锡长广溪智能制造有限公司"
+    assert leads[0].field_values["电话"] == "0510-12345678"
+
+
+def test_consumer_keeps_same_company_isolated_between_salespeople(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证不同销售的相同标准公司名不查询、不合并且各自拥有表格记录。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：跨销售复用 Lead 或 Smart Table record 时由 pytest 报告。
+    副作用：消费两名销售各自的同公司消息。
+    """
+    first_event_id = persist_outbox_text(
+        session_factory,
+        message_id="cross-sales-company-first",
+        sales_user_id="sales-1",
+        text="公司：长广溪；联系人：张三",
+    )
+    second_event_id = persist_outbox_text(
+        session_factory,
+        message_id="cross-sales-company-second",
+        sales_user_id="sales-2",
+        text="公司：长广溪；联系人：李四",
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    company_service = CompanyLeadService(
+        session_factory,
+        adapter,
+        MockQCCAdapter(
+            {
+                "长广溪": QCCLookupResult.matched(
+                    QCCCandidate("无锡长广溪智能制造有限公司", "qcc-1")
+                )
+            }
+        ),
+    )
+    service = FirstTextLeadWorkspaceService(
+        session_factory, adapter, company_lead_service=company_service
+    )
+
+    first = service.consume(first_event_id)
+    second = service.consume(second_event_id)
+
+    assert first.lead_id != second.lead_id
+    assert first.smart_table_record_id != second.smart_table_record_id
+    assert len(adapter.get_records()) == 2
+    with session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(Lead)) == 2
 
 
 def test_non_lead_text_is_ignored_without_polluting_the_review_workspace(
@@ -644,3 +748,109 @@ def test_free_text_ai_update_uses_current_context_without_creating_a_second_lead
     record = adapter.get_record(created.smart_table_record_id)
     assert record is not None
     assert record.fields["工艺"] == "装配"
+
+
+def test_controlled_temporary_confirmation_keeps_lifecycle_and_creates_first_record(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证受控确认先写人工来源，再在原 temporary Lead 上首次创建表格记录。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：生命周期替换、未核验审计或首次入表行为错误时由 pytest 报告。
+    副作用：消费一条无公司名消息后通过受控入口确认公司名称。
+    """
+    event_id = persist_outbox_text(
+        session_factory,
+        message_id="controlled-confirm-temporary",
+        sales_user_id="sales-1",
+        text="联系人：张三；手机：13800000001",
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    company_service = CompanyLeadService(session_factory, adapter, MockQCCAdapter())
+    workspace = FirstTextLeadWorkspaceService(
+        session_factory, adapter, company_lead_service=company_service
+    )
+    temporary = workspace.consume(event_id)
+
+    confirmed = workspace.confirm_temporary_company(temporary.lead_id or "", "sales-1", "上海智造")
+
+    assert confirmed.lead_id == temporary.lead_id
+    assert confirmed.smart_table_record_id is not None
+    assert len(adapter.get_records()) == 1
+    with session_factory() as session:
+        lead = session.get(Lead, confirmed.lead_id)
+        provenance = session.scalar(
+            select(LeadFieldProvenance).where(
+                LeadFieldProvenance.lead_id == confirmed.lead_id,
+                LeadFieldProvenance.field_name == "线索名称",
+                LeadFieldProvenance.is_user_confirmed.is_(True),
+            )
+        )
+    assert lead is not None
+    assert lead.company_confirmed_by_user is True
+    assert lead.company_verification_status == "user_confirmed_unverified"
+    assert provenance is not None
+
+
+def test_controlled_confirmation_matching_existing_record_uses_t09_protection(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证确认命中同销售既有公司时复用 record 并保留销售人工编辑。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：产生第二个 record 或覆盖人工字段时由 pytest 报告。
+    副作用：创建正式与 temporary Lead，模拟销售编辑后执行受控确认。
+    """
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    company_service = CompanyLeadService(
+        session_factory,
+        adapter,
+        MockQCCAdapter(
+            {"已有公司": QCCLookupResult.matched(QCCCandidate("已有公司有限公司", "qcc"))}
+        ),
+    )
+    workspace = FirstTextLeadWorkspaceService(
+        session_factory, adapter, company_lead_service=company_service
+    )
+    temporary_event = persist_outbox_text(
+        session_factory,
+        message_id="controlled-existing-temporary",
+        sales_user_id="sales-1",
+        text="联系人：李四；电话：0510-12345678；手机：13800000001",
+    )
+    temporary_seed = company_service.upsert(
+        CompanyUpsertCommand(
+            source_message_id="controlled-existing-temporary",
+            sales_user_id="sales-1",
+            fields={"联系人": "李四", "电话": "0510-12345678", "手机": "13800000001"},
+        )
+    )
+    with session_factory.begin() as session:
+        event = session.get(OutboxEvent, temporary_event)
+        assert event is not None
+        # 此来源只供受控确认审计；避免顺序续消费把无公司名碎片塞入已有上下文。
+        event.status = "succeeded"
+    existing_event = persist_outbox_text(
+        session_factory,
+        message_id="controlled-existing",
+        sales_user_id="sales-1",
+        text="公司：已有公司；联系人：张三",
+    )
+    existing = workspace.consume(existing_event)
+    assert existing.smart_table_record_id is not None
+    assert temporary_seed.smart_table_record_id is None
+    adapter.update_record(existing.smart_table_record_id, {"联系人": "销售手工联系人"})
+
+    confirmed = workspace.confirm_temporary_company(
+        temporary_seed.lead_id, "sales-1", "已有公司"
+    )
+
+    assert confirmed.lead_id == temporary_seed.lead_id
+    assert confirmed.smart_table_record_id == existing.smart_table_record_id
+    assert len(adapter.get_records()) == 1
+    record = adapter.get_record(existing.smart_table_record_id)
+    assert record is not None
+    assert record.fields["联系人"] == "销售手工联系人"
+    assert record.fields["手机"] == "13800000001"

@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.ai.gateway import AIGateway, AIGatewayError
 from app.ai.models import ExtractedLeadPatch, LeadAnalysis
-from app.companies.models import CompanyRegionEvidence, CompanyUpsertCommand
+from app.companies.models import CompanyRegionEvidence, CompanyUpsertCommand, CompanyUpsertResult
 from app.companies.service import CompanyLeadService
 from app.core.config import get_settings
 from app.core.logging import bind_log_context, reset_log_context
@@ -66,6 +66,7 @@ class LeadProcessingResult:
     lead_id: str | None = None
     smart_table_record_id: str | None = None
     lead_ids: tuple[str, ...] = ()
+    company_resolution_applied: bool = False
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,7 @@ class ContextUpdateRequest:
     record_id: str
     fields: dict[str, str]
     outbox_event_id: int
+    segment_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -270,10 +272,48 @@ class FirstTextLeadWorkspaceService:
             recover_expired_lease=recover_expired_lease,
         )
         # 表格首次同步成功后才应用公司核验和销售内去重，避免失败重试中重放外部写入。
-        result = self._apply_company_resolution(outbox_event_id, result)
+        if not result.company_resolution_applied:
+            result = self._apply_company_resolution(outbox_event_id, result)
         # 只在本事件已越过首次消费检查点后继续，防止 retrying/processing 事件被错误跳过。
         self._consume_next_after_checkpoint(outbox_event_id)
         return result
+
+    def confirm_temporary_company(
+        self, lead_id: str, sales_user_id: str, company_name: str
+    ) -> LeadProcessingResult:
+        """通过受控入口确认 temporary Lead 公司并复用首次入表前的公司决策收尾。
+
+        参数：lead_id 为待确认临时线索；sales_user_id 为当前销售；company_name 为人工输入名称。
+        返回值：保持原 Lead 生命周期的创建或更新结论。
+        异常：非本人、非 temporary、缺少来源事件或公司服务异常时按真实原因抛出。
+        副作用：先写人工确认来源与公司审计，再首次入表或经 T09 更新既有 record。
+        """
+        if self._company_lead_service is None:
+            raise ValueError("缺少公司解析服务")
+        company_result = self._company_lead_service.confirm_temporary_company(
+            lead_id, sales_user_id, company_name
+        )
+        with self._session_factory() as session:
+            lead = session.get(Lead, company_result.lead_id)
+            if lead is None:
+                raise ValueError(f"公司确认目标线索不存在：{company_result.lead_id}")
+            event_id = session.scalar(
+                select(OutboxEvent.id).where(OutboxEvent.message_id == lead.source_message_id)
+            )
+            if event_id is None:
+                raise ValueError(f"公司确认来源 Outbox 不存在：{lead.source_message_id}")
+            command = CompanyUpsertCommand(
+                source_message_id=lead.source_message_id,
+                source_segment_index=lead.source_segment_index,
+                sales_user_id=sales_user_id,
+                fields=dict(lead.field_values),
+                existing_lead_id=lead.id,
+                user_confirmed_company=True,
+                defer_smart_table_sync=True,
+            )
+        return self._finish_company_decision_before_smart_table(
+            event_id, command, company_result
+        )
 
     def _apply_company_resolution(
         self, outbox_event_id: int, result: LeadProcessingResult
@@ -318,6 +358,7 @@ class FirstTextLeadWorkspaceService:
                                 phone=lead.field_values.get("手机")
                                 or lead.field_values.get("电话"),
                             ),
+                            defer_smart_table_sync=True,
                         ),
                     )
                 )
@@ -345,6 +386,14 @@ class FirstTextLeadWorkspaceService:
                     )
                 ).all():
                     context.lead_id = company_result.lead_id
+        materialized_record_ids: dict[str, str | None] = {}
+        for source_lead_id, company_result in resolved:
+            materialized = self._materialize_company_resolved_lead(
+                outbox_event_id, company_result.lead_id, company_result.standard_company_name
+            )
+            if materialized.status is LeadProcessingStatus.SYNC_FAILED:
+                return materialized
+            materialized_record_ids[source_lead_id] = materialized.smart_table_record_id
         logger.info(
             "lead_company_resolution_completed",
             extra={
@@ -356,9 +405,160 @@ class FirstTextLeadWorkspaceService:
         return LeadProcessingResult(
             result.status,
             lead_id=final_ids[0],
-            smart_table_record_id=resolved[0][1].smart_table_record_id,
+            smart_table_record_id=materialized_record_ids[resolved[0][0]],
             lead_ids=final_ids if len(final_ids) > 1 else (),
         )
+
+    def _materialize_company_resolved_lead(
+        self,
+        outbox_event_id: int,
+        lead_id: str,
+        standard_company_name: str | None,
+        segment_index: int = 0,
+    ) -> LeadProcessingResult:
+        """为已获得可靠公司身份、但尚未入表的原 Lead 创建唯一审核记录。
+
+        参数：outbox_event_id 为本次公司确认来源；lead_id 为保持生命周期的目标；
+        standard_company_name 为公司服务给出的可靠去重键。
+        返回值：返回已有、创建成功或同步失败的表格定位。
+        异常：数据库事实缺失时抛出 ValueError；表格同步错误由既有创建路径转换为失败结果。
+        副作用：首次需要入表时创建 SmartTableSync、调用表格并进入 T09。
+        """
+        with self._session_factory.begin() as session:
+            lead = session.get(Lead, lead_id)
+            if lead is None:
+                raise ValueError(f"公司解析目标线索不存在：{lead_id}")
+            if lead.smart_table_record_id is not None:
+                return LeadProcessingResult(
+                    LeadProcessingStatus.UPDATED,
+                    lead_id=lead.id,
+                    smart_table_record_id=lead.smart_table_record_id,
+                )
+            if standard_company_name is None or lead.lifecycle_state == "merged":
+                # 未核验公司继续保持 temporary；它不能读取或写入 Smart Table/T09。
+                return LeadProcessingResult(LeadProcessingStatus.UPDATED, lead_id=lead.id)
+            sync = session.scalar(select(SmartTableSync).where(SmartTableSync.lead_id == lead.id))
+            if sync is None:
+                # 同一 Lead 只补一条同步事实，外部创建仍由 record_id 空值保证幂等检查点。
+                session.add(
+                    SmartTableSync(
+                        lead_id=lead.id,
+                        source_message_id=self._source_message_id(outbox_event_id),
+                        source_segment_index=segment_index,
+                    )
+                )
+            sales_user_id = lead.smart_table_owner_user_id
+            fields = dict(lead.field_values)
+        return self._create_smart_table_record(
+            sales_user_id, fields, lead_id, outbox_event_id, segment_index
+        )
+
+    def _consume_initial_company_before_smart_table(
+        self, outbox_event_id: int, command: CompanyUpsertCommand
+    ) -> LeadProcessingResult:
+        """在首次表格副作用前完成公司决策，并把消息归属到唯一目标 Lead。
+
+        参数：outbox_event_id 为已取得销售顺序锁检查点的事件；command 为本轮公司候选。
+        返回值：新建、更新或保留 temporary 的最终消费结果。
+        异常：公司服务、表格或数据库异常按既有 Outbox 语义向调用方传播。
+        副作用：可能创建或复用当前销售 Lead；正式 Lead 才会进入 T09 和 Smart Table。
+        """
+        if self._company_lead_service is None:
+            raise ValueError("缺少公司解析服务")
+        company_result = self._company_lead_service.upsert(command)
+        return self._finish_company_decision_before_smart_table(
+            outbox_event_id, command, company_result
+        )
+
+    def _finish_company_decision_before_smart_table(
+        self,
+        outbox_event_id: int,
+        command: CompanyUpsertCommand,
+        company_result: CompanyUpsertResult,
+    ) -> LeadProcessingResult:
+        """将已持久化的公司决策在首次表格副作用前收敛为唯一目标 Lead。
+
+        参数：outbox_event_id 为来源事件；command 提供来源和分段；company_result 为公司服务结果。
+        返回值：temporary、创建或更新后的可观察消费结论。
+        异常：公司结果结构不完整或表格同步失败时按既有 Outbox 语义传播或返回失败。
+        副作用：仅正式 Lead 创建记录；既有记录的增量始终进入 T09。
+        """
+        if company_result.standard_company_name is None:
+            # QCC 无结果、超时或多候选仍是 temporary，完成后台归属但绝不进入表格审核。
+            self._complete_deferred_company_message(
+                outbox_event_id, company_result.lead_id, command.source_segment_index
+            )
+            return LeadProcessingResult(
+                LeadProcessingStatus.CREATED,
+                lead_id=company_result.lead_id,
+                company_resolution_applied=True,
+            )
+
+        materialized = self._materialize_company_resolved_lead(
+            outbox_event_id,
+            company_result.lead_id,
+            company_result.standard_company_name,
+            command.source_segment_index,
+        )
+        if materialized.status is LeadProcessingStatus.SYNC_FAILED:
+            return LeadProcessingResult(
+                materialized.status,
+                lead_id=materialized.lead_id,
+                company_resolution_applied=True,
+            )
+        if company_result.smart_table_record_id is None:
+            # 新 Lead 在公司决策后才首次创建 record，_create_smart_table_record 会完成消息归属。
+            return LeadProcessingResult(
+                materialized.status,
+                lead_id=company_result.lead_id,
+                smart_table_record_id=materialized.smart_table_record_id,
+                company_resolution_applied=True,
+            )
+        if company_result.smart_table_patch:
+            # 命中当前销售已有记录时，只把公司服务判定安全的增量字段交给 T09。
+            updated = self._update_smart_table_record(
+                ContextUpdateRequest(
+                    source_message_id=command.source_message_id,
+                    lead_id=company_result.lead_id,
+                    record_id=company_result.smart_table_record_id,
+                    fields=company_result.smart_table_patch,
+                    outbox_event_id=outbox_event_id,
+                    segment_index=command.source_segment_index,
+                )
+            )
+            return LeadProcessingResult(
+                updated.status,
+                lead_id=company_result.lead_id,
+                smart_table_record_id=updated.smart_table_record_id,
+                company_resolution_applied=True,
+            )
+        self._complete_deferred_company_message(
+            outbox_event_id, company_result.lead_id, command.source_segment_index
+        )
+        return LeadProcessingResult(
+            LeadProcessingStatus.UPDATED,
+            lead_id=company_result.lead_id,
+            smart_table_record_id=company_result.smart_table_record_id,
+            company_resolution_applied=True,
+        )
+
+    def _complete_deferred_company_message(
+        self, outbox_event_id: int, lead_id: str, segment_index: int = 0
+    ) -> None:
+        """完成无需 Smart Table 调用的 temporary 或无字段变化消息归属。
+
+        参数：outbox_event_id 为待完成事件；lead_id 为同销售范围内已确定目标。
+        返回值：无。
+        异常：事件、消息或线索缺失时由既有查询抛出 ValueError。
+        副作用：写入消息归属、上下文和可审计的公司决策完成事件。
+        """
+        with self._session_factory.begin() as session:
+            event, message = self._load_event_and_message(session, outbox_event_id)
+            if session.get(Lead, lead_id) is None:
+                raise ValueError(f"公司决策目标线索不存在：{lead_id}")
+            self._mark_assigned(session, event, lead_id, segment_index)
+            self._refresh_context(session, message, lead_id)
+            self._record_audit(session, event, "company_resolution_completed_before_smart_table")
 
     def _consume_once(
         self,
@@ -378,6 +578,9 @@ class FirstTextLeadWorkspaceService:
         log_token = None
         context_update: ContextUpdateRequest | None = None
         ai_review: AIReviewRequest | None = None
+        temporary_capture: LeadProcessingResult | None = None
+        company_initial_command: CompanyUpsertCommand | None = None
+        multi_company_fields: list[dict[str, str]] | None = None
         try:
             with self._session_factory.begin() as session:
                 event, message = self._load_event_and_message(session, outbox_event_id)
@@ -436,24 +639,35 @@ class FirstTextLeadWorkspaceService:
                     # 多个公司候选未能按明确边界拆开时，宁可待归属也不能以最后字段覆盖前段事实。
                     self._mark_unassigned(session, event)
                     return LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
-                if len(multi_fields) > 1:
+                if len(multi_fields) > 1 and self._company_lead_service is None:
                     # 多客户消息先在同一事务内固定所有分段事实，再按既有失败检查点逐条同步。
                     multi_request = self._prepare_multi_leads(
                         session, event, message, multi_fields, outbox_event_id
                     )
+                elif len(multi_fields) > 1:
+                    # 有 T10 时各分段必须先完成公司目标定位，禁止预建 SmartTableSync。
+                    multi_request = None
+                    multi_company_fields = multi_fields
+                    event.status = "processing"
+                    event.processing_started_at = utc_now()
                 else:
                     multi_request = None
                 extracted_patch = extractor.extract_patch(message.normalized_text)
                 # 强身份优先于当前上下文，避免销售补充历史客户时把字段串到最近客户。
                 context_lead = (
                     None
-                    if multi_request is not None
+                    if multi_request is not None or multi_company_fields is not None
                     else self._get_strong_identity_lead(session, message, extracted_patch)
                 )
-                if context_lead is None and multi_request is None:
+                if (
+                    context_lead is None
+                    and multi_request is None
+                    and multi_company_fields is None
+                ):
                     context_lead = self._get_active_context_lead(session, message)
                 if (
                     multi_request is None
+                    and multi_company_fields is None
                     and not extracted_patch
                     and message.normalized_text
                     and self._ai_gateway is not None
@@ -475,6 +689,7 @@ class FirstTextLeadWorkspaceService:
                 )
                 if (
                     multi_request is None
+                    and multi_company_fields is None
                     and ai_review is None
                     and context_lead is not None
                     and (
@@ -506,6 +721,31 @@ class FirstTextLeadWorkspaceService:
                             smart_table_record_id=context_lead.smart_table_record_id,
                         )
                     if context_lead.smart_table_record_id is None:
+                        if temporary_context:
+                            # temporary 尚未进入审核表，补充只写后台事实与来源，绝不能误调用 T09。
+                            values = dict(context_lead.field_values)
+                            values.update(safe_patch)
+                            context_lead.field_values = values
+                            for field_name, value in safe_patch.items():
+                                session.add(
+                                    LeadFieldProvenance(
+                                        lead_id=context_lead.id,
+                                        source_message_id=message.message_id,
+                                        field_name=field_name,
+                                        value=value,
+                                    )
+                                )
+                            self._mark_assigned(session, event, context_lead.id)
+                            self._refresh_context(session, message, context_lead.id)
+                            self._record_audit(
+                                session,
+                                event,
+                                "temporary_lead_updated_before_company_resolution",
+                            )
+                            return LeadProcessingResult(
+                                LeadProcessingStatus.UPDATED,
+                                lead_id=context_lead.id,
+                            )
                         raise ValueError(f"当前线索缺少智能表格记录：{context_lead.id}")
                     event.status = "processing"
                     event.processing_started_at = utc_now()
@@ -519,7 +759,38 @@ class FirstTextLeadWorkspaceService:
                         outbox_event_id=outbox_event_id,
                     )
 
-                if multi_request is None and context_update is None and ai_review is None:
+                if (
+                    multi_request is None
+                    and multi_company_fields is None
+                    and context_update is None
+                    and ai_review is None
+                    and self._company_lead_service is not None
+                    and extracted_patch.get("线索名称")
+                ):
+                    # 有公司候选时先做 T10 销售内身份决策，禁止先生成临时 Lead 或表格 record。
+                    company_initial_command = CompanyUpsertCommand(
+                        source_message_id=message.message_id,
+                        sales_user_id=message.sales_user_id,
+                        fields={**extracted_patch, "线索来源": "展会"},
+                        region_evidence=CompanyRegionEvidence(
+                            message_text=message.normalized_text,
+                            company_name=extracted_patch.get("线索名称"),
+                            email=extracted_patch.get("邮箱"),
+                            phone=extracted_patch.get("手机")
+                            or extracted_patch.get("电话"),
+                        ),
+                        defer_smart_table_sync=True,
+                    )
+                    event.status = "processing"
+                    event.processing_started_at = utc_now()
+
+                if (
+                    multi_request is None
+                    and multi_company_fields is None
+                    and context_update is None
+                    and ai_review is None
+                    and company_initial_command is None
+                ):
                     existing_lead = session.scalar(
                         select(Lead).where(Lead.source_message_id == message.message_id)
                     )
@@ -558,27 +829,55 @@ class FirstTextLeadWorkspaceService:
                                 last_ai_synced_value=value,
                                 )
                             )
-                        session.add(
-                            SmartTableSync(lead_id=lead.id, source_message_id=message.message_id)
-                        )
                         self._record_audit(session, event, "lead_created")
+                        if (
+                            self._company_lead_service is not None
+                            and not fields.get("线索名称")
+                        ):
+                            # 无可靠公司身份只保留后台事实；A' 禁止提前产生表格副作用。
+                            self._mark_assigned(session, event, lead.id)
+                            self._refresh_context(session, message, lead.id)
+                            self._record_audit(
+                                session, event, "temporary_lead_smart_table_deferred"
+                            )
+                            temporary_capture = LeadProcessingResult(
+                                LeadProcessingStatus.CREATED,
+                                lead_id=lead.id,
+                            )
+                        else:
+                            session.add(
+                                SmartTableSync(
+                                    lead_id=lead.id, source_message_id=message.message_id
+                                )
+                            )
                     else:
                         # 重试只使用持久化字段快照，禁止重新解析并改变首次线索的业务事实。
                         lead = existing_lead
                         fields = dict(lead.field_values)
-                    event.status = "processing"
-                    event.processing_started_at = utc_now()
-                    bind_log_context(lead_id=lead.id)
-                    # 会话提交后 ORM 对象会脱离；只将下一步需要的不可变标识带出事务。
-                    sales_user_id = message.sales_user_id
-                    lead_id = lead.id
+                    if temporary_capture is None:
+                        event.status = "processing"
+                        event.processing_started_at = utc_now()
+                        bind_log_context(lead_id=lead.id)
+                        # 会话提交后 ORM 对象会脱离；只将下一步需要的不可变标识带出事务。
+                        sales_user_id = message.sales_user_id
+                        lead_id = lead.id
 
+            if multi_company_fields is not None:
+                return self._consume_multi_companies_before_smart_table(
+                    outbox_event_id, multi_company_fields
+                )
             if multi_request is not None:
                 return self._create_multi_smart_table_records(multi_request)
             if ai_review is not None:
                 return self._sync_ai_review(ai_review)
             if context_update is not None:
                 return self._update_smart_table_record(context_update)
+            if temporary_capture is not None:
+                return temporary_capture
+            if company_initial_command is not None:
+                return self._consume_initial_company_before_smart_table(
+                    outbox_event_id, company_initial_command
+                )
             assert fields is not None
             return self._create_smart_table_record(sales_user_id, fields, lead_id, outbox_event_id)
         finally:
@@ -782,6 +1081,65 @@ class FirstTextLeadWorkspaceService:
                     sync.error_summary = type(error).__name__
             self._record_audit(session, event, "ai_review_failed_pending_review")
         logger.exception("ai_review_sync_failed", extra={"error_type": type(error).__name__})
+
+    def _consume_multi_companies_before_smart_table(
+        self, outbox_event_id: int, fields_by_segment: list[dict[str, str]]
+    ) -> LeadProcessingResult:
+        """在多客户消息的任何表格副作用前逐段完成公司决策与销售内去重。
+
+        参数：outbox_event_id 为已取得销售顺序检查点的事件；fields_by_segment 为原始分段字段。
+        返回值：按消息顺序返回所有最终 Lead 标识；temporary 分段没有 Smart Table record。
+        异常：公司解析、表格或数据库错误按既有 Outbox 重试语义传播或返回失败。
+        副作用：只为正式且未命中既有记录的分段首次入表；所有归属仍保留原分段序号。
+        """
+        if self._company_lead_service is None:
+            raise ValueError("缺少公司解析服务")
+        with self._session_factory() as session:
+            _, message = self._load_event_and_message(session, outbox_event_id)
+            source_message_id = message.message_id
+            sales_user_id = message.sales_user_id
+            message_text = message.normalized_text
+
+        decisions: list[tuple[CompanyUpsertCommand, CompanyUpsertResult]] = []
+        for segment_index, fields in enumerate(fields_by_segment):
+            command = CompanyUpsertCommand(
+                source_message_id=source_message_id,
+                source_segment_index=segment_index,
+                sales_user_id=sales_user_id,
+                fields={**fields, "线索来源": "展会"},
+                region_evidence=CompanyRegionEvidence(
+                    message_text=message_text,
+                    company_name=fields.get("线索名称"),
+                    email=fields.get("邮箱"),
+                    phone=fields.get("手机") or fields.get("电话"),
+                ),
+                defer_smart_table_sync=True,
+            )
+            # 先固定全部分段的唯一目标，避免任一分段的表格副作用早于其他分段的去重决策。
+            decisions.append((command, self._company_lead_service.upsert(command)))
+
+        lead_ids: list[str] = []
+        record_id: str | None = None
+        for command, company_result in decisions:
+            finalized = self._finish_company_decision_before_smart_table(
+                outbox_event_id, command, company_result
+            )
+            if finalized.status is LeadProcessingStatus.SYNC_FAILED:
+                return LeadProcessingResult(
+                    LeadProcessingStatus.SYNC_FAILED,
+                    lead_ids=tuple(lead_ids),
+                    company_resolution_applied=True,
+                )
+            lead_ids.append(finalized.lead_id or company_result.lead_id)
+            if record_id is None:
+                record_id = finalized.smart_table_record_id
+        return LeadProcessingResult(
+            LeadProcessingStatus.CREATED,
+            lead_id=lead_ids[0],
+            smart_table_record_id=record_id,
+            lead_ids=tuple(lead_ids),
+            company_resolution_applied=True,
+        )
 
     def _prepare_multi_leads(
         self,
@@ -1153,7 +1511,7 @@ class FirstTextLeadWorkspaceService:
             lead = session.get(Lead, request.lead_id)
             if lead is None:
                 raise ValueError(f"上下文更新线索不存在：{request.lead_id}")
-            self._mark_assigned(session, event, request.lead_id)
+            self._mark_assigned(session, event, request.lead_id, request.segment_index)
             self._refresh_context(session, message, request.lead_id)
             self._record_audit(session, event, "smart_table_context_updated")
         logger.info("smart_table_context_updated")

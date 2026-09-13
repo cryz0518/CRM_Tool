@@ -9,6 +9,8 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.companies.models import QCCCandidate, QCCLookupResult
+from app.companies.service import CompanyLeadService, MockQCCAdapter
 from app.leads.models import (
     Lead,
     LeadFieldProvenance,
@@ -294,3 +296,129 @@ def test_reassignment_never_overwrites_smart_table_manual_value(
     assert audit is not None
     assert audit.status == "succeeded"
     assert adapter.get_record(target_record_id).fields["手机"] == "13900000002"
+
+
+def test_multi_customer_same_sales_reuses_existing_company_before_table_side_effect(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证多客户分段命中同销售公司时不创建来源 Lead 或重复表格记录。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：重复 Lead、重复 record 或错误归属时由 pytest 报告。
+    副作用：先创建正式公司，再消费包含该公司和新公司的多客户消息。
+    """
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    qcc = MockQCCAdapter(
+        {
+            "客户甲": QCCLookupResult.matched(QCCCandidate("客户甲有限公司", "qcc-a")),
+            "客户乙": QCCLookupResult.matched(QCCCandidate("客户乙有限公司", "qcc-b")),
+        }
+    )
+    company_service = CompanyLeadService(session_factory, adapter, qcc)
+    workspace = FirstTextLeadWorkspaceService(
+        session_factory, adapter, company_lead_service=company_service
+    )
+    existing_event = persist_message(session_factory, "multi-existing", "sales-1", "客户：客户甲")
+    existing = workspace.consume(existing_event)
+    event_id = persist_message(
+        session_factory,
+        "multi-reuse",
+        "sales-1",
+        "客户：客户甲；联系人：李四\n客户：客户乙；联系人：王五",
+    )
+
+    result = workspace.consume(event_id)
+
+    assert result.lead_ids == (existing.lead_id, result.lead_ids[1])
+    assert len(adapter.get_records()) == 2
+    with session_factory() as session:
+        leads = session.scalars(select(Lead).where(Lead.lifecycle_state != "merged")).all()
+        resolutions = session.scalars(
+            select(LeadMessageResolution)
+            .where(LeadMessageResolution.message_id == "multi-reuse")
+            .order_by(LeadMessageResolution.segment_index)
+        ).all()
+    assert len(leads) == 2
+    assert [(item.segment_index, item.lead_id) for item in resolutions] == [
+        (0, existing.lead_id),
+        (1, result.lead_ids[1]),
+    ]
+
+
+def test_multi_customer_only_formal_segment_enters_smart_table(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证多客户消息中的未核验分段仅保留 temporary Lead，不创建同步事实。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：temporary 分段入表或正式分段缺失时由 pytest 报告。
+    副作用：消费一个含匹配公司与无 QCC 结果公司的多客户消息。
+    """
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    company_service = CompanyLeadService(
+        session_factory,
+        adapter,
+        MockQCCAdapter(
+            {"正式客户": QCCLookupResult.matched(QCCCandidate("正式客户有限公司", "qcc"))}
+        ),
+    )
+    event_id = persist_message(
+        session_factory,
+        "multi-temporary",
+        "sales-1",
+        "客户：正式客户；联系人：张三\n客户：待确认客户；联系人：李四",
+    )
+
+    result = FirstTextLeadWorkspaceService(
+        session_factory, adapter, company_lead_service=company_service
+    ).consume(event_id)
+
+    assert len(result.lead_ids) == 2
+    assert len(adapter.get_records()) == 1
+    with session_factory() as session:
+        leads = [session.get(Lead, lead_id) for lead_id in result.lead_ids]
+    assert leads[0] is not None and leads[0].smart_table_record_id is not None
+    assert leads[1] is not None and leads[1].lifecycle_state == "temporary"
+    assert leads[1].smart_table_record_id is None
+
+
+def test_multi_customer_different_sales_keep_company_records_isolated(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证多客户公司的标准名匹配严格限制在消息所属销售范围内。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：跨销售复用 Lead 或 record 时由 pytest 报告。
+    副作用：两名销售分别消费包含相同公司的多客户消息。
+    """
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    company_service = CompanyLeadService(
+        session_factory,
+        adapter,
+        MockQCCAdapter(
+            {"共同客户": QCCLookupResult.matched(QCCCandidate("共同客户有限公司", "qcc"))}
+        ),
+    )
+    workspace = FirstTextLeadWorkspaceService(
+        session_factory, adapter, company_lead_service=company_service
+    )
+    first_event = persist_message(
+        session_factory, "multi-sales-one", "sales-1", "客户：共同客户\n客户：无结果一"
+    )
+    second_event = persist_message(
+        session_factory, "multi-sales-two", "sales-2", "客户：共同客户\n客户：无结果二"
+    )
+
+    first = workspace.consume(first_event)
+    second = workspace.consume(second_event)
+
+    assert first.lead_ids[0] != second.lead_ids[0]
+    assert len(adapter.get_records()) == 2
+    with session_factory() as session:
+        first_lead = session.get(Lead, first.lead_ids[0])
+        second_lead = session.get(Lead, second.lead_ids[0])
+    assert first_lead is not None and first_lead.smart_table_owner_user_id == "sales-1"
+    assert second_lead is not None and second_lead.smart_table_owner_user_id == "sales-2"

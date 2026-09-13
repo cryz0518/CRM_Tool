@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 
@@ -106,6 +106,8 @@ class CompanyUpsertCommand:
     existing_lead_id: str | None = None
     region_evidence: CompanyRegionEvidence | None = None
     user_confirmed_company: bool = False
+    defer_smart_table_sync: bool = False
+    source_segment_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -117,3 +119,4 @@ class CompanyUpsertResult:
     lifecycle_state: str
     standard_company_name: str | None
     verification_status: CompanyVerificationStatus
+    smart_table_patch: dict[str, str] = field(default_factory=dict)
