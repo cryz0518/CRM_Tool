@@ -77,7 +77,7 @@ class AIGateway:
         self,
         provider: LLMProvider,
         *,
-        timeout_seconds: float = 20.0,
+        timeout_seconds: float = 60.0,
         retry_count: int = 1,
         high_confidence_threshold: float = 0.85,
         medium_confidence_threshold: float = 0.60,

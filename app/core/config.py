@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     qwen_api_key: str | None = None
     qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     qwen_model: str = "qwen3.7-flash"
-    ai_gateway_timeout_seconds: float = 20.0
+    ai_gateway_timeout_seconds: float = 60.0
     ai_gateway_retry_count: int = 1
     ai_high_confidence_threshold: float = 0.85
     ai_medium_confidence_threshold: float = 0.60
