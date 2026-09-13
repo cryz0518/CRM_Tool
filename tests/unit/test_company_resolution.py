@@ -174,7 +174,7 @@ def test_salesperson_can_confirm_only_own_temporary_lead_without_llm(
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
-    异常：确认绕过销售边界、未留下未核验审计状态或未创建正式 record 时由 pytest 报告。
+    异常：确认绕过销售边界或未留下未核验审计状态时由 pytest 报告。
     副作用：创建 temporary Lead 后执行一次确定性人工公司确认。
     """
     persist_source_message(session_factory, "confirm-temporary", "sales-1")
@@ -195,11 +195,20 @@ def test_salesperson_can_confirm_only_own_temporary_lead_without_llm(
     assert confirmed.lead_id == temporary.lead_id
     assert confirmed.standard_company_name == "上海智造"
     assert confirmed.verification_status.value == "user_confirmed_unverified"
-    assert confirmed.smart_table_record_id is not None
+    # 公司服务只完成决策；首次入表必须由工作区服务统一走 T09 边界。
+    assert confirmed.smart_table_record_id is None
     with session_factory() as session:
         lead = session.get(Lead, confirmed.lead_id)
+        provenance = session.scalar(
+            select(LeadFieldProvenance).where(
+                LeadFieldProvenance.lead_id == confirmed.lead_id,
+                LeadFieldProvenance.field_name == "线索名称",
+                LeadFieldProvenance.is_user_confirmed.is_(True),
+            )
+        )
     assert lead is not None
     assert lead.company_confirmed_by_user is True
+    assert provenance is not None
 
 
 def test_temporary_confirmation_keeps_original_lead_when_same_sales_company_exists(

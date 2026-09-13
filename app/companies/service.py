@@ -198,7 +198,7 @@ class CompanyLeadService:
         返回值：保存确认事实后的公司处理结果。
         异常：线索不存在、非本人、非 temporary 或名称为空时抛出 ValueError 或 PermissionError。
         副作用：写入 company_confirmed_by_user 与 user_confirmed_unverified，
-        并在需要时首次创建表格记录。
+        返回延迟表格同步的公司决策，供工作区服务统一执行 T09 边界。
         """
         normalized_company_name = company_name.strip()
         if not normalized_company_name:
@@ -219,6 +219,8 @@ class CompanyLeadService:
                 fields=fields,
                 existing_lead_id=lead_id,
                 user_confirmed_company=True,
+                defer_smart_table_sync=True,
+                source_segment_index=lead.source_segment_index,
             )
         )
 
@@ -321,6 +323,8 @@ class CompanyLeadService:
             if merge_target is not None and lead is not None:
                 if lead.smart_table_record_id is None:
                     # A' temporary 尚无表格副作用，因此保留它作为生命周期主体并迁移既有正式目标。
+                    temporary_fields = dict(lead.field_values)
+                    existing_fields = dict(merge_target.field_values)
                     self._transfer_existing_lead_to_temporary(session, merge_target, lead)
                     transferred_fields = {
                         **merge_target.field_values,
@@ -330,6 +334,14 @@ class CompanyLeadService:
                     table_patch = self._merge_patch(
                         session, lead, transferred_fields, command.source_message_id
                     )
+                    for field_name, value in temporary_fields.items():
+                        if (
+                            field_name != "线索名称"
+                            and value
+                            and not existing_fields.get(field_name)
+                        ):
+                            # 原 record 尚无该字段时才补入；最终仍由 T09 回读决定是否写入。
+                            table_patch.setdefault(field_name, value)
                     target = lead
                 else:
                     # 兼容历史已入表 temporary：不能静默留下第二条 record，沿用原有保守合并行为。
@@ -419,6 +431,7 @@ class CompanyLeadService:
                 created = False
             if command.user_confirmed_company:
                 # 确认是受控命令事实，不得由 QCC 或后续模型输出替代或推断。
+                self._record_user_confirmed_company_provenance(session, lead, command)
                 self._record_audit(session, command, "company_user_confirmation_recorded")
             session.flush()
             lead_id = lead.id
@@ -547,6 +560,7 @@ class CompanyLeadService:
             fields["线索名称"] = standard_name
         lead = Lead(
             source_message_id=command.source_message_id,
+            source_segment_index=command.source_segment_index,
             original_capturing_sales_user_id=command.sales_user_id,
             smart_table_owner_user_id=command.sales_user_id,
             lifecycle_state=self._lifecycle_state(fields, standard_name),
@@ -580,6 +594,40 @@ class CompanyLeadService:
             extra={"message_id": command.source_message_id, "lead_id": lead.id},
         )
         return lead
+
+    @staticmethod
+    def _record_user_confirmed_company_provenance(
+        session: Session, lead: Lead, command: CompanyUpsertCommand
+    ) -> None:
+        """为受控公司确认保存可追溯的人工作为字段来源。
+
+        参数：session 为当前事务；lead 为确认后的生命周期主体；command 为确认命令。
+        返回值：无。
+        异常：数据库约束异常由 SQLAlchemy 抛出。
+        副作用：必要时新增一条“线索名称”的人工确认来源，重试不会重复新增。
+        """
+        value = lead.field_values.get("线索名称")
+        if not value:
+            return
+        existing = session.scalar(
+            select(LeadFieldProvenance).where(
+                LeadFieldProvenance.lead_id == lead.id,
+                LeadFieldProvenance.source_message_id == command.source_message_id,
+                LeadFieldProvenance.field_name == "线索名称",
+                LeadFieldProvenance.value == value,
+                LeadFieldProvenance.is_user_confirmed.is_(True),
+            )
+        )
+        if existing is None:
+            session.add(
+                LeadFieldProvenance(
+                    lead_id=lead.id,
+                    source_message_id=command.source_message_id,
+                    field_name="线索名称",
+                    value=value,
+                    is_user_confirmed=True,
+                )
+            )
 
     def _merge_patch(
         self, session: Session, lead: Lead, incoming: Mapping[str, str], source_message_id: str

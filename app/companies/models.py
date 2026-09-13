@@ -107,6 +107,7 @@ class CompanyUpsertCommand:
     region_evidence: CompanyRegionEvidence | None = None
     user_confirmed_company: bool = False
     defer_smart_table_sync: bool = False
+    source_segment_index: int = 0
 
 
 @dataclass(frozen=True)
