@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.crm.adapter import CRMAdapter
 from app.crm.service import CrmSubmissionService, SubmissionBatchResult, SubmissionCommand
+from app.leads.models import CrmSyncRecord
 from app.messaging.models import IncomingMessage, NotificationRecord, OutboxEvent
 from app.smart_table.adapter import SmartTableAdapter
 
@@ -40,7 +42,15 @@ def consume_submission_command(
     with session_factory.begin() as session:
         event = session.get(OutboxEvent, outbox_event_id)
         if event is not None:
-            event.status = "succeeded"
+            retrying = session.scalar(
+                select(CrmSyncRecord.id)
+                .where(
+                    CrmSyncRecord.status == "retrying",
+                    CrmSyncRecord.submitting_sales_user_id == command.sales_user_id,
+                )
+                .limit(1)
+            )
+            event.status = "retrying" if retrying is not None else "succeeded"
         key = f"crm-submission:{command.request_message_id}"
         if session.get(NotificationRecord, key) is None:
             session.add(
@@ -66,6 +76,6 @@ def format_submission_reply(result: SubmissionBatchResult) -> str:
     if result.updates_not_implemented:
         return "提交我的更新将在 T13 实现；本次未调用 CRM。"
     return (
-        f"CRM 提交结果：创建成功 {result.succeeded} 条；待完善 {result.incomplete} 条；"
-        f"可重试失败 {result.failed} 条。"
+        f"CRM 提交结果：创建成功 {result.succeeded} 条；待完善或待明确确认 {result.incomplete} 条；"
+        f"提交处理中或可重试失败 {result.failed} 条；需人工处理失败 0 条。"
     )

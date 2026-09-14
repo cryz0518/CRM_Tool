@@ -31,11 +31,18 @@ class WecomOutboundNotificationSender:
         with self._session_factory() as session:
             notices = session.scalars(
                 select(NotificationRecord).where(
-                    NotificationRecord.status.in_(("pending", "retrying"))
+                    NotificationRecord.notification_type == "crm_submission_summary",
+                    NotificationRecord.status.in_(("pending", "retrying")),
                 )
             ).all()
         sent = 0
         for notice in notices:
+            with self._session_factory.begin() as session:
+                current = session.get(NotificationRecord, notice.notification_key)
+                if current is None or current.status not in {"pending", "retrying"}:
+                    continue
+                # 先原子认领，避免多个 Bot 循环重复发送同一通知。
+                current.status = "processing"
             try:
                 await self._client.send_message(
                     notice.sales_user_id,

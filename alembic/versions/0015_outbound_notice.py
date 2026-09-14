@@ -6,7 +6,7 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "0015_outbound_notification_content"
+revision = "0015_outbound_notice"
 down_revision = "0014_crm_sync"
 branch_labels = None
 depends_on = None

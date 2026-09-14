@@ -218,7 +218,10 @@ def test_submission_reply_is_count_only_and_update_mentions_t13() -> None:
     )
     update_reply = format_submission_reply(SubmissionBatchResult(updates_not_implemented=True))
 
-    assert create_reply == "CRM 提交结果：创建成功 1 条；待完善 2 条；可重试失败 1 条。"
+    assert create_reply == (
+        "CRM 提交结果：创建成功 1 条；待完善或待明确确认 2 条；"
+        "提交处理中或可重试失败 1 条；需人工处理失败 0 条。"
+    )
     assert "手机号" not in create_reply and "payload" not in create_reply.lower()
     assert update_reply == "提交我的更新将在 T13 实现；本次未调用 CRM。"
 
