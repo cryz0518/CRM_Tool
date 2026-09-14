@@ -9,12 +9,22 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.crm.commands import format_submission_reply
+from app.crm.commands import (
+    consume_submission_command,
+    format_submission_reply,
+    notification_key_for_message,
+)
 from app.crm.mock import MockCRMAdapter
 from app.crm.service import CrmSubmissionService, SubmissionCommand
 from app.leads.models import CrmSyncRecord, Lead, LeadFieldProvenance
 from app.leads.review import LeadReviewService
-from app.messaging.models import Base, IncomingMessage, SalesAuthorization
+from app.messaging.models import (
+    Base,
+    IncomingMessage,
+    NotificationRecord,
+    OutboxEvent,
+    SalesAuthorization,
+)
 from app.smart_table.adapter import SmartTableActor
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.registry import build_required_smart_table_schema
@@ -265,3 +275,53 @@ def test_submission_reconcile_keeps_sales_edit_and_clears_its_pending_marker(
     assert reconciled.blocking_fields == ()
     record = adapter.get_record(record_id)
     assert record is not None and record.fields["AI待确认"] == ["客户行业"]
+
+
+def test_mock_crm_idempotency_is_stable_across_adapter_instances() -> None:
+    """验证独立 Mock 适配器实例对同一键返回相同 CRM identity。"""
+    payload = {"线索名称": "公司", "业务线": "协作机器人", "手机": "13800000000"}
+    first = MockCRMAdapter().create_lead(
+        payload, idempotency_key="crm:create:lead-1", crm_user_id="crm-1"
+    )
+    second = MockCRMAdapter().create_lead(
+        payload, idempotency_key="crm:create:lead-1", crm_user_id="crm-1"
+    )
+    assert first.crm_lead_id == second.crm_lead_id
+
+
+def test_long_message_id_uses_bounded_notification_key() -> None:
+    """验证 128 字符消息标识能够生成固定长度通知键。"""
+    assert len(notification_key_for_message("m" * 128)) == 64
+
+
+def test_replayed_command_restores_persisted_success_to_notification_summary(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证通知入库前中断后，命令恢复仍汇总原 CRM 成功事实。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    crm = MockCRMAdapter()
+    CrmSubmissionService(session_factory, adapter, crm).submit(
+        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+    )
+    with session_factory.begin() as session:
+        message = session.get(IncomingMessage, "message-12")
+        assert message is not None
+        message.normalized_text = "提交今天的线索"
+        event = OutboxEvent(
+            message_id="message-12",
+            sales_user_id="sales-1",
+            sequence=1,
+            event_type="crm_submission_command",
+            status="processing",
+        )
+        session.add(event)
+        session.flush()
+        event_id = event.id
+    reply = consume_submission_command(session_factory, adapter, crm, event_id)
+    assert "创建成功 1 条" in reply
+    with session_factory() as session:
+        assert (
+            session.get(NotificationRecord, notification_key_for_message("message-12")) is not None
+        )
+        assert session.get(Lead, lead_id).lifecycle_state == "synced"  # type: ignore[union-attr]

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
@@ -33,6 +33,7 @@ _BUSINESS_COMPLETENESS_FIELDS = (
     "备注",
 )
 _CONTACT_FIELDS = ("手机", "电话", "邮箱")
+_CRM_PROCESSING_LEASE = timedelta(minutes=5)
 
 
 @dataclass(frozen=True)
@@ -223,7 +224,12 @@ class CrmSubmissionService:
             )
             if sync is None:
                 return "failed_pending_review"
-            if sync.status not in {"pending", "retrying"}:
+            lease_expired = (
+                sync.status == "processing"
+                and sync.processing_lease_expires_at is not None
+                and self._as_utc(sync.processing_lease_expires_at) <= utc_now()
+            )
+            if sync.status not in {"pending", "retrying"} and not lease_expired:
                 return sync.status
             if sync.attempts >= self._crm_create_retry_count:
                 # 尝试次数达到上限后保留冻结操作供人工处理，禁止无限重试。
@@ -232,6 +238,8 @@ class CrmSubmissionService:
                 return "failed_pending_review"
             sync.status = "processing"
             sync.attempts += 1
+            sync.processing_started_at = utc_now()
+            sync.processing_lease_expires_at = sync.processing_started_at + _CRM_PROCESSING_LEASE
             payload = dict(sync.canonical_payload)
             idempotency_key = sync.idempotency_key
             crm_user_id = sync.submitting_crm_user_id
@@ -245,6 +253,8 @@ class CrmSubmissionService:
                 sync = session.get(CrmSyncRecord, sync_id)
                 if sync is not None:
                     sync.status = "retrying"
+                    sync.processing_started_at = None
+                    sync.processing_lease_expires_at = None
                     sync.response_summary = "CRM transport error"
             return "retrying"
         except Exception:
@@ -252,6 +262,8 @@ class CrmSubmissionService:
                 sync = session.get(CrmSyncRecord, sync_id)
                 if sync is not None:
                     sync.status = "failed_pending_review"
+                    sync.processing_started_at = None
+                    sync.processing_lease_expires_at = None
                     sync.response_summary = "CRM create failed"
             return "failed_pending_review"
 
@@ -261,6 +273,8 @@ class CrmSubmissionService:
             if sync is None or lead is None:
                 return "failed_pending_review"
             sync.status = "succeeded"
+            sync.processing_started_at = None
+            sync.processing_lease_expires_at = None
             sync.crm_lead_id = crm_result.crm_lead_id
             sync.crm_lead_owner_user_id = crm_result.crm_lead_owner_user_id
             sync.response_summary = crm_result.response_summary[:256]
@@ -268,6 +282,11 @@ class CrmSubmissionService:
             lead.lifecycle_state = "synced"
             self._record_audit_for_sync(session, sync, sales_user_id, "crm_create_succeeded")
         return "succeeded"
+
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        """将数据库返回的处理租约时间统一解释为 UTC。"""
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
     @staticmethod
     def _canonical_payload(fields: dict[str, object]) -> dict[str, object]:

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.messaging.models import NotificationRecord, utc_now
@@ -32,7 +33,13 @@ class WecomOutboundNotificationSender:
             notices = session.scalars(
                 select(NotificationRecord).where(
                     NotificationRecord.notification_type == "crm_submission_summary",
-                    NotificationRecord.status.in_(("pending", "retrying")),
+                    or_(
+                        NotificationRecord.status.in_(("pending", "retrying")),
+                        and_(
+                            NotificationRecord.status == "processing",
+                            NotificationRecord.processing_lease_expires_at <= utc_now(),
+                        ),
+                    ),
                 )
             ).all()
         sent = 0
@@ -43,10 +50,22 @@ class WecomOutboundNotificationSender:
                     .where(NotificationRecord.notification_key == notice.notification_key)
                     .with_for_update()
                 )
-                if current is None or current.status not in {"pending", "retrying"}:
+                lease_expired = (
+                    current is not None
+                    and current.status == "processing"
+                    and current.processing_lease_expires_at is not None
+                    and _as_utc(current.processing_lease_expires_at) <= utc_now()
+                )
+                if current is None or (
+                    current.status not in {"pending", "retrying"} and not lease_expired
+                ):
                     continue
                 # 先原子认领，避免多个 Bot 循环重复发送同一通知。
                 current.status = "processing"
+                current.processing_started_at = utc_now()
+                current.processing_lease_expires_at = current.processing_started_at + timedelta(
+                    minutes=5
+                )
             try:
                 await self._client.send_message(
                     notice.sales_user_id,
@@ -57,13 +76,22 @@ class WecomOutboundNotificationSender:
                     current = session.get(NotificationRecord, notice.notification_key)
                     if current is not None:
                         current.status = "retrying"
+                        current.processing_started_at = None
+                        current.processing_lease_expires_at = None
                         current.attempts += 1
                 continue
             with self._session_factory.begin() as session:
                 current = session.get(NotificationRecord, notice.notification_key)
                 if current is not None:
                     current.status = "succeeded"
+                    current.processing_started_at = None
+                    current.processing_lease_expires_at = None
                     current.attempts += 1
                     current.sent_at = utc_now()
             sent += 1
         return sent
+
+
+def _as_utc(value: datetime) -> datetime:
+    """将数据库返回的时间统一解释为 UTC，以兼容 SQLite 测试存储。"""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)

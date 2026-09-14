@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -45,21 +47,23 @@ def consume_submission_command(
         # 命令编排失败需要有界结束，不能永久占住同销售的消息顺序检查点。
         _record_command_failure(session_factory, outbox_event_id)
         return "CRM 提交任务暂时失败，系统将自动重试；请勿重复提交。"
+    # 重放时必须将本请求已成功的同步事实重新计入汇总，不能因 Lead 已 synced 漏报成功。
+    result = _include_persisted_results(session_factory, command, result)
     reply = format_submission_reply(result)
     with session_factory.begin() as session:
         event = session.get(OutboxEvent, outbox_event_id)
         if event is not None:
-            retrying = session.scalar(
+            retrying_or_processing = session.scalar(
                 select(CrmSyncRecord.id)
                 .where(
-                    CrmSyncRecord.status == "retrying",
+                    CrmSyncRecord.status.in_(("retrying", "processing")),
                     # 仅以本命令冻结的同步记录决定其 Outbox 状态，禁止串到同销售的其他命令。
                     CrmSyncRecord.request_message_id == command.request_message_id,
                 )
                 .limit(1)
             )
-            event.status = "retrying" if retrying is not None else "succeeded"
-        key = f"crm-submission:{command.request_message_id}"
+            event.status = "retrying" if retrying_or_processing is not None else "succeeded"
+        key = notification_key_for_message(command.request_message_id)
         if session.get(NotificationRecord, key) is None:
             session.add(
                 NotificationRecord(
@@ -71,6 +75,51 @@ def consume_submission_command(
                 )
             )
     return reply
+
+
+def notification_key_for_message(message_id: str) -> str:
+    """为 CRM 提交通知生成带命名空间的固定长度 SHA-256 键。
+
+    参数：message_id 为企业微信来源消息标识。
+    返回值：不超过 notification_key 列限制的 64 位十六进制键。
+    异常：无。
+    副作用：无。
+    """
+    return hashlib.sha256(f"crm_submission_notification:{message_id}".encode()).hexdigest()
+
+
+def _include_persisted_results(
+    session_factory: sessionmaker[Session],
+    command: SubmissionCommand,
+    result: SubmissionBatchResult,
+) -> SubmissionBatchResult:
+    """将同一请求已冻结的 CRM 同步状态补入重放汇总。
+
+    参数：session_factory 读取持久化事实；command 标识本次提交；result 为本轮处理结果。
+    返回值：首次或恢复执行均可使用的确定性汇总。
+    异常：数据库读取错误向调用方传播。
+    副作用：仅读取 CRM 同步记录。
+    """
+    with session_factory() as session:
+        statuses = session.scalars(
+            select(CrmSyncRecord.status).where(
+                CrmSyncRecord.request_message_id == command.request_message_id
+            )
+        ).all()
+    # 本轮实际成功已经在 result 中，不应被同一持久化记录再次累计。
+    if result.succeeded:
+        return result
+    return SubmissionBatchResult(
+        succeeded=statuses.count("succeeded"),
+        incomplete=result.incomplete,
+        retrying=max(result.retrying, statuses.count("retrying")),
+        processing=max(result.processing, statuses.count("processing")),
+        failed_pending_review=max(
+            result.failed_pending_review, statuses.count("failed_pending_review")
+        ),
+        updates_not_implemented=result.updates_not_implemented,
+        incomplete_lead_ids=result.incomplete_lead_ids,
+    )
 
 
 def _record_command_failure(session_factory: sessionmaker[Session], outbox_event_id: int) -> None:

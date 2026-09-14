@@ -211,6 +211,8 @@ class CrmSyncRecord(Base):
     crm_lead_owner_user_id: Mapped[str | None] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     response_summary: Mapped[str | None] = mapped_column(String(256))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False

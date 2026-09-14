@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.messaging.models import Base, NotificationRecord
+from app.messaging.models import Base, NotificationRecord, utc_now
 from app.notifications.outbound import WecomOutboundNotificationSender
 
 
@@ -84,3 +85,24 @@ def test_notification_failure_is_retryable_without_duplicate_business_work() -> 
         assert notice is not None
         assert notice.status == "retrying"
         assert notice.attempts == 1
+
+
+def test_expired_processing_notification_is_reclaimed() -> None:
+    """验证 Bot 崩溃遗留的过期通知可重新发送。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    factory = sessionmaker(engine)
+    Base.metadata.create_all(engine)
+    with factory.begin() as session:
+        session.add(
+            NotificationRecord(
+                notification_key="n-3",
+                sales_user_id="sales-3",
+                source_message_id="message-3",
+                notification_type="crm_submission_summary",
+                status="processing",
+                processing_lease_expires_at=utc_now() - timedelta(minutes=1),
+                content="完成",
+            )
+        )
+    sender = WecomOutboundNotificationSender(factory, FakeClient())
+    assert asyncio.run(sender.send_pending_once()) == 1
