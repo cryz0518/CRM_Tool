@@ -126,6 +126,7 @@ class NotificationRecord(Base):
     sales_user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     source_message_id: Mapped[str] = mapped_column(String(128), nullable=False)
     notification_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    content: Mapped[str | None] = mapped_column(String(512))
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     provider_message_id: Mapped[str | None] = mapped_column(String(128))

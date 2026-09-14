@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.crm.adapter import CRMAdapter
 from app.crm.service import CrmSubmissionService, SubmissionBatchResult, SubmissionCommand
-from app.messaging.models import IncomingMessage, OutboxEvent
+from app.messaging.models import IncomingMessage, NotificationRecord, OutboxEvent
 from app.smart_table.adapter import SmartTableAdapter
 
 
@@ -36,11 +36,23 @@ def consume_submission_command(
             request_message_id=message.message_id,
         )
     result = CrmSubmissionService(session_factory, smart_table_adapter, crm_adapter).submit(command)
+    reply = format_submission_reply(result)
     with session_factory.begin() as session:
         event = session.get(OutboxEvent, outbox_event_id)
         if event is not None:
             event.status = "succeeded"
-    return format_submission_reply(result)
+        key = f"crm-submission:{command.request_message_id}"
+        if session.get(NotificationRecord, key) is None:
+            session.add(
+                NotificationRecord(
+                    notification_key=key,
+                    sales_user_id=command.sales_user_id,
+                    source_message_id=command.request_message_id,
+                    notification_type="crm_submission_summary",
+                    content=reply,
+                )
+            )
+    return reply
 
 
 def format_submission_reply(result: SubmissionBatchResult) -> str:
