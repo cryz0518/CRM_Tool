@@ -45,8 +45,7 @@ def consume_submission_command(
         result = service.submit(command)
     except Exception:
         # 命令编排失败需要有界结束，不能永久占住同销售的消息顺序检查点。
-        _record_command_failure(session_factory, outbox_event_id)
-        return "CRM 提交任务暂时失败，系统将自动重试；请勿重复提交。"
+        return _record_command_failure(session_factory, outbox_event_id, command)
     # 重放时必须将本请求已成功的同步事实重新计入汇总，不能因 Lead 已 synced 漏报成功。
     result = _include_persisted_results(session_factory, command, result)
     reply = format_submission_reply(result)
@@ -88,6 +87,13 @@ def notification_key_for_message(message_id: str) -> str:
     return hashlib.sha256(f"crm_submission_notification:{message_id}".encode()).hexdigest()
 
 
+def terminal_failure_notification_key_for_message(message_id: str) -> str:
+    """为命令终态失败通知生成与成功汇总隔离的固定长度键。"""
+    return hashlib.sha256(
+        f"crm_submission_terminal_failure:{message_id}".encode()
+    ).hexdigest()
+
+
 def _include_persisted_results(
     session_factory: sessionmaker[Session],
     command: SubmissionCommand,
@@ -122,25 +128,45 @@ def _include_persisted_results(
     )
 
 
-def _record_command_failure(session_factory: sessionmaker[Session], outbox_event_id: int) -> None:
+def _record_command_failure(
+    session_factory: sessionmaker[Session], outbox_event_id: int, command: SubmissionCommand
+) -> str:
     """记录一次命令编排失败，并在重试耗尽后释放销售顺序检查点。
 
     参数：session_factory 提供事务；outbox_event_id 为已认领的命令事件。
-    返回值：无。
+    返回值：可安全发送给销售的失败摘要。
     异常：数据库写入错误向 Worker 传播。
     副作用：增加尝试次数并置为 retrying 或 failed_pending_review。
     """
     with session_factory.begin() as session:
-        event = session.get(OutboxEvent, outbox_event_id)
+        event = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.id == outbox_event_id).with_for_update()
+        )
         if event is None:
-            return
+            raise ValueError("CRM 提交命令 Outbox 不存在")
         event.attempts += 1
         # 配置值表示额外重试次数；耗尽后该命令成为完成检查点，后续消息可继续。
-        event.status = (
-            "failed_pending_review"
-            if event.attempts > get_settings().lead_message_retry_count
-            else "retrying"
+        if event.attempts <= get_settings().lead_message_retry_count:
+            event.status = "retrying"
+            return "CRM 提交任务暂时失败，系统将自动重试；请勿重复提交。"
+        reply = (
+            "本次线索提交未能完成，需要人工处理。"
+            "已成功提交：0 条；待完善：0 条；需人工处理：1 条。"
         )
+        key = terminal_failure_notification_key_for_message(command.request_message_id)
+        if session.get(NotificationRecord, key) is None:
+            # 通知插入与命令终态在同一事务；插入失败会回滚，命令仍可由 lease 恢复。
+            session.add(
+                NotificationRecord(
+                    notification_key=key,
+                    sales_user_id=command.sales_user_id,
+                    source_message_id=command.request_message_id,
+                    notification_type="crm_submission_summary",
+                    content=reply,
+                )
+            )
+        event.status = "failed_pending_review"
+        return reply
 
 
 def format_submission_reply(result: SubmissionBatchResult) -> str:

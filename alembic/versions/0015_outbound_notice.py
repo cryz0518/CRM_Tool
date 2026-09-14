@@ -15,7 +15,9 @@ depends_on = None
 def upgrade() -> None:
     """为通知记录增加持久化的脱敏发送正文。"""
     op.add_column("notification_records", sa.Column("content", sa.String(length=512)))
-    op.add_column("notification_records", sa.Column("processing_started_at", sa.DateTime(timezone=True)))
+    op.add_column(
+        "notification_records", sa.Column("processing_started_at", sa.DateTime(timezone=True))
+    )
     op.add_column(
         "notification_records", sa.Column("processing_lease_expires_at", sa.DateTime(timezone=True))
     )

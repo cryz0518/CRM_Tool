@@ -13,6 +13,7 @@ from app.crm.commands import (
     consume_submission_command,
     format_submission_reply,
     notification_key_for_message,
+    terminal_failure_notification_key_for_message,
 )
 from app.crm.mock import MockCRMAdapter
 from app.crm.service import CrmSubmissionService, SubmissionCommand
@@ -325,3 +326,39 @@ def test_replayed_command_restores_persisted_success_to_notification_summary(
             session.get(NotificationRecord, notification_key_for_message("message-12")) is not None
         )
         assert session.get(Lead, lead_id).lifecycle_state == "synced"  # type: ignore[union-attr]
+
+
+def test_terminal_command_failure_persists_notification_before_terminal_status(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证编排异常耗尽重试后先持久化销售失败通知再结束命令。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    _lead(session_factory, adapter)
+    with session_factory.begin() as session:
+        message = session.get(IncomingMessage, "message-12")
+        assert message is not None
+        message.normalized_text = "提交今天的线索"
+        event = OutboxEvent(
+            message_id="message-12",
+            sales_user_id="sales-1",
+            sequence=1,
+            event_type="crm_submission_command",
+        )
+        session.add(event)
+        session.flush()
+        event_id = event.id
+
+    def broken_submit(self: object, command: object) -> object:
+        """模拟提交服务发生不可预期编排异常。"""
+        raise RuntimeError("internal")
+
+    monkeypatch.setattr(CrmSubmissionService, "submit", broken_submit)
+    consume_submission_command(session_factory, adapter, MockCRMAdapter(), event_id)
+    consume_submission_command(session_factory, adapter, MockCRMAdapter(), event_id)
+    with session_factory() as session:
+        event = session.get(OutboxEvent, event_id)
+        notice = session.get(
+            NotificationRecord, terminal_failure_notification_key_for_message("message-12")
+        )
+        assert event is not None and event.status == "failed_pending_review"
+        assert notice is not None and "需要人工处理" in (notice.content or "")
