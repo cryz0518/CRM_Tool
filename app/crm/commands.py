@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
@@ -149,9 +149,16 @@ def _record_command_failure(
         if event.attempts <= get_settings().lead_message_retry_count:
             event.status = "retrying"
             return "CRM 提交任务暂时失败，系统将自动重试；请勿重复提交。"
+        succeeded = session.scalar(
+            select(func.count())
+            .where(
+                CrmSyncRecord.request_message_id == command.request_message_id,
+                CrmSyncRecord.status == "succeeded",
+            )
+        )
         reply = (
             "本次线索提交未能完成，需要人工处理。"
-            "已成功提交：0 条；待完善：0 条；需人工处理：1 条。"
+            f"已成功提交：{succeeded or 0} 条；待完善：0 条；需人工处理：1 条。"
         )
         key = terminal_failure_notification_key_for_message(command.request_message_id)
         if session.get(NotificationRecord, key) is None:
