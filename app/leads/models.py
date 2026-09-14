@@ -228,6 +228,14 @@ class CrmSyncRecord(Base):
             postgresql_where=(operation == "create"),
             sqlite_where=(operation == "create"),
         ),
+        Index(
+            "uq_crm_sync_records_update_snapshot",
+            "lead_id",
+            "snapshot_hash",
+            unique=True,
+            postgresql_where=(operation == "update"),
+            sqlite_where=(operation == "update"),
+        ),
     )
 
 

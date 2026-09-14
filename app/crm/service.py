@@ -236,6 +236,15 @@ class CrmSubmissionService:
                             },
                         )
                     )
+                    _LOGGER.info(
+                        "crm_submission_event=company_identity_change_pending_review "
+                        "request_id=%s message_id=%s lead_id=%s record_id=%s wecom_user_id=%s",
+                        command.request_message_id,
+                        command.request_message_id,
+                        lead.id,
+                        lead.smart_table_record_id,
+                        command.sales_user_id,
+                    )
             return "company_identity_review"
         snapshot_hash = self._snapshot_hash(payload)
         if payload == previous:
@@ -393,6 +402,10 @@ class CrmSubmissionService:
                 session.flush()
                 if operation == "create" and identity is not None:
                     identity.creating_sync_record_id = sync.id
+                elif operation == "update":
+                    self._record_audit_for_sync(
+                        session, sync, command.sales_user_id, "crm_update_created"
+                    )
                 sync_id = sync.id
         except IntegrityError:
             # 只作为最后一层兜底；正常唯一键竞争会在 savepoint 中恢复并返回 processing。
