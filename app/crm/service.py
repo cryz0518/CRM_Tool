@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.crm.adapter import CRMAdapter
-from app.leads.models import CrmSyncRecord, Lead
+from app.leads.models import CrmCompanyIdentity, CrmSyncRecord, Lead
 from app.leads.review import LeadReviewService
 from app.messaging.models import BusinessAuditEvent, SalesAuthorization, utc_now
 from app.smart_table.adapter import SmartTableAdapter
@@ -187,6 +187,18 @@ class CrmSubmissionService:
             latest = self._last_successful_sync(session, lead_id)
             if latest is None or latest.crm_lead_id is None:
                 return "incomplete"
+            # 未完成 update 是冻结事实，必须优先恢复，不能先读表并换掉 payload。
+            unfinished = session.scalar(
+                select(CrmSyncRecord)
+                .where(
+                    CrmSyncRecord.lead_id == lead_id,
+                    CrmSyncRecord.operation == "update",
+                    CrmSyncRecord.status.in_(("pending", "retrying", "processing")),
+                )
+                .order_by(CrmSyncRecord.id.asc())
+            )
+            if unfinished is not None:
+                return self._claim_and_call(unfinished.id, command.sales_user_id)
         reconciled = LeadReviewService(
             self._session_factory, self._smart_table_adapter
         ).reconcile_submission(lead_id)
@@ -305,8 +317,25 @@ class CrmSubmissionService:
                 )
                 if existing is not None:
                     return "incomplete" if existing.status == "succeeded" else existing.status
-                # CRM 层全局去重只读取已成功持久化的同步事实，绝不扫描另一销售的表格。
-                target = self._global_crm_identity(session, lead.standard_company_name)
+                # 以唯一公司预留锁住首次创建；其他销售绝不能在 reserving 时另建 CRM Lead。
+                company_name = lead.standard_company_name
+                if not company_name:
+                    return "incomplete"
+                identity = session.get(CrmCompanyIdentity, company_name)
+                if identity is not None and identity.state == "reserving":
+                    return "processing"
+                if identity is not None and identity.state == "failed_pending_review":
+                    return "failed_pending_review"
+                target = self._global_crm_identity(session, company_name)
+                if identity is None and target is None:
+                    identity = CrmCompanyIdentity(
+                        standard_company_name=company_name, creating_lead_id=lead.id
+                    )
+                    session.add(identity)
+                    session.flush()
+                    self._record_audit(session, command, "crm_global_identity_reserved")
+                elif identity is not None and identity.state == "active":
+                    self._record_audit(session, command, "crm_global_identity_reused")
                 operation = "update" if target is not None else "create"
                 idempotency_key = (
                     f"crm:update:{lead.id}:{snapshot_hash}"
@@ -331,6 +360,8 @@ class CrmSubmissionService:
                 )
                 session.add(sync)
                 session.flush()
+                if operation == "create" and identity is not None:
+                    identity.creating_sync_record_id = sync.id
                 sync_id = sync.id
         except IntegrityError:
             # 并发创建只能有一个胜者；另一个调用不允许再触发 CRM。
@@ -412,6 +443,16 @@ class CrmSubmissionService:
                 sync.crm_lead_owner_user_id = crm_result.crm_lead_owner_user_id
             sync.response_summary = crm_result.response_summary[:256]
             sync.completed_at = utc_now()
+            if sync.operation == "create":
+                identity = session.scalar(
+                    select(CrmCompanyIdentity)
+                    .where(CrmCompanyIdentity.creating_sync_record_id == sync.id)
+                    .with_for_update()
+                )
+                if identity is not None:
+                    identity.state = "active"
+                    identity.crm_lead_id = sync.crm_lead_id
+                    identity.crm_lead_owner_user_id = sync.crm_lead_owner_user_id
             lead.lifecycle_state = "synced"
             self._record_audit_for_sync(
                 session, sync, sales_user_id, f"crm_{sync.operation}_succeeded"

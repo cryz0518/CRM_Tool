@@ -21,8 +21,20 @@ def upgrade() -> None:
         unique=True,
         postgresql_where=sa.text("operation = 'update'"),
     )
+    op.create_table(
+        "crm_company_identities",
+        sa.Column("standard_company_name", sa.String(length=512), primary_key=True),
+        sa.Column("crm_lead_id", sa.String(length=128)),
+        sa.Column("crm_lead_owner_user_id", sa.String(length=128)),
+        sa.Column("state", sa.String(length=32), nullable=False, server_default="reserving"),
+        sa.Column("creating_lead_id", sa.String(length=36), sa.ForeignKey("leads.id")),
+        sa.Column("creating_sync_record_id", sa.Integer(), sa.ForeignKey("crm_sync_records.id")),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    )
 
 
 def downgrade() -> None:
     """删除 T13 update 快照并发约束。"""
+    op.drop_table("crm_company_identities")
     op.drop_index("uq_crm_sync_records_update_snapshot", table_name="crm_sync_records")
