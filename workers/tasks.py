@@ -14,6 +14,8 @@ from app.ai.dependencies import get_ai_gateway
 from app.ai.models import ExtractedLeadPatch, LeadAnalysis
 from app.companies.service import CompanyLeadService, MockQCCAdapter
 from app.core.config import get_settings
+from app.crm.commands import consume_submission_command
+from app.crm.mock import MockCRMAdapter
 from app.leads.review import LeadReviewService
 from app.leads.service import COMPLETED_CHECKPOINT_STATUSES, FirstTextLeadWorkspaceService
 from app.media.dependencies import get_media_attachment_service
@@ -55,6 +57,11 @@ def consume_lead_outbox_event(
         if claimed_at is None or not _take_lead_outbox_claim(factory, outbox_event_id, claimed_at):
             return "already_processed"
         smart_table_adapter = get_smart_table_adapter()
+        if _is_submission_command(factory, outbox_event_id):
+            # 命令已在 T02 确定性分类；只编排现有 T12 服务，绝不进入 AI 线索路径。
+            return consume_submission_command(
+                factory, smart_table_adapter, MockCRMAdapter(), outbox_event_id
+            )
         # T10 首期明确只接入 Mock QCC；真实企查查 API 留给 T21 的专用适配器。
         service = FirstTextLeadWorkspaceService(
             factory,
@@ -129,6 +136,21 @@ def _message_id(session_factory: sessionmaker[Session], outbox_event_id: int) ->
         if event is None:
             raise ValueError(f"Outbox 事件不存在：{outbox_event_id}")
         return event.message_id
+
+
+def _is_submission_command(session_factory: sessionmaker[Session], outbox_event_id: int) -> bool:
+    """判断已认领 Outbox 是否为 T12 确定性 CRM 提交命令。
+
+    参数：session_factory 为数据库会话工厂；outbox_event_id 为待消费事件。
+    返回值：仅 event_type 为 crm_submission_command 时返回 True。
+    异常：事件缺失时抛出 ValueError。
+    副作用：仅读取数据库。
+    """
+    with session_factory() as session:
+        event = session.get(OutboxEvent, outbox_event_id)
+        if event is None:
+            raise ValueError(f"Outbox 事件不存在：{outbox_event_id}")
+        return event.event_type == "crm_submission_command"
 
 
 @dataclass(frozen=True)

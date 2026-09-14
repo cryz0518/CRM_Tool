@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.crm.commands import format_submission_reply
 from app.crm.mock import MockCRMAdapter
 from app.crm.service import CrmSubmissionService, SubmissionCommand
 from app.leads.models import CrmSyncRecord, Lead, LeadFieldProvenance
@@ -206,6 +207,20 @@ def test_update_command_is_explicitly_not_implemented_and_never_calls_crm(
 
     assert result.updates_not_implemented is True
     assert crm.calls == 0
+
+
+def test_submission_reply_is_count_only_and_update_mentions_t13() -> None:
+    """验证销售汇总不泄露 payload 或联系方式，更新命令明确提示 T13。"""
+    from app.crm.service import SubmissionBatchResult
+
+    create_reply = format_submission_reply(
+        SubmissionBatchResult(succeeded=1, incomplete=2, failed=1)
+    )
+    update_reply = format_submission_reply(SubmissionBatchResult(updates_not_implemented=True))
+
+    assert create_reply == "CRM 提交结果：创建成功 1 条；待完善 2 条；可重试失败 1 条。"
+    assert "手机号" not in create_reply and "payload" not in create_reply.lower()
+    assert update_reply == "提交我的更新将在 T13 实现；本次未调用 CRM。"
 
 
 def test_submission_reconcile_keeps_sales_edit_and_clears_its_pending_marker(
