@@ -23,3 +23,14 @@ class CRMAdapter(Protocol):
     ) -> CRMCreateResult:
         """以冻结的提交人 CRM 身份创建线索，并由实现再次校验最低条件。"""
         ...
+
+    def update_lead(
+        self,
+        crm_lead_id: str,
+        payload: Mapping[str, object],
+        *,
+        idempotency_key: str,
+        crm_user_id: str,
+    ) -> CRMCreateResult:
+        """以冻结提交身份更新既有 CRM 线索，且不得改变其负责人。"""
+        ...

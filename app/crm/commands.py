@@ -89,9 +89,7 @@ def notification_key_for_message(message_id: str) -> str:
 
 def terminal_failure_notification_key_for_message(message_id: str) -> str:
     """为命令终态失败通知生成与成功汇总隔离的固定长度键。"""
-    return hashlib.sha256(
-        f"crm_submission_terminal_failure:{message_id}".encode()
-    ).hexdigest()
+    return hashlib.sha256(f"crm_submission_terminal_failure:{message_id}".encode()).hexdigest()
 
 
 def _include_persisted_results(
@@ -150,8 +148,7 @@ def _record_command_failure(
             event.status = "retrying"
             return "CRM 提交任务暂时失败，系统将自动重试；请勿重复提交。"
         succeeded = session.scalar(
-            select(func.count())
-            .where(
+            select(func.count()).where(
                 CrmSyncRecord.request_message_id == command.request_message_id,
                 CrmSyncRecord.status == "succeeded",
             )
@@ -187,7 +184,10 @@ def format_submission_reply(result: SubmissionBatchResult) -> str:
     if result.updates_not_implemented:
         return "提交我的更新将在 T13 实现；本次未调用 CRM。"
     return (
-        f"CRM 提交结果：创建成功 {result.succeeded} 条；待完善或待明确确认 {result.incomplete} 条；"
+        f"CRM 提交结果：创建成功 {result.succeeded} 条；更新成功 {result.updated} 条；"
+        f"无变化 {result.unchanged} 条；"
+        f"公司身份变化待人工审查 {result.company_identity_review} 条；"
+        f"待完善或待明确确认 {result.incomplete} 条；"
         f"提交处理中 {result.processing} 条；可重试失败 {result.retrying} 条；"
         f"需人工处理失败 {result.failed_pending_review} 条。"
     )

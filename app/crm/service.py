@@ -56,6 +56,9 @@ class SubmissionBatchResult:
     failed_pending_review: int = 0
     updates_not_implemented: bool = False
     incomplete_lead_ids: tuple[str, ...] = ()
+    updated: int = 0
+    unchanged: int = 0
+    company_identity_review: int = 0
 
 
 class CrmSubmissionService:
@@ -93,8 +96,7 @@ class CrmSubmissionService:
         副作用：可能创建或重试一个冻结的 CRM Sync Record，并调用 CRM create。
         """
         if command.text == _UPDATES_COMMAND:
-            # T13 才能扫描 synced 并调用 update；T12 必须零 CRM 调用。
-            return SubmissionBatchResult(updates_not_implemented=True)
+            return self._submit_updates(command)
         if command.text != _TODAY_COMMAND:
             raise ValueError("不支持的 CRM 提交命令")
 
@@ -135,6 +137,111 @@ class CrmSubmissionService:
                 ),
             )
         return result
+
+    def _submit_updates(self, command: SubmissionCommand) -> SubmissionBatchResult:
+        """扫描当前表格负责人的已同步记录，并仅提交规范业务快照差异。"""
+        with self._session_factory() as session:
+            authorization = session.get(SalesAuthorization, command.sales_user_id)
+            if (
+                authorization is None
+                or not authorization.is_authorized
+                or not authorization.is_active
+            ):
+                raise ValueError("提交销售未授权")
+            candidate_ids = list(
+                session.scalars(
+                    select(Lead.id).where(
+                        Lead.smart_table_owner_user_id == command.sales_user_id,
+                        Lead.lifecycle_state == "synced",
+                        Lead.smart_table_record_id.is_not(None),
+                    )
+                )
+            )
+        result = SubmissionBatchResult()
+        for lead_id in candidate_ids:
+            outcome = self._submit_update(lead_id, command)
+            result = SubmissionBatchResult(
+                succeeded=result.succeeded,
+                incomplete=result.incomplete + (outcome == "incomplete"),
+                retrying=result.retrying + (outcome == "retrying"),
+                processing=result.processing + (outcome == "processing"),
+                failed_pending_review=result.failed_pending_review
+                + (outcome == "failed_pending_review"),
+                updated=result.updated + (outcome == "succeeded"),
+                unchanged=result.unchanged + (outcome == "unchanged"),
+                company_identity_review=result.company_identity_review
+                + (outcome == "company_identity_review"),
+            )
+        return result
+
+    def _submit_update(self, lead_id: str, command: SubmissionCommand) -> str:
+        """重读一条已同步线索，冻结一个新业务快照或复用其既有 update 重试。"""
+        with self._session_factory() as session:
+            lead = session.get(Lead, lead_id)
+            if (
+                lead is None
+                or lead.smart_table_owner_user_id != command.sales_user_id
+                or lead.lifecycle_state != "synced"
+            ):
+                return "incomplete"
+            latest = self._last_successful_sync(session, lead_id)
+            if latest is None or latest.crm_lead_id is None:
+                return "incomplete"
+        reconciled = LeadReviewService(
+            self._session_factory, self._smart_table_adapter
+        ).reconcile_submission(lead_id)
+        if reconciled.blocking_fields:
+            return "incomplete"
+        payload = self._canonical_payload(reconciled.fields)
+        previous = dict(latest.canonical_payload)
+        # 公司身份是全局去重键，变动绝不能伪装成普通字段更新。
+        if payload.get("线索名称") != previous.get("线索名称"):
+            with self._session_factory.begin() as session:
+                lead = session.get(Lead, lead_id)
+                if lead is not None:
+                    lead.lifecycle_state = "company_identity_change_pending_review"
+                    self._record_audit(session, command, "company_identity_change_pending_review")
+            return "company_identity_review"
+        snapshot_hash = self._snapshot_hash(payload)
+        if payload == previous:
+            return "unchanged"
+        with self._session_factory.begin() as session:
+            lead = session.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
+            authorization = session.get(SalesAuthorization, command.sales_user_id)
+            if lead is None or authorization is None or authorization.crm_user_id is None:
+                return "incomplete"
+            existing = session.scalar(
+                select(CrmSyncRecord).where(
+                    CrmSyncRecord.lead_id == lead_id,
+                    CrmSyncRecord.operation == "update",
+                    CrmSyncRecord.snapshot_hash == snapshot_hash,
+                )
+            )
+            if existing is not None:
+                return (
+                    "unchanged"
+                    if existing.status == "succeeded"
+                    else self._claim_and_call(existing.id, command.sales_user_id)
+                )
+            # 已持久化成功同步事实是全局身份索引；绝不读取其他销售的智能表格。
+            target = self._global_crm_identity(session, lead.standard_company_name) or latest
+            sync = CrmSyncRecord(
+                lead_id=lead.id,
+                operation="update",
+                smart_table_record_id=lead.smart_table_record_id or "",
+                idempotency_key=f"crm:update:{lead.id}:{snapshot_hash}",
+                canonical_payload=payload,
+                snapshot_hash=snapshot_hash,
+                request_message_id=command.request_message_id,
+                submitting_sales_user_id=command.sales_user_id,
+                submitting_crm_user_id=authorization.crm_user_id,
+                crm_lead_id=target.crm_lead_id,
+                crm_lead_owner_user_id=target.crm_lead_owner_user_id,
+            )
+            session.add(sync)
+            session.flush()
+            sync_id = sync.id
+        return self._claim_and_call(sync_id, command.sales_user_id)
 
     def _submit_create(self, lead_id: str, command: SubmissionCommand) -> str:
         """为单个 Lead 建立或认领一次稳定的 create 逻辑操作。
@@ -182,8 +289,10 @@ class CrmSubmissionService:
                     .where(SalesAuthorization.wecom_user_id == command.sales_user_id)
                     .with_for_update()
                 )
-                if lead is None or authorization is None or not self._is_today_owned_candidate(
-                    lead, command.sales_user_id
+                if (
+                    lead is None
+                    or authorization is None
+                    or not self._is_today_owned_candidate(lead, command.sales_user_id)
                 ):
                     return "incomplete"
                 if authorization.crm_user_id is None:
@@ -243,11 +352,21 @@ class CrmSubmissionService:
             payload = dict(sync.canonical_payload)
             idempotency_key = sync.idempotency_key
             crm_user_id = sync.submitting_crm_user_id
+            operation = sync.operation
+            crm_lead_id = sync.crm_lead_id
 
         try:
-            crm_result = self._crm_adapter.create_lead(
-                payload, idempotency_key=idempotency_key, crm_user_id=crm_user_id
-            )
+            if operation == "update":
+                crm_result = self._crm_adapter.update_lead(
+                    crm_lead_id or "",
+                    payload,
+                    idempotency_key=idempotency_key,
+                    crm_user_id=crm_user_id,
+                )
+            else:
+                crm_result = self._crm_adapter.create_lead(
+                    payload, idempotency_key=idempotency_key, crm_user_id=crm_user_id
+                )
         except (TimeoutError, ConnectionError, OSError):
             with self._session_factory.begin() as session:
                 sync = session.get(CrmSyncRecord, sync_id)
@@ -276,11 +395,15 @@ class CrmSubmissionService:
             sync.processing_started_at = None
             sync.processing_lease_expires_at = None
             sync.crm_lead_id = crm_result.crm_lead_id
-            sync.crm_lead_owner_user_id = crm_result.crm_lead_owner_user_id
+            # 更新响应无权把既有 CRM 负责人改写为本次提交人。
+            if crm_result.crm_lead_owner_user_id is not None:
+                sync.crm_lead_owner_user_id = crm_result.crm_lead_owner_user_id
             sync.response_summary = crm_result.response_summary[:256]
             sync.completed_at = utc_now()
             lead.lifecycle_state = "synced"
-            self._record_audit_for_sync(session, sync, sales_user_id, "crm_create_succeeded")
+            self._record_audit_for_sync(
+                session, sync, sales_user_id, f"crm_{sync.operation}_succeeded"
+            )
         return "succeeded"
 
     @staticmethod
@@ -325,6 +448,33 @@ class CrmSubmissionService:
             lead.smart_table_owner_user_id == sales_user_id
             and lead.lifecycle_state == "pending_create"
             and created.astimezone(shanghai).date() == datetime.now(shanghai).date()
+        )
+
+    @staticmethod
+    def _last_successful_sync(session: Session, lead_id: str) -> CrmSyncRecord | None:
+        """读取一条线索最后成功的 CRM 快照，作为 update 差异基线。"""
+        return session.scalar(
+            select(CrmSyncRecord)
+            .where(CrmSyncRecord.lead_id == lead_id, CrmSyncRecord.status == "succeeded")
+            .order_by(CrmSyncRecord.completed_at.desc(), CrmSyncRecord.id.desc())
+        )
+
+    @staticmethod
+    def _global_crm_identity(
+        session: Session, standard_company_name: str | None
+    ) -> CrmSyncRecord | None:
+        """仅按标准公司名称查询本地成功 CRM 事实，返回首次成功的既有身份。"""
+        if not standard_company_name:
+            return None
+        return session.scalar(
+            select(CrmSyncRecord)
+            .join(Lead, CrmSyncRecord.lead_id == Lead.id)
+            .where(
+                Lead.standard_company_name == standard_company_name,
+                CrmSyncRecord.status == "succeeded",
+                CrmSyncRecord.crm_lead_id.is_not(None),
+            )
+            .order_by(CrmSyncRecord.completed_at.asc(), CrmSyncRecord.id.asc())
         )
 
     def _audit(self, command: SubmissionCommand, event_type: str) -> None:

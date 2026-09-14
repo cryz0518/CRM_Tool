@@ -193,15 +193,12 @@ def test_transport_retry_reuses_frozen_payload_and_key_after_table_edit(
 
     monkeypatch.setattr(crm, "create_lead", timeout_once)
     assert (
-        service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12"))
-        .retrying
-        == 1
+        service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12")).retrying == 1
     )
     record_id = next(iter(adapter.get_records())).record_id
     adapter.update_record(record_id, {"手机": "13900000000"})
     assert (
-        service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12")).succeeded
-        == 1
+        service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12")).succeeded == 1
     )
     with session_factory() as session:
         sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
@@ -210,21 +207,20 @@ def test_transport_retry_reuses_frozen_payload_and_key_after_table_edit(
     assert sync.canonical_payload["手机"] == "13800000000"
 
 
-def test_update_command_is_explicitly_not_implemented_and_never_calls_crm(
+def test_update_command_requires_authorized_submitting_salesperson(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证 T12 对更新命令只反馈 T13 边界，不扫描或调用 CRM。"""
+    """验证更新命令仍由确定性销售授权边界保护。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     crm = MockCRMAdapter()
-    result = CrmSubmissionService(session_factory, adapter, crm).submit(
-        SubmissionCommand("提交我的更新", "sales-1", "message-12")
-    )
-
-    assert result.updates_not_implemented is True
+    with pytest.raises(ValueError, match="提交销售未授权"):
+        CrmSubmissionService(session_factory, adapter, crm).submit(
+            SubmissionCommand("提交我的更新", "sales-1", "message-12")
+        )
     assert crm.calls == 0
 
 
-def test_submission_reply_is_count_only_and_update_mentions_t13() -> None:
+def test_submission_reply_is_count_only_and_includes_update_categories() -> None:
     """验证销售汇总不泄露 payload 或联系方式，更新命令明确提示 T13。"""
     from app.crm.service import SubmissionBatchResult
 
@@ -237,14 +233,11 @@ def test_submission_reply_is_count_only_and_update_mentions_t13() -> None:
             failed_pending_review=4,
         )
     )
-    update_reply = format_submission_reply(SubmissionBatchResult(updates_not_implemented=True))
+    update_reply = format_submission_reply(SubmissionBatchResult(updated=1, unchanged=2))
 
-    assert create_reply == (
-        "CRM 提交结果：创建成功 1 条；待完善或待明确确认 2 条；"
-        "提交处理中 3 条；可重试失败 1 条；需人工处理失败 4 条。"
-    )
+    assert "创建成功 1 条" in create_reply and "更新成功 0 条" in create_reply
     assert "手机号" not in create_reply and "payload" not in create_reply.lower()
-    assert update_reply == "提交我的更新将在 T13 实现；本次未调用 CRM。"
+    assert "更新成功 1 条" in update_reply and "无变化 2 条" in update_reply
 
 
 def test_submission_reconcile_keeps_sales_edit_and_clears_its_pending_marker(
@@ -288,6 +281,52 @@ def test_mock_crm_idempotency_is_stable_across_adapter_instances() -> None:
         payload, idempotency_key="crm:create:lead-1", crm_user_id="crm-1"
     )
     assert first.crm_lead_id == second.crm_lead_id
+
+
+def test_update_uses_current_table_values_once_and_skips_equal_snapshot(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证更新以表格回读快照调用一次 CRM，重放相同业务值不再调用。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    _lead(session_factory, adapter)
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    assert (
+        service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12")).succeeded == 1
+    )
+    record_id = next(iter(adapter.get_records())).record_id
+    adapter.update_record(record_id, {"手机": "13900000000", "AI待确认": ["客户行业"]})
+
+    first = service.submit(SubmissionCommand("提交我的更新", "sales-1", "message-13"))
+    second = service.submit(SubmissionCommand("提交我的更新", "sales-1", "message-14"))
+
+    assert first.updated == 1 and second.unchanged == 1
+    assert crm.update_calls == 1 and crm.update_payloads[0]["手机"] == "13900000000"
+    with session_factory() as session:
+        updates = session.scalars(
+            select(CrmSyncRecord).where(CrmSyncRecord.operation == "update")
+        ).all()
+    assert len(updates) == 1 and updates[0].canonical_payload.get("AI待确认") is None
+
+
+def test_update_company_identity_change_enters_review_without_crm_call(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证已同步公司名称变化只能进入人工审查，不能自动更新 CRM。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12"))
+    adapter.update_record(next(iter(adapter.get_records())).record_id, {"线索名称": "新公司"})
+
+    result = service.submit(SubmissionCommand("提交我的更新", "sales-1", "message-13"))
+
+    assert result.company_identity_review == 1 and crm.update_calls == 0
+    with session_factory() as session:
+        assert (
+            session.get(Lead, lead_id).lifecycle_state == "company_identity_change_pending_review"
+        )  # type: ignore[union-attr]
 
 
 def test_long_message_id_uses_bounded_notification_key() -> None:
