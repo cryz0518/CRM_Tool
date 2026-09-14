@@ -19,6 +19,7 @@ from app.core.logging import configure_logging
 from app.media.dependencies import get_media_attachment_service
 from app.media.service import MediaAttachmentService
 from app.messaging.service import MessageIntakeService
+from app.notifications.outbound import WecomOutboundNotificationSender
 from app.wecom_bot.adapter import WecomMediaMessageAdapter, WecomTextMessageAdapter
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,11 @@ class WecomBotRuntime:
                 logger=WecomSdkLogger(),
             )
         )
+        # 发送器复用当前进程唯一已认证 WSClient，Worker 永不建立第二条连接。
+        self._notification_sender = WecomOutboundNotificationSender(
+            sessionmaker(engine), self._client
+        )
+        self._notification_task: asyncio.Task[None] | None = None
         self._register_sdk_handlers()
 
     def _register_sdk_handlers(self) -> None:
@@ -149,7 +155,21 @@ class WecomBotRuntime:
         """
         # SDK 没有 is_authenticated 属性，因此以认证事件维护独立的就绪状态。
         self._ready_file.write_text("authenticated\n", encoding="utf-8")
+        if self._notification_task is None or self._notification_task.done():
+            self._notification_task = asyncio.get_running_loop().create_task(
+                self._consume_outbound_notifications()
+            )
         logger.info("wecom_bot_authenticated")
+
+    async def _consume_outbound_notifications(self) -> None:
+        """在已认证 Bot 进程中持续投递可靠通知，不阻塞入站处理。"""
+        while self._shutdown_event is None or not self._shutdown_event.is_set():
+            try:
+                # 单次发送失败仅记录通知 retrying，循环本身必须继续服务后续通知。
+                await self._notification_sender.send_pending_once()
+            except Exception:
+                logger.exception("wecom_outbound_notification_consume_failed")
+            await asyncio.sleep(1)
 
     def _handle_disconnected(self, reason: str) -> None:
         """在 SDK 报告断线时撤销就绪状态。

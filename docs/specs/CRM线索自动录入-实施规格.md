@@ -122,7 +122,7 @@
 - `pending_create` 项目级最小必填为公司/线索名称、业务线、手机号/电话/邮箱至少一种。CRM Adapter 仍要执行 CRM 接口自身硬性校验，且其实际要求优先。
 - 提交前必须重新读取智能表格，构造 Final Snapshot 与规范化 CRM Payload，处理人工编辑、公司状态、枚举、格式、地点和必填校验。批量提交始终部分成功。
 - “提交我的更新”仅分页读取当前 Smart Table Owner 的已同步记录。由统一 Payload Builder 规范化并比较当前 CRM Payload 与 Last Successful CRM Snapshot；AI待确认、内部状态、置信度、字段排序及标准化后等价的空值不构成更新。
-- CRM 幂等键为 `hash(smart_table_record_id + canonical_snapshot_hash + operation_type)`。同记录、同规范快照和同操作类型必须复用此前成功结果，不再次调用 CRM；有效字段变化产生新的快照与合法更新。
+- T12 首次 CRM create 的幂等键为 Lead 级稳定键 `crm:create:{lead_id}`；一个 CRM Sync Record 表示该逻辑 create 及其所有 retry。规范最终快照哈希只保存实际提交事实，不参与 create 幂等键；timeout/transport error 后复用原记录、原键和原 payload，绝不重读表格替换 payload 再 create。T13 的 update 幂等契约另行定义。
 - CRM Sync Record 至少保存幂等键、表格记录、操作、快照哈希、CRM lead ID、提交销售、CRM 负责人（可取得时）、状态、尝试次数、响应摘要、创建与完成时间。
 - CRM 成功只更新后端同步元数据，绝不将 CRM 业务字段或 CRM 负责人回写/覆盖智能表格；因此跨销售去重不得破坏智能表格权限。
 - 未开始的 CRM Create 在废弃后必须取消或跳过。CRM 已在处理时的废弃遵循外部事实优先：成功即 `synced`，记录 `discard_request_not_effective`；失败可保持 `discarded`；禁止自动 CRM 删除补偿。

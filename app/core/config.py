@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     ai_high_confidence_threshold: float = 0.85
     ai_medium_confidence_threshold: float = 0.60
     robot_submission_confirmation_available: bool = True
+    crm_create_retry_count: int = 3
     media_storage_path: str = "/var/lib/crm-lead/media"
     media_image_mime_types: tuple[str, ...] = ("image/png", "image/jpeg", "image/webp")
     media_audio_mime_types: tuple[str, ...] = ("audio/mpeg", "audio/wav", "audio/mp4")
@@ -123,6 +124,20 @@ class Settings(BaseSettings):
         """
         if value <= 0:
             raise ValueError("LEAD_PROCESSING_TIMEOUT_SECONDS 必须大于 0")
+        return value
+
+    @field_validator("crm_create_retry_count")
+    @classmethod
+    def crm_create_retry_count_must_be_positive(cls, value: int) -> int:
+        """校验 CRM create 总尝试次数，避免传输失败无限重试。
+
+        参数：value 为环境变量解析后的总尝试次数。
+        返回值：通过校验的正整数。
+        异常：值不为正时抛出 ValueError。
+        副作用：无。
+        """
+        if value <= 0:
+            raise ValueError("CRM_CREATE_RETRY_COUNT 必须大于 0")
         return value
 
 

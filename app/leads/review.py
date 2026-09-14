@@ -49,6 +49,14 @@ class SubmissionConfirmationState:
         return not self.blocking_fields
 
 
+@dataclass(frozen=True)
+class SubmissionReconcileResult:
+    """描述提交前重读表格后的规范业务快照与阻塞字段。"""
+
+    fields: dict[str, object]
+    blocking_fields: tuple[str, ...]
+
+
 class LeadReviewService:
     """在 AI 写入和 CRM 提交前保护销售表格编辑并维护确认事实。"""
 
@@ -224,12 +232,33 @@ class LeadReviewService:
         异常：线索或表格记录缺失时抛出 ValueError；适配器读取异常向调用方传播。
         副作用：发现销售修改时会持久化人工确认状态并维护 AI待确认。
         """
+        reconciled = self.reconcile_submission(lead_id)
+        return SubmissionConfirmationState(reconciled.blocking_fields)
+
+    def reconcile_submission(self, lead_id: str) -> SubmissionReconcileResult:
+        """重读表格、落实 T09 人工编辑并返回不含审核元数据的最终快照。
+
+        参数：lead_id 为准备首次 CRM 创建的线索标识。
+        返回值：当前表格的业务字段和仍会阻塞 CRM minimum 的待确认字段。
+        异常：线索或表格记录缺失时抛出 ValueError；适配器错误向调用方传播。
+        副作用：发现人工编辑时更新 provenance、AI待确认 和审计记录。
+        """
         record, lead = self._read_record_for_lead(lead_id)
         protected = self._reconcile_user_edits(lead, record.fields, lead.source_message_id)
+        # 若本轮移除了 AI待确认，必须再读一次，最终快照不能携带旧审核元数据。
+        if protected:
+            record, _ = self._read_record_for_lead(lead_id)
         pending = self._confirmation_names(record.fields.get(AI_CONFIRMATION_FIELD))
         pending.difference_update(protected)
-        blocking = self._required_pending_fields(pending, record.fields)
-        return SubmissionConfirmationState(tuple(sorted(blocking)))
+        fields = {
+            name: value
+            for name, value in record.fields.items()
+            if name != AI_CONFIRMATION_FIELD
+        }
+        return SubmissionReconcileResult(
+            fields=fields,
+            blocking_fields=tuple(sorted(self._required_pending_fields(pending, fields))),
+        )
 
     def confirm_submission_fields(
         self, lead_id: str, sales_user_id: str, field_names: tuple[str, ...]

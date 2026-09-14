@@ -22,6 +22,8 @@ from app.messaging.models import (
 
 logger = logging.getLogger(__name__)
 
+CRM_SUBMISSION_COMMANDS = frozenset({"提交今天的线索", "提交我的更新"})
+
 
 @dataclass(frozen=True)
 class IncomingMessageCommand:
@@ -117,6 +119,12 @@ class MessageIntakeService:
                         message_id=command.message_id,
                         sales_user_id=command.sales_user_id,
                         sequence=authorization.next_message_sequence,
+                        # 命令在持久化时确定性分类，Worker 因此绝不把它送入 AI 线索提取。
+                        event_type=(
+                            "crm_submission_command"
+                            if command.normalized_text in CRM_SUBMISSION_COMMANDS
+                            else "message_received"
+                        ),
                     )
                 )
                 self._record_audit_event(session, command, "message_received")

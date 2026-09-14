@@ -73,7 +73,33 @@ def test_text_frame_is_forwarded_to_reliable_message_intake(
         assert message.sales_user_id == "sales-1"
         assert message.normalized_text == "客户需要码垛机器人"
         assert message.raw_payload == frame
-        assert len(session.scalars(select(OutboxEvent)).all()) == 1
+        [event] = session.scalars(select(OutboxEvent)).all()
+        assert event.event_type == "message_received"
+
+
+def test_submission_command_is_persisted_as_a_command_outbox_event(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证精确提交命令只进入可靠命令 Outbox，不在接入层调用 CRM。"""
+    with session_factory.begin() as session:
+        session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
+    frame = {
+        "body": {
+            "msgid": "command-1",
+            "from": {"userid": "sales-1"},
+            "msgtype": "text",
+            "text": {"content": "提交今天的线索"},
+        }
+    }
+
+    result = WecomTextMessageAdapter(MessageIntakeService(session_factory)).receive_text_frame(
+        frame
+    )
+
+    assert result is not None and result.accepted is True
+    with session_factory() as session:
+        [event] = session.scalars(select(OutboxEvent)).all()
+        assert event.event_type == "crm_submission_command"
 
 
 def test_text_frame_without_official_identity_fields_is_not_forwarded(
