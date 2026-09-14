@@ -212,7 +212,20 @@ class CrmSubmissionService:
                 lead = session.get(Lead, lead_id)
                 if lead is not None:
                     lead.lifecycle_state = "company_identity_change_pending_review"
-                    self._record_audit(session, command, "company_identity_change_pending_review")
+                    session.add(
+                        BusinessAuditEvent(
+                            message_id=command.request_message_id,
+                            sales_user_id=command.sales_user_id,
+                            event_type="company_identity_change_pending_review",
+                            details={
+                                "old_standard_company_name": previous.get("线索名称"),
+                                "new_candidate_company_name": payload.get("线索名称"),
+                                "lead_id": lead.id,
+                                "smart_table_record_id": lead.smart_table_record_id,
+                                "smart_table_owner_user_id": lead.smart_table_owner_user_id,
+                            },
+                        )
+                    )
             return "company_identity_review"
         snapshot_hash = self._snapshot_hash(payload)
         if payload == previous:
@@ -387,6 +400,7 @@ class CrmSubmissionService:
                 # 尝试次数达到上限后保留冻结操作供人工处理，禁止无限重试。
                 sync.status = "failed_pending_review"
                 sync.response_summary = "CRM retry limit reached"
+                self._fail_company_identity(session, sync, sales_user_id)
                 return "failed_pending_review"
             sync.status = "processing"
             sync.attempts += 1
@@ -427,6 +441,7 @@ class CrmSubmissionService:
                     sync.processing_started_at = None
                     sync.processing_lease_expires_at = None
                     sync.response_summary = "CRM create failed"
+                    self._fail_company_identity(session, sync, sales_user_id)
             return "failed_pending_review"
 
         with self._session_factory.begin() as session:
@@ -439,7 +454,7 @@ class CrmSubmissionService:
             sync.processing_lease_expires_at = None
             sync.crm_lead_id = crm_result.crm_lead_id
             # 更新响应无权把既有 CRM 负责人改写为本次提交人。
-            if crm_result.crm_lead_owner_user_id is not None:
+            if sync.operation == "create" and crm_result.crm_lead_owner_user_id is not None:
                 sync.crm_lead_owner_user_id = crm_result.crm_lead_owner_user_id
             sync.response_summary = crm_result.response_summary[:256]
             sync.completed_at = utc_now()
@@ -453,6 +468,9 @@ class CrmSubmissionService:
                     identity.state = "active"
                     identity.crm_lead_id = sync.crm_lead_id
                     identity.crm_lead_owner_user_id = sync.crm_lead_owner_user_id
+                    self._record_audit_for_sync(
+                        session, sync, sales_user_id, "crm_global_identity_activated"
+                    )
             lead.lifecycle_state = "synced"
             self._record_audit_for_sync(
                 session, sync, sales_user_id, f"crm_{sync.operation}_succeeded"
@@ -534,6 +552,21 @@ class CrmSubmissionService:
         """为未创建 CRM 同步记录的普通校验结果保存审计反馈。"""
         with self._session_factory.begin() as session:
             self._record_audit(session, command, event_type)
+
+    def _fail_company_identity(
+        self, session: Session, sync: CrmSyncRecord, sales_user_id: str
+    ) -> None:
+        """将首创失败与其公司预留在同一事务转为人工处理状态。"""
+        if sync.operation != "create":
+            return
+        identity = session.scalar(
+            select(CrmCompanyIdentity).where(CrmCompanyIdentity.creating_sync_record_id == sync.id)
+        )
+        if identity is not None:
+            identity.state = "failed_pending_review"
+            self._record_audit_for_sync(
+                session, sync, sales_user_id, "crm_global_identity_failed_pending_review"
+            )
 
     @staticmethod
     def _record_audit(session: Session, command: SubmissionCommand, event_type: str) -> None:

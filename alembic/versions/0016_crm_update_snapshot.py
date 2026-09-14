@@ -32,9 +32,14 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
     )
+    op.add_column(
+        "business_audit_events",
+        sa.Column("details", sa.JSON(), nullable=False, server_default="{}"),
+    )
 
 
 def downgrade() -> None:
     """删除 T13 update 快照并发约束。"""
     op.drop_table("crm_company_identities")
+    op.drop_column("business_audit_events", "details")
     op.drop_index("uq_crm_sync_records_update_snapshot", table_name="crm_sync_records")
