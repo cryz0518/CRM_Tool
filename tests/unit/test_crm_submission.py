@@ -181,7 +181,11 @@ def test_transport_retry_reuses_frozen_payload_and_key_after_table_edit(
         return original(payload, idempotency_key=idempotency_key, crm_user_id=crm_user_id)  # type: ignore[arg-type]
 
     monkeypatch.setattr(crm, "create_lead", timeout_once)
-    assert service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12")).failed == 1
+    assert (
+        service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12"))
+        .retrying
+        == 1
+    )
     record_id = next(iter(adapter.get_records())).record_id
     adapter.update_record(record_id, {"手机": "13900000000"})
     assert (
@@ -214,13 +218,19 @@ def test_submission_reply_is_count_only_and_update_mentions_t13() -> None:
     from app.crm.service import SubmissionBatchResult
 
     create_reply = format_submission_reply(
-        SubmissionBatchResult(succeeded=1, incomplete=2, failed=1)
+        SubmissionBatchResult(
+            succeeded=1,
+            incomplete=2,
+            processing=3,
+            retrying=1,
+            failed_pending_review=4,
+        )
     )
     update_reply = format_submission_reply(SubmissionBatchResult(updates_not_implemented=True))
 
     assert create_reply == (
         "CRM 提交结果：创建成功 1 条；待完善或待明确确认 2 条；"
-        "提交处理中或可重试失败 1 条；需人工处理失败 0 条。"
+        "提交处理中 3 条；可重试失败 1 条；需人工处理失败 4 条。"
     )
     assert "手机号" not in create_reply and "payload" not in create_reply.lower()
     assert update_reply == "提交我的更新将在 T13 实现；本次未调用 CRM。"

@@ -50,7 +50,9 @@ class SubmissionBatchResult:
 
     succeeded: int = 0
     incomplete: int = 0
-    failed: int = 0
+    retrying: int = 0
+    processing: int = 0
+    failed_pending_review: int = 0
     updates_not_implemented: bool = False
     incomplete_lead_ids: tuple[str, ...] = ()
 
@@ -120,7 +122,11 @@ class CrmSubmissionService:
             result = SubmissionBatchResult(
                 succeeded=result.succeeded + (outcome == "succeeded"),
                 incomplete=result.incomplete + (outcome == "incomplete"),
-                failed=result.failed + (outcome == "failed"),
+                retrying=result.retrying + (outcome == "retrying"),
+                processing=result.processing + (outcome == "processing"),
+                failed_pending_review=(
+                    result.failed_pending_review + (outcome == "failed_pending_review")
+                ),
                 incomplete_lead_ids=(
                     result.incomplete_lead_ids + (lead_id,)
                     if outcome == "incomplete"
@@ -188,7 +194,7 @@ class CrmSubmissionService:
                     )
                 )
                 if existing is not None:
-                    return "incomplete" if existing.status == "succeeded" else "failed"
+                    return "incomplete" if existing.status == "succeeded" else existing.status
                 sync = CrmSyncRecord(
                     lead_id=lead.id,
                     operation="create",
@@ -215,13 +221,15 @@ class CrmSubmissionService:
             sync = session.scalar(
                 select(CrmSyncRecord).where(CrmSyncRecord.id == sync_id).with_for_update()
             )
-            if sync is None or sync.status not in {"pending", "retrying"}:
-                return "incomplete"
+            if sync is None:
+                return "failed_pending_review"
+            if sync.status not in {"pending", "retrying"}:
+                return sync.status
             if sync.attempts >= self._crm_create_retry_count:
                 # 尝试次数达到上限后保留冻结操作供人工处理，禁止无限重试。
                 sync.status = "failed_pending_review"
                 sync.response_summary = "CRM retry limit reached"
-                return "failed"
+                return "failed_pending_review"
             sync.status = "processing"
             sync.attempts += 1
             payload = dict(sync.canonical_payload)
@@ -238,20 +246,20 @@ class CrmSubmissionService:
                 if sync is not None:
                     sync.status = "retrying"
                     sync.response_summary = "CRM transport error"
-            return "failed"
+            return "retrying"
         except Exception:
             with self._session_factory.begin() as session:
                 sync = session.get(CrmSyncRecord, sync_id)
                 if sync is not None:
                     sync.status = "failed_pending_review"
                     sync.response_summary = "CRM create failed"
-            return "failed"
+            return "failed_pending_review"
 
         with self._session_factory.begin() as session:
             sync = session.get(CrmSyncRecord, sync_id)
             lead = session.get(Lead, sync.lead_id) if sync is not None else None
             if sync is None or lead is None:
-                return "failed"
+                return "failed_pending_review"
             sync.status = "succeeded"
             sync.crm_lead_id = crm_result.crm_lead_id
             sync.crm_lead_owner_user_id = crm_result.crm_lead_owner_user_id

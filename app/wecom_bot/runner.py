@@ -164,8 +164,11 @@ class WecomBotRuntime:
     async def _consume_outbound_notifications(self) -> None:
         """在已认证 Bot 进程中持续投递可靠通知，不阻塞入站处理。"""
         while self._shutdown_event is None or not self._shutdown_event.is_set():
-            await asyncio.to_thread(lambda: None)
-            await self._notification_sender.send_pending_once()
+            try:
+                # 单次发送失败仅记录通知 retrying，循环本身必须继续服务后续通知。
+                await self._notification_sender.send_pending_once()
+            except Exception:
+                logger.exception("wecom_outbound_notification_consume_failed")
             await asyncio.sleep(1)
 
     def _handle_disconnected(self, reason: str) -> None:
