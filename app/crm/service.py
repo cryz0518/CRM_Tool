@@ -305,17 +305,29 @@ class CrmSubmissionService:
                 )
                 if existing is not None:
                     return "incomplete" if existing.status == "succeeded" else existing.status
+                # CRM 层全局去重只读取已成功持久化的同步事实，绝不扫描另一销售的表格。
+                target = self._global_crm_identity(session, lead.standard_company_name)
+                operation = "update" if target is not None else "create"
+                idempotency_key = (
+                    f"crm:update:{lead.id}:{snapshot_hash}"
+                    if target is not None
+                    else f"crm:create:{lead.id}"
+                )
                 sync = CrmSyncRecord(
                     lead_id=lead.id,
-                    operation="create",
+                    operation=operation,
                     smart_table_record_id=lead.smart_table_record_id or "",
-                    idempotency_key=f"crm:create:{lead.id}",
+                    idempotency_key=idempotency_key,
                     canonical_payload=canonical_payload,
                     snapshot_hash=snapshot_hash,
                     request_message_id=command.request_message_id,
                     submitting_sales_user_id=command.sales_user_id,
                     # 销售 CRM 映射在逻辑 create 创建时冻结，retry 不重新读取它。
                     submitting_crm_user_id=authorization.crm_user_id,
+                    crm_lead_id=target.crm_lead_id if target is not None else None,
+                    crm_lead_owner_user_id=(
+                        target.crm_lead_owner_user_id if target is not None else None
+                    ),
                 )
                 session.add(sync)
                 session.flush()
