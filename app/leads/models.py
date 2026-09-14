@@ -5,7 +5,17 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.messaging.models import Base, utc_now
@@ -180,3 +190,40 @@ class SmartTableSync(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (UniqueConstraint("source_message_id", "source_segment_index"),)
+
+
+class CrmSyncRecord(Base):
+    """保存一个逻辑 CRM create 及其全部重试的冻结事实。"""
+
+    __tablename__ = "crm_sync_records"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    lead_id: Mapped[str] = mapped_column(ForeignKey("leads.id"), nullable=False, index=True)
+    operation: Mapped[str] = mapped_column(String(32), nullable=False)
+    smart_table_record_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    canonical_payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_message_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    submitting_sales_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    submitting_crm_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    crm_lead_id: Mapped[str | None] = mapped_column(String(128))
+    crm_lead_owner_user_id: Mapped[str | None] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    response_summary: Mapped[str | None] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        # T13 可为同一 Lead 保存多次 update；仅首次 create 是 Lead 级单例。
+        Index(
+            "uq_crm_sync_records_one_create_per_lead",
+            "lead_id",
+            unique=True,
+            postgresql_where=(operation == "create"),
+            sqlite_where=(operation == "create"),
+        ),
+    )
