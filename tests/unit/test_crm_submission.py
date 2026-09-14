@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Generator
 from datetime import timedelta
 
@@ -329,6 +330,32 @@ def test_expired_create_lease_recovers_remote_success_with_original_frozen_fact(
     assert sync.status == "succeeded" and sync.idempotency_key == f"crm:create:{lead_id}"
     assert sync.snapshot_hash == "a" * 64 and sync.submitting_crm_user_id == "crm-1"
     assert identity.state == "active" and identity.crm_lead_id == sync.crm_lead_id
+
+
+def test_t13_audit_and_logs_keep_identity_metadata_without_sensitive_payload(
+    session_factory: sessionmaker[Session], caplog: pytest.LogCaptureFixture
+) -> None:
+    """验证 T13 identity 关键审计与日志只保留标识/哈希，不泄露 CRM 业务载荷。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    crm = MockCRMAdapter()
+    with caplog.at_level(logging.INFO, logger="app.crm.service"):
+        result = CrmSubmissionService(session_factory, adapter, crm).submit(
+            SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+        )
+    assert result.succeeded == 1
+    with session_factory() as session:
+        event_types = set(session.scalars(select(BusinessAuditEvent.event_type)).all())
+        activated = session.scalar(
+            select(BusinessAuditEvent).where(
+                BusinessAuditEvent.event_type == "crm_global_identity_activated"
+            )
+        )
+    assert {"crm_global_identity_reserved", "crm_global_identity_activated"} <= event_types
+    assert activated is not None and activated.details["lead_id"] == lead_id
+    logged = caplog.text
+    for sensitive in ("13800000000", "人工最终备注", "crm-1", "payload", "secret"):
+        assert sensitive not in logged.lower()
     assert CrmSubmissionService._company_advisory_lock_key("公司 X") != (
         CrmSubmissionService._company_advisory_lock_key("公司 Y")
     )
