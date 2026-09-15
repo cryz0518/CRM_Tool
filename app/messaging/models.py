@@ -153,6 +153,7 @@ class BusinessAuditEvent(Base):
     message_id: Mapped[str] = mapped_column(String(128), nullable=False)
     sales_user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

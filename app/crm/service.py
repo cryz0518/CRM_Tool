@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.crm.adapter import CRMAdapter
-from app.leads.models import CrmSyncRecord, Lead
+from app.leads.models import CrmCompanyIdentity, CrmSyncRecord, Lead
 from app.leads.review import LeadReviewService
 from app.messaging.models import BusinessAuditEvent, SalesAuthorization, utc_now
 from app.smart_table.adapter import SmartTableAdapter
@@ -34,6 +35,7 @@ _BUSINESS_COMPLETENESS_FIELDS = (
 )
 _CONTACT_FIELDS = ("手机", "电话", "邮箱")
 _CRM_PROCESSING_LEASE = timedelta(minutes=5)
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -56,10 +58,21 @@ class SubmissionBatchResult:
     failed_pending_review: int = 0
     updates_not_implemented: bool = False
     incomplete_lead_ids: tuple[str, ...] = ()
+    updated: int = 0
+    unchanged: int = 0
+    company_identity_review: int = 0
+
+
+@dataclass(frozen=True)
+class GlobalIdentityResolution:
+    """描述全局 CRM 公司身份注册表的一次确定性解析结果。"""
+
+    state: str
+    identity: CrmCompanyIdentity | None = None
 
 
 class CrmSubmissionService:
-    """仅执行 T12 首次 CRM create，绝不承担 T13 更新职责。"""
+    """执行冻结 CRM create/update，并以全局公司身份注册表阻止跨销售重复创建。"""
 
     def __init__(
         self,
@@ -93,8 +106,7 @@ class CrmSubmissionService:
         副作用：可能创建或重试一个冻结的 CRM Sync Record，并调用 CRM create。
         """
         if command.text == _UPDATES_COMMAND:
-            # T13 才能扫描 synced 并调用 update；T12 必须零 CRM 调用。
-            return SubmissionBatchResult(updates_not_implemented=True)
+            return self._submit_updates(command)
         if command.text != _TODAY_COMMAND:
             raise ValueError("不支持的 CRM 提交命令")
 
@@ -135,6 +147,159 @@ class CrmSubmissionService:
                 ),
             )
         return result
+
+    def _submit_updates(self, command: SubmissionCommand) -> SubmissionBatchResult:
+        """扫描当前表格负责人的已同步记录，并仅提交规范业务快照差异。"""
+        with self._session_factory() as session:
+            authorization = session.get(SalesAuthorization, command.sales_user_id)
+            if (
+                authorization is None
+                or not authorization.is_authorized
+                or not authorization.is_active
+            ):
+                raise ValueError("提交销售未授权")
+            candidate_ids = list(
+                session.scalars(
+                    select(Lead.id).where(
+                        Lead.smart_table_owner_user_id == command.sales_user_id,
+                        Lead.lifecycle_state == "synced",
+                        Lead.smart_table_record_id.is_not(None),
+                    )
+                )
+            )
+        result = SubmissionBatchResult()
+        for lead_id in candidate_ids:
+            outcome = self._submit_update(lead_id, command)
+            result = SubmissionBatchResult(
+                succeeded=result.succeeded,
+                incomplete=result.incomplete + (outcome == "incomplete"),
+                retrying=result.retrying + (outcome == "retrying"),
+                processing=result.processing + (outcome == "processing"),
+                failed_pending_review=result.failed_pending_review
+                + (outcome == "failed_pending_review"),
+                updated=result.updated + (outcome == "succeeded"),
+                unchanged=result.unchanged + (outcome == "unchanged"),
+                company_identity_review=result.company_identity_review
+                + (outcome == "company_identity_review"),
+            )
+        return result
+
+    def _submit_update(self, lead_id: str, command: SubmissionCommand) -> str:
+        """重读一条已同步线索，冻结一个新业务快照或复用其既有 update 重试。"""
+        with self._session_factory() as session:
+            lead = session.get(Lead, lead_id)
+            if (
+                lead is None
+                or lead.smart_table_owner_user_id != command.sales_user_id
+                or lead.lifecycle_state != "synced"
+            ):
+                return "incomplete"
+            latest = self._last_successful_sync(session, lead_id)
+            if latest is None or latest.crm_lead_id is None:
+                return "incomplete"
+            # 未完成 update 是冻结事实，必须优先恢复，不能先读表并换掉 payload。
+            unfinished = session.scalar(
+                select(CrmSyncRecord)
+                .where(
+                    CrmSyncRecord.lead_id == lead_id,
+                    CrmSyncRecord.operation == "update",
+                    CrmSyncRecord.status.in_(("pending", "retrying", "processing")),
+                )
+                .order_by(CrmSyncRecord.id.asc())
+            )
+            if unfinished is not None:
+                return self._claim_and_call(unfinished.id, command.sales_user_id)
+        reconciled = LeadReviewService(
+            self._session_factory, self._smart_table_adapter
+        ).reconcile_submission(lead_id)
+        if reconciled.blocking_fields:
+            return "incomplete"
+        payload = self._canonical_payload(reconciled.fields)
+        previous = dict(latest.canonical_payload)
+        # 公司身份是全局去重键，变动绝不能伪装成普通字段更新。
+        if payload.get("线索名称") != previous.get("线索名称"):
+            with self._session_factory.begin() as session:
+                lead = session.get(Lead, lead_id)
+                if lead is not None:
+                    lead.lifecycle_state = "company_identity_change_pending_review"
+                    session.add(
+                        BusinessAuditEvent(
+                            message_id=command.request_message_id,
+                            sales_user_id=command.sales_user_id,
+                            event_type="company_identity_change_pending_review",
+                            details={
+                                "old_standard_company_name": previous.get("线索名称"),
+                                "new_candidate_company_name": payload.get("线索名称"),
+                                "lead_id": lead.id,
+                                "smart_table_record_id": lead.smart_table_record_id,
+                                "smart_table_owner_user_id": lead.smart_table_owner_user_id,
+                            },
+                        )
+                    )
+                    _LOGGER.info(
+                        "crm_submission_event=company_identity_change_pending_review "
+                        "request_id=%s message_id=%s lead_id=%s record_id=%s wecom_user_id=%s",
+                        command.request_message_id,
+                        command.request_message_id,
+                        lead.id,
+                        lead.smart_table_record_id,
+                        command.sales_user_id,
+                    )
+            return "company_identity_review"
+        snapshot_hash = self._snapshot_hash(payload)
+        if payload == previous:
+            return "unchanged"
+        existing_sync_id: int | None = None
+        with self._session_factory.begin() as session:
+            lead = session.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
+            authorization = session.get(SalesAuthorization, command.sales_user_id)
+            if lead is None or authorization is None or authorization.crm_user_id is None:
+                return "incomplete"
+            existing = session.scalar(
+                select(CrmSyncRecord).where(
+                    CrmSyncRecord.lead_id == lead_id,
+                    CrmSyncRecord.operation == "update",
+                    CrmSyncRecord.snapshot_hash == snapshot_hash,
+                )
+            )
+            if existing is not None:
+                if existing.status == "succeeded":
+                    return "unchanged"
+                # 先提交并释放 Lead 行锁，再认领既有冻结操作。
+                existing_sync_id = existing.id
+            if existing_sync_id is not None:
+                # 该分支只记录认领目标，不能在持锁事务中调用 CRM。
+                pass
+            else:
+                # 注册表是身份权威；历史同步仅在注册表缺失时由解析器一次性回填。
+                resolution = self._resolve_global_identity(session, lead, command)
+                if resolution.state in {"ambiguous", "failed_pending_review"}:
+                    return "failed_pending_review"
+                if resolution.state == "reserving":
+                    return "processing"
+                target = resolution.identity
+                if target is None or target.crm_lead_id is None:
+                    return "failed_pending_review"
+                sync = CrmSyncRecord(
+                    lead_id=lead.id,
+                    operation="update",
+                    smart_table_record_id=lead.smart_table_record_id or "",
+                    idempotency_key=f"crm:update:{lead.id}:{snapshot_hash}",
+                    canonical_payload=payload,
+                    snapshot_hash=snapshot_hash,
+                    request_message_id=command.request_message_id,
+                    submitting_sales_user_id=command.sales_user_id,
+                    submitting_crm_user_id=authorization.crm_user_id,
+                    crm_lead_id=target.crm_lead_id,
+                    crm_lead_owner_user_id=target.crm_lead_owner_user_id,
+                )
+                session.add(sync)
+                session.flush()
+                self._record_audit_for_sync(
+                    session, sync, command.sales_user_id, "crm_update_created"
+                )
+                sync_id = sync.id
+        return self._claim_and_call(existing_sync_id or sync_id, command.sales_user_id)
 
     def _submit_create(self, lead_id: str, command: SubmissionCommand) -> str:
         """为单个 Lead 建立或认领一次稳定的 create 逻辑操作。
@@ -182,8 +347,10 @@ class CrmSubmissionService:
                     .where(SalesAuthorization.wecom_user_id == command.sales_user_id)
                     .with_for_update()
                 )
-                if lead is None or authorization is None or not self._is_today_owned_candidate(
-                    lead, command.sales_user_id
+                if (
+                    lead is None
+                    or authorization is None
+                    or not self._is_today_owned_candidate(lead, command.sales_user_id)
                 ):
                     return "incomplete"
                 if authorization.crm_user_id is None:
@@ -196,24 +363,59 @@ class CrmSubmissionService:
                 )
                 if existing is not None:
                     return "incomplete" if existing.status == "succeeded" else existing.status
+                # 以唯一公司预留锁住首次创建；其他销售绝不能在 reserving 时另建 CRM Lead。
+                company_name = lead.standard_company_name
+                if not company_name:
+                    return "incomplete"
+                resolution = self._resolve_global_identity(session, lead, command)
+                if resolution.state == "reserving":
+                    return "processing"
+                if resolution.state in {"ambiguous", "failed_pending_review"}:
+                    return "failed_pending_review"
+                identity = resolution.identity
+                if resolution.state == "no_identity":
+                    identity = self._reserve_global_identity(session, lead, command)
+                    if identity is None:
+                        # 唯一键竞争后重新读取的 reservation 已成为其他销售的冻结事实。
+                        return "processing"
+                if identity is None:
+                    return "failed_pending_review"
+                if identity.state == "active":
+                    self._record_audit(session, command, "crm_global_identity_reused")
+                operation = "update" if identity.state == "active" else "create"
+                idempotency_key = (
+                    f"crm:update:{lead.id}:{snapshot_hash}"
+                    if operation == "update"
+                    else f"crm:create:{lead.id}"
+                )
                 sync = CrmSyncRecord(
                     lead_id=lead.id,
-                    operation="create",
+                    operation=operation,
                     smart_table_record_id=lead.smart_table_record_id or "",
-                    idempotency_key=f"crm:create:{lead.id}",
+                    idempotency_key=idempotency_key,
                     canonical_payload=canonical_payload,
                     snapshot_hash=snapshot_hash,
                     request_message_id=command.request_message_id,
                     submitting_sales_user_id=command.sales_user_id,
                     # 销售 CRM 映射在逻辑 create 创建时冻结，retry 不重新读取它。
                     submitting_crm_user_id=authorization.crm_user_id,
+                    crm_lead_id=identity.crm_lead_id if operation == "update" else None,
+                    crm_lead_owner_user_id=(
+                        identity.crm_lead_owner_user_id if operation == "update" else None
+                    ),
                 )
                 session.add(sync)
                 session.flush()
+                if operation == "create" and identity is not None:
+                    identity.creating_sync_record_id = sync.id
+                elif operation == "update":
+                    self._record_audit_for_sync(
+                        session, sync, command.sales_user_id, "crm_update_created"
+                    )
                 sync_id = sync.id
         except IntegrityError:
-            # 并发创建只能有一个胜者；另一个调用不允许再触发 CRM。
-            return "incomplete"
+            # 只作为最后一层兜底；正常唯一键竞争会在 savepoint 中恢复并返回 processing。
+            return "processing"
         return self._claim_and_call(sync_id, command.sales_user_id)
 
     def _claim_and_call(self, sync_id: int, sales_user_id: str) -> str:
@@ -235,6 +437,7 @@ class CrmSubmissionService:
                 # 尝试次数达到上限后保留冻结操作供人工处理，禁止无限重试。
                 sync.status = "failed_pending_review"
                 sync.response_summary = "CRM retry limit reached"
+                self._fail_company_identity(session, sync, sales_user_id)
                 return "failed_pending_review"
             sync.status = "processing"
             sync.attempts += 1
@@ -243,11 +446,23 @@ class CrmSubmissionService:
             payload = dict(sync.canonical_payload)
             idempotency_key = sync.idempotency_key
             crm_user_id = sync.submitting_crm_user_id
+            operation = sync.operation
+            crm_lead_id = sync.crm_lead_id
+            if sync.operation == "update" and sync.attempts > 1:
+                self._record_audit_for_sync(session, sync, sales_user_id, "crm_update_retried")
 
         try:
-            crm_result = self._crm_adapter.create_lead(
-                payload, idempotency_key=idempotency_key, crm_user_id=crm_user_id
-            )
+            if operation == "update":
+                crm_result = self._crm_adapter.update_lead(
+                    crm_lead_id or "",
+                    payload,
+                    idempotency_key=idempotency_key,
+                    crm_user_id=crm_user_id,
+                )
+            else:
+                crm_result = self._crm_adapter.create_lead(
+                    payload, idempotency_key=idempotency_key, crm_user_id=crm_user_id
+                )
         except (TimeoutError, ConnectionError, OSError):
             with self._session_factory.begin() as session:
                 sync = session.get(CrmSyncRecord, sync_id)
@@ -265,6 +480,7 @@ class CrmSubmissionService:
                     sync.processing_started_at = None
                     sync.processing_lease_expires_at = None
                     sync.response_summary = "CRM create failed"
+                    self._fail_company_identity(session, sync, sales_user_id)
             return "failed_pending_review"
 
         with self._session_factory.begin() as session:
@@ -276,11 +492,28 @@ class CrmSubmissionService:
             sync.processing_started_at = None
             sync.processing_lease_expires_at = None
             sync.crm_lead_id = crm_result.crm_lead_id
-            sync.crm_lead_owner_user_id = crm_result.crm_lead_owner_user_id
+            # 更新响应无权把既有 CRM 负责人改写为本次提交人。
+            if sync.operation == "create" and crm_result.crm_lead_owner_user_id is not None:
+                sync.crm_lead_owner_user_id = crm_result.crm_lead_owner_user_id
             sync.response_summary = crm_result.response_summary[:256]
             sync.completed_at = utc_now()
+            if sync.operation == "create":
+                identity = session.scalar(
+                    select(CrmCompanyIdentity)
+                    .where(CrmCompanyIdentity.creating_sync_record_id == sync.id)
+                    .with_for_update()
+                )
+                if identity is not None:
+                    identity.state = "active"
+                    identity.crm_lead_id = sync.crm_lead_id
+                    identity.crm_lead_owner_user_id = sync.crm_lead_owner_user_id
+                    self._record_audit_for_sync(
+                        session, sync, sales_user_id, "crm_global_identity_activated"
+                    )
             lead.lifecycle_state = "synced"
-            self._record_audit_for_sync(session, sync, sales_user_id, "crm_create_succeeded")
+            self._record_audit_for_sync(
+                session, sync, sales_user_id, f"crm_{sync.operation}_succeeded"
+            )
         return "succeeded"
 
     @staticmethod
@@ -327,13 +560,182 @@ class CrmSubmissionService:
             and created.astimezone(shanghai).date() == datetime.now(shanghai).date()
         )
 
+    @staticmethod
+    def _last_successful_sync(session: Session, lead_id: str) -> CrmSyncRecord | None:
+        """读取一条线索最后成功的 CRM 快照，作为 update 差异基线。"""
+        return session.scalar(
+            select(CrmSyncRecord)
+            .where(CrmSyncRecord.lead_id == lead_id, CrmSyncRecord.status == "succeeded")
+            .order_by(CrmSyncRecord.completed_at.desc(), CrmSyncRecord.id.desc())
+        )
+
+    def _resolve_global_identity(
+        self, session: Session, lead: Lead, command: SubmissionCommand
+    ) -> GlobalIdentityResolution:
+        """以 registry 为权威解析公司身份，必要时从成功历史同步原子回填。"""
+        company_name = lead.standard_company_name
+        if not company_name:
+            return GlobalIdentityResolution("no_identity")
+        # PostgreSQL 对尚不存在的唯一键没有可锁行；事务级 advisory lock
+        # 让同一公司名称的“查 registry → 建 reservation”成为一个数据库临界区。
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            session.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                {"lock_key": self._company_advisory_lock_key(company_name)},
+            )
+        registry = session.get(CrmCompanyIdentity, company_name)
+        if registry is not None:
+            return GlobalIdentityResolution(registry.state, registry)
+
+        # 仅查询当前数据库中已成功的最小身份事实，绝不读取其他销售的表格或 payload。
+        rows = session.execute(
+            select(CrmSyncRecord.crm_lead_id, CrmSyncRecord.crm_lead_owner_user_id)
+            .join(Lead, CrmSyncRecord.lead_id == Lead.id)
+            .where(
+                Lead.standard_company_name == company_name,
+                CrmSyncRecord.status == "succeeded",
+                CrmSyncRecord.crm_lead_id.is_not(None),
+            )
+        ).all()
+        owners_by_identity: dict[str, set[str | None]] = {}
+        for crm_lead_id, owner_user_id in rows:
+            if crm_lead_id is not None:
+                owners_by_identity.setdefault(crm_lead_id, set()).add(owner_user_id)
+        if not owners_by_identity:
+            return GlobalIdentityResolution("no_identity")
+        if len(owners_by_identity) != 1 or any(
+            len(owners) != 1 for owners in owners_by_identity.values()
+        ):
+            ambiguous = self._insert_identity(
+                session, company_name, state="ambiguous", creating_lead_id=lead.id
+            )
+            if ambiguous is not None:
+                self._record_audit(
+                    session,
+                    command,
+                    "crm_global_identity_ambiguous",
+                    details=self._identity_audit_details(company_name, lead),
+                )
+            return GlobalIdentityResolution("ambiguous", ambiguous)
+        crm_lead_id, owners = next(iter(owners_by_identity.items()))
+        restored = self._insert_identity(
+            session,
+            company_name,
+            state="active",
+            creating_lead_id=lead.id,
+            crm_lead_id=crm_lead_id,
+            crm_lead_owner_user_id=next(iter(owners)),
+        )
+        if restored is None:
+            # 并发写入后重读到的 registry 会在下一轮按照其真实状态处理。
+            registry = session.get(CrmCompanyIdentity, company_name)
+            return GlobalIdentityResolution(
+                registry.state if registry is not None else "reserving", registry
+            )
+        self._record_audit(
+            session,
+            command,
+            "crm_global_identity_reused",
+            details=self._identity_audit_details(company_name, lead),
+        )
+        return GlobalIdentityResolution("active", restored)
+
+    def _reserve_global_identity(
+        self, session: Session, lead: Lead, command: SubmissionCommand
+    ) -> CrmCompanyIdentity | None:
+        """插入首创 reservation，并在唯一键竞争后安全地返回已存在的事实。"""
+        company_name = lead.standard_company_name
+        if not company_name:
+            return None
+        identity = self._insert_identity(
+            session, company_name, state="reserving", creating_lead_id=lead.id
+        )
+        if identity is not None:
+            self._record_audit(
+                session,
+                command,
+                "crm_global_identity_reserved",
+                details=self._identity_audit_details(company_name, lead),
+            )
+            return identity
+        # PostgreSQL 唯一索引竞争会被 savepoint 回滚；此时以已提交 reservation 的实际状态为准。
+        return session.get(CrmCompanyIdentity, company_name)
+
+    @staticmethod
+    def _insert_identity(
+        session: Session,
+        company_name: str,
+        *,
+        state: str,
+        creating_lead_id: str,
+        crm_lead_id: str | None = None,
+        crm_lead_owner_user_id: str | None = None,
+    ) -> CrmCompanyIdentity | None:
+        """在 savepoint 内写注册表，避免唯一键竞争污染外层 CRM 同步事务。"""
+        identity: CrmCompanyIdentity | None = None
+        try:
+            with session.begin_nested():
+                identity = CrmCompanyIdentity(
+                    standard_company_name=company_name,
+                    state=state,
+                    creating_lead_id=creating_lead_id,
+                    crm_lead_id=crm_lead_id,
+                    crm_lead_owner_user_id=crm_lead_owner_user_id,
+                )
+                session.add(identity)
+                session.flush()
+            return identity
+        except IntegrityError:
+            # 回滚 savepoint 后清空失败 INSERT 留在 identity map 的暂态对象，
+            # 使调用方只能重新读取 PostgreSQL 已提交的 reservation。
+            session.expire_all()
+            if identity is not None and identity in session:
+                session.expunge(identity)
+            return None
+
+    @staticmethod
+    def _identity_audit_details(company_name: str, lead: Lead) -> dict[str, str]:
+        """生成不含 payload、联系方式或其他销售身份的全局身份审计元数据。"""
+        return {
+            "standard_company_name_hash": hashlib.sha256(company_name.encode()).hexdigest(),
+            "lead_id": lead.id,
+            "record_id": lead.smart_table_record_id or "",
+        }
+
+    @staticmethod
+    def _company_advisory_lock_key(company_name: str) -> int:
+        """以 SHA-256 前 64 位生成跨进程稳定的 PostgreSQL advisory lock 键。"""
+        digest = hashlib.sha256(company_name.encode()).digest()
+        return int.from_bytes(digest[:8], "big", signed=True)
+
     def _audit(self, command: SubmissionCommand, event_type: str) -> None:
         """为未创建 CRM 同步记录的普通校验结果保存审计反馈。"""
         with self._session_factory.begin() as session:
             self._record_audit(session, command, event_type)
 
+    def _fail_company_identity(
+        self, session: Session, sync: CrmSyncRecord, sales_user_id: str
+    ) -> None:
+        """将首创失败与其公司预留在同一事务转为人工处理状态。"""
+        if sync.operation != "create":
+            return
+        identity = session.scalar(
+            select(CrmCompanyIdentity).where(CrmCompanyIdentity.creating_sync_record_id == sync.id)
+        )
+        if identity is not None:
+            identity.state = "failed_pending_review"
+            self._record_audit_for_sync(
+                session, sync, sales_user_id, "crm_global_identity_failed_pending_review"
+            )
+
     @staticmethod
-    def _record_audit(session: Session, command: SubmissionCommand, event_type: str) -> None:
+    def _record_audit(
+        session: Session,
+        command: SubmissionCommand,
+        event_type: str,
+        *,
+        details: dict[str, str] | None = None,
+    ) -> None:
         """在来源消息存在时幂等保存一条业务审计事件。"""
         existing = session.scalar(
             select(BusinessAuditEvent).where(
@@ -347,7 +749,17 @@ class CrmSubmissionService:
                     message_id=command.request_message_id,
                     sales_user_id=command.sales_user_id,
                     event_type=event_type,
+                    details=details or {},
                 )
+            )
+            # 关键转换仅记录可关联标识和公司哈希，绝不输出 CRM payload 或联系方式。
+            _LOGGER.info(
+                "crm_submission_event=%s request_id=%s message_id=%s lead_id=%s record_id=%s",
+                event_type,
+                command.request_message_id,
+                command.request_message_id,
+                (details or {}).get("lead_id", ""),
+                (details or {}).get("record_id", ""),
             )
 
     @staticmethod
@@ -367,5 +779,19 @@ class CrmSubmissionService:
                     message_id=sync.request_message_id,
                     sales_user_id=sales_user_id,
                     event_type=event_type,
+                    details={
+                        "lead_id": sync.lead_id,
+                        "record_id": sync.smart_table_record_id,
+                        "crm_sync_record_id": str(sync.id),
+                    },
                 )
+            )
+            _LOGGER.info(
+                "crm_submission_event=%s message_id=%s lead_id=%s record_id=%s "
+                "crm_sync_record_id=%s",
+                event_type,
+                sync.request_message_id,
+                sync.lead_id,
+                sync.smart_table_record_id,
+                sync.id,
             )

@@ -15,13 +15,17 @@ class MockCRMAdapter:
         """初始化调用计数、载荷历史和按幂等键缓存的创建结果。"""
         self.calls = 0
         self.payloads: list[dict[str, object]] = []
+        self.update_calls = 0
+        self.update_payloads: list[dict[str, object]] = []
 
     def create_lead(
         self, payload: Mapping[str, object], *, idempotency_key: str, crm_user_id: str
     ) -> CRMCreateResult:
         """防御性校验最低创建条件后记录首次调用并返回模拟 CRM 身份。"""
-        if not payload.get("线索名称") or not payload.get("业务线") or not any(
-            payload.get(name) for name in ("手机", "电话", "邮箱")
+        if (
+            not payload.get("线索名称")
+            or not payload.get("业务线")
+            or not any(payload.get(name) for name in ("手机", "电话", "邮箱"))
         ):
             raise ValueError("CRM minimum create 条件不满足")
         self.calls += 1
@@ -32,3 +36,16 @@ class MockCRMAdapter:
             crm_lead_owner_user_id=crm_user_id,
             response_summary="mock CRM 创建成功",
         )
+
+    def update_lead(
+        self,
+        crm_lead_id: str,
+        payload: Mapping[str, object],
+        *,
+        idempotency_key: str,
+        crm_user_id: str,
+    ) -> CRMCreateResult:
+        """记录对既有身份的模拟更新，并保留由已有 CRM 决定的负责人。"""
+        self.update_calls += 1
+        self.update_payloads.append(dict(payload))
+        return CRMCreateResult(crm_lead_id, None, "mock CRM 更新成功")

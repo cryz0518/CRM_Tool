@@ -228,4 +228,31 @@ class CrmSyncRecord(Base):
             postgresql_where=(operation == "create"),
             sqlite_where=(operation == "create"),
         ),
+        Index(
+            "uq_crm_sync_records_update_snapshot",
+            "lead_id",
+            "snapshot_hash",
+            unique=True,
+            postgresql_where=(operation == "update"),
+            sqlite_where=(operation == "update"),
+        ),
+    )
+
+
+class CrmCompanyIdentity(Base):
+    """保存标准公司名称到 CRM 身份的全局、持久化预留事实。"""
+
+    __tablename__ = "crm_company_identities"
+
+    standard_company_name: Mapped[str] = mapped_column(String(512), primary_key=True)
+    crm_lead_id: Mapped[str | None] = mapped_column(String(128))
+    crm_lead_owner_user_id: Mapped[str | None] = mapped_column(String(128))
+    state: Mapped[str] = mapped_column(String(32), default="reserving", nullable=False)
+    creating_lead_id: Mapped[str | None] = mapped_column(ForeignKey("leads.id"))
+    creating_sync_record_id: Mapped[int | None] = mapped_column(ForeignKey("crm_sync_records.id"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )
