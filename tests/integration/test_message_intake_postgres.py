@@ -268,7 +268,12 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
     postgres_session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """验证同快照 loser 在 CRM 执行期间已释放 Lead 锁并复用唯一操作。"""
+    """验证同快照 loser 在 CRM 执行期间已释放 Lead 锁并复用唯一操作。
+
+    参数：postgres_session_factory 提供真实 PostgreSQL 的独立事务；monkeypatch
+    仅替换本测试的同步钩子。返回值：无。异常：任一 Event/Barrier 在五秒内
+    未达预期状态即断言失败。副作用：创建测试专属 schema，并临时阻塞 Mock CRM。
+    """
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     record = adapter.create_record(
         {"负责人": "sales-1", "线索名称": "公司 Z", "业务线": "协作机器人", "手机": "13900000000"},
@@ -328,16 +333,27 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
                 creating_lead_id=lead.id,
             )
         )
+    # winner 在外部 CRM 调用中保持阻塞；loser 的 claim 边界必须在此期间抵达。
     winner_crm_entered, winner_crm_release = Event(), Event()
     loser_reached_claim_boundary, allow_loser_claim = Event(), Event()
+    # 两个调用都先通过初始 unfinished 检查，才能进入同快照 create/find 竞态。
     reconcile_barrier = Barrier(2)
     reconcile_order_lock = Lock()
     reconcile_order = 0
 
     class BlockingCRM(MockCRMAdapter):
-        """在首个 CRM update 暂停，暴露数据库锁边界。"""
+        """在首个 CRM update 暂停，暴露数据库锁边界。
+
+        参数：继承的 MockCRMAdapter 无额外构造参数。返回值：沿用模拟 CRM 响应。
+        异常：五秒内未收到释放事件时断言失败。副作用：阻塞 winner 线程。
+        """
 
         def update_lead(self, *args: object, **kwargs: object) -> object:
+            """通知 CRM 已进入并等待测试显式释放后再执行模拟更新。
+
+            参数：args/kwargs 透传给父类 update_lead。返回值：模拟 CRM 更新响应。
+            异常：五秒内未释放时断言失败。副作用：设置 winner 到达事件并阻塞线程。
+            """
             winner_crm_entered.set()
             assert winner_crm_release.wait(timeout=5)
             return super().update_lead(*args, **kwargs)
@@ -349,7 +365,12 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
     def order_same_snapshot_reconcile(
         review_service: LeadReviewService, target_lead_id: str
     ) -> object:
-        """让两个请求都通过 unfinished 检查后，winner 先创建并执行 frozen 操作。"""
+        """让两个请求通过 unfinished 检查后，winner 先创建并执行 frozen 操作。
+
+        参数：review_service 为原审核服务；target_lead_id 为同一 Lead。返回值：
+        原 reconcile 结果。异常：Barrier 或 winner CRM 事件超时即断言失败。副作用：
+        第二个调用等待 winner 进入 CRM，构造既有 snapshot 的 create/find 路径。
+        """
         nonlocal reconcile_order
         try:
             reconcile_barrier.wait(timeout=5)
@@ -358,6 +379,7 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
         with reconcile_order_lock:
             reconcile_order += 1
             position = reconcile_order
+        # 第二个调用只能在 winner 已开始外部 CRM 调用后继续处理既有 snapshot。
         if position == 2:
             assert winner_crm_entered.wait(timeout=5)
         return original_reconcile(review_service, target_lead_id)
@@ -365,17 +387,27 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
     def pause_loser_before_claim(
         service: CrmSubmissionService, sync_id: int, sales_user_id: str
     ) -> str:
-        """仅暂停 loser 的 claim，保留 winner 的 CRM 调用阻塞以验证 Lead 锁已释放。"""
+        """仅暂停 loser claim，保留 winner CRM 阻塞以验证 Lead 锁已释放。
+
+        参数：service、sync_id 和 sales_user_id 均透传给原 claim 方法。返回值：
+        原方法的状态字符串。异常：五秒内未允许 loser 继续时断言失败。副作用：
+        设置 loser 边界事件，令第三会话可在其继续前执行 NOWAIT 验证。
+        """
         if winner_crm_entered.is_set():
             loser_reached_claim_boundary.set()
             assert allow_loser_claim.wait(timeout=5)
         return original_claim(service, sync_id, sales_user_id)
 
+    # 两个替换共同保证 loser 走既有 snapshot 分支，且在 claim 前可被确定性观察。
     monkeypatch.setattr(LeadReviewService, "reconcile_submission", order_same_snapshot_reconcile)
     monkeypatch.setattr(CrmSubmissionService, "_claim_and_call", pause_loser_before_claim)
 
     def submit() -> object:
-        """在独立线程和独立 SQLAlchemy 会话中提交同一冻结快照。"""
+        """在独立线程和 SQLAlchemy 会话中提交同一冻结快照。
+
+        参数：无。返回值：CrmSubmissionService 的批次提交结果。异常：数据库或测试
+        同步超时向 future 传播。副作用：可能认领或复用同一 CRM update 操作。
+        """
         return CrmSubmissionService(postgres_session_factory, adapter, crm).submit(
             SubmissionCommand("提交我的更新", "sales-1", "update-message")
         )
