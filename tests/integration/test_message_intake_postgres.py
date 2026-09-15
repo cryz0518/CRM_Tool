@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, Event
+from threading import Barrier, BrokenBarrierError, Event, Lock
 from uuid import uuid4
 
 import pytest
@@ -17,6 +17,7 @@ from app.core.config import get_settings
 from app.crm.mock import MockCRMAdapter
 from app.crm.service import CrmSubmissionService, SubmissionCommand
 from app.leads.models import CrmCompanyIdentity, CrmSyncRecord, Lead
+from app.leads.review import LeadReviewService
 from app.messaging.models import Base, IncomingMessage, SalesAuthorization
 from app.messaging.service import IncomingMessageCommand, MessageIntakeResult, MessageIntakeService
 from app.smart_table.adapter import SmartTableActor
@@ -265,8 +266,9 @@ def test_concurrent_first_submission_reserves_exactly_one_global_crm_identity(
 
 def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
     postgres_session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """验证同一 Lead 同快照并发更新只形成一个操作，且 CRM 执行不持有 Lead 锁。"""
+    """验证同快照 loser 在 CRM 执行期间已释放 Lead 锁并复用唯一操作。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     record = adapter.create_record(
         {"负责人": "sales-1", "线索名称": "公司 Z", "业务线": "协作机器人", "手机": "13900000000"},
@@ -296,6 +298,7 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
         )
         session.add(lead)
         session.flush()
+        lead_id = lead.id
         session.add(
             CrmSyncRecord(
                 lead_id=lead.id,
@@ -325,34 +328,80 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
                 creating_lead_id=lead.id,
             )
         )
-    entered, release, start = Event(), Event(), Event()
+    winner_crm_entered, winner_crm_release = Event(), Event()
+    loser_reached_claim_boundary, allow_loser_claim = Event(), Event()
+    reconcile_barrier = Barrier(2)
+    reconcile_order_lock = Lock()
+    reconcile_order = 0
 
     class BlockingCRM(MockCRMAdapter):
         """在首个 CRM update 暂停，暴露数据库锁边界。"""
 
         def update_lead(self, *args: object, **kwargs: object) -> object:
-            entered.set()
-            assert release.wait(timeout=5)
+            winner_crm_entered.set()
+            assert winner_crm_release.wait(timeout=5)
             return super().update_lead(*args, **kwargs)
 
     crm = BlockingCRM()
+    original_reconcile = LeadReviewService.reconcile_submission
+    original_claim = CrmSubmissionService._claim_and_call
+
+    def order_same_snapshot_reconcile(
+        review_service: LeadReviewService, target_lead_id: str
+    ) -> object:
+        """让两个请求都通过 unfinished 检查后，winner 先创建并执行 frozen 操作。"""
+        nonlocal reconcile_order
+        try:
+            reconcile_barrier.wait(timeout=5)
+        except BrokenBarrierError as error:
+            raise AssertionError("同快照请求未能并发到达 reconcile 边界") from error
+        with reconcile_order_lock:
+            reconcile_order += 1
+            position = reconcile_order
+        if position == 2:
+            assert winner_crm_entered.wait(timeout=5)
+        return original_reconcile(review_service, target_lead_id)
+
+    def pause_loser_before_claim(
+        service: CrmSubmissionService, sync_id: int, sales_user_id: str
+    ) -> str:
+        """仅暂停 loser 的 claim，保留 winner 的 CRM 调用阻塞以验证 Lead 锁已释放。"""
+        if winner_crm_entered.is_set():
+            loser_reached_claim_boundary.set()
+            assert allow_loser_claim.wait(timeout=5)
+        return original_claim(service, sync_id, sales_user_id)
+
+    monkeypatch.setattr(LeadReviewService, "reconcile_submission", order_same_snapshot_reconcile)
+    monkeypatch.setattr(CrmSubmissionService, "_claim_and_call", pause_loser_before_claim)
 
     def submit() -> object:
-        """同步启动独立提交调用。"""
-        start.set()
+        """在独立线程和独立 SQLAlchemy 会话中提交同一冻结快照。"""
         return CrmSubmissionService(postgres_session_factory, adapter, crm).submit(
             SubmissionCommand("提交我的更新", "sales-1", "update-message")
         )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(submit) for _ in range(2)]
-        start.wait()
-        assert entered.wait(timeout=5)
-        release.set()
+        try:
+            assert winner_crm_entered.wait(timeout=5)
+            assert loser_reached_claim_boundary.wait(timeout=5)
+
+            # winner 仍在外部 CRM 调用中。此处 NOWAIT 成功才证明 loser 已提交短事务并释放 Lead 锁。
+            with postgres_session_factory.begin() as lock_session:
+                locked_lead = lock_session.scalar(
+                    select(Lead).where(Lead.id == lead_id).with_for_update(nowait=True)
+                )
+                assert locked_lead is not None
+
+            allow_loser_claim.set()
+        finally:
+            # 无论断言是否失败都解除两个阻塞点，避免失败测试留下等待线程。
+            allow_loser_claim.set()
+            winner_crm_release.set()
         outcomes = [future.result(timeout=5) for future in futures]
     with postgres_session_factory() as session:
         updates = session.scalars(
             select(CrmSyncRecord).where(CrmSyncRecord.operation == "update")
         ).all()
     assert len(updates) == 1 and crm.update_calls == 1
-    assert any(result.updated or result.processing for result in outcomes)
+    assert sorted((result.updated, result.processing) for result in outcomes) == [(0, 1), (1, 0)]
