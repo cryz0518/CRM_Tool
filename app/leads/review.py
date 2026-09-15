@@ -129,7 +129,10 @@ class LeadReviewService:
                 if is_pending and self._must_not_prefill_without_confirmation(field_name):
                     # 没有可靠卡片时，冻结规则要求必填中置信度候选仅留在后台，不写正式字段。
                     continue
-                if field_provenance is not None and field_provenance.is_user_modified:
+                if field_provenance is not None and (
+                    field_provenance.is_user_modified or field_provenance.is_user_confirmed
+                ):
+                    # 已被销售确认的字段即使仍等于最后 AI 值，也不得被失败消息重试改写。
                     protected.add(field_name)
                     pending.discard(field_name)
                     continue

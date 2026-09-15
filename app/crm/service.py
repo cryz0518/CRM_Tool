@@ -14,8 +14,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
+from app.core.failures import classify_task_failure, safe_failure_summary
 from app.crm.adapter import CRMAdapter
-from app.leads.models import CrmCompanyIdentity, CrmSyncRecord, Lead
+from app.leads.models import CrmCompanyIdentity, CrmSyncRecord, Lead, LeadDiscardRequest
 from app.leads.review import LeadReviewService
 from app.messaging.models import BusinessAuditEvent, SalesAuthorization, utc_now
 from app.smart_table.adapter import SmartTableAdapter
@@ -424,6 +425,9 @@ class CrmSubmissionService:
             sync = session.scalar(
                 select(CrmSyncRecord).where(CrmSyncRecord.id == sync_id).with_for_update()
             )
+            if sync is not None and sync.operation == "create":
+                # create 与废弃请求共享 Sync -> Lead 锁序；外部调用仍在提交后进行。
+                session.scalar(select(Lead).where(Lead.id == sync.lead_id).with_for_update())
             if sync is None:
                 return "failed_pending_review"
             lease_expired = (
@@ -436,8 +440,32 @@ class CrmSubmissionService:
             if sync.attempts >= self._crm_create_retry_count:
                 # 尝试次数达到上限后保留冻结操作供人工处理，禁止无限重试。
                 sync.status = "failed_pending_review"
+                sync.failure_category = "transient"
+                sync.failure_summary = "crm_retry_limit_reached"
+                sync.failed_at = utc_now()
                 sync.response_summary = "CRM retry limit reached"
                 self._fail_company_identity(session, sync, sales_user_id)
+                self._finalize_pending_discard(session, sync)
+                return "failed_pending_review"
+            discard_request = session.scalar(
+                select(LeadDiscardRequest)
+                .where(LeadDiscardRequest.lead_id == sync.lead_id)
+                .with_for_update()
+            )
+            if (
+                sync.operation == "create"
+                and sync.status == "pending"
+                and discard_request is not None
+                and discard_request.status == "pending"
+            ):
+                # 受控废弃与认领同样使用短事务；未开始的 create 不得在废弃后调用 CRM。
+                sync.status = "failed_pending_review"
+                sync.failure_category = "permanent"
+                sync.failure_summary = "discarded_before_crm_create"
+                sync.failed_at = utc_now()
+                sync.response_summary = "CRM create skipped after discard"
+                self._fail_company_identity(session, sync, sales_user_id)
+                self._finalize_pending_discard(session, sync)
                 return "failed_pending_review"
             sync.status = "processing"
             sync.attempts += 1
@@ -463,29 +491,33 @@ class CrmSubmissionService:
                 crm_result = self._crm_adapter.create_lead(
                     payload, idempotency_key=idempotency_key, crm_user_id=crm_user_id
                 )
-        except (TimeoutError, ConnectionError, OSError):
+        except (TimeoutError, ConnectionError, OSError) as error:
+            # PermissionError 属于 OSError，但它是永久失败，必须先于传输重试分支终止。
+            if classify_task_failure(error).value != "transient":
+                return self._record_crm_failure(sync_id, sales_user_id, error)
             with self._session_factory.begin() as session:
                 sync = session.get(CrmSyncRecord, sync_id)
                 if sync is not None:
                     sync.status = "retrying"
+                    sync.failure_category = classify_task_failure(error).value
+                    sync.failure_summary = safe_failure_summary(error)
                     sync.processing_started_at = None
                     sync.processing_lease_expires_at = None
                     sync.response_summary = "CRM transport error"
             return "retrying"
-        except Exception:
-            with self._session_factory.begin() as session:
-                sync = session.get(CrmSyncRecord, sync_id)
-                if sync is not None:
-                    sync.status = "failed_pending_review"
-                    sync.processing_started_at = None
-                    sync.processing_lease_expires_at = None
-                    sync.response_summary = "CRM create failed"
-                    self._fail_company_identity(session, sync, sales_user_id)
-            return "failed_pending_review"
+        except Exception as error:
+            return self._record_crm_failure(sync_id, sales_user_id, error)
 
         with self._session_factory.begin() as session:
-            sync = session.get(CrmSyncRecord, sync_id)
-            lead = session.get(Lead, sync.lead_id) if sync is not None else None
+            # CRM 成功事实与废弃请求竞争时，Lead 行锁保证结算看到请求的真实提交顺序。
+            sync = session.scalar(
+                select(CrmSyncRecord).where(CrmSyncRecord.id == sync_id).with_for_update()
+            )
+            lead: Lead | None = None
+            if sync is not None and sync.operation == "create":
+                lead = session.scalar(select(Lead).where(Lead.id == sync.lead_id).with_for_update())
+            elif sync is not None:
+                lead = session.get(Lead, sync.lead_id)
             if sync is None or lead is None:
                 return "failed_pending_review"
             sync.status = "succeeded"
@@ -510,7 +542,32 @@ class CrmSubmissionService:
                     self._record_audit_for_sync(
                         session, sync, sales_user_id, "crm_global_identity_activated"
                     )
+            previous_lifecycle_state = lead.lifecycle_state
             lead.lifecycle_state = "synced"
+            discard_request = session.scalar(
+                select(LeadDiscardRequest)
+                .where(LeadDiscardRequest.lead_id == lead.id)
+                .with_for_update()
+            )
+            if discard_request is not None and discard_request.status == "pending":
+                # 外部 CRM 成功是最终事实；废弃请求只留下未生效审计，不调用不存在的 CRM delete。
+                discard_request.status = "not_effective"
+                discard_request.completed_at = utc_now()
+                self._record_discard_audit(
+                    session,
+                    lead,
+                    discard_request.operator_user_id,
+                    "discard_request_not_effective",
+                    {
+                        "lead_id": lead.id,
+                        "operator_user_id": discard_request.operator_user_id,
+                        "operator_role": discard_request.operator_role,
+                        "old_lifecycle_state": previous_lifecycle_state,
+                        "new_lifecycle_state": lead.lifecycle_state,
+                        "crm_sync_record_id": sync.id,
+                        "discard_request_id": discard_request.id,
+                    },
+                )
             self._record_audit_for_sync(
                 session, sync, sales_user_id, f"crm_{sync.operation}_succeeded"
             )
@@ -726,6 +783,109 @@ class CrmSubmissionService:
             identity.state = "failed_pending_review"
             self._record_audit_for_sync(
                 session, sync, sales_user_id, "crm_global_identity_failed_pending_review"
+            )
+
+    def _record_crm_failure(
+        self, sync_id: int, sales_user_id: str, error: BaseException
+    ) -> str:
+        """将 CRM 永久失败及其废弃协调事实写入一个短事务。
+
+        参数：sync_id 为冻结 CRM 操作；sales_user_id 为提交销售；error 为外部失败异常。
+        返回值：固定返回 failed_pending_review，供批次统计。
+        异常：数据库写入失败时由 SQLAlchemy 抛出。
+        副作用：按 Sync 后 Lead 锁序保存失败分类，释放公司失败事实并结算等待中的废弃请求。
+        """
+        with self._session_factory.begin() as session:
+            # 先锁 Sync 保持 T13 update 路径；create 再锁 Lead，与 discard 统一。
+            sync = session.scalar(
+                select(CrmSyncRecord).where(CrmSyncRecord.id == sync_id).with_for_update()
+            )
+            if sync is not None and sync.operation == "create":
+                session.scalar(select(Lead).where(Lead.id == sync.lead_id).with_for_update())
+            elif sync is not None:
+                session.get(Lead, sync.lead_id)
+            if sync is not None:
+                sync.status = "failed_pending_review"
+                sync.failure_category = classify_task_failure(error).value
+                sync.failure_summary = safe_failure_summary(error)
+                sync.failed_at = utc_now()
+                sync.processing_started_at = None
+                sync.processing_lease_expires_at = None
+                sync.response_summary = "CRM create failed"
+                self._fail_company_identity(session, sync, sales_user_id)
+                self._finalize_pending_discard(session, sync)
+        return "failed_pending_review"
+
+    def _finalize_pending_discard(self, session: Session, sync: CrmSyncRecord) -> None:
+        """在 CRM create 已得到最终失败事实后落实此前等待中的废弃请求。
+
+        参数：session 为已按 Sync 后 Lead 加锁的短事务；sync 为失败的 CRM 同步事实。
+        返回值：无。
+        异常：数据库写入失败时由 SQLAlchemy 抛出。
+        副作用：将 pending 废弃请求和未同步 Lead 置为有效废弃，并写入审计；不改变 CRM 失败事实。
+        """
+        if sync.operation != "create":
+            return
+        request = session.scalar(
+            select(LeadDiscardRequest)
+            .where(LeadDiscardRequest.lead_id == sync.lead_id)
+            .with_for_update()
+        )
+        if request is None or request.status != "pending":
+            return
+        lead = session.scalar(select(Lead).where(Lead.id == sync.lead_id).with_for_update())
+        if lead is None:
+            return
+        previous_lifecycle_state = lead.lifecycle_state
+        request.status = "effective"
+        request.completed_at = utc_now()
+        lead.lifecycle_state = "discarded"
+        self._record_discard_audit(
+            session,
+            lead,
+            request.operator_user_id,
+            "lead_discarded_after_crm_create_failed",
+            {
+                "lead_id": lead.id,
+                "operator_user_id": request.operator_user_id,
+                "operator_role": request.operator_role,
+                "old_lifecycle_state": previous_lifecycle_state,
+                "new_lifecycle_state": lead.lifecycle_state,
+                "crm_sync_record_id": sync.id,
+                "discard_request_id": request.id,
+            },
+        )
+
+    @staticmethod
+    def _record_discard_audit(
+        session: Session,
+        lead: Lead,
+        sales_user_id: str,
+        event_type: str,
+        details: dict[str, object],
+    ) -> None:
+        """按线索来源消息幂等写入 CRM create 与废弃请求的协调审计。
+
+        参数：session 为当前事务；lead 提供来源消息；sales_user_id 为原废弃操作人；
+        其余参数为审计详情。
+        返回值：无。
+        异常：数据库写入失败时由 SQLAlchemy 抛出。
+        副作用：首次出现的事件新增 BusinessAuditEvent。
+        """
+        existing = session.scalar(
+            select(BusinessAuditEvent).where(
+                BusinessAuditEvent.message_id == lead.source_message_id,
+                BusinessAuditEvent.event_type == event_type,
+            )
+        )
+        if existing is None:
+            session.add(
+                BusinessAuditEvent(
+                    message_id=lead.source_message_id,
+                    sales_user_id=sales_user_id,
+                    event_type=event_type,
+                    details=details,
+                )
             )
 
     @staticmethod
