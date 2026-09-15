@@ -38,6 +38,7 @@ class MockSmartTableAdapter:
         )
         self._records: dict[str, SmartTableRecord] = {}
         self._next_record_number = 1
+        self.delete_calls = 0
 
     @property
     def sales_can_create_records(self) -> bool:
@@ -131,3 +132,14 @@ class MockSmartTableAdapter:
         updated_record = SmartTableRecord(record_id=record_id, fields=updated_fields)
         self._records[record_id] = updated_record
         return updated_record
+
+    def delete_record(self, _record_id: str, *, actor: SmartTableActor) -> None:
+        """记录并拒绝物理删除调用，供 T14 断言逻辑废弃不删除审核表行。
+
+        参数：_record_id 为待删除记录；actor 为调用主体。
+        返回：无。
+        异常：始终抛出 AssertionError，因为业务服务不应提供物理删除路径。
+        副作用：递增 delete_calls，保留测试对错误调用的直接证据。
+        """
+        self.delete_calls += 1
+        raise AssertionError(f"T14 禁止物理删除 Smart Table 记录：{actor}")

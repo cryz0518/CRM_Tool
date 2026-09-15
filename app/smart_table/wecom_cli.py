@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal
 
+from app.core.failures import PermanentTaskFailure, RetryableTaskFailure
 from app.smart_table.adapter import (
     SmartTableActor,
     SmartTableAdapterConfigurationError,
@@ -46,6 +47,14 @@ _FIELD_TYPES = {
 
 class WecomCliSmartTableAdapterError(RuntimeError):
     """表示 wecom-cli 返回了不能安全继续处理的响应。"""
+
+
+class WecomCliTransportError(WecomCliSmartTableAdapterError, RetryableTaskFailure):
+    """表示 wecom-cli 网络或进程传输失败，可安全重试同一请求。"""
+
+
+class WecomCliProtocolError(WecomCliSmartTableAdapterError, PermanentTaskFailure):
+    """表示 wecom-cli 返回结构、参数或权限业务失败，不应自动重试。"""
 
 
 class WecomCliSmartTableAdapter:
@@ -230,7 +239,7 @@ class WecomCliSmartTableAdapter:
             response = self._call(resource, "list", payload)
             raw_items = response.get(result_key, [])
             if not isinstance(raw_items, list):
-                raise WecomCliSmartTableAdapterError(
+                raise WecomCliProtocolError(
                     f"wecom-cli {resource} list 返回的 {result_key} 不是列表"
                 )
             # 外部 JSON 数组逐项收窄为对象，拒绝异常条目而不是静默丢失字段或记录。
@@ -241,7 +250,7 @@ class WecomCliSmartTableAdapter:
                 # 没有后续游标即表明当前快照读取完整。
                 return items
             if next_cursor in seen_cursors:
-                raise WecomCliSmartTableAdapterError(
+                raise WecomCliProtocolError(
                     f"wecom-cli {resource} list 返回了循环分页游标"
                 )
             # 记录已消费游标，防止外部服务异常导致无限分页循环。
@@ -279,13 +288,15 @@ class WecomCliSmartTableAdapter:
             except (OSError, subprocess.TimeoutExpired) as error:
                 if attempt == self._retry_count:
                     # 最后一次仍失败时隐藏底层请求和响应，避免异常泄露表格数据。
-                    raise WecomCliSmartTableAdapterError("wecom-cli 调用失败") from error
+                    raise WecomCliTransportError("wecom-cli 调用失败") from error
                 self._log_retry(resource, action, attempt, type(error).__name__)
                 time.sleep(0.2 * (attempt + 1))
                 continue
 
-            if self._is_transient_network_error(response) and attempt < self._retry_count:
+            if self._is_transient_network_error(response):
                 # CLI 明确标记的 NetworkError 才允许重放同一个请求。
+                if attempt == self._retry_count:
+                    raise WecomCliTransportError("wecom-cli 网络调用失败")
                 self._log_retry(resource, action, attempt, "NetworkError")
                 time.sleep(0.2 * (attempt + 1))
                 continue
@@ -316,14 +327,14 @@ class WecomCliSmartTableAdapter:
         )
         if completed.returncode != 0:
             # 非零退出不解析可能包含敏感上下文的标准错误输出。
-            raise WecomCliSmartTableAdapterError(
+            raise WecomCliProtocolError(
                 f"wecom-cli 退出失败，退出码：{completed.returncode}"
             )
         try:
             parsed: Any = json.loads(completed.stdout)
         except json.JSONDecodeError as error:
             # CLI 成功退出但协议异常时，拒绝将非 JSON 文本当作业务数据继续处理。
-            raise WecomCliSmartTableAdapterError("wecom-cli 未返回 JSON 对象") from error
+            raise WecomCliProtocolError("wecom-cli 未返回 JSON 对象") from error
         return self._as_mapping(parsed, "CLI 响应")
 
     @staticmethod
@@ -348,11 +359,11 @@ class WecomCliSmartTableAdapter:
         """
         if "error" in response:
             # 外部 error 对象可能带有敏感上下文，因此只转换为稳定错误类型。
-            raise WecomCliSmartTableAdapterError("wecom-cli 返回外部服务错误")
+            raise WecomCliProtocolError("wecom-cli 返回外部服务错误")
         errcode = response.get("errcode")
         if errcode not in (None, 0):
             # errcode 非零属于业务失败，不应走网络重试或继续解析写入结果。
-            raise WecomCliSmartTableAdapterError("wecom-cli 返回业务错误")
+            raise WecomCliProtocolError("wecom-cli 返回业务错误")
 
     @staticmethod
     def _as_mapping(value: object, name: str) -> Mapping[str, object]:
@@ -365,7 +376,7 @@ class WecomCliSmartTableAdapter:
         """
         if not isinstance(value, Mapping) or not all(isinstance(key, str) for key in value):
             # 字段和记录键必须能安全映射到冻结契约的字符串名称。
-            raise WecomCliSmartTableAdapterError(f"wecom-cli {name} 返回的对象结构无效")
+            raise WecomCliProtocolError(f"wecom-cli {name} 返回的对象结构无效")
         return value
 
     def _parse_field(self, item: Mapping[str, object]) -> SmartTableField:
@@ -384,11 +395,11 @@ class WecomCliSmartTableAdapter:
             or not isinstance(name, str)
             or not isinstance(raw_type, str)
         ):
-            raise WecomCliSmartTableAdapterError("wecom-cli 字段定义缺少标识、名称或类型")
+            raise WecomCliProtocolError("wecom-cli 字段定义缺少标识、名称或类型")
         # 只将冻结契约中声明的 CLI 类型映射为领域类型，未知类型必须阻断 readiness。
         field_type = _FIELD_TYPES.get(raw_type)
         if field_type is None:
-            raise WecomCliSmartTableAdapterError(f"冻结契约不支持智能表格字段类型：{raw_type}")
+            raise WecomCliProtocolError(f"冻结契约不支持智能表格字段类型：{raw_type}")
 
         property_name = "property_select" if raw_type == "select" else f"property_{raw_type}"
         # 枚举选项只存在于选择字段属性中，其他字段统一保留空选项列表。
@@ -405,10 +416,10 @@ class WecomCliSmartTableAdapter:
         副作用：无。
         """
         if not isinstance(property_value, Mapping):
-            raise WecomCliSmartTableAdapterError("wecom-cli 字段属性不是对象")
+            raise WecomCliProtocolError("wecom-cli 字段属性不是对象")
         raw_options = property_value.get("options", [])
         if not isinstance(raw_options, list):
-            raise WecomCliSmartTableAdapterError("wecom-cli 字段选项不是列表")
+            raise WecomCliProtocolError("wecom-cli 字段选项不是列表")
         options: list[SmartTableOption] = []
         for raw_option in raw_options:
             # 服务端 option ID 是后续真实写入必需的值，不能用展示文本替代或自行生成。
@@ -416,7 +427,7 @@ class WecomCliSmartTableAdapter:
             option_id = option.get("id")
             name = option.get("text")
             if not isinstance(option_id, str) or not isinstance(name, str):
-                raise WecomCliSmartTableAdapterError("wecom-cli 字段选项缺少标识或名称")
+                raise WecomCliProtocolError("wecom-cli 字段选项缺少标识或名称")
             options.append(SmartTableOption(option_id=option_id, name=name))
         return tuple(options)
 
@@ -434,7 +445,7 @@ class WecomCliSmartTableAdapter:
         for canonical_name, value in fields.items():
             field = schema.get_field(canonical_name)
             if field is None:
-                raise WecomCliSmartTableAdapterError(f"智能表格未配置字段：{canonical_name}")
+                raise WecomCliProtocolError(f"智能表格未配置字段：{canonical_name}")
             # 字段名称唯一由 schema 解析，业务层绝不拼接管理员维护的必填前缀。
             converted[field.name] = self._to_cli_value(canonical_name, field, value)
         return converted
@@ -480,7 +491,7 @@ class WecomCliSmartTableAdapter:
         record_id = item.get("record_id")
         fields = item.get("values")
         if not isinstance(record_id, str) or not isinstance(fields, Mapping):
-            raise WecomCliSmartTableAdapterError("wecom-cli 记录缺少 record_id 或 values")
+            raise WecomCliProtocolError("wecom-cli 记录缺少 record_id 或 values")
         normalized: dict[str, object] = {}
         for display_name, value in self._as_mapping(fields, "记录 values").items():
             # 真实记录可能包含管理员后续新增字段；未知字段保留原名以避免读数据丢失。
@@ -508,11 +519,11 @@ class WecomCliSmartTableAdapter:
                 or not isinstance(value[0], Mapping)
                 or not isinstance(value[0].get("userId"), str)
             ):
-                raise WecomCliSmartTableAdapterError("MEMBER 字段返回值不符合单成员 CLI 契约")
+                raise WecomCliProtocolError("MEMBER 字段返回值不符合单成员 CLI 契约")
             return value[0]["userId"]
         if field is not None and field.field_type is SmartTableFieldType.MULTI_SELECT:
             if not isinstance(value, list):
-                raise WecomCliSmartTableAdapterError("多选字段返回值不是选项列表")
+                raise WecomCliProtocolError("多选字段返回值不是选项列表")
             values = [WecomCliSmartTableAdapter._cell_text(item) for item in value]
             # 读回选项文本同样去除管理员必填前缀，使 T09 永远与规范字段名比较。
             return (
@@ -533,7 +544,7 @@ class WecomCliSmartTableAdapter:
                     return None
                 if len(value) != 1:
                     # 多个候选无法无损收敛为单一领域值，禁止拼接、任选或猜测。
-                    raise WecomCliSmartTableAdapterError("文本或单选字段返回值不是唯一单元格")
+                    raise WecomCliProtocolError("文本或单选字段返回值不是唯一单元格")
                 value = value[0]
             return WecomCliSmartTableAdapter._cell_text(value)
         return value
@@ -553,7 +564,7 @@ class WecomCliSmartTableAdapter:
             text = value.get("text")
             if isinstance(text, str):
                 return text
-        raise WecomCliSmartTableAdapterError("CLI CellValue 缺少文本")
+        raise WecomCliProtocolError("CLI CellValue 缺少文本")
 
     def _parse_written_record(
         self, response: Mapping[str, object], schema: SmartTableSchema
@@ -568,7 +579,7 @@ class WecomCliSmartTableAdapter:
         records = response.get("records")
         if not isinstance(records, list) or len(records) != 1:
             # 单条写入必须返回唯一结果，批量或空结果会导致调用方无法确定真实记录。
-            raise WecomCliSmartTableAdapterError("wecom-cli 写入响应未返回唯一记录")
+            raise WecomCliProtocolError("wecom-cli 写入响应未返回唯一记录")
         return self._parse_record(self._as_mapping(records[0], "写入记录"), schema)
 
     @staticmethod

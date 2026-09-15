@@ -8,9 +8,10 @@ from typing import Protocol
 import httpx
 
 from app.ai.models import LLMRequest, LLMResponse
+from app.core.failures import RetryableTaskFailure
 
 
-class LLMProviderError(RuntimeError):
+class LLMProviderError(RetryableTaskFailure):
     """表示可由 AI Gateway 统一归一化的模型传输或供应商错误。"""
 
 

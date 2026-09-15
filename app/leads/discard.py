@@ -9,7 +9,6 @@ from enum import StrEnum
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.core.failures import TaskFailureCategory
 from app.leads.models import CrmCompanyIdentity, CrmSyncRecord, Lead, LeadDiscardRequest
 from app.messaging.models import BusinessAuditEvent, SalesAuthorization, utc_now
 
@@ -36,7 +35,7 @@ class LeadDiscardService:
     """以确定性权限和事务顺序执行线索逻辑废弃，不物理删除表格或来源事实。"""
 
     _DISCARDABLE_LIFECYCLE_STATES = frozenset({"temporary", "pending_create"})
-    _IN_FLIGHT_CRM_STATUSES = frozenset({"processing", "retrying"})
+    _IN_FLIGHT_CRM_STATUSES = frozenset({"pending", "processing", "retrying"})
 
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         """注入逻辑废弃所需的数据库事务工厂。
@@ -63,13 +62,14 @@ class LeadDiscardService:
         if not normalized_reason:
             raise ValueError("废弃线索必须填写原因")
         with self._session_factory.begin() as session:
-            # 与 CRM create 认领和结算统一先锁 Sync、再锁 Lead，避免双向等待。
+            # 先锁 Lead，确保本事务之后读取的 CRM create 是锁释放后的最新提交事实。
+            lead = session.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
+            # CRM create 也采用 Lead -> Sync 锁序，避免 discard 与 create 互相等待。
             sync = session.scalar(
                 select(CrmSyncRecord)
                 .where(CrmSyncRecord.lead_id == lead_id, CrmSyncRecord.operation == "create")
                 .with_for_update()
             )
-            lead = session.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
             operator = session.get(SalesAuthorization, operator_user_id)
             if lead is None or operator is None:
                 raise ValueError("线索或废弃操作人不存在")
@@ -110,8 +110,11 @@ class LeadDiscardService:
             )
             session.add(request)
             session.flush()
-            if sync is not None and sync.status in self._IN_FLIGHT_CRM_STATUSES:
-                # processing/retrying 代表外部事实尚未最终确定，不能抢先改变 Lead 生命周期。
+            if sync is not None and (
+                sync.status in self._IN_FLIGHT_CRM_STATUSES
+                or (sync.status == "failed_pending_review" and sync.failure_category == "unknown")
+            ):
+                # 已登记的 create 即使尚未认领外部调用，也必须等待同一冻结操作的最终事实。
                 self._record_audit(
                     session,
                     lead,
@@ -129,13 +132,10 @@ class LeadDiscardService:
                 )
                 return LeadDiscardResult(LeadDiscardStatus.WAITING_FOR_CRM, lead_id, request.id)
 
-            # pending 表示 CRM create 尚未启动；废弃后阻止该冻结操作被外部调用。
-            if sync is not None and sync.status == "pending":
-                sync.status = "failed_pending_review"
-                sync.failure_category = TaskFailureCategory.PERMANENT.value
-                sync.failure_summary = "discarded_before_crm_create"
-                sync.failed_at = utc_now()
-                sync.response_summary = "CRM create skipped after discard"
+            if sync is not None and sync.status == "succeeded":
+                # CRM 成功事实优先；异常本地生命周期不能通过 discard 被继续扩大。
+                raise ValueError("CRM 已成功创建的线索不能废弃")
+
             if sync is None or sync.status == "failed_pending_review":
                 self._release_pending_identity(session, lead, operator_user_id, operator_role)
             lead.lifecycle_state = "discarded"

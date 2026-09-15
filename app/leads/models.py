@@ -251,6 +251,7 @@ class MessageRetryAttempt(Base):
     message_id: Mapped[str] = mapped_column(
         ForeignKey("incoming_messages.message_id"), nullable=False, index=True
     )
+    segment_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     lead_id: Mapped[str | None] = mapped_column(ForeignKey("leads.id"), index=True)
     operator_user_id: Mapped[str] = mapped_column(
         ForeignKey("sales_authorizations.wecom_user_id"), nullable=False
@@ -267,7 +268,17 @@ class MessageRetryAttempt(Base):
 
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    __table_args__ = (UniqueConstraint("message_id", "attempt_number"),)
+    processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint(
+            "message_id",
+            "segment_index",
+            "attempt_number",
+            name="uq_message_retry_attempts_message_segment_attempt",
+        ),
+    )
 
 
 class LeadDiscardRequest(Base):
