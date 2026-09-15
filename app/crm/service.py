@@ -249,6 +249,7 @@ class CrmSubmissionService:
         snapshot_hash = self._snapshot_hash(payload)
         if payload == previous:
             return "unchanged"
+        existing_sync_id: int | None = None
         with self._session_factory.begin() as session:
             lead = session.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
             authorization = session.get(SalesAuthorization, command.sales_user_id)
@@ -262,38 +263,43 @@ class CrmSubmissionService:
                 )
             )
             if existing is not None:
-                return (
-                    "unchanged"
-                    if existing.status == "succeeded"
-                    else self._claim_and_call(existing.id, command.sales_user_id)
+                if existing.status == "succeeded":
+                    return "unchanged"
+                # 先提交并释放 Lead 行锁，再认领既有冻结操作。
+                existing_sync_id = existing.id
+            if existing_sync_id is not None:
+                # 该分支只记录认领目标，不能在持锁事务中调用 CRM。
+                pass
+            else:
+                # 注册表是身份权威；历史同步仅在注册表缺失时由解析器一次性回填。
+                resolution = self._resolve_global_identity(session, lead, command)
+                if resolution.state in {"ambiguous", "failed_pending_review"}:
+                    return "failed_pending_review"
+                if resolution.state == "reserving":
+                    return "processing"
+                target = resolution.identity
+                if target is None or target.crm_lead_id is None:
+                    return "failed_pending_review"
+                sync = CrmSyncRecord(
+                    lead_id=lead.id,
+                    operation="update",
+                    smart_table_record_id=lead.smart_table_record_id or "",
+                    idempotency_key=f"crm:update:{lead.id}:{snapshot_hash}",
+                    canonical_payload=payload,
+                    snapshot_hash=snapshot_hash,
+                    request_message_id=command.request_message_id,
+                    submitting_sales_user_id=command.sales_user_id,
+                    submitting_crm_user_id=authorization.crm_user_id,
+                    crm_lead_id=target.crm_lead_id,
+                    crm_lead_owner_user_id=target.crm_lead_owner_user_id,
                 )
-            # 注册表是身份权威；历史同步仅在注册表缺失时由解析器一次性回填。
-            resolution = self._resolve_global_identity(session, lead, command)
-            if resolution.state in {"ambiguous", "failed_pending_review"}:
-                return "failed_pending_review"
-            if resolution.state == "reserving":
-                return "processing"
-            target = resolution.identity
-            if target is None or target.crm_lead_id is None:
-                return "failed_pending_review"
-            sync = CrmSyncRecord(
-                lead_id=lead.id,
-                operation="update",
-                smart_table_record_id=lead.smart_table_record_id or "",
-                idempotency_key=f"crm:update:{lead.id}:{snapshot_hash}",
-                canonical_payload=payload,
-                snapshot_hash=snapshot_hash,
-                request_message_id=command.request_message_id,
-                submitting_sales_user_id=command.sales_user_id,
-                submitting_crm_user_id=authorization.crm_user_id,
-                crm_lead_id=target.crm_lead_id,
-                crm_lead_owner_user_id=target.crm_lead_owner_user_id,
-            )
-            session.add(sync)
-            session.flush()
-            self._record_audit_for_sync(session, sync, command.sales_user_id, "crm_update_created")
-            sync_id = sync.id
-        return self._claim_and_call(sync_id, command.sales_user_id)
+                session.add(sync)
+                session.flush()
+                self._record_audit_for_sync(
+                    session, sync, command.sales_user_id, "crm_update_created"
+                )
+                sync_id = sync.id
+        return self._claim_and_call(existing_sync_id or sync_id, command.sales_user_id)
 
     def _submit_create(self, lead_id: str, command: SubmissionCommand) -> str:
         """为单个 Lead 建立或认领一次稳定的 create 逻辑操作。

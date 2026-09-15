@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event
 from uuid import uuid4
 
 import pytest
@@ -108,9 +108,7 @@ def test_business_audit_event_schema_exists() -> None:
         # 审计事件与原始消息、Outbox 位于同一事务，缺表会使真实入站消息整体回滚。
         inspector = inspect(engine)
         assert "business_audit_events" in inspector.get_table_names()
-        column_names = {
-            column["name"] for column in inspector.get_columns("business_audit_events")
-        }
+        column_names = {column["name"] for column in inspector.get_columns("business_audit_events")}
     finally:
         engine.dispose()
 
@@ -236,8 +234,7 @@ def test_concurrent_first_submission_reserves_exactly_one_global_crm_identity(
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = [
-            executor.submit(submit, sales_user_id)
-            for sales_user_id in ("sales-A", "sales-B")
+            executor.submit(submit, sales_user_id) for sales_user_id in ("sales-A", "sales-B")
         ]
         outcomes = [future.result() for future in results]
 
@@ -264,3 +261,98 @@ def test_concurrent_first_submission_reserves_exactly_one_global_crm_identity(
             select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_ids[loser])
         )
     assert loser_sync is not None and loser_sync.crm_lead_id == identities[0].crm_lead_id
+
+
+def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
+    postgres_session_factory: sessionmaker[Session],
+) -> None:
+    """验证同一 Lead 同快照并发更新只形成一个操作，且 CRM 执行不持有 Lead 锁。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    record = adapter.create_record(
+        {"负责人": "sales-1", "线索名称": "公司 Z", "业务线": "协作机器人", "手机": "13900000000"},
+        actor=SmartTableActor.ROBOT,
+    )
+    with postgres_session_factory.begin() as session:
+        session.add(
+            SalesAuthorization(
+                wecom_user_id="sales-1", crm_user_id="crm-1", is_authorized=True, is_active=True
+            )
+        )
+        session.flush()
+        session.add(
+            IncomingMessage(
+                message_id="update-message", sales_user_id="sales-1", sequence=1, raw_payload={}
+            )
+        )
+        session.flush()
+        lead = Lead(
+            source_message_id="update-message",
+            original_capturing_sales_user_id="sales-1",
+            smart_table_owner_user_id="sales-1",
+            smart_table_record_id=record.record_id,
+            lifecycle_state="synced",
+            standard_company_name="公司 Z",
+            field_values={},
+        )
+        session.add(lead)
+        session.flush()
+        session.add(
+            CrmSyncRecord(
+                lead_id=lead.id,
+                operation="create",
+                smart_table_record_id=record.record_id,
+                idempotency_key="create-z",
+                canonical_payload={
+                    "线索名称": "公司 Z",
+                    "业务线": "协作机器人",
+                    "手机": "13800000000",
+                },
+                snapshot_hash="c" * 64,
+                request_message_id="update-message",
+                submitting_sales_user_id="sales-1",
+                submitting_crm_user_id="crm-1",
+                crm_lead_id="crm-z",
+                crm_lead_owner_user_id="crm-1",
+                status="succeeded",
+            )
+        )
+        session.add(
+            CrmCompanyIdentity(
+                standard_company_name="公司 Z",
+                crm_lead_id="crm-z",
+                crm_lead_owner_user_id="crm-1",
+                state="active",
+                creating_lead_id=lead.id,
+            )
+        )
+    entered, release, start = Event(), Event(), Event()
+
+    class BlockingCRM(MockCRMAdapter):
+        """在首个 CRM update 暂停，暴露数据库锁边界。"""
+
+        def update_lead(self, *args: object, **kwargs: object) -> object:
+            entered.set()
+            assert release.wait(timeout=5)
+            return super().update_lead(*args, **kwargs)
+
+    crm = BlockingCRM()
+
+    def submit() -> object:
+        """同步启动独立提交调用。"""
+        start.set()
+        return CrmSubmissionService(postgres_session_factory, adapter, crm).submit(
+            SubmissionCommand("提交我的更新", "sales-1", "update-message")
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(submit) for _ in range(2)]
+        start.wait()
+        assert entered.wait(timeout=5)
+        release.set()
+        outcomes = [future.result(timeout=5) for future in futures]
+    with postgres_session_factory() as session:
+        updates = session.scalars(
+            select(CrmSyncRecord).where(CrmSyncRecord.operation == "update")
+        ).all()
+    assert len(updates) == 1 and crm.update_calls == 1
+    assert any(result.updated or result.processing for result in outcomes)
