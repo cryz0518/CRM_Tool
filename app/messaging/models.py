@@ -104,6 +104,9 @@ class OutboxEvent(Base):
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failure_category: Mapped[str | None] = mapped_column(String(32))
+    failure_summary: Mapped[str | None] = mapped_column(String(128))
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

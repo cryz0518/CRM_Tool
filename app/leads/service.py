@@ -16,6 +16,7 @@ from app.ai.models import ExtractedLeadPatch, LeadAnalysis
 from app.companies.models import CompanyRegionEvidence, CompanyUpsertCommand, CompanyUpsertResult
 from app.companies.service import CompanyLeadService
 from app.core.config import get_settings
+from app.core.failures import classify_task_failure, safe_failure_summary
 from app.core.logging import bind_log_context, reset_log_context
 from app.leads.identity import DatabaseSalesIdentityProvider, SalesIdentityProvider
 from app.leads.models import (
@@ -23,6 +24,7 @@ from app.leads.models import (
     LeadFieldProvenance,
     LeadMessageResolution,
     MessageReassignmentAudit,
+    MessageRetryAttempt,
     SalesLeadContext,
     SmartTableSync,
 )
@@ -56,6 +58,27 @@ class LeadProcessingStatus(StrEnum):
     UPDATED = "updated"
     UNASSIGNED = "unassigned"
     SYNC_FAILED = "sync_failed"
+
+
+class ProtectedSupplementStatus(StrEnum):
+    """描述失败消息受保护补充重试的确定性结果。"""
+
+    SUCCEEDED = "succeeded"
+    PROCESSING = "processing"
+    FAILED_PENDING_REVIEW = "failed_pending_review"
+    NO_TARGET = "no_target"
+
+
+@dataclass(frozen=True)
+class ProtectedSupplementResult:
+    """返回一次失败消息补充重试的审计标识和字段保护结果。"""
+
+    status: ProtectedSupplementStatus
+    message_id: str
+    lead_id: str | None = None
+    attempt_id: int | None = None
+    updated_fields: tuple[str, ...] = ()
+    protected_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -189,9 +212,42 @@ class DeterministicFirstTextLeadExtractor:
         """
         if text is None:
             return []
-        # 仅在明确字段标签前切分，兼容销售常用的换行、分号和逗号而不猜测自由文本边界。
+        return [fields for _, fields in self.extract_many_with_segments(text)]
+
+    def extract_many_with_segments(self, text: str | None) -> list[tuple[str, dict[str, str]]]:
+        """返回显式多客户分段原文及字段，保持 retry 的原始分段边界。
+
+        参数：text 为已标准化并持久化的消息文本。
+        返回值：按消息顺序返回可识别客户分段原文和字段补丁。
+        异常：无；不调用外部服务。
+        副作用：无。
+        """
+        if text is None:
+            return []
+        # 只在明确客户标签前切分，避免人工重试重新运行多客户归属算法。
         segments = re.split(r"(?:\r?\n|[；;，,、]\s*(?=(?:客户|公司)\s*[:：]))", text)
-        return [fields for segment in segments if (fields := self.extract(segment)) is not None]
+        return [
+            (segment, fields)
+            for segment in segments
+            if (fields := self.extract(segment)) is not None
+        ]
+
+    def extract_segment_patch(self, text: str | None, segment_index: int) -> dict[str, str]:
+        """只从原消息指定分段生成字段补丁，不重新解析其他客户。
+
+        参数：text 为原始标准化消息；segment_index 为已持久化的失败分段序号。
+        返回值：该分段的确定性字段补丁；索引不存在时返回空字典。
+        异常：无；不调用外部服务。
+        副作用：无。
+        """
+        if segment_index < 0:
+            return {}
+        segments = self.extract_many_with_segments(text)
+        if len(segments) <= 1 and segment_index == 0:
+            return self.extract_patch(text)
+        if segment_index >= len(segments):
+            return {}
+        return segments[segment_index][1]
 
     def has_ambiguous_multiple_companies(self, text: str | None) -> bool:
         """判断一条文本是否出现多个不同公司候选却未能可靠拆分。
@@ -277,6 +333,311 @@ class FirstTextLeadWorkspaceService:
         # 只在本事件已越过首次消费检查点后继续，防止 retrying/processing 事件被错误跳过。
         self._consume_next_after_checkpoint(outbox_event_id)
         return result
+
+    def retry_failed_message(
+        self,
+        message_id: str,
+        operator_user_id: str | None = None,
+        *,
+        segment_index: int = 0,
+    ) -> ProtectedSupplementResult:
+        """在当前线索状态上重试失败消息，禁止回放失败消息之后的历史消息。
+
+        参数：message_id 为已进入 failed_pending_review 的原始消息；operator_user_id 为重试操作人，
+        省略时仅允许该消息所属销售执行。返回值：受保护补充的状态、目标线索和字段保护结果。
+        异常：消息不存在、权限不足或非失败终态时抛出 ValueError/PermissionError；
+        外部失败会保存失败事实。
+        副作用：新增一次指定分段的 MessageRetryAttempt，最多调用一次当前消息的解析和
+        T09 安全补丁同步，
+        原始顺序检查点不变。
+        """
+        if segment_index < 0:
+            raise ValueError("失败消息分段序号不能为负数")
+        message_text: str | None = None
+        with self._session_factory.begin() as session:
+            event = session.scalar(
+                select(OutboxEvent).where(OutboxEvent.message_id == message_id).with_for_update()
+            )
+            message = session.get(IncomingMessage, message_id)
+            if event is None or message is None:
+                raise ValueError(f"失败消息不存在：{message_id}")
+            if event.status != "failed_pending_review":
+                raise ValueError("只有 failed_pending_review 消息允许人工重试")
+            operator_id = operator_user_id or message.sales_user_id
+            operator = session.get(SalesAuthorization, operator_id)
+            if operator is None or not operator.is_active or not (
+                operator.is_authorized or operator.is_administrator
+            ):
+                raise PermissionError("重试操作人没有可用的销售权限")
+            # 原始采集销售只用于审计；合法转交后，普通销售权限由当前 Lead owner 决定。
+            # 具体消息分段和目标 Lead 仍在 _retry_target_lead 中校验，避免借转交跨销售读取。
+            operator_role = "administrator" if operator.is_administrator else "sales"
+            latest_attempt = session.scalar(
+                select(MessageRetryAttempt)
+                .where(MessageRetryAttempt.message_id == message_id)
+                .where(MessageRetryAttempt.segment_index == segment_index)
+                .order_by(MessageRetryAttempt.attempt_number.desc())
+                .with_for_update()
+                .limit(1)
+            )
+            if latest_attempt is not None and latest_attempt.status == "processing":
+                lease_expired = (
+                    latest_attempt.processing_lease_expires_at is not None
+                    and self._as_utc(latest_attempt.processing_lease_expires_at)
+                    <= self._as_utc(utc_now())
+                )
+                if not lease_expired:
+                    return ProtectedSupplementResult(
+                        ProtectedSupplementStatus.PROCESSING,
+                        message_id,
+                        lead_id=latest_attempt.lead_id,
+                        attempt_id=latest_attempt.id,
+                    )
+                # 只恢复同一个 attempt 和同一个目标，绝不新建另一笔补充执行。
+                target = self._retry_target_lead(
+                    session, message, segment_index, operator_id, operator.is_administrator
+                )
+                if target is None or target.id != latest_attempt.lead_id:
+                    latest_attempt.status = ProtectedSupplementStatus.NO_TARGET.value
+                    latest_attempt.failure_category = "permanent"
+                    latest_attempt.error_summary = "retry_target_missing_after_lease"
+                    latest_attempt.completed_at = utc_now()
+                    return ProtectedSupplementResult(
+                        ProtectedSupplementStatus.NO_TARGET,
+                        message_id,
+                        attempt_id=latest_attempt.id,
+                    )
+                attempt = latest_attempt
+                attempt.processing_started_at = utc_now()
+                attempt.processing_lease_expires_at = (
+                    attempt.processing_started_at + self._lead_processing_timeout
+                )
+                lead_id = target.id
+                attempt_id = attempt.id
+                message_text = message.normalized_text
+                retry_text = self._retry_text(message_text, segment_index)
+                self._record_audit(
+                    session,
+                    event,
+                    "lead_message_protected_retry_recovered",
+                    details={"attempt_id": attempt_id, "segment_index": segment_index},
+                )
+            elif latest_attempt is not None and latest_attempt.status == "succeeded":
+                return ProtectedSupplementResult(
+                    ProtectedSupplementStatus.SUCCEEDED,
+                    message_id,
+                    lead_id=latest_attempt.lead_id,
+                    attempt_id=latest_attempt.id,
+                    updated_fields=tuple(latest_attempt.updated_fields),
+                    protected_fields=tuple(latest_attempt.protected_fields),
+                )
+            elif latest_attempt is not None and latest_attempt.status == "no_target":
+                return ProtectedSupplementResult(
+                    ProtectedSupplementStatus.NO_TARGET,
+                    message_id,
+                    lead_id=latest_attempt.lead_id,
+                    attempt_id=latest_attempt.id,
+                )
+            else:
+                target = self._retry_target_lead(
+                    session, message, segment_index, operator_id, operator.is_administrator
+                )
+                attempt_number = (
+                    latest_attempt.attempt_number if latest_attempt is not None else 0
+                ) + 1
+                now = utc_now()
+                attempt = MessageRetryAttempt(
+                    message_id=message_id,
+                    segment_index=segment_index,
+                    lead_id=target.id if target is not None else None,
+                    operator_user_id=operator_id,
+                    attempt_number=attempt_number,
+                    status="processing",
+                    processing_started_at=now,
+                    processing_lease_expires_at=now + self._lead_processing_timeout,
+                    updated_fields=[],
+                    protected_fields=[],
+                )
+                session.add(attempt)
+                session.flush()
+                self._record_audit(
+                    session,
+                    event,
+                    "lead_message_protected_retry_started",
+                    details={
+                        "attempt_id": attempt.id,
+                        "lead_id": target.id if target else None,
+                        "segment_index": segment_index,
+                        "operator_user_id": operator_id,
+                        "operator_role": operator_role,
+                    },
+                )
+                if target is None:
+                    attempt.status = ProtectedSupplementStatus.NO_TARGET.value
+                    attempt.failure_category = "permanent"
+                    attempt.error_summary = "retry_target_missing"
+                    attempt.completed_at = utc_now()
+                    return ProtectedSupplementResult(
+                        ProtectedSupplementStatus.NO_TARGET,
+                        message_id,
+                        attempt_id=attempt.id,
+                    )
+                lead_id = target.id
+                attempt_id = attempt.id
+                message_text = message.normalized_text
+                retry_text = self._retry_text(message_text, segment_index)
+
+        try:
+            # 只重新解析这一条原始消息，不调用 consume，因此不会重放 N+1/N+2 或推进顺序检查点。
+            fields = DeterministicFirstTextLeadExtractor().extract_segment_patch(
+                message_text, segment_index
+            )
+            # 自由文本只重新调用已注入的 T08 网关；不读取或重放该消息之后的任何历史事件。
+            patch = (
+                self._ai_gateway.extract_fields(retry_text or "")
+                if not fields and self._ai_gateway is not None
+                else ExtractedLeadPatch(
+                    trace_id=f"protected-retry-{attempt_id}",
+                    analysis=LeadAnalysis(intent="UPDATE_LEAD"),
+                    fields=fields,
+                    pending_confirmation_fields=(),
+                    low_confidence_candidates={},
+                )
+            )
+            sync_result = LeadReviewService(
+                self._session_factory, self._smart_table_adapter
+            ).sync_ai_patch(
+                lead_id,
+                message_id,
+                patch,
+                protected_supplement=True,
+            )
+        except Exception as error:
+            with self._session_factory.begin() as session:
+                retry_attempt = session.get(MessageRetryAttempt, attempt_id)
+                if retry_attempt is None:
+                    raise ValueError(f"补充重试事实不存在：{attempt_id}")
+                retry_attempt.status = ProtectedSupplementStatus.FAILED_PENDING_REVIEW.value
+                retry_attempt.failure_category = classify_task_failure(error).value
+                retry_attempt.error_summary = safe_failure_summary(error)
+                retry_attempt.completed_at = utc_now()
+                event = session.scalar(
+                    select(OutboxEvent).where(OutboxEvent.message_id == message_id)
+                )
+                if event is not None:
+                    self._record_audit(
+                        session,
+                        event,
+                        "lead_message_protected_retry_failed",
+                        details={
+                            "attempt_id": attempt_id,
+                            "segment_index": segment_index,
+                            "error": retry_attempt.error_summary,
+                            "operator_user_id": operator_id,
+                        },
+                    )
+            logger.exception("lead_message_protected_retry_failed")
+            return ProtectedSupplementResult(
+                ProtectedSupplementStatus.FAILED_PENDING_REVIEW,
+                message_id,
+                lead_id=lead_id,
+                attempt_id=attempt_id,
+            )
+
+        with self._session_factory.begin() as session:
+            retry_attempt = session.get(MessageRetryAttempt, attempt_id)
+            if retry_attempt is None:
+                raise ValueError(f"补充重试事实不存在：{attempt_id}")
+            retry_attempt.status = ProtectedSupplementStatus.SUCCEEDED.value
+            retry_attempt.updated_fields = list(sync_result.updated_fields)
+            retry_attempt.protected_fields = list(sync_result.protected_fields)
+            retry_attempt.completed_at = utc_now()
+            retry_attempt.processing_started_at = None
+            retry_attempt.processing_lease_expires_at = None
+            event = session.scalar(select(OutboxEvent).where(OutboxEvent.message_id == message_id))
+            if event is not None:
+                self._record_audit(
+                    session,
+                    event,
+                    "lead_message_protected_retry_succeeded",
+                    details={
+                        "attempt_id": attempt_id,
+                        "segment_index": segment_index,
+                        "updated_fields": list(sync_result.updated_fields),
+                        "protected_fields": list(sync_result.protected_fields),
+                        "operator_user_id": operator_id,
+                    },
+                )
+        return ProtectedSupplementResult(
+            ProtectedSupplementStatus.SUCCEEDED,
+            message_id,
+            lead_id=lead_id,
+            attempt_id=attempt_id,
+            updated_fields=sync_result.updated_fields,
+            protected_fields=sync_result.protected_fields,
+        )
+
+    @staticmethod
+    def _retry_text(text: str | None, segment_index: int) -> str | None:
+        """从失败消息中取出指定分段供 AI 补充解析，避免把其他客户上下文带入重试。
+
+        参数：text 为原始标准化消息；segment_index 为失败分段序号。
+        返回值：指定分段原文；分段无法可靠定位时仅分段 0 使用完整原文，其余返回 None。
+        异常：无。
+        副作用：无；不访问数据库或外部服务。
+        """
+        segments = DeterministicFirstTextLeadExtractor().extract_many_with_segments(text)
+        if len(segments) <= 1:
+            return text if segment_index == 0 else None
+        if segment_index >= len(segments):
+            return None
+        return segments[segment_index][0]
+
+    @staticmethod
+    def _retry_target_lead(
+        session: Session,
+        message: IncomingMessage,
+        segment_index: int,
+        operator_user_id: str,
+        operator_is_administrator: bool,
+    ) -> Lead | None:
+        """按当前持久化归属或来源线索确定受保护重试目标。
+
+        参数：session 为当前事务；message 为失败消息；segment_index 为失败分段；
+        operator_user_id 为当前操作人；operator_is_administrator 表示是否为管理员。
+        返回值：当前仍可由该操作人补充的 Lead；无法可靠确定时返回 None。
+        异常：数据库读取失败时由 SQLAlchemy 抛出。
+        副作用：仅读取当前事实，不读取可变销售上下文、不解析历史消息或写入归属关系。
+        """
+        resolution = session.scalar(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id == message.message_id,
+                LeadMessageResolution.segment_index == segment_index,
+            )
+        )
+        target_id = resolution.lead_id if resolution is not None else None
+        target = (
+            session.scalar(select(Lead).where(Lead.id == target_id).with_for_update())
+            if target_id is not None
+            else None
+        )
+        if target is None:
+            target = session.scalar(
+                select(Lead)
+                .where(
+                    Lead.source_message_id == message.message_id,
+                    Lead.source_segment_index == segment_index,
+                )
+                .with_for_update()
+            )
+        if target is None or (
+            not operator_is_administrator
+            and target.smart_table_owner_user_id != operator_user_id
+        ):
+            return None
+        if target.lifecycle_state == "discarded":
+            return None
+        return target
 
     def confirm_temporary_company(
         self, lead_id: str, sales_user_id: str, company_name: str
@@ -581,6 +942,7 @@ class FirstTextLeadWorkspaceService:
         temporary_capture: LeadProcessingResult | None = None
         company_initial_command: CompanyUpsertCommand | None = None
         multi_company_fields: list[dict[str, str]] | None = None
+        smart_table_recovery_sync: SmartTableSync | None = None
         try:
             with self._session_factory.begin() as session:
                 event, message = self._load_event_and_message(session, outbox_event_id)
@@ -602,12 +964,18 @@ class FirstTextLeadWorkspaceService:
                         return self._processed_result(session, event)
                     # 调度器已唯一认领失联租约；保留既有人工复核语义而不重放外部调用。
                     event.status = "failed_pending_review"
+                    event.failure_category = "unknown"
+                    event.failure_summary = "processing_lease_expired"
+                    event.failed_at = utc_now()
                     self._record_audit(session, event, "lead_outbox_processing_lease_expired")
                     logger.error("lead_outbox_processing_lease_expired")
                     return self._processed_result(session, event)
                 if not claimed_for_processing and self._processing_lease_expired(event):
                     # 失联 Worker 不得永久占住该销售队列；未知外部结果保留给人工核验而不重放。
                     event.status = "failed_pending_review"
+                    event.failure_category = "unknown"
+                    event.failure_summary = "processing_lease_expired"
+                    event.failed_at = utc_now()
                     self._record_audit(session, event, "lead_outbox_processing_lease_expired")
                     logger.error("lead_outbox_processing_lease_expired")
                     return self._processed_result(session, event)
@@ -639,6 +1007,18 @@ class FirstTextLeadWorkspaceService:
                     # 多个公司候选未能按明确边界拆开时，宁可待归属也不能以最后字段覆盖前段事实。
                     self._mark_unassigned(session, event)
                     return LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
+                if len(multi_fields) <= 1:
+                    # 已有表格记录但 T09 后续步骤失败时，先恢复该同步事实，不能被上下文解析短路。
+                    smart_table_recovery_sync = session.scalar(
+                        select(SmartTableSync)
+                        .where(
+                            SmartTableSync.source_message_id == message.message_id,
+                            SmartTableSync.status != "succeeded",
+                            SmartTableSync.smart_table_record_id.is_not(None),
+                        )
+                        .order_by(SmartTableSync.id.asc())
+                        .limit(1)
+                    )
                 if len(multi_fields) > 1 and self._company_lead_service is None:
                     # 多客户消息先在同一事务内固定所有分段事实，再按既有失败检查点逐条同步。
                     multi_request = self._prepare_multi_leads(
@@ -656,7 +1036,11 @@ class FirstTextLeadWorkspaceService:
                 # 强身份优先于当前上下文，避免销售补充历史客户时把字段串到最近客户。
                 context_lead = (
                     None
-                    if multi_request is not None or multi_company_fields is not None
+                    if (
+                        multi_request is not None
+                        or multi_company_fields is not None
+                        or smart_table_recovery_sync is not None
+                    )
                     else self._get_strong_identity_lead(session, message, extracted_patch)
                 )
                 if (
@@ -668,6 +1052,7 @@ class FirstTextLeadWorkspaceService:
                 if (
                     multi_request is None
                     and multi_company_fields is None
+                    and smart_table_recovery_sync is None
                     and not extracted_patch
                     and message.normalized_text
                     and self._ai_gateway is not None
@@ -691,6 +1076,7 @@ class FirstTextLeadWorkspaceService:
                     multi_request is None
                     and multi_company_fields is None
                     and ai_review is None
+                    and smart_table_recovery_sync is None
                     and context_lead is not None
                     and (
                         "线索名称" not in extracted_patch
@@ -749,6 +1135,7 @@ class FirstTextLeadWorkspaceService:
                         raise ValueError(f"当前线索缺少智能表格记录：{context_lead.id}")
                     event.status = "processing"
                     event.processing_started_at = utc_now()
+                    self._mark_processing_assignment(session, event, context_lead.id)
                     bind_log_context(lead_id=context_lead.id)
                     # 外部表格调用必须等本事务提交后执行，避免在销售顺序锁内等待网络。
                     context_update = ContextUpdateRequest(
@@ -764,6 +1151,7 @@ class FirstTextLeadWorkspaceService:
                     and multi_company_fields is None
                     and context_update is None
                     and ai_review is None
+                    and smart_table_recovery_sync is None
                     and self._company_lead_service is not None
                     and extracted_patch.get("线索名称")
                 ):
@@ -822,11 +1210,12 @@ class FirstTextLeadWorkspaceService:
                             session.add(
                                 LeadFieldProvenance(
                                     lead_id=lead.id,
-                                source_message_id=message.message_id,
-                                field_name=field_name,
-                                value=value,
-                                # 确定性首录同样由系统写表，保存基线以便 T09 正确识别后续人工编辑。
-                                last_ai_synced_value=value,
+                                    source_message_id=message.message_id,
+                                    field_name=field_name,
+                                    value=value,
+                                    # 确定性首录同样由系统写表，保存基线。
+                                    # T09 后续读取该基线以识别销售人工编辑。
+                                    last_ai_synced_value=value,
                                 )
                             )
                         self._record_audit(session, event, "lead_created")
@@ -905,6 +1294,9 @@ class FirstTextLeadWorkspaceService:
         except AIGatewayError as error:
             # 网关已完成自身传输重试；此处绝不伪造建档成功，也不能阻塞该销售的后续消息。
             event.status = "failed_pending_review"
+            event.failure_category = classify_task_failure(error).value
+            event.failure_summary = safe_failure_summary(error)
+            event.failed_at = utc_now()
             self._record_audit(session, event, "ai_gateway_failed_pending_review")
             logger.exception(
                 "ai_gateway_first_text_failed", extra={"error_type": type(error).__name__}
@@ -932,6 +1324,7 @@ class FirstTextLeadWorkspaceService:
                 return None, LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
             event.status = "processing"
             event.processing_started_at = utc_now()
+            self._mark_processing_assignment(session, event, context_lead.id)
             bind_log_context(lead_id=context_lead.id)
             return (
                 AIReviewRequest(
@@ -1072,6 +1465,9 @@ class FirstTextLeadWorkspaceService:
         with self._session_factory.begin() as session:
             event, _ = self._load_event_and_message(session, request.outbox_event_id)
             event.status = "failed_pending_review"
+            event.failure_category = classify_task_failure(error).value
+            event.failure_summary = safe_failure_summary(error)
+            event.failed_at = utc_now()
             if request.creates_lead:
                 sync = session.scalar(
                     select(SmartTableSync).where(SmartTableSync.lead_id == request.lead_id)
@@ -1424,9 +1820,42 @@ class FirstTextLeadWorkspaceService:
                     segment_index=segment_index,
                 )
             )
+        else:
+            resolution.lead_id = lead_id
+            resolution.status = "assigned"
         event.status = "succeeded"
         self._record_audit(session, event, "lead_message_assigned")
         logger.info("lead_message_assigned")
+
+    def _mark_processing_assignment(
+        self, session: Session, event: OutboxEvent, lead_id: str
+    ) -> None:
+        """在外部同步开始前持久化已确定的消息目标，供失败补充重试复用。
+
+        参数：session 为当前处理事务；event 为消息 Outbox 事实；lead_id 为已由 T07 确定的线索。
+        返回值：无。
+        异常：数据库写入失败时由 SQLAlchemy 抛出。
+        副作用：新增或补全 processing 归属，不改变 Outbox 的任务状态或线索生命周期。
+        """
+        resolution = session.scalar(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id == event.message_id,
+                LeadMessageResolution.segment_index == 0,
+            )
+        )
+        if resolution is None:
+            session.add(
+                LeadMessageResolution(
+                    message_id=event.message_id,
+                    segment_index=0,
+                    lead_id=lead_id,
+                    status="processing",
+                )
+            )
+        elif resolution.lead_id is None:
+            # 已有待归属事实没有目标时，只能补入本次确定的同一消息目标，不能覆盖已有归属。
+            resolution.lead_id = lead_id
+            resolution.status = "processing"
 
     def _only_empty_fields(self, lead: Lead, fields: dict[str, str]) -> dict[str, str]:
         """从字段补丁中保留当前线索尚无值的字段，避免覆盖既有或人工数据。
@@ -1497,6 +1926,7 @@ class FirstTextLeadWorkspaceService:
                     event,
                     retrying_event_type="smart_table_context_update_retrying",
                     failed_event_type="smart_table_context_update_failed_pending_review",
+                    error=error,
                 )
             logger.exception(
                 "smart_table_context_update_failed",
@@ -1607,15 +2037,22 @@ class FirstTextLeadWorkspaceService:
         异常：数据库回写错误向调用方传播；表格适配器错误转换为可审计失败结果。
         副作用：调用 SmartTableAdapter，并更新 Lead、同步结果、Outbox 与审计。
         """
+        existing_record_id: str | None = None
         with self._session_factory() as session:
             existing_lead = session.get(Lead, lead_id)
             if existing_lead is not None and existing_lead.smart_table_record_id is not None:
-                # 同一消息的另一分段失败后重试时，已成功分段不得再次调用无幂等键的表格创建。
-                return LeadProcessingResult(
-                    LeadProcessingStatus.CREATED,
-                    lead_id=lead_id,
-                    smart_table_record_id=existing_lead.smart_table_record_id,
+                sync = session.scalar(
+                    select(SmartTableSync).where(SmartTableSync.lead_id == lead_id)
                 )
+                if sync is not None and sync.status == "succeeded":
+                    # 同一消息的另一分段失败后重试时，已成功分段不得再次调用无幂等键的表格创建。
+                    return LeadProcessingResult(
+                        LeadProcessingStatus.CREATED,
+                        lead_id=lead_id,
+                        smart_table_record_id=existing_lead.smart_table_record_id,
+                    )
+                # 记录已经由前一次调用创建，但 T09 或回写阶段失败时只恢复后续短步骤。
+                existing_record_id = existing_lead.smart_table_record_id
         # 创建人和负责人共同写为当前销售，绝不使用机器人、管理员或公共账号。
         record_fields: dict[str, object] = {
             **fields,
@@ -1624,10 +2061,13 @@ class FirstTextLeadWorkspaceService:
             "负责人": sales_user_id,
         }
         logger.info("smart_table_first_lead_sync_started")
+        record_id = existing_record_id
         try:
-            record = self._smart_table_adapter.create_record(
-                record_fields, actor=SmartTableActor.ROBOT
-            )
+            if record_id is None:
+                record = self._smart_table_adapter.create_record(
+                    record_fields, actor=SmartTableActor.ROBOT
+                )
+                record_id = record.record_id
         except Exception as error:
             # 失败保留线索和待审同步事实，避免将外部错误误记为销售已看到记录。
             with self._session_factory.begin() as session:
@@ -1642,6 +2082,7 @@ class FirstTextLeadWorkspaceService:
                     event,
                     retrying_event_type="smart_table_sync_retrying",
                     failed_event_type="smart_table_sync_failed_pending_review",
+                    error=error,
                 )
                 if sync is not None:
                     sync.status = "failed_pending_review" if failed_pending_review else "retrying"
@@ -1657,8 +2098,8 @@ class FirstTextLeadWorkspaceService:
             if lead is None or sync is None:
                 raise ValueError(f"线索同步事实不存在：{lead_id}")
             # 表格成功结果是后续审核和 CRM 提交唯一可用的表格定位信息。
-            lead.smart_table_record_id = record.record_id
-            sync.smart_table_record_id = record.record_id
+            lead.smart_table_record_id = record_id
+            sync.smart_table_record_id = record_id
             sync.status = "processing"
         try:
             # 显式标签路径不调用 Qwen，仍必须经 T09 生成受人工保护的冻结备注和字段来源。
@@ -1687,6 +2128,7 @@ class FirstTextLeadWorkspaceService:
                     event,
                     retrying_event_type="smart_table_sync_retrying",
                     failed_event_type="smart_table_sync_failed_pending_review",
+                    error=error,
                 )
             logger.exception("smart_table_first_lead_remark_failed")
             return LeadProcessingResult(LeadProcessingStatus.SYNC_FAILED, lead_id=lead_id)
@@ -1701,12 +2143,13 @@ class FirstTextLeadWorkspaceService:
             self._mark_assigned(session, event, lead_id, segment_index)
             self._refresh_context(session, message, lead_id)
             self._record_audit(session, event, "smart_table_record_created")
-        bind_log_context(record_id=record.record_id)
+        assert record_id is not None
+        bind_log_context(record_id=record_id)
         logger.info("smart_table_first_lead_created")
         return LeadProcessingResult(
             LeadProcessingStatus.CREATED,
             lead_id=lead_id,
-            smart_table_record_id=record.record_id,
+            smart_table_record_id=record_id,
         )
 
     def _source_message_id(self, outbox_event_id: int) -> str:
@@ -1730,6 +2173,7 @@ class FirstTextLeadWorkspaceService:
         *,
         retrying_event_type: str,
         failed_event_type: str,
+        error: BaseException | None = None,
     ) -> bool:
         """记录一次外部同步失败，并在重试耗尽时将其变为顺序检查点。
 
@@ -1739,9 +2183,22 @@ class FirstTextLeadWorkspaceService:
         副作用：增加尝试次数，更新任务状态并写入对应业务审计事件。
         """
         event.attempts += 1
+        failure_category: str | None = None
+        if error is not None:
+            failure_category = classify_task_failure(error).value
+            event.failure_category = failure_category
+            event.failure_summary = safe_failure_summary(error)
+        if failure_category is not None and failure_category != "transient":
+            # 永久或未知失败不重复调用确定性失败的外部接口，直接成为可人工处理的检查点。
+            event.status = "failed_pending_review"
+            event.failed_at = utc_now()
+            self._record_audit(session, event, failed_event_type)
+            logger.error("lead_outbox_failed_pending_review")
+            return True
         # 配置值表示额外重试次数：首次失败可重试，超过上限后才允许后续消息越过。
         if event.attempts > self._lead_message_retry_count:
             event.status = "failed_pending_review"
+            event.failed_at = utc_now()
             self._record_audit(session, event, failed_event_type)
             logger.error("lead_outbox_failed_pending_review")
             return True
@@ -1750,10 +2207,17 @@ class FirstTextLeadWorkspaceService:
         logger.warning("lead_outbox_retrying")
         return False
 
-    def _record_audit(self, session: Session, event: OutboxEvent, event_type: str) -> None:
+    def _record_audit(
+        self,
+        session: Session,
+        event: OutboxEvent,
+        event_type: str,
+        details: dict[str, object] | None = None,
+    ) -> None:
         """为当前 Outbox 处理阶段添加唯一且可查询的业务审计事件。
 
-        参数：session 为当前事务；event 为来源事件；event_type 为受控处理阶段名称。
+        参数：session 为当前事务；event 为来源事件；event_type 为受控处理阶段名称；
+        details 为可选审计详情。
         返回值：无。
         异常：数据库查询或写入失败时由 SQLAlchemy 抛出。
         副作用：首次出现的阶段向业务审计表新增一条记录。
@@ -1770,6 +2234,7 @@ class FirstTextLeadWorkspaceService:
                     message_id=event.message_id,
                     sales_user_id=event.sales_user_id,
                     event_type=event_type,
+                    details=details or {},
                 )
             )
 

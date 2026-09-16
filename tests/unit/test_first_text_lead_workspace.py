@@ -474,7 +474,7 @@ def test_smart_table_failure_can_be_consumed_again_without_creating_a_second_lea
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     service = FirstTextLeadWorkspaceService(session_factory, adapter)
 
-    with patch.object(adapter, "create_record", side_effect=RuntimeError("temporary")):
+    with patch.object(adapter, "create_record", side_effect=ConnectionError("temporary")):
         failed = service.consume(event_id)
     retried = service.consume(event_id)
 
@@ -492,6 +492,40 @@ def test_smart_table_failure_can_be_consumed_again_without_creating_a_second_lea
     assert sync.status == "succeeded"
     assert event is not None
     assert event.status == "succeeded"
+
+
+def test_remark_failure_after_record_creation_recovers_without_sticking(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证表格记录已创建但 T09 备注失败后，后续消费会恢复而非永久停留 retrying。"""
+    event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-remark-recovery",
+        sales_user_id="sales-1",
+        text="客户：备注恢复客户；联系人：张三",
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+
+    with patch.object(adapter, "update_record", side_effect=ConnectionError("temporary")):
+        failed = service.consume(event_id)
+    retried = service.consume(event_id)
+
+    assert failed.status is LeadProcessingStatus.SYNC_FAILED
+    assert retried.status is LeadProcessingStatus.CREATED
+    assert len(adapter.get_records()) == 1
+    with session_factory() as session:
+        lead = session.scalar(
+            select(Lead).where(Lead.source_message_id == "message-remark-recovery")
+        )
+        sync = (
+            session.scalar(select(SmartTableSync).where(SmartTableSync.lead_id == lead.id))
+            if lead
+            else None
+        )
+        event = session.get(OutboxEvent, event_id)
+    assert lead is not None and sync is not None and sync.status == "succeeded"
+    assert event is not None and event.status == "succeeded"
 
 
 def test_mismatched_outbox_sales_identity_cannot_create_another_sales_record(

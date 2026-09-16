@@ -57,6 +57,17 @@ class SubmissionReconcileResult:
     blocking_fields: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _SafePatchPlan:
+    """保存一次短事务计算出的安全字段补丁及其并发比较基线。"""
+
+    fields_to_write: dict[str, object]
+    written_names: tuple[str, ...]
+    synced_values: dict[str, str]
+    protected_fields: tuple[str, ...]
+    base_lead_values: dict[str, str | None]
+
+
 class LeadReviewService:
     """在 AI 写入和 CRM 提交前保护销售表格编辑并维护确认事实。"""
 
@@ -84,12 +95,17 @@ class LeadReviewService:
         )
 
     def sync_ai_patch(
-        self, lead_id: str, source_message_id: str, patch: ExtractedLeadPatch
+        self,
+        lead_id: str,
+        source_message_id: str,
+        patch: ExtractedLeadPatch,
+        *,
+        protected_supplement: bool = False,
     ) -> ReviewSyncResult:
         """重读智能表格后同步 T08 的合法字段，并永久保护人工编辑字段。
 
-        参数：lead_id 为目标线索；source_message_id 为已持久化 AI 来源消息；
-        patch 为 T08 结果。
+        参数：lead_id 为目标线索；source_message_id 为已持久化 AI 来源消息；patch 为 T08 结果；
+        protected_supplement 表示该补丁来自历史失败消息，只允许补充当前空字段。
         返回值：实际写入与被保护字段的确定性结果。
         异常：线索、消息或表格记录缺失时抛出 ValueError；适配器错误向调用方传播。
         副作用：可能更新表格、字段来源、人工编辑标记和审计记录。
@@ -97,6 +113,8 @@ class LeadReviewService:
         with self._session_factory() as session:
             lead = self._require_lead(session, lead_id)
             self._require_source_message(session, source_message_id)
+            if lead.lifecycle_state == "discarded":
+                raise ValueError(f"已废弃线索禁止 AI 补充：{lead_id}")
             if lead.smart_table_record_id is None:
                 raise ValueError(f"线索缺少智能表格记录：{lead_id}")
             record_id = lead.smart_table_record_id
@@ -106,9 +124,106 @@ class LeadReviewService:
         if record is None:
             raise ValueError(f"智能表格记录不存在：{record_id}")
         current_fields = dict(record.fields)
+        plan = self._plan_safe_patch(
+            lead_id, source_message_id, patch, current_fields, protected_supplement
+        )
+
+        # 在外部写入前再读一次表格；并发的后续消息若已提交，必须基于最新状态重算补丁。
+        latest_record = self._smart_table_adapter.get_record(record_id)
+        if latest_record is None:
+            raise ValueError(f"智能表格记录不存在：{record_id}")
+        if dict(latest_record.fields) != current_fields:
+            current_fields = dict(latest_record.fields)
+            plan = self._plan_safe_patch(
+                lead_id, source_message_id, patch, current_fields, protected_supplement
+            )
+
+        # 外部写入前再次短暂锁定 Lead；若废弃已提交，不能再把表格或后台事实写成补充结果。
+        with self._session_factory.begin() as session:
+            current_lead = session.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
+            if current_lead is None:
+                raise ValueError(f"线索不存在：{lead_id}")
+            if current_lead.lifecycle_state == "discarded":
+                raise ValueError(f"已废弃线索禁止 AI 补充：{lead_id}")
+
+        # 数据库事务不包裹外部调用；Adapter 只收到确有变化的字段补丁。
+        if plan.fields_to_write:
+            self._smart_table_adapter.update_record(record_id, plan.fields_to_write)
 
         with self._session_factory.begin() as session:
-            lead = self._require_lead(session, lead_id)
+            # 最终写回仍要取得 Lead 行锁，并只合并本次计划中未被并发后续写入改变的字段。
+            final_lead = session.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
+            if final_lead is None:
+                raise ValueError(f"线索不存在：{lead_id}")
+            if final_lead.lifecycle_state == "discarded":
+                raise ValueError(f"已废弃线索禁止 AI 补充：{lead_id}")
+            provenance = self._latest_provenance_by_field(session, lead_id)
+            actual_written_names: list[str] = []
+            current_values = dict(final_lead.field_values)
+            for field_name in plan.written_names:
+                value = plan.synced_values[field_name]
+                # 后续消息若已改写该字段，旧失败消息只能保留当前事实，不能以整份 JSON 回写覆盖它。
+                if current_values.get(field_name) != plan.base_lead_values.get(field_name):
+                    continue
+                current_values[field_name] = value
+                actual_written_names.append(field_name)
+                source = provenance.get(field_name)
+                if source is None:
+                    session.add(
+                        LeadFieldProvenance(
+                            lead_id=lead_id,
+                            source_message_id=source_message_id,
+                            field_name=field_name,
+                            value=value,
+                            last_ai_synced_value=value,
+                        )
+                    )
+                else:
+                    source.value = value
+                    source.last_ai_synced_value = value
+            if actual_written_names:
+                # 仅按字段合并本次 T09 实际写入值，绝不使用旧 Lead JSON 整体覆盖后续消息。
+                final_lead.field_values = current_values
+            if patch.enrichment:
+                # 补充信息按当前字典合并，且不回滚已存在的后续键值。
+                final_lead.enrichment_values = {
+                    **final_lead.enrichment_values,
+                    **patch.enrichment,
+                }
+            if actual_written_names:
+                self._record_audit(
+                    session,
+                    source_message_id,
+                    final_lead.smart_table_owner_user_id,
+                    "ai_review_fields_synced",
+                )
+
+        logger.info("lead_review_patch_synced", extra={"lead_id": lead_id, "record_id": record_id})
+        return ReviewSyncResult(tuple(actual_written_names), plan.protected_fields)
+
+    def _plan_safe_patch(
+        self,
+        lead_id: str,
+        source_message_id: str,
+        patch: ExtractedLeadPatch,
+        current_fields: Mapping[str, object],
+        protected_supplement: bool = False,
+    ) -> _SafePatchPlan:
+        """在短数据库事务中基于当前 Lead 与表格值生成受保护字段补丁。
+
+        参数：lead_id 为目标线索；source_message_id 为来源消息；patch 为已校验 AI 补丁；
+        current_fields 为刚从智能表格读取的当前字段；protected_supplement 表示历史失败补充。
+        返回值：包含外部写入补丁、字段保护结果和 Lead 并发比较基线的计划。
+        异常：目标不存在、已废弃或来源消息不存在时抛出 ValueError。
+        副作用：识别并持久化销售对字段的修改事实，但不调用外部适配器。
+        """
+        with self._session_factory.begin() as session:
+            lead = session.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
+            if lead is None:
+                raise ValueError(f"线索不存在：{lead_id}")
+            if lead.lifecycle_state == "discarded":
+                raise ValueError(f"已废弃线索禁止 AI 补充：{lead_id}")
+            self._require_source_message(session, source_message_id)
             provenance = self._latest_provenance_by_field(session, lead_id)
             pending = self._confirmation_names(current_fields.get(AI_CONFIRMATION_FIELD))
             protected = self._detect_user_edits(
@@ -129,7 +244,10 @@ class LeadReviewService:
                 if is_pending and self._must_not_prefill_without_confirmation(field_name):
                     # 没有可靠卡片时，冻结规则要求必填中置信度候选仅留在后台，不写正式字段。
                     continue
-                if field_provenance is not None and field_provenance.is_user_modified:
+                if field_provenance is not None and (
+                    field_provenance.is_user_modified or field_provenance.is_user_confirmed
+                ):
+                    # 已被销售确认的字段即使仍等于最后 AI 值，也不得被失败消息重试改写。
                     protected.add(field_name)
                     pending.discard(field_name)
                     continue
@@ -139,6 +257,11 @@ class LeadReviewService:
                 ):
                     # 未由 AI 写入过的非空值同样不能被本轮建议静默覆盖。
                     protected.add(field_name)
+                    continue
+                if protected_supplement and current_value not in (None, ""):
+                    # 历史失败消息只能补充当前空字段，不能覆盖后续消息已经形成的非空事实。
+                    protected.add(field_name)
+                    pending.discard(field_name)
                     continue
                 if current_value == value:
                     if is_pending:
@@ -181,48 +304,15 @@ class LeadReviewService:
                 fields_to_write["备注"] = remark_value
                 written_names.append("备注")
                 synced_values["备注"] = remark_value
-
-        # 数据库事务不包裹外部调用；Adapter 只收到确有变化的字段补丁。
-        if fields_to_write:
-            self._smart_table_adapter.update_record(record_id, fields_to_write)
-
-        with self._session_factory.begin() as session:
-            lead = self._require_lead(session, lead_id)
-            provenance = self._latest_provenance_by_field(session, lead_id)
-            for field_name in written_names:
-                value = synced_values[field_name]
-                # 后台草稿与审核表必须同步保存 T08 已实际写入的值，供后续 T06/T07 归属读取。
-                synced_values[field_name] = value
-                source = provenance.get(field_name)
-                if source is None:
-                    session.add(
-                        LeadFieldProvenance(
-                            lead_id=lead_id,
-                            source_message_id=source_message_id,
-                            field_name=field_name,
-                            value=value,
-                            last_ai_synced_value=value,
-                        )
-                    )
-                else:
-                    source.value = value
-                    source.last_ai_synced_value = value
-            if synced_values:
-                # 仅合并本次 T09 实际写入字段；被人工保护或低置信度候选绝不进入正式后台快照。
-                lead.field_values = {**lead.field_values, **synced_values}
-            if patch.enrichment:
-                # 原文有证据的补充信息保留在后台，供下一条可靠补充重新生成备注。
-                lead.enrichment_values = {**lead.enrichment_values, **patch.enrichment}
-            if written_names:
-                self._record_audit(
-                    session,
-                    source_message_id,
-                    lead.smart_table_owner_user_id,
-                    "ai_review_fields_synced",
-                )
-
-        logger.info("lead_review_patch_synced", extra={"lead_id": lead_id, "record_id": record_id})
-        return ReviewSyncResult(tuple(written_names), tuple(sorted(protected)))
+            return _SafePatchPlan(
+                fields_to_write=fields_to_write,
+                written_names=tuple(written_names),
+                synced_values=synced_values,
+                protected_fields=tuple(sorted(protected)),
+                base_lead_values={
+                    field_name: lead.field_values.get(field_name) for field_name in written_names
+                },
+            )
 
     def get_submission_confirmation_state(self, lead_id: str) -> SubmissionConfirmationState:
         """重读审核表并返回当前 CRM 最小必填集中仍待显式确认的字段。

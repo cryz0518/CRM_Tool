@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from app.ai.models import ExtractedLeadPatch, LeadAnalysis, LLMRequest, LLMResponse
 from app.ai.provider import LLMProvider, LLMProviderError
+from app.core.failures import PermanentTaskFailure, RetryableTaskFailure
 from app.smart_table.registry import (
     BUSINESS_LINE_OPTIONS,
     COMMUNICATION_METHOD_OPTIONS,
@@ -48,11 +49,15 @@ class AIGatewayError(RuntimeError):
     """表示网关已经完成重试和错误归一化后的失败结论。"""
 
 
-class BusinessValidationError(AIGatewayError):
+class AIGatewayTransportError(AIGatewayError, RetryableTaskFailure):
+    """表示模型传输重试耗尽但仍可由人工任务重试的暂态故障。"""
+
+
+class BusinessValidationError(AIGatewayError, PermanentTaskFailure):
     """表示结构合法但不满足 CRM 字段业务规则的候选。"""
 
 
-class FailedStructuredOutputError(AIGatewayError):
+class FailedStructuredOutputError(AIGatewayError, PermanentTaskFailure):
     """承载待人工审查所需的两次模型输出和结构校验摘要。"""
 
     def __init__(self, original_output: str, repaired_output: str, error_summary: str) -> None:
@@ -169,7 +174,7 @@ class AIGateway:
                     },
                 )
                 if attempt > self._retry_count:
-                    raise AIGatewayError("ai_transport_failed") from error
+                    raise AIGatewayTransportError("ai_transport_failed") from error
         raise AssertionError("不可达：循环在成功或耗尽时结束")
 
     @staticmethod

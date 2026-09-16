@@ -5,6 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Mapping, Protocol
 
+from app.core.failures import PermanentTaskFailure
 from app.smart_table.models import (
     SmartTablePermissions,
     SmartTableRecord,
@@ -28,7 +29,7 @@ class SmartTableRecordNotFoundError(LookupError):
     """表示请求的智能表格记录不存在。"""
 
 
-class SmartTableAdapterConfigurationError(RuntimeError):
+class SmartTableAdapterConfigurationError(PermanentTaskFailure):
     """表示部署尚未提供可读取管理员配置的智能表格适配器。"""
 
 

@@ -213,6 +213,9 @@ class CrmSyncRecord(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     processing_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failure_category: Mapped[str | None] = mapped_column(String(32))
+    failure_summary: Mapped[str | None] = mapped_column(String(128))
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     response_summary: Mapped[str | None] = mapped_column(String(256))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
@@ -237,6 +240,64 @@ class CrmSyncRecord(Base):
             sqlite_where=(operation == "update"),
         ),
     )
+
+
+class MessageRetryAttempt(Base):
+    """保存一次失败消息的受保护补充重试，不改变原始消息顺序检查点。"""
+
+    __tablename__ = "message_retry_attempts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    message_id: Mapped[str] = mapped_column(
+        ForeignKey("incoming_messages.message_id"), nullable=False, index=True
+    )
+    segment_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lead_id: Mapped[str | None] = mapped_column(ForeignKey("leads.id"), index=True)
+    operator_user_id: Mapped[str] = mapped_column(
+        ForeignKey("sales_authorizations.wecom_user_id"), nullable=False
+    )
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="processing", nullable=False)
+    failure_category: Mapped[str | None] = mapped_column(String(32))
+    error_summary: Mapped[str | None] = mapped_column(String(128))
+    updated_fields: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    protected_fields: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint(
+            "message_id",
+            "segment_index",
+            "attempt_number",
+            name="uq_message_retry_attempts_message_segment_attempt",
+        ),
+    )
+
+
+class LeadDiscardRequest(Base):
+    """保存线索逻辑废弃请求，作为 CRM 在途事实与线索生命周期之间的协调记录。"""
+
+    __tablename__ = "lead_discard_requests"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    lead_id: Mapped[str] = mapped_column(ForeignKey("leads.id"), nullable=False, unique=True)
+    operator_user_id: Mapped[str] = mapped_column(
+        ForeignKey("sales_authorizations.wecom_user_id"), nullable=False
+    )
+    operator_role: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class CrmCompanyIdentity(Base):

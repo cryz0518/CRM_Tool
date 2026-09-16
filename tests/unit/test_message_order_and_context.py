@@ -255,10 +255,10 @@ def test_failed_retries_automatically_continue_to_the_next_sales_message(
 
             参数：位置和关键字参数用于兼容适配器调用。
             返回值：无正常返回。
-            异常：始终抛出 RuntimeError。
+            异常：始终抛出 ConnectionError，表示可恢复传输故障。
             副作用：无。
             """
-            raise RuntimeError("temporary")
+            raise ConnectionError("temporary")
 
         monkeypatch.setattr(adapter, "create_record", raise_table_error)
         service.consume(first_event_id)

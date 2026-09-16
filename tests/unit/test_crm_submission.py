@@ -19,7 +19,14 @@ from app.crm.commands import (
 )
 from app.crm.mock import MockCRMAdapter
 from app.crm.service import CrmSubmissionService, SubmissionCommand
-from app.leads.models import CrmCompanyIdentity, CrmSyncRecord, Lead, LeadFieldProvenance
+from app.leads.discard import LeadDiscardService, LeadDiscardStatus
+from app.leads.models import (
+    CrmCompanyIdentity,
+    CrmSyncRecord,
+    Lead,
+    LeadDiscardRequest,
+    LeadFieldProvenance,
+)
 from app.leads.review import LeadReviewService
 from app.messaging.models import (
     Base,
@@ -210,6 +217,52 @@ def test_transport_retry_reuses_frozen_payload_and_key_after_table_edit(
     assert sync is not None
     assert sync.idempotency_key == f"crm:create:{lead_id}"
     assert sync.canonical_payload["手机"] == "13800000000"
+
+
+def test_unknown_crm_failure_does_not_finalize_discard_request(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证未分类 CRM 异常只代表外部结果未知，不能把等待中的废弃结算为有效。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+
+    class UnknownCRM(MockCRMAdapter):
+        """模拟无法判定远端是否已提交的未知 CRM 调用结果。"""
+
+        def create_lead(
+            self, payload: object, *, idempotency_key: str, crm_user_id: str
+        ) -> object:
+            """抛出未分类异常，表示响应边界发生未知故障。"""
+            raise RuntimeError("unknown remote outcome")
+
+    crm = UnknownCRM()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    result = service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12"))
+
+    assert result.failed_pending_review == 1
+    discard = LeadDiscardService(session_factory).discard(
+        lead_id, "sales-1", "等待核实 CRM 结果"
+    )
+    assert discard.status is LeadDiscardStatus.WAITING_FOR_CRM
+    with session_factory() as session:
+        lead = session.get(Lead, lead_id)
+        sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
+        request = session.scalar(
+            select(LeadDiscardRequest).where(LeadDiscardRequest.lead_id == lead_id)
+        )
+        identity = session.scalar(
+            select(CrmCompanyIdentity).where(CrmCompanyIdentity.creating_lead_id == lead_id)
+        )
+        audit = session.scalar(
+            select(BusinessAuditEvent).where(
+                BusinessAuditEvent.event_type == "crm_external_outcome_unknown"
+            )
+        )
+    assert lead is not None and lead.lifecycle_state == "pending_create"
+    assert sync is not None and sync.failure_category == "unknown"
+    assert request is not None and request.status == "pending"
+    assert identity is not None and identity.state == "reserving"
+    assert audit is not None and audit.details["attempts"] == 1
 
 
 def test_update_command_requires_authorized_submitting_salesperson(
