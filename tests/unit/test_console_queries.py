@@ -72,7 +72,10 @@ def seeded_session_factory(session_factory: sessionmaker[Session]) -> sessionmak
                 sales_user_id="sales-1",
                 sequence=1,
                 raw_payload={"raw": "do-not-return"},
-                normalized_text="联系人王验收，电话 13812345678，邮箱 alice@example.com",
+                normalized_text=(
+                    "原始客户描述-should-not-appear；联系人王验收，电话 "
+                    "13812345678，邮箱 alice@example.com"
+                ),
                 received_at=timestamp,
             )
         )
@@ -193,15 +196,21 @@ def test_query_service_returns_masked_dtos_without_raw_message_payload(
     service = ConsoleQueryService(seeded_session_factory, FakeHealthProvider())
 
     messages = service.list_messages(limit=10)
+    message_detail = service.get_message("message-1")
     leads = service.list_leads(limit=10)
 
     assert len(messages.items) == 1
     message = messages.items[0]
-    assert message.text_summary is not None
+    assert message.text_summary == "已接收文本消息，原文默认隐藏"
+    assert "联系人王验收" not in message.text_summary
     assert "13812345678" not in message.text_summary
     assert "alice@example.com" not in message.text_summary
+    assert "原始客户描述-should-not-appear" not in message.text_summary
     assert "raw_payload" not in message.model_dump()
     assert message.has_raw_payload is True
+    assert message_detail is not None
+    assert message_detail.text_summary == "已接收文本消息，原文默认隐藏"
+    assert "联系人王验收" not in message_detail.text_summary
 
     lead = leads.items[0]
     assert lead.masked_field_values["手机"] == "138****5678"
@@ -241,6 +250,47 @@ def test_query_service_limits_pages_and_exposes_ai_metadata_only(
     assert len(ai_records.items) == 1
     assert "prompt" not in ai_records.items[0].model_dump()
     assert "response" not in ai_records.items[0].model_dump()
+
+
+def test_conflict_projection_paginates_all_retry_conflicts_by_source(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 100 条以上的重试冲突可以通过稳定游标分多页完整读取。"""
+    timestamp = datetime(2026, 9, 16, tzinfo=UTC)
+    with session_factory.begin() as session:
+        session.add_all(
+            [
+                MessageRetryAttempt(
+                    message_id=f"message-{index}",
+                    segment_index=0,
+                    lead_id=None,
+                    operator_user_id="sales-1",
+                    attempt_number=1,
+                    status="failed_pending_review",
+                    failure_category="transient",
+                    error_summary=f"retry-{index}",
+                    created_at=timestamp.replace(minute=index % 60, hour=index // 60),
+                    completed_at=timestamp,
+                )
+                for index in range(105)
+            ]
+        )
+
+    service = ConsoleQueryService(session_factory, FakeHealthProvider())
+    first_page = service.list_conflicts(limit=100, source="message_retry")
+    second_page = service.list_conflicts(
+        limit=100,
+        cursor=first_page.next_cursor,
+        source="message_retry",
+    )
+
+    assert len(first_page.items) == 100
+    assert first_page.next_cursor is not None
+    assert len(second_page.items) == 5
+    assert all(item.source == "message_retry" for item in first_page.items + second_page.items)
+    assert {
+        item.conflict_id for item in first_page.items + second_page.items
+    } == {f"task:message_retry:{index + 1}" for index in range(105)}
 
 
 def test_audit_and_config_queries_keep_security_facts_and_mapping_status(

@@ -87,6 +87,7 @@ class ConflictProjection:
         conflict_status = "blocking" if status == "unknown" else "open"
         return ConsoleConflictDTO(
             conflict_id=f"task:{task_kind}:{subject_id}",
+            source=task_kind,
             conflict_kind="task_failure",
             severity=conflict_status,
             status="failed_pending_review" if status != "unknown" else "unknown",
@@ -118,6 +119,7 @@ class ConflictProjection:
             return None
         return ConsoleConflictDTO(
             conflict_id=f"audit:{audit_id}",
+            source="business_audit",
             conflict_kind="discard_request_not_effective",
             severity="review_required",
             status="not_effective",
@@ -139,6 +141,7 @@ class ConflictProjection:
         """构造单条线索冲突 DTO，避免返回公司或联系人原值。"""
         return ConsoleConflictDTO(
             conflict_id=f"lead:{lead.id}:{kind}",
+            source="lead",
             conflict_kind=kind,
             severity=severity,
             status="open",

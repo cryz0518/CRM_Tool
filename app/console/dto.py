@@ -113,6 +113,7 @@ class ConsoleConflictDTO(ConsoleDTO):
     """将多个领域状态投影为可检索的冲突事实。"""
 
     conflict_id: str
+    source: str
     conflict_kind: str
     severity: str
     status: str

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
+import traceback as traceback_module
 from contextvars import ContextVar, Token
 from datetime import UTC, datetime
+from types import TracebackType
 from typing import Any
 
 LOG_CONTEXT: ContextVar[dict[str, str]] = ContextVar("log_context", default={})
@@ -32,6 +35,11 @@ STRUCTURED_EXTRA_FIELDS = (
     "attempt",
     "duplicate",
     "has_reason",
+)
+_LOG_EMAIL_PATTERN = re.compile(r"(?P<local>[^\s@]+)@(?P<domain>[^\s@]+)")
+_LOG_PHONE_PATTERN = re.compile(r"(?<!\d)(?P<number>\+?[0-9][0-9 -]{6,22}[0-9])(?!\d)")
+_LOG_CREDENTIAL_PATTERN = re.compile(
+    r"(?i)(?:密码|口令|验证码|password|token)\s*[:=：]?\s*[^\s；;，,]+"
 )
 
 
@@ -69,7 +77,7 @@ class JsonFormatter(logging.Formatter):
             "environment": self._environment,
             "service": self._service,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": _redact_log_text(record.getMessage()),
         }
         for field in CONTEXT_FIELDS:
             payload[field] = getattr(record, field, None)
@@ -79,8 +87,47 @@ class JsonFormatter(logging.Formatter):
             if value is not None:
                 payload[field] = value
         if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
+            # 保留文件、行号和异常类型，移除异常消息与源码行，防止 traceback 携带正文或凭据。
+            payload["exception"] = _safe_exception_traceback(record.exc_info)
         return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _redact_log_text(value: str) -> str:
+    """脱敏普通日志消息中的邮箱、电话号码和凭据片段。"""
+    redacted = _LOG_CREDENTIAL_PATTERN.sub("[已遮蔽凭据]", value)
+    redacted = _LOG_EMAIL_PATTERN.sub("[已遮蔽邮箱]", redacted)
+    return _LOG_PHONE_PATTERN.sub("[已遮蔽电话]", redacted)
+
+
+def _safe_exception_traceback(
+    exc_info: tuple[
+        type[BaseException] | None,
+        BaseException | None,
+        TracebackType | None,
+    ],
+) -> str:
+    """保留异常调用栈结构但不输出异常正文、源码行或局部变量。"""
+    exception_type, exception, traceback_obj = exc_info
+    lines = ["Traceback (most recent call last):"]
+    if traceback_obj is not None:
+        for frame in traceback_module.extract_tb(traceback_obj):
+            lines.append(f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}')
+
+    current: BaseException | None = exception
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        lines.append(f"{type(current).__name__}: [异常详情已隐藏]")
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
+    if exception is None:
+        type_name = exception_type.__name__ if exception_type is not None else "UnknownException"
+        lines.append(f"{type_name}: [异常详情已隐藏]")
+    return "\n".join(lines)
 
 
 def bind_log_context(**values: str | None) -> Token[dict[str, str]]:

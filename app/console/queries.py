@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from typing import TypeVar
 
 from sqlalchemy import func, or_, select
@@ -150,7 +154,7 @@ class ConsoleQueryService:
                 sales_user_id=message.sales_user_id,
                 sequence=message.sequence,
                 received_at=message.received_at,
-                text_summary=self._masking_policy.mask_text(message.normalized_text),
+                text_summary=self._message_summary(message),
                 has_raw_payload=bool(message.raw_payload),
                 attachment_count=int(attachment_total),
                 resolution_status=resolution,
@@ -357,8 +361,20 @@ class ConsoleQueryService:
         )
         return ConsolePage(items=items)
 
-    def list_conflicts(self, *, limit: int = 50) -> ConsolePage[ConsoleConflictDTO]:
-        """查询公司身份、核验、人工修改、任务失败和 T14 废弃竞态冲突。"""
+    def list_conflicts(
+        self,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+        source: str | None = None,
+    ) -> ConsolePage[ConsoleConflictDTO]:
+        """查询可按来源筛选并使用稳定游标分页的完整冲突投影。
+
+        参数：limit 为单页上限；cursor 为上一页返回的稳定游标；source 为冲突来源筛选。
+        返回值：不含敏感原值的冲突 DTO 分页结果。
+        异常：非法 limit 或 cursor 抛出 ValueError；数据库异常向上传播。
+        副作用：仅读取既有线索、任务和审计事实，不修改领域状态。
+        """
         with self._session_factory() as session:
             conflicts: list[ConsoleConflictDTO] = []
             lead_statement = select(Lead).where(
@@ -370,7 +386,7 @@ class ConsoleQueryService:
                     LeadFieldProvenance.is_user_modified.is_(True),
                 )
             ).outerjoin(LeadFieldProvenance).distinct()
-            for lead in session.scalars(lead_statement.limit(self._MAX_PAGE_SIZE)).all():
+            for lead in session.scalars(lead_statement).all():
                 provenances = session.scalars(
                     select(LeadFieldProvenance).where(LeadFieldProvenance.lead_id == lead.id)
                 ).all()
@@ -379,7 +395,6 @@ class ConsoleQueryService:
             for event in session.scalars(
                 select(OutboxEvent)
                 .where(OutboxEvent.status.in_(tuple(ConflictProjection._TASK_CONFLICT_STATUSES)))
-                .limit(self._MAX_PAGE_SIZE)
             ).all():
                 conflict = ConflictProjection.for_task(
                     task_kind="outbox",
@@ -396,7 +411,6 @@ class ConsoleQueryService:
             for attempt in session.scalars(
                 select(MessageRetryAttempt)
                 .where(MessageRetryAttempt.status.in_(tuple(ConflictProjection._TASK_CONFLICT_STATUSES)))
-                .limit(self._MAX_PAGE_SIZE)
             ).all():
                 conflict = ConflictProjection.for_task(
                     task_kind="message_retry",
@@ -418,7 +432,6 @@ class ConsoleQueryService:
                         tuple(ConflictProjection._TASK_CONFLICT_STATUSES)
                     )
                 )
-                .limit(self._MAX_PAGE_SIZE)
             ).all():
                 conflict = ConflictProjection.for_task(
                     task_kind="media",
@@ -436,7 +449,6 @@ class ConsoleQueryService:
                 .where(
                     SmartTableSync.status.in_(tuple(ConflictProjection._TASK_CONFLICT_STATUSES))
                 )
-                .limit(self._MAX_PAGE_SIZE)
             ).all():
                 conflict = ConflictProjection.for_task(
                     task_kind="smart_table",
@@ -453,7 +465,6 @@ class ConsoleQueryService:
             for crm_task in session.scalars(
                 select(CrmSyncRecord)
                 .where(CrmSyncRecord.status.in_(tuple(ConflictProjection._TASK_CONFLICT_STATUSES)))
-                .limit(self._MAX_PAGE_SIZE)
             ).all():
                 conflict = ConflictProjection.for_task(
                     task_kind="crm",
@@ -472,11 +483,11 @@ class ConsoleQueryService:
             for resolution in session.scalars(
                 select(LeadMessageResolution)
                 .where(LeadMessageResolution.status == "unassigned")
-                .limit(self._MAX_PAGE_SIZE)
             ).all():
                 conflicts.append(
                     ConsoleConflictDTO(
                         conflict_id=f"resolution:{resolution.id}",
+                        source="assignment",
                         conflict_kind="assignment",
                         severity="review_required",
                         status="unassigned",
@@ -492,7 +503,6 @@ class ConsoleQueryService:
             for audit in session.scalars(
                 select(BusinessAuditEvent)
                 .where(BusinessAuditEvent.event_type == "discard_request_not_effective")
-                .limit(self._MAX_PAGE_SIZE)
             ).all():
                 conflict = ConflictProjection.for_audit(
                     audit_id=str(audit.id),
@@ -502,8 +512,35 @@ class ConsoleQueryService:
                 )
                 if conflict is not None:
                     conflicts.append(conflict)
-        conflicts.sort(key=lambda item: (item.updated_at, item.conflict_id), reverse=True)
-        return self._page(conflicts, limit)
+        if source is not None:
+            # 来源筛选让运维可单独翻阅某一类任务，避免跨来源合并时丢失定位上下文。
+            conflicts = [item for item in conflicts if item.source == source]
+
+        conflicts.sort(
+            key=lambda item: (self._normalise_datetime(item.updated_at), item.conflict_id),
+            reverse=True,
+        )
+        conflict_cursor = self._parse_conflict_cursor(cursor)
+        if conflict_cursor is not None:
+            # 游标按“最后一条记录之后”继续，避免新增记录导致 offset 页面漂移。
+            conflicts = [
+                item
+                for item in conflicts
+                if (
+                    self._normalise_datetime(item.updated_at),
+                    item.conflict_id,
+                )
+                < conflict_cursor
+            ]
+
+        bounded_limit = self._bounded_limit(limit)
+        page_items = conflicts[:bounded_limit]
+        next_cursor = (
+            self._encode_conflict_cursor(page_items[-1])
+            if len(conflicts) > bounded_limit and page_items
+            else None
+        )
+        return ConsolePage(items=page_items, next_cursor=next_cursor)
 
     def list_audits(self, *, limit: int = 50) -> ConsolePage[ConsoleAuditEventDTO]:
         """查询业务审计和 Break-glass 审计的安全白名单字段。"""
@@ -576,7 +613,7 @@ class ConsoleQueryService:
             sales_user_id=message.sales_user_id,
             sequence=message.sequence,
             received_at=message.received_at,
-            text_summary=self._masking_policy.mask_text(message.normalized_text),
+            text_summary=self._message_summary(message),
             has_raw_payload=bool(message.raw_payload),
             attachment_count=int(attachment_count),
             resolution_status=resolution,
@@ -607,12 +644,66 @@ class ConsoleQueryService:
             updated_at=lead.updated_at,
         )
 
+    @staticmethod
+    def _message_summary(message: IncomingMessage) -> str:
+        """根据消息类型生成不含客户描述的安全摘要。
+
+        参数：message 为已持久化的消息事实，仅读取媒体处理标记。
+        返回值：不包含 normalized_text、raw payload 或客户原始描述的固定摘要。
+        异常：无。
+        副作用：无，不读取或修改消息正文。
+        """
+        # 默认 Console 只展示结构化消息类型，绝不将原始正文伪装成摘要返回。
+        if message.requires_media_enrichment:
+            return "已接收媒体消息，原文默认隐藏"
+        return "已接收文本消息，原文默认隐藏"
+
     def _safe_text(self, value: str | None) -> str | None:
         """统一脱敏并限制错误摘要长度，避免传递外部响应正文。"""
         if value is None:
             return None
         masked = self._masking_policy.mask_text(value)
         return masked[:256] if masked is not None else None
+
+    @staticmethod
+    def _normalise_datetime(value: datetime) -> datetime:
+        """将数据库返回的有无时区时间统一为 UTC，供游标稳定比较。"""
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    @classmethod
+    def _encode_conflict_cursor(cls, item: ConsoleConflictDTO) -> str:
+        """编码冲突列表最后一条记录的排序键为不透明游标。"""
+        payload = {
+            "updated_at": cls._normalise_datetime(item.updated_at).isoformat(),
+            "conflict_id": item.conflict_id,
+        }
+        return base64.urlsafe_b64encode(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+        ).decode()
+
+    @classmethod
+    def _parse_conflict_cursor(cls, cursor: str | None) -> tuple[datetime, str] | None:
+        """解析冲突游标并校验其排序键结构。"""
+        if cursor is None:
+            return None
+        try:
+            payload = json.loads(base64.urlsafe_b64decode(cursor.encode()).decode())
+            updated_at = datetime.fromisoformat(payload["updated_at"])
+            conflict_id = payload["conflict_id"]
+        except (
+            binascii.Error,
+            KeyError,
+            TypeError,
+            ValueError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as error:
+            raise ValueError("Console 冲突 cursor 非法") from error
+        if not isinstance(conflict_id, str):
+            raise ValueError("Console 冲突 cursor 非法")
+        return cls._normalise_datetime(updated_at), conflict_id
 
     def _business_audit_detail(self, item: BusinessAuditEvent) -> str:
         """将业务审计详情压缩为允许展示的键值摘要。"""

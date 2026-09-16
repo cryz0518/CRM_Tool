@@ -236,9 +236,11 @@ def conflicts(
     _: Annotated[AdminPrincipal, Depends(_require_console_admin)],
     service: Annotated[ConsoleQueryService, Depends(get_console_query_service)],
     limit: int = Query(50, ge=1, le=100),
+    cursor: str | None = None,
+    source: str | None = None,
 ) -> ConsolePage[ConsoleConflictDTO]:
-    """返回完整冲突状态投影。"""
-    return service.list_conflicts(limit=limit)
+    """返回可按来源筛选并分页的完整冲突状态投影。"""
+    return service.list_conflicts(limit=limit, cursor=cursor, source=source)
 
 
 @console_api.get("/audits", response_model=ConsolePage[ConsoleAuditEventDTO])
