@@ -6,11 +6,13 @@ import json
 import logging
 import re
 import time
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from pydantic import ValidationError
 
 from app.ai.models import ExtractedLeadPatch, LeadAnalysis, LLMRequest, LLMResponse
+from app.ai.persistence import AIExecutionRecorder, AIExecutionRecorderEvent
 from app.ai.provider import LLMProvider, LLMProviderError
 from app.core.failures import PermanentTaskFailure, RetryableTaskFailure
 from app.smart_table.registry import (
@@ -86,6 +88,7 @@ class AIGateway:
         retry_count: int = 1,
         high_confidence_threshold: float = 0.85,
         medium_confidence_threshold: float = 0.60,
+        execution_recorder: AIExecutionRecorder | None = None,
     ) -> None:
         """注入 Provider 与冻结为配置的调用、置信度参数。
 
@@ -102,8 +105,15 @@ class AIGateway:
         self._retry_count = retry_count
         self._high_confidence_threshold = high_confidence_threshold
         self._medium_confidence_threshold = medium_confidence_threshold
+        self._execution_recorder = execution_recorder
 
-    def extract_fields(self, text: str) -> ExtractedLeadPatch:
+    def extract_fields(
+        self,
+        text: str,
+        *,
+        source_message_id: str | None = None,
+        lead_id: str | None = None,
+    ) -> ExtractedLeadPatch:
         """提取一条文本的字段补丁并完成 Parse、Schema 与 Business Validation。
 
         参数：text 为已持久化消息中本次字段提取必要的文本。
@@ -130,6 +140,14 @@ class AIGateway:
             fields, pending, low_candidates = self._apply_confidence(analysis, safe_text)
         except AIGatewayError as error:
             self._log(trace_id, started_at, "failed", error_type=type(error).__name__)
+            self._record_execution(
+                trace_id,
+                status="failed",
+                source_message_id=source_message_id,
+                lead_id=lead_id,
+                error_type=type(error).__name__,
+                duration_ms=round((time.monotonic() - started_at) * 1000),
+            )
             raise
         # 只写统计量，既可定位成本和重试，又不会把客户文本写入日志。
         all_responses = (response,) + ((repair_response,) if repair_response is not None else ())
@@ -141,9 +159,65 @@ class AIGateway:
             input_tokens=sum(item.input_tokens or 0 for item in all_responses),
             output_tokens=sum(item.output_tokens or 0 for item in all_responses),
         )
+        self._record_execution(
+            trace_id,
+            status="succeeded",
+            source_message_id=source_message_id,
+            lead_id=lead_id,
+            call_count=attempts + repair_attempts,
+            input_tokens=sum(item.input_tokens or 0 for item in all_responses),
+            output_tokens=sum(item.output_tokens or 0 for item in all_responses),
+            duration_ms=round((time.monotonic() - started_at) * 1000),
+        )
         return ExtractedLeadPatch(
             trace_id, analysis, fields, pending, low_candidates, analysis.enrichment
         )
+
+    def _record_execution(
+        self,
+        trace_id: str,
+        *,
+        status: str,
+        source_message_id: str | None,
+        lead_id: str | None,
+        call_count: int | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        duration_ms: int | None = None,
+        error_type: str | None = None,
+    ) -> None:
+        """尽力持久化不含原文的 AI 执行元数据，不让观测故障伪造业务结果。
+
+        参数：trace_id 为调用追踪标识；其余参数为状态、来源引用和统计信息。
+        返回值：无。
+        异常：记录器异常被吞并写入脱敏日志，原始 AI 结果不受影响。
+        副作用：可能新增一条 AI execution record，但绝不保存 Prompt 或响应。
+        """
+        if self._execution_recorder is None:
+            return
+        try:
+            self._execution_recorder.record(
+                AIExecutionRecorderEvent(
+                    trace_id=trace_id,
+                    operation="extract_fields",
+                    provider=type(self._provider).__name__,
+                    model=self._provider.model_name,
+                    status=status,
+                    message_id=source_message_id,
+                    lead_id=lead_id,
+                    call_count=call_count,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    duration_ms=duration_ms,
+                    error_type=error_type,
+                    error_summary=(f"ai_gateway:{error_type}" if error_type else None),
+                    created_at=datetime.fromtimestamp(time.time(), tz=UTC),
+                    completed_at=datetime.fromtimestamp(time.time(), tz=UTC),
+                )
+            )
+        except Exception:
+            # 观测表故障不能改变已完成的 AI 业务结论，日志同样不带模型内容。
+            logger.exception("ai_execution_record_failed")
 
     def _call_with_transport_retry(
         self, request: LLMRequest, trace_id: str

@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.ai.dependencies import get_ai_gateway
 from app.ai.models import ExtractedLeadPatch, LeadAnalysis
+from app.ai.persistence import DatabaseAIExecutionRecorder
 from app.companies.service import CompanyLeadService, MockQCCAdapter
 from app.core.config import get_settings
 from app.crm.commands import consume_submission_command
@@ -66,7 +67,7 @@ def consume_lead_outbox_event(
         service = FirstTextLeadWorkspaceService(
             factory,
             smart_table_adapter,
-            ai_gateway=get_ai_gateway(),
+            ai_gateway=get_ai_gateway(execution_recorder=DatabaseAIExecutionRecorder(factory)),
             company_lead_service=CompanyLeadService(
                 factory, smart_table_adapter, MockQCCAdapter()
             ),

@@ -45,7 +45,8 @@ def test_ticket14_migration_chain_upgrades_fresh_database() -> None:
             text=True,
             env=command_environment,
         )
-        assert "0018_message_retry_lease_segment" in heads.stdout
+        # T14 链必须继续存在，并由当前 T15 revision 作为唯一 head 收束。
+        assert "0019_ticket15_console_observability" in heads.stdout
     finally:
         # 只删除本测试刚创建的临时数据库，不触碰 Compose volume 或其他数据库。
         with admin_engine.connect() as connection:

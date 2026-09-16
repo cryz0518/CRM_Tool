@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     asr_provider: Literal["mock", "qwen"] = "qwen"
     qwen_ocr_model: str = "qwen3.5-ocr"
     qwen_asr_model: str = "qwen3-asr-flash"
+    console_dev_admin_token: str | None = None
+    console_dev_admin_subject: str = "development-admin"
+    console_dev_admin_role: str = "administrator"
 
     @field_validator(
         "wecom_smart_table_sales_can_create_records",

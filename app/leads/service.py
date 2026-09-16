@@ -494,7 +494,11 @@ class FirstTextLeadWorkspaceService:
             )
             # 自由文本只重新调用已注入的 T08 网关；不读取或重放该消息之后的任何历史事件。
             patch = (
-                self._ai_gateway.extract_fields(retry_text or "")
+                self._ai_gateway.extract_fields(
+                    retry_text or "",
+                    source_message_id=message_id,
+                    lead_id=lead_id,
+                )
                 if not fields and self._ai_gateway is not None
                 else ExtractedLeadPatch(
                     trace_id=f"protected-retry-{attempt_id}",
@@ -1290,7 +1294,11 @@ class FirstTextLeadWorkspaceService:
         """
         assert self._ai_gateway is not None
         try:
-            patch = self._ai_gateway.extract_fields(message.normalized_text or "")
+            patch = self._ai_gateway.extract_fields(
+                message.normalized_text or "",
+                source_message_id=message.message_id,
+                lead_id=context_lead.id if context_lead is not None else None,
+            )
         except AIGatewayError as error:
             # 网关已完成自身传输重试；此处绝不伪造建档成功，也不能阻塞该销售的后续消息。
             event.status = "failed_pending_review"

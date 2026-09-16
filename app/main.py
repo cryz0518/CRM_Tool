@@ -1,4 +1,4 @@
-"""FastAPI 应用入口，仅提供 T01 所需健康检查。"""
+"""FastAPI 应用入口，提供健康检查与内部 Operations Console。"""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import RequestResponseEndpoint
 
+from app.console.routes import router as console_router
 from app.core.config import get_settings
 from app.core.logging import bind_log_context, configure_logging, reset_log_context
 from app.smart_table.adapter import SmartTableAdapter
@@ -21,6 +22,7 @@ configure_logging(settings.log_level, environment=settings.app_env, service="app
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="CRM 线索自动录入", version="0.1.0")
+app.include_router(console_router)
 
 
 @app.middleware("http")

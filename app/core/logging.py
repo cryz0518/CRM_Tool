@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
+import traceback as traceback_module
 from contextvars import ContextVar, Token
 from datetime import UTC, datetime
+from types import TracebackType
 from typing import Any
 
 LOG_CONTEXT: ContextVar[dict[str, str]] = ContextVar("log_context", default={})
@@ -33,6 +36,13 @@ STRUCTURED_EXTRA_FIELDS = (
     "duplicate",
     "has_reason",
 )
+_LOG_EMAIL_PATTERN = re.compile(r"(?P<local>[^\s@]+)@(?P<domain>[^\s@]+)")
+_LOG_PHONE_PATTERN = re.compile(r"(?<!\d)(?P<number>\+?[0-9][0-9 -]{6,22}[0-9])(?!\d)")
+_LOG_CREDENTIAL_PATTERN = re.compile(
+    r"(?i)(?:密码|口令|验证码|secret|credential|cookie|password|token|api[_-]?key)"
+    r"\s*[:=：]?\s*[^\s；;，,]+"
+)
+_TRACEBACK_FRAME_PATTERN = re.compile(r'^\s*File ".+", line \d+, in .+$')
 
 
 class ContextFilter(logging.Filter):
@@ -69,7 +79,7 @@ class JsonFormatter(logging.Formatter):
             "environment": self._environment,
             "service": self._service,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": _redact_log_text(record.getMessage()),
         }
         for field in CONTEXT_FIELDS:
             payload[field] = getattr(record, field, None)
@@ -77,10 +87,90 @@ class JsonFormatter(logging.Formatter):
         for field in STRUCTURED_EXTRA_FIELDS:
             value = getattr(record, field, None)
             if value is not None:
-                payload[field] = value
+                # readiness 传入的 traceback 可能包含源码行，统一裁剪为安全的栈帧摘要。
+                payload[field] = (
+                    _safe_traceback_text(str(value))
+                    if field == "error_traceback"
+                    else value
+                )
         if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
+            # 保留文件、行号和异常类型，移除异常消息与源码行，防止 traceback 携带正文或凭据。
+            payload["exception"] = _safe_exception_traceback(record.exc_info)
         return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _redact_log_text(value: str) -> str:
+    """脱敏普通日志消息中的邮箱、电话号码和凭据片段。
+
+    参数：value 为待写入日志的文本。
+    返回值：隐藏邮箱、电话和凭据值后的文本。
+    异常：无。
+    副作用：无，不修改传入字符串。
+    """
+    redacted = _LOG_CREDENTIAL_PATTERN.sub("[已遮蔽凭据]", value)
+    redacted = _LOG_EMAIL_PATTERN.sub("[已遮蔽邮箱]", redacted)
+    return _LOG_PHONE_PATTERN.sub("[已遮蔽电话]", redacted)
+
+
+def _safe_exception_traceback(
+    exc_info: tuple[
+        type[BaseException] | None,
+        BaseException | None,
+        TracebackType | None,
+    ],
+) -> str:
+    """保留异常调用栈结构但不输出异常正文、源码行或局部变量。
+
+    参数：exc_info 为 logging 捕获的异常类型、实例和 traceback 三元组。
+    返回值：仅含安全栈帧和异常类型的文本摘要。
+    异常：无；异常链循环会被安全终止。
+    副作用：无，不读取或修改异常对象。
+    """
+    exception_type, exception, traceback_obj = exc_info
+    lines = ["Traceback (most recent call last):"]
+    if traceback_obj is not None:
+        for frame in traceback_module.extract_tb(traceback_obj):
+            # 文件路径和函数名也经过同一规则处理，避免异常栈元数据携带凭据片段。
+            lines.append(
+                _redact_log_text(
+                    f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}'
+                )
+            )
+
+    current: BaseException | None = exception
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        lines.append(f"{type(current).__name__}: [异常详情已隐藏]")
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
+    if exception is None:
+        type_name = exception_type.__name__ if exception_type is not None else "UnknownException"
+        lines.append(f"{type_name}: [异常详情已隐藏]")
+    return "\n".join(lines)
+
+
+def _safe_traceback_text(value: str) -> str:
+    """将外部传入的 traceback 文本裁剪为不含源码行的安全栈帧摘要。
+
+    参数：value 为 readiness 或其他结构化日志字段中的 traceback 文本。
+    返回值：仅保留文件、行号和函数名的 traceback 摘要；没有栈帧时返回固定提示。
+    异常：无。
+    副作用：无，不将原始 traceback 写入日志。
+    """
+    # format_tb 每个栈帧后会附带一行源码；这里只保留可定位问题的栈帧结构。
+    frames = [
+        _redact_log_text(line)
+        for line in value.splitlines()
+        if _TRACEBACK_FRAME_PATTERN.match(line)
+    ]
+    if not frames:
+        return "Traceback [调用栈不可用]"
+    return "\n".join(["Traceback (most recent call last):", *frames])
 
 
 def bind_log_context(**values: str | None) -> Token[dict[str, str]]:
