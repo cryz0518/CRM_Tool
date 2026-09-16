@@ -667,14 +667,26 @@ class ConsoleQueryService:
 
     @staticmethod
     def _normalise_datetime(value: datetime) -> datetime:
-        """将数据库返回的有无时区时间统一为 UTC，供游标稳定比较。"""
+        """将数据库返回的有无时区时间统一为 UTC，供游标稳定比较。
+
+        参数：value 为数据库记录中的时间值。
+        返回值：带 UTC 时区的时间值。
+        异常：无。
+        副作用：无，不修改原时间对象。
+        """
         if value.tzinfo is None:
             return value.replace(tzinfo=UTC)
         return value.astimezone(UTC)
 
     @classmethod
     def _encode_conflict_cursor(cls, item: ConsoleConflictDTO) -> str:
-        """编码冲突列表最后一条记录的排序键为不透明游标。"""
+        """编码冲突列表最后一条记录的排序键为不透明游标。
+
+        参数：item 为当前页最后一条冲突 DTO。
+        返回值：包含更新时间和冲突标识的不透明 URL-safe 游标。
+        异常：序列化失败时向上传播异常。
+        副作用：无，不修改冲突 DTO。
+        """
         payload = {
             "updated_at": cls._normalise_datetime(item.updated_at).isoformat(),
             "conflict_id": item.conflict_id,
@@ -685,7 +697,13 @@ class ConsoleQueryService:
 
     @classmethod
     def _parse_conflict_cursor(cls, cursor: str | None) -> tuple[datetime, str] | None:
-        """解析冲突游标并校验其排序键结构。"""
+        """解析冲突游标并校验其排序键结构。
+
+        参数：cursor 为上一页返回的不透明游标，可为空表示第一页。
+        返回值：规范化后的更新时间和冲突标识；无游标时返回 None。
+        异常：游标编码、JSON 或排序键结构非法时抛出 ValueError。
+        副作用：无，不访问数据库。
+        """
         if cursor is None:
             return None
         try:

@@ -277,6 +277,7 @@ def test_conflict_projection_paginates_all_retry_conflicts_by_source(
         )
 
     service = ConsoleQueryService(session_factory, FakeHealthProvider())
+    # 通过来源筛选验证不会把其他冲突类型混入重试冲突分页。
     first_page = service.list_conflicts(limit=100, source="message_retry")
     second_page = service.list_conflicts(
         limit=100,
@@ -284,9 +285,11 @@ def test_conflict_projection_paginates_all_retry_conflicts_by_source(
         source="message_retry",
     )
 
+    # 第一页到达上限并返回游标，第二页应收齐剩余 5 条记录。
     assert len(first_page.items) == 100
     assert first_page.next_cursor is not None
     assert len(second_page.items) == 5
+    # 合并两页后必须覆盖所有 105 个稳定冲突标识，不能因来源查询上限而丢失。
     assert all(item.source == "message_retry" for item in first_page.items + second_page.items)
     assert {
         item.conflict_id for item in first_page.items + second_page.items
