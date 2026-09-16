@@ -28,6 +28,19 @@ class StorageProvider(Protocol):
         """删除此前保存的对象。"""
 
 
+class SignedURLProvider(Protocol):
+    """定义附件预览和下载所需的私有签名地址边界。"""
+
+    def create_signed_url(
+        self,
+        storage_key: str,
+        *,
+        expires_in_seconds: int,
+        download: bool,
+    ) -> str:
+        """为单个私有对象生成带有效期的签名地址。"""
+
+
 class LocalVolumeStorageProvider:
     """将开发和测试工件保存到 Docker 持久卷目录。"""
 

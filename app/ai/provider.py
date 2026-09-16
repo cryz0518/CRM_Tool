@@ -18,6 +18,10 @@ class LLMProviderError(RetryableTaskFailure):
 class LLMProvider(Protocol):
     """定义业务层唯一可依赖的同步 LLM 调用边界。"""
 
+    @property
+    def model_name(self) -> str | None:
+        """返回当前 Provider 使用的模型名称，未知时返回 None。"""
+
     def complete(self, request: LLMRequest, *, timeout_seconds: float) -> LLMResponse:
         """执行一次模型调用并返回文本结果。
 
@@ -42,6 +46,11 @@ class QwenLLMProvider:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._model = model
+
+    @property
+    def model_name(self) -> str:
+        """返回当前 Qwen Provider 的配置模型名。"""
+        return self._model
 
     def complete(self, request: LLMRequest, *, timeout_seconds: float) -> LLMResponse:
         """调用 Qwen 兼容接口并提取首个 assistant 文本。
@@ -102,6 +111,11 @@ class MockLLMProvider:
         """
         self._responses = list(responses)
         self.requests: list[LLMRequest] = []
+
+    @property
+    def model_name(self) -> str:
+        """返回测试 Provider 的固定模型标识。"""
+        return "mock"
 
     def complete(self, request: LLMRequest, *, timeout_seconds: float) -> LLMResponse:
         """消费下一个预设响应，模拟一次成功模型调用。

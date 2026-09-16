@@ -1,4 +1,4 @@
-"""T14 migration chain 的真实 PostgreSQL 建库与升级验证。"""
+"""T15 migration 链升级、head 和 current 验证。"""
 
 from __future__ import annotations
 
@@ -11,13 +11,13 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 
 
-def test_ticket14_migration_chain_upgrades_fresh_database() -> None:
-    """在显式提供的独立 PostgreSQL 管理连接上，从空数据库执行完整 Alembic 链。"""
-    admin_url_text = os.environ.get("T14_MIGRATION_ADMIN_URL")
+def test_ticket15_migration_chain_reaches_single_current_head() -> None:
+    """在显式 PostgreSQL 管理连接上验证 0019 成为唯一 head。"""
+    admin_url_text = os.environ.get("T15_MIGRATION_ADMIN_URL")
     if not admin_url_text:
-        pytest.skip("设置 T14_MIGRATION_ADMIN_URL 后执行真实空库 migration 验证")
+        pytest.skip("设置 T15_MIGRATION_ADMIN_URL 后执行真实空库 migration 验证")
 
-    database_name = f"t14_migration_{uuid4().hex}"
+    database_name = f"t15_migration_{uuid4().hex}"
     admin_engine = create_engine(admin_url_text, isolation_level="AUTOCOMMIT")
     target_url = make_url(admin_url_text).set(database=database_name)
     command_environment = {
@@ -26,7 +26,6 @@ def test_ticket14_migration_chain_upgrades_fresh_database() -> None:
     }
     try:
         with admin_engine.connect() as connection:
-            # 数据库名由 UUID 生成，不含用户可控 SQL；仅在测试专用 PostgreSQL 中创建临时库。
             connection.execute(text(f'CREATE DATABASE "{database_name}"'))
 
         for arguments in (("upgrade", "head"), ("heads",), ("current",)):
@@ -45,10 +44,8 @@ def test_ticket14_migration_chain_upgrades_fresh_database() -> None:
             text=True,
             env=command_environment,
         )
-        # T14 链必须继续存在，并由当前 T15 revision 作为唯一 head 收束。
-        assert "0019_ticket15_console_observability" in heads.stdout
+        assert heads.stdout.count("0019_ticket15_console_observability") == 1
     finally:
-        # 只删除本测试刚创建的临时数据库，不触碰 Compose volume 或其他数据库。
         with admin_engine.connect() as connection:
             connection.execute(text(f'DROP DATABASE IF EXISTS "{database_name}"'))
         admin_engine.dispose()
