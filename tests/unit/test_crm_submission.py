@@ -131,21 +131,59 @@ def test_create_uses_stable_lead_key_and_current_smart_table_values(
     assert lead is not None and lead.lifecycle_state == "synced"
 
 
-def test_missing_crm_mapping_or_minimum_fields_never_calls_crm(
+def test_missing_crm_mapping_creates_auditable_terminal_record_without_calling_crm(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证映射缺失及 CRM 最低条件失败均只形成待完善结果。"""
+    """验证映射缺失保留待创建线索并形成不可重试的审计事实。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
-    _lead(session_factory, adapter, crm_user_id=None)
+    lead_id = _lead(session_factory, adapter, crm_user_id=None)
     crm = MockCRMAdapter()
-    result = CrmSubmissionService(session_factory, adapter, crm).submit(
+    service = CrmSubmissionService(session_factory, adapter, crm)
+
+    result = service.submit(
         SubmissionCommand("提交今天的线索", "sales-1", "message-12")
     )
 
-    assert result.incomplete == 1
+    assert result.mapping_missing == 1
     assert crm.calls == 0
     with session_factory() as session:
-        assert session.scalars(select(CrmSyncRecord)).all() == []
+        sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
+        lead = session.get(Lead, lead_id)
+    assert sync is not None
+    assert sync.operation == "validation"
+    assert sync.status == "failed_pending_review"
+    assert sync.failure_category == "permanent"
+    assert sync.failure_kind == "validation_failed"
+    assert sync.failure_code == "mapping_missing"
+    assert sync.submitting_crm_user_id is None
+    assert lead is not None and lead.lifecycle_state == "pending_create"
+
+    with session_factory.begin() as session:
+        authorization = session.get(SalesAuthorization, "sales-1")
+        assert authorization is not None
+        authorization.crm_user_id = "crm-1"
+
+    recovered = service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-13"))
+
+    assert recovered.succeeded == 1
+    assert crm.calls == 1
+
+
+def test_mapping_missing_audit_key_is_bounded_for_a_maximum_length_message_id(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证长消息标识仍可写入映射缺失审计事实。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter, crm_user_id=None)
+    service = CrmSubmissionService(session_factory, adapter, MockCRMAdapter())
+
+    result = service.submit(SubmissionCommand("提交今天的线索", "sales-1", "m" * 128))
+
+    assert result.mapping_missing == 1
+    with session_factory() as session:
+        sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
+    assert sync is not None
+    assert len(sync.idempotency_key) <= 128
 
 
 def test_non_minimum_confirmation_does_not_block_but_only_pending_contact_does(
@@ -207,6 +245,10 @@ def test_transport_retry_reuses_frozen_payload_and_key_after_table_edit(
     assert (
         service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12")).retrying == 1
     )
+    with session_factory.begin() as session:
+        authorization = session.get(SalesAuthorization, "sales-1")
+        assert authorization is not None
+        authorization.crm_user_id = "crm-2"
     record_id = next(iter(adapter.get_records())).record_id
     adapter.update_record(record_id, {"手机": "13900000000"})
     assert (
@@ -217,6 +259,7 @@ def test_transport_retry_reuses_frozen_payload_and_key_after_table_edit(
     assert sync is not None
     assert sync.idempotency_key == f"crm:create:{lead_id}"
     assert sync.canonical_payload["手机"] == "13800000000"
+    assert crm.crm_user_ids == ["crm-1"]
 
 
 def test_unknown_crm_failure_does_not_finalize_discard_request(
@@ -440,6 +483,47 @@ def test_update_uses_current_table_values_once_and_skips_equal_snapshot(
     assert len(updates) == 1 and updates[0].canonical_payload.get("AI待确认") is None
 
 
+def test_update_mapping_missing_keeps_pending_update_until_a_later_submit(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证缺映射的真实更新不调用 CRM，补齐映射后才允许提交。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    assert service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12")).succeeded
+    adapter.update_record(next(iter(adapter.get_records())).record_id, {"手机": "13900000000"})
+    with session_factory.begin() as session:
+        authorization = session.get(SalesAuthorization, "sales-1")
+        assert authorization is not None
+        authorization.crm_user_id = None
+
+    blocked = service.submit(SubmissionCommand("提交我的更新", "sales-1", "message-13"))
+
+    assert blocked.mapping_missing == 1
+    assert crm.update_calls == 0
+    with session_factory() as session:
+        lead = session.get(Lead, lead_id)
+        validation = session.scalar(
+            select(CrmSyncRecord).where(
+                CrmSyncRecord.lead_id == lead_id,
+                CrmSyncRecord.operation == "validation",
+            )
+        )
+    assert lead is not None and lead.lifecycle_state == "pending_update"
+    assert validation is not None and validation.failure_code == "mapping_missing"
+
+    with session_factory.begin() as session:
+        authorization = session.get(SalesAuthorization, "sales-1")
+        assert authorization is not None
+        authorization.crm_user_id = "crm-1"
+
+    resumed = service.submit(SubmissionCommand("提交我的更新", "sales-1", "message-14"))
+
+    assert resumed.updated == 1
+    assert crm.update_calls == 1
+
+
 def test_update_company_identity_change_enters_review_without_crm_call(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -583,6 +667,10 @@ def test_retrying_update_does_not_read_changed_smart_table_before_frozen_retry(
 
     monkeypatch.setattr(crm, "update_lead", timeout_once)
     assert service.submit(SubmissionCommand("提交我的更新", "sales-1", "message-13")).retrying == 1
+    with session_factory.begin() as session:
+        authorization = session.get(SalesAuthorization, "sales-1")
+        assert authorization is not None
+        authorization.crm_user_id = "crm-2"
     adapter.update_record(record_id, {"手机": "13700000000"})
     calls = 0
     original_get_record = adapter.get_record
@@ -597,6 +685,7 @@ def test_retrying_update_does_not_read_changed_smart_table_before_frozen_retry(
     result = service.submit(SubmissionCommand("提交我的更新", "sales-1", "message-14"))
 
     assert result.updated == 1 and calls == 0
+    assert crm.update_crm_user_ids == ["crm-1"]
     assert crm.update_payloads == [
         {
             "业务线": "协作机器人",
@@ -682,6 +771,32 @@ def test_replayed_command_restores_persisted_success_to_notification_summary(
             session.get(NotificationRecord, notification_key_for_message("message-12")) is not None
         )
         assert session.get(Lead, lead_id).lifecycle_state == "synced"  # type: ignore[union-attr]
+
+
+def test_mapping_missing_reply_does_not_double_count_generic_terminal_failure(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 CRM 映射缺失在销售汇总中只计入专用错误分类。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    _lead(session_factory, adapter, crm_user_id=None)
+    with session_factory.begin() as session:
+        message = session.get(IncomingMessage, "message-12")
+        assert message is not None
+        message.normalized_text = "提交今天的线索"
+        event = OutboxEvent(
+            message_id="message-12",
+            sales_user_id="sales-1",
+            sequence=1,
+            event_type="crm_submission_command",
+        )
+        session.add(event)
+        session.flush()
+        event_id = event.id
+
+    reply = consume_submission_command(session_factory, adapter, MockCRMAdapter(), event_id)
+
+    assert "CRM 用户映射缺失 1 条" in reply
+    assert "需人工处理失败 0 条" in reply
 
 
 def test_terminal_command_failure_persists_notification_before_terminal_status(

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import get_settings
 from app.core.failures import classify_task_failure, safe_failure_summary
 from app.crm.adapter import CRMAdapter
+from app.crm.user_mapping import CRMUserMapper, DatabaseCRMUserMapper
 from app.leads.models import CrmCompanyIdentity, CrmSyncRecord, Lead, LeadDiscardRequest
 from app.leads.review import LeadReviewService
 from app.messaging.models import BusinessAuditEvent, SalesAuthorization, utc_now
@@ -62,6 +63,7 @@ class SubmissionBatchResult:
     updated: int = 0
     unchanged: int = 0
     company_identity_review: int = 0
+    mapping_missing: int = 0
 
 
 @dataclass(frozen=True)
@@ -81,6 +83,7 @@ class CrmSubmissionService:
         smart_table_adapter: SmartTableAdapter,
         crm_adapter: CRMAdapter,
         crm_create_retry_count: int | None = None,
+        crm_user_mapper: CRMUserMapper | None = None,
     ) -> None:
         """保存数据库、表格、CRM 与重试上限依赖。
 
@@ -97,6 +100,7 @@ class CrmSubmissionService:
             if crm_create_retry_count is None
             else crm_create_retry_count
         )
+        self._crm_user_mapper = crm_user_mapper or DatabaseCRMUserMapper()
 
     def submit(self, command: SubmissionCommand) -> SubmissionBatchResult:
         """解析固定命令并逐条提交当日本人待创建 Lead，保持批次部分成功。
@@ -146,6 +150,7 @@ class CrmSubmissionService:
                     if outcome == "incomplete"
                     else result.incomplete_lead_ids
                 ),
+                mapping_missing=result.mapping_missing + (outcome == "mapping_missing"),
             )
         return result
 
@@ -163,7 +168,7 @@ class CrmSubmissionService:
                 session.scalars(
                     select(Lead.id).where(
                         Lead.smart_table_owner_user_id == command.sales_user_id,
-                        Lead.lifecycle_state == "synced",
+                        Lead.lifecycle_state.in_(("synced", "pending_update")),
                         Lead.smart_table_record_id.is_not(None),
                     )
                 )
@@ -182,6 +187,7 @@ class CrmSubmissionService:
                 unchanged=result.unchanged + (outcome == "unchanged"),
                 company_identity_review=result.company_identity_review
                 + (outcome == "company_identity_review"),
+                mapping_missing=result.mapping_missing + (outcome == "mapping_missing"),
             )
         return result
 
@@ -192,7 +198,7 @@ class CrmSubmissionService:
             if (
                 lead is None
                 or lead.smart_table_owner_user_id != command.sales_user_id
-                or lead.lifecycle_state != "synced"
+                or lead.lifecycle_state not in {"synced", "pending_update"}
             ):
                 return "incomplete"
             latest = self._last_successful_sync(session, lead_id)
@@ -249,13 +255,25 @@ class CrmSubmissionService:
             return "company_identity_review"
         snapshot_hash = self._snapshot_hash(payload)
         if payload == previous:
+            if lead.lifecycle_state == "pending_update":
+                with self._session_factory.begin() as session:
+                    current = session.scalar(
+                        select(Lead).where(Lead.id == lead_id).with_for_update()
+                    )
+                    if current is not None and current.lifecycle_state == "pending_update":
+                        current.lifecycle_state = "synced"
             return "unchanged"
         existing_sync_id: int | None = None
         with self._session_factory.begin() as session:
             lead = session.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
             authorization = session.get(SalesAuthorization, command.sales_user_id)
-            if lead is None or authorization is None or authorization.crm_user_id is None:
+            if lead is None or authorization is None:
                 return "incomplete"
+            crm_user_id = self._crm_user_mapper.get_crm_user_id(session, command.sales_user_id)
+            if crm_user_id is None:
+                return self._record_mapping_missing(
+                    session, lead, command, payload, snapshot_hash, "update"
+                )
             existing = session.scalar(
                 select(CrmSyncRecord).where(
                     CrmSyncRecord.lead_id == lead_id,
@@ -290,7 +308,7 @@ class CrmSubmissionService:
                     snapshot_hash=snapshot_hash,
                     request_message_id=command.request_message_id,
                     submitting_sales_user_id=command.sales_user_id,
-                    submitting_crm_user_id=authorization.crm_user_id,
+                    submitting_crm_user_id=crm_user_id,
                     crm_lead_id=target.crm_lead_id,
                     crm_lead_owner_user_id=target.crm_lead_owner_user_id,
                 )
@@ -354,9 +372,11 @@ class CrmSubmissionService:
                     or not self._is_today_owned_candidate(lead, command.sales_user_id)
                 ):
                     return "incomplete"
-                if authorization.crm_user_id is None:
-                    self._record_audit(session, command, "crm_mapping_missing")
-                    return "incomplete"
+                crm_user_id = self._crm_user_mapper.get_crm_user_id(session, command.sales_user_id)
+                if crm_user_id is None:
+                    return self._record_mapping_missing(
+                        session, lead, command, canonical_payload, snapshot_hash, "create"
+                    )
                 existing = session.scalar(
                     select(CrmSyncRecord).where(
                         CrmSyncRecord.lead_id == lead_id, CrmSyncRecord.operation == "create"
@@ -399,7 +419,7 @@ class CrmSubmissionService:
                     request_message_id=command.request_message_id,
                     submitting_sales_user_id=command.sales_user_id,
                     # 销售 CRM 映射在逻辑 create 创建时冻结，retry 不重新读取它。
-                    submitting_crm_user_id=authorization.crm_user_id,
+                    submitting_crm_user_id=crm_user_id,
                     crm_lead_id=identity.crm_lead_id if operation == "update" else None,
                     crm_lead_owner_user_id=(
                         identity.crm_lead_owner_user_id if operation == "update" else None
@@ -418,6 +438,59 @@ class CrmSubmissionService:
             # 只作为最后一层兜底；正常唯一键竞争会在 savepoint 中恢复并返回 processing。
             return "processing"
         return self._claim_and_call(sync_id, command.sales_user_id)
+
+    def _record_mapping_missing(
+        self,
+        session: Session,
+        lead: Lead,
+        command: SubmissionCommand,
+        payload: dict[str, object],
+        snapshot_hash: str,
+        requested_operation: str,
+    ) -> str:
+        """持久化不调用 CRM 的映射缺失终态验证记录。
+
+        参数：session 为已锁定 Lead 的当前事务；lead 为待提交线索；command 为提交事实；
+        payload 与 snapshot_hash 为已审核快照；requested_operation 为原本请求的 create 或 update。
+        返回值：固定返回 mapping_missing，供批次汇总明确反馈。
+        异常：数据库写入失败时由 SQLAlchemy 抛出。
+        副作用：写入不可自动重试的验证记录；update 同时保留 pending_update 生命周期。
+        """
+        # 操作、线索和请求消息合计可超过同步表幂等键列的长度限制，统一派生固定长度键。
+        validation_identity = f"{requested_operation}:{lead.id}:{command.request_message_id}"
+        validation_digest = hashlib.sha256(validation_identity.encode("utf-8")).hexdigest()
+        idempotency_key = f"crm:validation:mapping_missing:{validation_digest}"
+        existing = session.scalar(
+            select(CrmSyncRecord).where(CrmSyncRecord.idempotency_key == idempotency_key)
+        )
+        if existing is None:
+            sync = CrmSyncRecord(
+                lead_id=lead.id,
+                # 验证失败没有开始 CRM create/update，不能占用两类操作的唯一约束。
+                operation="validation",
+                smart_table_record_id=lead.smart_table_record_id or "",
+                idempotency_key=idempotency_key,
+                canonical_payload=payload,
+                snapshot_hash=snapshot_hash,
+                request_message_id=command.request_message_id,
+                submitting_sales_user_id=command.sales_user_id,
+                submitting_crm_user_id=None,
+                status="failed_pending_review",
+                attempts=0,
+                failure_category="permanent",
+                failure_kind="validation_failed",
+                failure_code="mapping_missing",
+                failure_summary="CRM 用户映射缺失",
+                failed_at=utc_now(),
+                completed_at=utc_now(),
+            )
+            session.add(sync)
+            session.flush()
+            self._record_audit_for_sync(session, sync, command.sales_user_id, "crm_mapping_missing")
+        if requested_operation == "update" and lead.lifecycle_state == "synced":
+            # 未提交的有效 CRM 变更必须保留为待更新，映射补齐后可由新命令继续处理。
+            lead.lifecycle_state = "pending_update"
+        return "mapping_missing"
 
     def _claim_and_call(self, sync_id: int, sales_user_id: str) -> str:
         """原子认领 pending/retrying 同步记录后调用 CRM，并持久化独立结果。"""
@@ -470,6 +543,16 @@ class CrmSubmissionService:
             crm_lead_id = sync.crm_lead_id
             if sync.operation == "update" and sync.attempts > 1:
                 self._record_audit_for_sync(session, sync, sales_user_id, "crm_update_retried")
+
+        if crm_user_id is None:
+            # validation 记录不会进入认领路径；此处仅防御历史异常数据误触发 CRM 调用。
+            return self._record_crm_failure(
+                sync_id,
+                sales_user_id,
+                ValueError("CRM 同步记录缺少冻结提交身份"),
+                claim_started_at,
+                claim_attempts,
+            )
 
         try:
             if operation == "update":

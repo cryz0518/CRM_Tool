@@ -38,6 +38,8 @@ def test_authorize_salesperson_is_repeatable_in_test_environment(tmp_path: Path)
             assert authorization is not None
             assert authorization.is_authorized is True
             assert authorization.is_active is True
+            assert authorization.created_by == "local_sales_authorization_cli"
+            assert authorization.updated_by == "local_sales_authorization_cli"
             assert len(session.query(SalesAuthorization).all()) == 1
     finally:
         engine.dispose()
