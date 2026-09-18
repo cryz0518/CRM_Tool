@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Mapping
 
+from app.smart_table.registry import ENUM_FIELDS_WITH_OTHER
+
 
 class RemarksBuilder:
     """只使用已审核字段和有原文证据的补充信息生成备注。"""
@@ -24,14 +26,36 @@ class RemarksBuilder:
         demand = self._text(enrichment.get("客户需求/痛点")) or self._demand_from_fields(fields)
         budget = self._text(enrichment.get("预算"))
         requirement = self._text(enrichment.get("特殊要求"))
-        return "\n".join(
-            (
-                self._basic_information(company, city, product, revenue, industry),
-                f"线索需求：{self._sentence(demand)}",
-                f"预算情况：{self._sentence(budget)}",
-                f"特殊要求：{self._sentence(requirement)}",
-            )
-        )
+        sections = [
+            self._basic_information(company, city, product, revenue, industry),
+            f"线索需求：{self._sentence(demand)}",
+            f"预算情况：{self._sentence(budget)}",
+            f"特殊要求：{self._sentence(requirement)}",
+        ]
+        other_details = self._other_enum_details(fields, enrichment)
+        if other_details:
+            # 枚举字段的实际自由文本统一追加在备注尾部，保留字段名与“其他”选项语义。
+            sections.append(f"备注补充：{'；'.join(other_details)}")
+        return "\n".join(sections)
+
+    @staticmethod
+    def _other_enum_details(
+        fields: Mapping[str, object], enrichment: Mapping[str, str]
+    ) -> tuple[str, ...]:
+        """生成所有已选择“其他”的枚举字段补充文本。
+
+        参数：fields 为已审核正式字段；enrichment 为有原文证据的补充信息。
+        返回值：按字段名排序的“字段名：其他（内容）”文本；无对应字段时使用“请补充”。
+        异常：无。
+        副作用：无。
+        """
+        details: list[str] = []
+        for field_name in sorted(ENUM_FIELDS_WITH_OTHER):
+            if fields.get(field_name) != "其他":
+                continue
+            detail = RemarksBuilder._text(enrichment.get(field_name)) or "请补充"
+            details.append(f"{field_name}：其他（{detail}）")
+        return tuple(details)
 
     def _basic_information(
         self,

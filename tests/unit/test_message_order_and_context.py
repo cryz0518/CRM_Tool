@@ -12,7 +12,14 @@ from sqlalchemy.pool import StaticPool
 
 from app.leads.models import LeadFieldProvenance, LeadMessageResolution, SalesLeadContext
 from app.leads.service import FirstTextLeadWorkspaceService, LeadProcessingStatus
-from app.messaging.models import Base, IncomingMessage, OutboxEvent, SalesAuthorization, utc_now
+from app.messaging.models import (
+    Base,
+    IncomingMessage,
+    MessageAttachment,
+    OutboxEvent,
+    SalesAuthorization,
+    utc_now,
+)
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.registry import build_required_smart_table_schema
 
@@ -312,6 +319,39 @@ def test_expired_processing_lease_becomes_a_checkpoint_for_the_next_message(
     assert second_event.status == "ignored"
 
 
+def test_media_message_wait_releases_claim_for_ocr_retry(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证图片附件尚未落库时释放处理租约，供下一轮 OCR 消费重试。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：媒体等待仍占用 processing 租约时由 pytest 报告断言失败。
+    副作用：模拟媒体消息先入 Outbox、附件稍后才完成下载的真实竞态。
+    """
+    event_id = persist_outbox_texts(session_factory, "sales-1", ["名片 OCR 尚未完成"])[0]
+    with session_factory.begin() as session:
+        message = session.get(IncomingMessage, "sales-1-message-1")
+        event = session.get(OutboxEvent, event_id)
+        assert message is not None and event is not None
+        message.requires_media_enrichment = True
+        event.status = "processing"
+        event.processing_started_at = utc_now()
+
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        MockSmartTableAdapter(schema=build_required_smart_table_schema()),
+    )
+    result = service.consume(event_id, claimed_for_processing=True)
+
+    assert result.status is LeadProcessingStatus.WAITING_FOR_PREVIOUS
+    with session_factory() as session:
+        event = session.get(OutboxEvent, event_id)
+    assert event is not None
+    assert event.status == "pending"
+    assert event.processing_started_at is None
+
+
 def test_expired_current_context_keeps_weak_fragment_unassigned(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -392,6 +432,136 @@ def test_expired_context_uses_unique_phone_as_strong_identity(
     record = adapter.get_record(created.smart_table_record_id)
     assert record is not None
     assert record.fields["工艺"] == "码垛"
+
+
+def test_expired_context_uses_unique_card_contact_as_strong_identity(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证名片联系人在上下文过期后仍能唯一定位其所属线索。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：联系人补充未归并到名片线索时由 pytest 报告断言失败。
+    副作用：模拟先识别名片、三十一分钟后销售再次提及该联系人的场景。
+    """
+    first_event_id = persist_outbox_texts(
+        session_factory,
+        "sales-1",
+        ["客户：名片客户；联系人：邢总"],
+    )[0]
+    with session_factory.begin() as session:
+        card_message = session.get(IncomingMessage, "sales-1-message-1")
+        assert card_message is not None
+        # 以已完成 OCR 的图片消息模拟销售先发名片，文本来自该名片识别结果。
+        card_message.requires_media_enrichment = True
+        session.add(
+            MessageAttachment(
+                id="card-contact-attachment",
+                message_id=card_message.message_id,
+                media_kind="image",
+                scan_status="clean",
+                processing_status="succeeded",
+                recognized_text=card_message.normalized_text,
+            )
+        )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter, lead_context_ttl_minutes=30)
+    created = service.consume(first_event_id)
+    second_event_id = persist_outbox_texts(
+        session_factory,
+        "sales-1",
+        ["联系人：邢总；需求：码垛机器人"],
+    )[0]
+    with session_factory.begin() as session:
+        first_message = session.get(IncomingMessage, "sales-1-message-1")
+        second_message = session.get(IncomingMessage, "sales-1-message-2")
+        assert first_message is not None and second_message is not None
+        second_message.received_at = first_message.received_at + timedelta(minutes=31)
+
+    updated = service.consume(second_event_id)
+
+    assert updated.status is LeadProcessingStatus.UPDATED
+    assert updated.lead_id == created.lead_id
+    assert created.smart_table_record_id is not None
+    record = adapter.get_record(created.smart_table_record_id)
+    assert record is not None
+    assert record.fields["工艺"] == "码垛"
+
+
+def test_audio_transcript_then_text_updates_the_same_lead(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证销售先发语音、转写完成后再发文字时仍归并为同一线索。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：语音转写线索与后续文字被拆分时由 pytest 报告断言失败。
+    副作用：模拟已完成 ASR 的语音消息和一条后续需求补充。
+    """
+    first_event_id = persist_outbox_texts(
+        session_factory,
+        "sales-1",
+        ["客户：语音客户；联系人：刘总"],
+    )[0]
+    with session_factory.begin() as session:
+        voice_message = session.get(IncomingMessage, "sales-1-message-1")
+        assert voice_message is not None
+        # 消费逻辑只依赖媒体终态与标准化文本，OCR 和 ASR 使用相同归属路径。
+        voice_message.requires_media_enrichment = True
+        session.add(
+            MessageAttachment(
+                id="voice-context-attachment",
+                message_id=voice_message.message_id,
+                media_kind="audio",
+                scan_status="clean",
+                processing_status="succeeded",
+                recognized_text=voice_message.normalized_text,
+            )
+        )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+    created = service.consume(first_event_id)
+    second_event_id = persist_outbox_texts(session_factory, "sales-1", ["需求：码垛机器人"])[0]
+
+    updated = service.consume(second_event_id)
+
+    assert updated.status is LeadProcessingStatus.UPDATED
+    assert updated.lead_id == created.lead_id
+    assert created.smart_table_record_id is not None
+    record = adapter.get_record(created.smart_table_record_id)
+    assert record is not None
+    assert record.fields["工艺"] == "码垛"
+
+
+def test_explicit_new_customer_does_not_inherit_active_card_context(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证销售明确说明新客户时不把信息错误补充到当前名片线索。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：新客户被归并到当前客户时由 pytest 报告断言失败。
+    副作用：依次建立当前名片线索和一条明确标识的新客户线索。
+    """
+    first_event_id = persist_outbox_texts(
+        session_factory,
+        "sales-1",
+        ["客户：名片客户；联系人：邢总"],
+    )[0]
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+    first = service.consume(first_event_id)
+    second_event_id = persist_outbox_texts(
+        session_factory,
+        "sales-1",
+        ["新客户；客户：另一家公司；需求：码垛机器人"],
+    )[0]
+
+    second = service.consume(second_event_id)
+
+    assert second.status is LeadProcessingStatus.CREATED
+    assert second.lead_id != first.lead_id
+    assert len(adapter.get_records()) == 2
 
 
 def test_strong_identity_beats_an_active_context_from_another_lead(

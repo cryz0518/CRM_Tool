@@ -174,6 +174,8 @@ class MediaAttachmentService:
                     scan_status=scan_status,
                 )
             )
+            # 显式先落附件，避免没有 ORM 关系时任务插入顺序触发外键约束。
+            session.flush()
             session.add(MediaProcessingTask(attachment_id=attachment_id, task_type=media_kind))
             self._audit(session, message_id, "media_attachment_stored")
         return attachment_id
@@ -274,6 +276,8 @@ class MediaAttachmentService:
                     completed_at=utc_now(),
                 )
             )
+            # 失败记录同样必须先持久化父附件，再插入依赖它的媒体任务。
+            session.flush()
             session.add(
                 MediaProcessingTask(
                     attachment_id=attachment_id,

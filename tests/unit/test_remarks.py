@@ -35,3 +35,20 @@ def test_builder_marks_absent_evidence_as_not_provided_without_invention() -> No
         "预算情况：未提供。\n"
         "特殊要求：未提供。"
     )
+
+
+def test_builder_appends_generic_other_enum_details_to_remark_tail() -> None:
+    """验证所有带“其他”的枚举字段都按字段名保留实际补充内容。"""
+    remark = RemarksBuilder().build(
+        {"客户行业": "其他", "工艺": "其他"},
+        {"客户行业": "机器人集成", "工艺": "焊接"},
+    )
+
+    assert remark.endswith("备注补充：客户行业：其他（机器人集成）；工艺：其他（焊接）")
+
+
+def test_builder_marks_other_enum_without_detail_as_to_be_filled() -> None:
+    """验证枚举选择“其他”但没有可靠原文内容时保留待补充提示。"""
+    remark = RemarksBuilder().build({"工艺": "其他"}, {})
+
+    assert remark.endswith("备注补充：工艺：其他（请补充）")

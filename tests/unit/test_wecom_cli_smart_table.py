@@ -14,7 +14,11 @@ from app.smart_table.adapter import (
     SmartTablePermissionError,
 )
 from app.smart_table.models import SmartTableFieldType
-from app.smart_table.wecom_cli import WecomCliSmartTableAdapter, WecomCliSmartTableAdapterError
+from app.smart_table.wecom_cli import (
+    WecomCliProcessError,
+    WecomCliSmartTableAdapter,
+    WecomCliSmartTableAdapterError,
+)
 
 
 class FakeCli:
@@ -187,6 +191,104 @@ def test_canonical_fields_and_pending_options_are_mapped_to_real_schema_names() 
         "创建人": "sales-1",
         "负责人": "sales-1",
     }
+
+
+def test_record_add_normalizes_phone_and_skips_unrepresentable_location() -> None:
+    """验证恢复记录时不会因格式化座机或纯文本位置阻断整行创建。
+
+    参数：无。
+    返回值：无。
+    异常：字段转换错误或把不合法位置值发送给 CLI 时由 pytest 报告。
+    副作用：仅消费 Fake CLI 响应并检查待发送 payload，不访问企业微信。
+    """
+    fake_cli = FakeCli(
+        [
+            {
+                "errcode": 0,
+                "fields": [
+                    {"field_id": "phone", "field_title": "电话", "field_type": "phone_number"},
+                    {
+                        "field_id": "location",
+                        "field_title": "地区定位",
+                        "field_type": "location",
+                    },
+                    {"field_id": "owner", "field_title": "负责人", "field_type": "user"},
+                ],
+            },
+            {"errcode": 0, "records": [{"record_id": "record-1", "values": {}}]},
+        ]
+    )
+
+    _adapter(fake_cli).create_record(
+        {
+            "电话": "0510-83480979-917",
+            "地区定位": "江苏省无锡市滨湖区",
+            "负责人": "sales-1",
+        },
+        actor=SmartTableActor.ROBOT,
+    )
+
+    payload = _payload(fake_cli.calls[1])
+    assert payload["records"] == [
+        {"values": {"电话": "051083480979917", "负责人": [{"userId": "sales-1"}]}}
+    ]
+
+
+def test_get_record_falls_back_to_recent_create_when_list_is_eventually_consistent() -> None:
+    """验证写入成功但列表暂未反映新行时，读取可使用本进程的创建快照。
+
+    参数：无。
+    返回值：无。
+    异常：新建记录被误判为不存在时由 pytest 报告断言失败。
+    副作用：模拟 records add 已成功而紧随其后的 records list 暂时为空。
+    """
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {"errcode": 0, "records": [{"record_id": "record-new", "values": {}}]},
+            {"errcode": 0, "records": []},
+        ]
+    )
+    adapter = _adapter(fake_cli)
+
+    created = adapter.create_record({"负责人": "sales-1"}, actor=SmartTableActor.ROBOT)
+    reread = adapter.get_record(created.record_id)
+
+    assert reread is not None
+    assert reread.record_id == created.record_id
+    assert reread.fields == {"负责人": "sales-1"}
+
+
+def test_recent_create_fallback_keeps_only_fields_sent_for_the_new_record() -> None:
+    """验证新增响应夹带旧行字段时，不会污染列表暂未可见的新行快照。
+
+    参数：无。
+    返回值：无。
+    异常：旧行联系人被缓存为新行字段时由 pytest 报告断言失败。
+    副作用：模拟 records add 返回正确新行标识但 values 含旧行字段的外部异常响应。
+    """
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "records": [
+                    {
+                        "record_id": "record-new",
+                        "values": {"*联系人": "线索A联系人"},
+                    }
+                ],
+            },
+            {"errcode": 0, "records": []},
+        ]
+    )
+    adapter = _adapter(fake_cli)
+
+    created = adapter.create_record({"负责人": "sales-1"}, actor=SmartTableActor.ROBOT)
+    reread = adapter.get_record(created.record_id)
+
+    assert reread is not None
+    assert reread.fields == {"负责人": "sales-1"}
 
 
 def test_get_record_restores_canonical_names_before_t09_compares_ai_values() -> None:
@@ -535,4 +637,34 @@ def test_subprocess_timeout_is_retried_once() -> None:
     )
 
     assert _adapter(fake_cli).get_schema().fields == ()
+    assert len(fake_cli.calls) == 2
+
+
+def test_idempotent_cli_process_exit_is_retried() -> None:
+    """验证 records list/update 的 CLI 进程异常会有限重试。"""
+    fake_cli = FakeCli(
+        [
+            WecomCliProcessError("wecom-cli 退出失败，退出码：1"),
+            {"errcode": 0, "fields": []},
+        ]
+    )
+
+    assert _adapter(fake_cli).get_schema().fields == ()
+    assert len(fake_cli.calls) == 2
+
+
+def test_cli_process_exit_during_add_is_not_retried() -> None:
+    """验证新增记录遇到未知进程退出时不重放，避免服务端已成功而本地重复建行。"""
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            WecomCliProcessError("wecom-cli 退出失败，退出码：1"),
+        ]
+    )
+
+    with pytest.raises(WecomCliProcessError):
+        _adapter(fake_cli).create_record(
+            {"负责人": "sales-1"},
+            actor=SmartTableActor.ROBOT,
+        )
     assert len(fake_cli.calls) == 2

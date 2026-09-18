@@ -103,8 +103,8 @@ REQUIRED_SMART_TABLE_FIELDS = (
     RequiredSmartTableField(
         "沟通方式", SmartTableFieldType.SINGLE_SELECT, COMMUNICATION_METHOD_OPTIONS
     ),
-    RequiredSmartTableField("手机", SmartTableFieldType.TEXT),
-    RequiredSmartTableField("电话", SmartTableFieldType.TEXT),
+    RequiredSmartTableField("手机", SmartTableFieldType.PHONE_NUMBER),
+    RequiredSmartTableField("电话", SmartTableFieldType.PHONE_NUMBER),
     RequiredSmartTableField("邮箱", SmartTableFieldType.EMAIL),
     RequiredSmartTableField(
         "客户行业", SmartTableFieldType.SINGLE_SELECT, CUSTOMER_INDUSTRY_OPTIONS
@@ -119,6 +119,9 @@ REQUIRED_SMART_TABLE_FIELDS = (
     RequiredSmartTableField("AI待确认", SmartTableFieldType.MULTI_SELECT, CRM_BUSINESS_FIELD_NAMES),
     RequiredSmartTableField("创建人", SmartTableFieldType.MEMBER),
     RequiredSmartTableField("负责人", SmartTableFieldType.MEMBER),
+)
+ENUM_FIELDS_WITH_OTHER = frozenset(
+    field.name for field in REQUIRED_SMART_TABLE_FIELDS if "其他" in field.required_options
 )
 
 

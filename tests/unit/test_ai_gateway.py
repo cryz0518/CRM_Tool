@@ -10,7 +10,11 @@ import pytest
 from app.ai.gateway import AIGateway, BusinessValidationError, FailedStructuredOutputError
 from app.ai.models import LLMResponse
 from app.ai.provider import LLMProviderError, MockLLMProvider
-from app.smart_table.registry import COMMUNICATION_METHOD_OPTIONS, CRM_BUSINESS_FIELD_NAMES
+from app.smart_table.registry import (
+    COMMUNICATION_METHOD_OPTIONS,
+    CRM_BUSINESS_FIELD_NAMES,
+    ENUM_FIELDS_WITH_OTHER,
+)
 
 
 def valid_analysis(**changes: object) -> str:
@@ -92,6 +96,39 @@ def test_gateway_accepts_registered_communication_method() -> None:
     assert result.fields == {"沟通方式": "微信"}
 
 
+def test_gateway_normalizes_explicit_communication_alias_before_enum_validation() -> None:
+    """验证明确的“电话沟通”自然表达先映射为注册枚举再校验。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"沟通方式": "电话沟通"},
+                confidence_by_field={"沟通方式": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("电话沟通")
+
+    assert result.fields == {"沟通方式": "打电话"}
+
+
+def test_gateway_drops_unverified_communication_candidate_without_blocking_other_fields() -> None:
+    """验证无法由原文证实的沟通方式候选不会阻塞其他可靠字段。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "长广溪智造", "沟通方式": "电话"},
+                confidence_by_field={"线索名称": 0.95, "沟通方式": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("客户：长广溪智造，手机号：13800138000")
+
+    assert result.fields == {"线索名称": "长广溪智造", "手机": "13800138000"}
+    assert result.low_confidence_candidates == {}
+
+
 def test_gateway_rejects_unregistered_communication_method_without_alias_conversion() -> None:
     """验证未注册沟通描述被严格拒绝，不能静默映射为任一枚举值。
 
@@ -159,6 +196,144 @@ def test_gateway_prompt_maps_input_labels_to_canonical_crm_field_names() -> None
     assert prompt.rfind("禁止输出 JSON key") > prompt.rfind("必须符合此 JSON Schema")
 
 
+def test_gateway_prompt_includes_current_context_only_for_relation_judgment() -> None:
+    """验证模型能读取当前销售上下文判断名片或碎片是新增还是补充。
+
+    参数：无。
+    返回值：无。
+    异常：提示未包含上下文边界或历史字段时由 pytest 报告。
+    副作用：Mock Provider 记录一次带上下文的提取请求。
+    """
+    provider = MockLLMProvider(responses=[valid_analysis()])
+
+    AIGateway(provider).extract_fields(
+        "邢伟伟，长广溪智能制造（无锡）有限公司",
+        context_fields={"线索名称": "邢总公司", "联系人": "邢总"},
+    )
+
+    prompt = provider.requests[0].messages[0]["content"]
+    assert "当前销售最近一条线索上下文如下" in prompt
+    assert '"线索名称": "邢总公司"' in prompt
+    assert "不是本条消息事实；本条消息没有证据的字段不得从上下文复制" in prompt
+    assert "明确介绍另一个客户时返回 NEW_LEAD" in prompt
+
+
+def test_gateway_drops_field_when_model_omits_its_confidence(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """验证单个字段缺少置信度时不会阻塞同一响应中的可靠字段。
+
+    参数：无。
+    返回值：无。
+    异常：字段置信度缺失不应再使整次提取抛出 BusinessValidationError。
+    副作用：Mock Provider 记录一次提取请求；无外部写入。
+    """
+    source_text = "中国动力的张总，电话是13913991399"
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                customer_reference={},
+                crm_fields={"线索名称": "中国动力", "联系人": "张总"},
+                confidence_by_field={"联系人": 0.95},
+            )
+        ]
+    )
+    caplog.set_level(logging.WARNING)
+
+    result = AIGateway(provider).extract_fields(source_text)
+
+    assert result.fields == {"联系人": "张总", "手机": "13913991399"}
+    assert "线索名称" not in result.analysis.crm_fields
+    assert "ai_fields_dropped_missing_confidence" in caplog.text
+
+
+def test_gateway_moves_enrichment_only_field_out_of_crm_fields() -> None:
+    """验证模型误把预算放入 crm_fields 时仍按补充信息处理。
+
+    参数：无。
+    返回值：无。
+    异常：补充信息字段被错误判定为未知 CRM 字段时由 pytest 报告。
+    副作用：Mock Provider 记录一次提取请求；无外部写入。
+    """
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                customer_reference={},
+                crm_fields={"线索名称": "长广溪智造", "预算": "预算100万元"},
+                confidence_by_field={"线索名称": 0.95, "预算": 0.90},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("长广溪智造，预算100万元")
+
+    assert result.fields == {"线索名称": "长广溪智造"}
+    assert result.enrichment == {"预算": "预算100万元"}
+
+
+def test_gateway_quarantines_other_unknown_evidence_to_special_requirements() -> None:
+    """验证其他未知业务字段有原文证据时也不会阻塞，并保留字段名和内容。
+
+    参数：无。
+    返回值：无。
+    异常：未知字段有原文事实却继续触发白名单错误时由 pytest 报告。
+    副作用：Mock Provider 记录一次提取请求；无外部写入。
+    """
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                customer_reference={},
+                crm_fields={"线索名称": "长广溪智造", "采购数量": "10台"},
+                confidence_by_field={"线索名称": 0.95, "采购数量": 0.90},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("长广溪智造，准备采购10台")
+
+    assert result.fields == {"线索名称": "长广溪智造"}
+    assert result.enrichment == {"特殊要求": "采购数量：10台"}
+
+
+def test_gateway_recovers_explicit_title_adjacent_to_verified_contact() -> None:
+    """验证“总经理张总”连写时，职务不会因模型漏返回而被丢弃。
+
+    参数：无。
+    返回值：无。
+    异常：原文明确职位却未形成职务字段时由 pytest 报告。
+    副作用：Mock Provider 记录一次提取请求；无外部写入。
+    """
+    source_text = (
+        "今天和中国动力的总经理张总谈了一下，他们想买我们的机器人，"
+        "他们准备买100台台，预算5000万，用于喷涂生产线，电话是13913991399"
+    )
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                customer_reference={
+                    "company": "中国动力",
+                },
+                crm_fields={
+                    "线索名称": "中国动力",
+                    "联系人": "张总",
+                    "手机": "13913991399",
+                },
+                confidence_by_field={
+                    "线索名称": 0.95,
+                    "联系人": 0.95,
+                    "手机": 0.99,
+                },
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(source_text)
+
+    assert result.fields["职务"] == "总经理"
+    assert result.analysis.confidence_by_field["职务"] == 1.0
+
+
+
 def test_gateway_schema_restricts_model_output_keys_to_extractable_fields() -> None:
     """验证 Gateway 交给 Provider 的 schema 排除备注和未注册字段。"""
     provider = MockLLMProvider(responses=[valid_analysis()])
@@ -194,7 +369,7 @@ def test_gateway_schema_restricts_model_output_keys_to_extractable_fields() -> N
         "客户需求/痛点",
         "预算",
         "特殊要求",
-    }
+    } | ENUM_FIELDS_WITH_OTHER
 
 
 def test_gateway_accepts_crm_field_with_matching_confidence() -> None:
@@ -220,12 +395,12 @@ def test_gateway_accepts_crm_field_with_matching_confidence() -> None:
     assert result.pending_confirmation_fields == ()
 
 
-def test_gateway_rejects_crm_field_without_matching_confidence() -> None:
-    """验证缺少同名置信度的 CRM 建议字段仍会被严格拒绝。
+def test_gateway_recovers_crm_field_without_matching_confidence_from_source() -> None:
+    """验证缺少同名置信度但原文有明确标签的 CRM 字段可由确定性证据恢复。
 
     参数：无。
-    返回：无。
-    异常：BusinessValidationError 为受控业务校验结论。
+    返回值：无。
+    异常：确定性恢复失败时由 pytest 报告。
     副作用：Mock Provider 仅收到初始提取请求，不触发模型重试。
     """
     provider = MockLLMProvider(
@@ -237,9 +412,9 @@ def test_gateway_rejects_crm_field_without_matching_confidence() -> None:
         ]
     )
 
-    with pytest.raises(BusinessValidationError, match="置信度缺失或不合法：线索名称"):
-        AIGateway(provider).extract_fields("客户：星海验收科技有限公司")
+    result = AIGateway(provider).extract_fields("客户：星海验收科技有限公司")
 
+    assert result.fields == {"线索名称": "星海验收科技有限公司"}
     assert len(provider.requests) == 1
 
 
@@ -267,22 +442,23 @@ def test_gateway_accepts_company_and_contact_in_canonical_fields() -> None:
     assert len(provider.requests) == 1
 
 
-def test_gateway_rejects_customer_name_without_alias_conversion() -> None:
-    """验证未注册的客户名称不静默转换为联系人或线索名称。
+def test_gateway_quarantines_unknown_customer_name_with_source_evidence() -> None:
+    """验证未知的客户名称字段有原文证据时保留到特殊要求，不阻塞整条消息。
 
     参数：无。
-    返回：无。
-    异常：BusinessValidationError 为受控的字段白名单失败结论。
-    副作用：Mock Provider 仅收到初始提取请求。
+    返回值：无。
+    异常：未知字段未被安全隔离时由 pytest 报告。
+    副作用：Mock Provider 仅收到初始提取请求；无外部写入。
     """
     response = valid_analysis(
         crm_fields={"客户名称": "王验收"}, confidence_by_field={"客户名称": 0.9}
     )
     provider = MockLLMProvider(responses=[response])
 
-    with pytest.raises(BusinessValidationError, match="未知 CRM 字段：客户名称"):
-        AIGateway(provider).extract_fields("客户名称王验收")
+    result = AIGateway(provider).extract_fields("客户名称王验收")
 
+    assert result.fields == {}
+    assert result.enrichment == {"特殊要求": "客户名称：王验收"}
     assert len(provider.requests) == 1
 
 
@@ -319,12 +495,12 @@ def test_gateway_rejects_array_crm_field_values_without_conversion() -> None:
     assert len(provider.requests) == 2
 
 
-def test_gateway_keeps_english_phone_alias_as_business_validation_failure() -> None:
-    """验证英文 phone 别名仍由业务白名单拒绝，禁止自动映射为手机。
+def test_gateway_drops_unknown_phone_alias_without_source_evidence() -> None:
+    """验证未知的 phone 字段没有原文证据时被丢弃，不阻塞整条消息。
 
     参数：无。
-    返回：无。
-    异常：BusinessValidationError 为受控的字段白名单失败结论。
+    返回值：无。
+    异常：未知字段继续阻塞消息时由 pytest 报告。
     副作用：Mock Provider 只收到初始请求，不触发结构修复。
     """
     response = valid_analysis(
@@ -332,9 +508,10 @@ def test_gateway_keeps_english_phone_alias_as_business_validation_failure() -> N
     )
     provider = MockLLMProvider(responses=[response])
 
-    with pytest.raises(BusinessValidationError, match="phone"):
-        AIGateway(provider).extract_fields("客户电话已提供")
+    result = AIGateway(provider).extract_fields("客户电话已提供")
 
+    assert result.fields == {}
+    assert result.enrichment == {}
     assert len(provider.requests) == 1
 
 
@@ -436,16 +613,194 @@ def test_gateway_accepts_explicit_communication_and_evidence_enrichment_in_one_c
     assert len(provider.requests) == 1
 
 
-def test_gateway_rejects_enrichment_without_verbatim_source_evidence() -> None:
-    """验证补充信息不是原文片段时不能进入备注生成链路。"""
+def test_gateway_drops_enrichment_without_verbatim_source_evidence() -> None:
+    """验证补充信息不是原文片段时被丢弃且不阻塞核心字段。
+
+    参数：无。
+    返回值：无。
+    异常：补充信息证据失败阻塞整次提取时由 pytest 报告。
+    副作用：Mock Provider 记录一次提取请求；无外部写入。
+    """
     provider = MockLLMProvider(
         responses=[valid_analysis(enrichment={"预算": "预算充足"})]
     )
 
-    with pytest.raises(BusinessValidationError, match="补充信息缺少原文证据"):
-        AIGateway(provider).extract_fields("客户希望后续沟通")
+    result = AIGateway(provider).extract_fields("客户希望后续沟通")
 
+    assert result.fields == {"线索名称": "长广溪智造", "业务线": "协作机器人"}
+    assert result.enrichment == {}
     assert len(provider.requests) == 1
+
+
+def test_gateway_drops_invalid_enrichment_without_blocking_core_fields() -> None:
+    """验证需求摘要缺少原文连续证据时不会阻塞公司与联系方式录入。
+
+    参数：无。
+    返回值：无。
+    异常：核心字段被补充信息校验失败一并拒绝时由 pytest 报告。
+    副作用：Mock Provider 记录一次提取请求；无外部写入。
+    """
+    source_text = (
+        "锋元机器人～沈秋冰\n18959247813，做焊接非标项目，"
+        "主要是汽车铝型材的焊接，当前用的都是发那科的工业，也会有客户涉及协作焊接机器人需求"
+    )
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={
+                    "线索名称": "锋元机器人",
+                    "联系人": "沈秋冰",
+                    "手机": "18959247813",
+                },
+                confidence_by_field={"线索名称": 0.95, "联系人": 0.95, "手机": 0.99},
+                enrichment={"客户需求/痛点": "客户希望提升焊接工位自动化效率"},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(source_text)
+
+    assert result.fields == {
+        "线索名称": "锋元机器人",
+        "联系人": "沈秋冰",
+        "手机": "18959247813",
+    }
+    assert result.enrichment == {}
+    assert len(provider.requests) == 1
+
+
+def test_gateway_promotes_verified_customer_reference_to_identity_fields() -> None:
+    """验证模型把身份放入 customer_reference 时仍能形成可写入的正式字段。
+
+    参数：无。
+    返回值：无。
+    异常：身份引用未经过原文核验就进入 CRM 字段时由 pytest 报告。
+    副作用：Mock Provider 记录一次提取请求；无外部写入。
+    """
+    source_text = (
+        "锋元机器人～沈秋冰\n18959247813，做焊接非标项目，"
+        "主要是汽车铝型材的焊接，当前用的都是发那科的工业，也会有客户涉及协作焊接机器人需求"
+    )
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                customer_reference={
+                    "company": "锋元机器人",
+                    "contact": "沈秋冰",
+                    "phone": "18959247813",
+                },
+                crm_fields={"线索名称": "锋元机器人～沈秋冰"},
+                confidence_by_field={"线索名称": 0.40},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(source_text)
+
+    assert result.fields == {
+        "线索名称": "锋元机器人",
+        "联系人": "沈秋冰",
+        "手机": "18959247813",
+    }
+
+
+def test_gateway_uses_semantic_identity_reference_without_separator() -> None:
+    """验证无分隔符时依靠模型语义引用拆分公司与联系人，而不是依赖某种符号。
+
+    参数：无。
+    返回值：无。
+    异常：模型已按语义提供并经原文核验的身份仍被拼回单字段时由 pytest 报告。
+    副作用：Mock Provider 记录一次提取请求；无外部写入。
+    """
+    source_text = "锋元机器人沈秋冰\n18959247813，做焊接非标项目"
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                customer_reference={
+                    "company": "锋元机器人",
+                    "contact": "沈秋冰",
+                    "phone": "18959247813",
+                },
+                crm_fields={
+                    "线索名称": "锋元机器人沈秋冰",
+                    "联系人": "沈秋冰",
+                },
+                confidence_by_field={"线索名称": 0.9, "联系人": 0.9},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(source_text)
+
+    assert result.fields["线索名称"] == "锋元机器人"
+    assert result.fields["联系人"] == "沈秋冰"
+    assert result.fields["手机"] == "18959247813"
+    assert "不依赖波浪线" in provider.requests[0].messages[0]["content"]
+
+
+def test_gateway_extracts_multiple_fields_from_unstructured_message() -> None:
+    """验证多个 CRM 字段按各自语义提取，不依赖标签顺序或固定分隔符。
+
+    参数：无。
+    返回值：无。
+    异常：字段被整句上下文污染或跨字段拼接时由 pytest 报告。
+    副作用：Mock Provider 记录一次提取请求；无外部写入。
+    """
+    source_text = (
+        "锋元机器人沈秋冰 18959247813，做焊接非标项目，主要是汽车铝型材的焊接，"
+        "当前用的都是发那科的工业机器人，也会有客户涉及协作焊接机器人需求"
+    )
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                customer_reference={
+                    "company": "锋元机器人",
+                    "contact": "沈秋冰",
+                    "phone": "18959247813",
+                },
+                crm_fields={
+                    "线索名称": "锋元机器人",
+                    "联系人": "沈秋冰",
+                    "手机": "18959247813",
+                    "业务线": "协作机器人",
+                    "客户行业": "汽车",
+                    "工艺": "其他",
+                },
+                enrichment={
+                    "主营产品": "发那科的工业机器人",
+                    "客户需求/痛点": "涉及协作焊接机器人需求",
+                    "工艺": "焊接",
+                },
+                confidence_by_field={
+                    "线索名称": 0.95,
+                    "联系人": 0.95,
+                    "手机": 0.99,
+                    "业务线": 0.90,
+                    "客户行业": 0.90,
+                    "工艺": 0.80,
+                },
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(source_text)
+
+    assert result.fields == {
+        "线索名称": "锋元机器人",
+        "联系人": "沈秋冰",
+        "手机": "18959247813",
+        "业务线": "协作机器人",
+        "客户行业": "汽车",
+        "工艺": "其他",
+    }
+    assert result.enrichment == {
+        "主营产品": "发那科的工业机器人",
+        "客户需求/痛点": "涉及协作焊接机器人需求",
+        "工艺": "焊接",
+    }
+    prompt = provider.requests[0].messages[0]["content"]
+    assert "对所有 CRM 字段都必须先理解整条消息的语义" in prompt
+    assert "不得按换行、逗号、短横线、波浪线或其他符号机械切段" in prompt
 
 
 def test_gateway_classifies_budget_without_generating_annual_sales() -> None:
@@ -487,40 +842,49 @@ def test_gateway_keeps_budget_and_annual_sales_as_separate_facts() -> None:
     assert result.enrichment == {"预算": "50万元", "年销售额": "100万元"}
 
 
-def test_gateway_rejects_budget_amount_misclassified_as_annual_sales() -> None:
+def test_gateway_drops_budget_amount_misclassified_as_annual_sales() -> None:
     """验证金额没有经营规模表达时不能进入年销售额。
 
-    参数：无。返回值：无。异常：BusinessValidationError 为受控的分类校验结论。
-    副作用：Mock Provider 记录一次提取请求。
+    参数：无。
+    返回值：无。
+    异常：补充信息分类失败阻塞整次提取时由 pytest 报告。
+    副作用：Mock Provider 记录一次提取请求；无外部写入。
     """
     provider = MockLLMProvider(responses=[valid_analysis(enrichment={"年销售额": "50万元"})])
 
-    with pytest.raises(BusinessValidationError, match="年销售额缺少明确经营规模表达"):
-        AIGateway(provider).extract_fields("预算50万元")
+    result = AIGateway(provider).extract_fields("预算50万元")
+
+    assert result.enrichment == {}
 
 
-def test_gateway_rejects_adjacent_budget_amount_misclassified_as_annual_sales() -> None:
+def test_gateway_drops_adjacent_budget_amount_misclassified_as_annual_sales() -> None:
     """验证无标点相邻事实中的预算金额不能被年销售额关键词错误绑定。
 
-    参数：无。返回值：无。异常：BusinessValidationError 为受控的分类校验结论。
-    副作用：Mock Provider 记录一次提取请求。
+    参数：无。
+    返回值：无。
+    异常：补充信息分类失败阻塞整次提取时由 pytest 报告。
+    副作用：Mock Provider 记录一次提取请求；无外部写入。
     """
     provider = MockLLMProvider(responses=[valid_analysis(enrichment={"年销售额": "50万元"})])
 
-    with pytest.raises(BusinessValidationError, match="年销售额缺少明确经营规模表达"):
-        AIGateway(provider).extract_fields("预算50万元 年销售额100万元")
+    result = AIGateway(provider).extract_fields("预算50万元 年销售额100万元")
+
+    assert result.enrichment == {}
 
 
-def test_gateway_rejects_adjacent_annual_sales_misclassified_as_budget() -> None:
+def test_gateway_drops_adjacent_annual_sales_misclassified_as_budget() -> None:
     """验证无标点相邻事实中的年销售额不能被预算关键词错误绑定。
 
-    参数：无。返回值：无。异常：BusinessValidationError 为受控的分类校验结论。
-    副作用：Mock Provider 记录一次提取请求。
+    参数：无。
+    返回值：无。
+    异常：补充信息分类失败阻塞整次提取时由 pytest 报告。
+    副作用：Mock Provider 记录一次提取请求；无外部写入。
     """
     provider = MockLLMProvider(responses=[valid_analysis(enrichment={"预算": "100万元"})])
 
-    with pytest.raises(BusinessValidationError, match="预算缺少明确预算表达"):
-        AIGateway(provider).extract_fields("预算50万元 年销售额100万元")
+    result = AIGateway(provider).extract_fields("预算50万元 年销售额100万元")
+
+    assert result.enrichment == {}
 
 
 def test_gateway_keeps_two_failed_outputs_for_pending_review() -> None:
