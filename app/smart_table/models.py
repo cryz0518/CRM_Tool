@@ -12,6 +12,7 @@ class SmartTableFieldType(StrEnum):
 
     TEXT = "TEXT"
     LONG_TEXT = "LONG_TEXT"
+    PHONE_NUMBER = "PHONE_NUMBER"
     EMAIL = "EMAIL"
     SINGLE_SELECT = "SINGLE_SELECT"
     MULTI_SELECT = "MULTI_SELECT"

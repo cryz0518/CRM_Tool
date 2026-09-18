@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -21,6 +22,7 @@ from app.smart_table.registry import (
     CRM_BUSINESS_FIELD_NAMES,
     CUSTOMER_INDUSTRY_OPTIONS,
     CUSTOMER_LEVEL_OPTIONS,
+    ENUM_FIELDS_WITH_OTHER,
     LEAD_SOURCE_OPTIONS,
     PROCESS_OPTIONS,
 )
@@ -37,14 +39,74 @@ _ENUM_OPTIONS = {
 }
 _PHONE_PATTERN = re.compile(r"^\+?[0-9][0-9 -]{5,24}$")
 _EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+_PHONE_SEARCH_PATTERN = re.compile(r"(?<!\d)(?:\+?86[ -]?)?(1[3-9]\d{9})(?!\d)")
+_EMAIL_SEARCH_PATTERN = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])")
+_COMMUNICATION_EVIDENCE = (
+    ("线上会议", "线上会议"),
+    ("电话", "打电话"),
+    ("邮件", "发邮件"),
+    ("微信", "微信"),
+    ("拜访", "见面拜访"),
+    ("现场", "见面拜访"),
+)
+_COMMUNICATION_ALIASES = frozenset(
+    {
+        "电话",
+        "电话沟通",
+        "电话咨询",
+        "邮件",
+        "邮件沟通",
+        "邮件咨询",
+        "微信沟通",
+        "微信联系",
+        "拜访",
+        "现场",
+        "现场拜访",
+    }
+)
 _SENSITIVE_PATTERN = re.compile(
     r"(?i)(?:(?<!\d)(?:\d{17}[\dXx]|\d{16,19}|\d{15})(?!\d)|"
     r"(?:密码|口令|验证码|password|token)\s*[:：]?\s*[^\s；;，,]+)"
 )
-_ENRICHMENT_FIELD_NAMES = frozenset(
+_ENRICHMENT_ONLY_FIELD_NAMES = frozenset(
     {"城市/地区", "主营产品", "年销售额", "客户需求/痛点", "预算", "特殊要求"}
 )
+_ENRICHMENT_FIELD_NAMES = _ENRICHMENT_ONLY_FIELD_NAMES | ENUM_FIELDS_WITH_OTHER
 _FORBIDDEN_AI_CRM_FIELD_NAMES = frozenset({"备注"})
+_NON_QUARANTINABLE_AI_FIELD_NAMES = frozenset(
+    {"备注", "AI待确认", "创建人", "负责人", "智能表格负责人", "CRM线索负责人"}
+)
+_CUSTOMER_REFERENCE_FIELD_ALIASES = {
+    "company": "线索名称",
+    "company_name": "线索名称",
+    "企业": "线索名称",
+    "企业名称": "线索名称",
+    "公司": "线索名称",
+    "公司名称": "线索名称",
+    "线索名称": "线索名称",
+    "contact": "联系人",
+    "contact_name": "联系人",
+    "联系人": "联系人",
+    "联系人姓名": "联系人",
+    "title": "职务",
+    "job_title": "职务",
+    "position": "职务",
+    "role": "职务",
+    "职务": "职务",
+    "职位": "职务",
+    "岗位": "职务",
+    "mobile": "手机",
+    "mobile_phone": "手机",
+    "phone": "手机",
+    "手机号": "手机",
+    "手机": "手机",
+    "telephone": "电话",
+    "tel": "电话",
+    "电话": "电话",
+    "email": "邮箱",
+    "email_address": "邮箱",
+    "邮箱": "邮箱",
+}
 
 
 class AIGatewayError(RuntimeError):
@@ -113,10 +175,12 @@ class AIGateway:
         *,
         source_message_id: str | None = None,
         lead_id: str | None = None,
+        context_fields: Mapping[str, str] | None = None,
     ) -> ExtractedLeadPatch:
         """提取一条文本的字段补丁并完成 Parse、Schema 与 Business Validation。
 
-        参数：text 为已持久化消息中本次字段提取必要的文本。
+        参数：text 为已持久化消息中本次字段提取必要的文本；context_fields 为当前销售最近
+        线索的非敏感字段，仅供模型判断新客户或补充消息。
         返回：正式字段、中置信度待确认字段及低置信度后台候选。
         异常：传输/结构二次失败时抛出 AIGatewayError；业务校验失败抛出 BusinessValidationError。
         副作用：调用 Provider，输出不含原文和联系方式的结构化日志。
@@ -124,9 +188,15 @@ class AIGateway:
         trace_id = str(uuid4())
         # 只将字段提取所需文本交给模型，并在发送前移除无关的高敏感信息。
         safe_text = _SENSITIVE_PATTERN.sub("[已遮蔽敏感号码]", text)
+        safe_context_fields = {
+            field_name: _SENSITIVE_PATTERN.sub("[已遮蔽敏感号码]", value)
+            for field_name, value in (context_fields or {}).items()
+            if value
+        }
         json_schema = self._output_json_schema()
         request = LLMRequest(
-            messages=self._messages(safe_text, json_schema), json_schema=json_schema
+            messages=self._messages(safe_text, json_schema, safe_context_fields),
+            json_schema=json_schema,
         )
         started_at = time.monotonic()
         try:
@@ -135,8 +205,18 @@ class AIGateway:
             analysis, repair_response, repair_attempts = self._parse_schema_or_repair(
                 request, response, trace_id
             )
+            # 只把原文可逐字核验的身份引用提升为正式字段，避免自然表达因模型字段放错位置而待归属。
+            analysis = self._recover_verified_identity_fields(analysis, safe_text)
+            # 先将少量可确定映射的沟通自然表达归一化，再执行枚举校验。
+            analysis = self._normalize_communication_candidate(analysis, safe_text)
+            # 兼容模型把预算、痛点等备注素材误放入 CRM 字段的结果，先归位再做业务白名单校验。
+            analysis = self._normalize_enrichment_field_placement(analysis, safe_text)
+            # 兼容 Qwen 兼容模式偶发漏返回置信度键的结果；无置信度字段不参与写入，但不阻塞其他字段。
+            analysis = self._drop_fields_missing_confidence(analysis)
             self._validate_business(analysis)
-            self._validate_enrichment_evidence(analysis, safe_text)
+            validated_enrichment = self._validate_enrichment_evidence(analysis, safe_text)
+            # 补充信息只是备注素材；证据不足时丢弃该字段，不能阻塞已通过校验的 CRM 主字段。
+            analysis = analysis.model_copy(update={"enrichment": validated_enrichment})
             fields, pending, low_candidates = self._apply_confidence(analysis, safe_text)
         except AIGatewayError as error:
             self._log(trace_id, started_at, "failed", error_type=type(error).__name__)
@@ -170,8 +250,205 @@ class AIGateway:
             duration_ms=round((time.monotonic() - started_at) * 1000),
         )
         return ExtractedLeadPatch(
-            trace_id, analysis, fields, pending, low_candidates, analysis.enrichment
+            trace_id, analysis, fields, pending, low_candidates, validated_enrichment
         )
+
+    @staticmethod
+    def _recover_verified_identity_fields(
+        analysis: LeadAnalysis, source_text: str
+    ) -> LeadAnalysis:
+        """恢复可由原文确定性核验的公司、联系人和联系方式字段。
+
+        参数：analysis 为模型输出的结构化分析；source_text 为脱敏后的当前消息文本。
+        返回值：补入原文证据充分的身份字段，或纠正明确的身份拼接错误后的分析结果。
+        异常：无；不合格引用被忽略，普通模型字段不被覆盖。
+        副作用：无；不调用外部服务，仅修正模型已拆分身份被拼回单字段的格式错误。
+        """
+        recovered = AIGateway._extract_identity_from_source(source_text)
+        # 模型按语义拆开的引用优先于本地标签兜底，但仍必须逐字存在于原文。
+        reference_fields = AIGateway._verified_customer_reference_fields(
+            analysis.customer_reference, source_text
+        )
+        recovered.update(reference_fields)
+        # 联系人与职位在自然语言中经常连写；仅在原文明确出现职位并紧邻模型核验联系人时补回职务。
+        contact = recovered.get("联系人")
+        # 若模型把联系人放在正式字段而不是 customer_reference，仅借用该已输出值判断相邻职位，
+        # 不提升其原有置信度，也不改变人工/低置信度分级结果。
+        contact_candidate = analysis.crm_fields.get("联系人")
+        if not contact and contact_candidate and contact_candidate.strip() in source_text:
+            contact = contact_candidate.strip()
+        if contact:
+            recovered_title = AIGateway._extract_verified_title(source_text, contact)
+            if recovered_title:
+                recovered["职务"] = recovered_title
+
+        if not recovered:
+            return analysis
+        fields = dict(analysis.crm_fields)
+        confidence_by_field = dict(analysis.confidence_by_field)
+        identity_pair = (recovered.get("线索名称"), recovered.get("联系人"))
+        changed = False
+        for field_name, value in recovered.items():
+            # 普通模型候选可能包含上下文信息，确定性兜底只补空位或修正明确的身份拼接错误。
+            if field_name in fields:
+                current_confidence = confidence_by_field.get(field_name)
+                if (
+                    fields[field_name] == value
+                    and (current_confidence is None or current_confidence < 1.0)
+                ):
+                    # 原文直接证实模型候选时，确定性证据可以补齐缺失或过低置信度造成的误过滤。
+                    confidence_by_field[field_name] = 1.0
+                    changed = True
+                elif (
+                    identity_pair[0]
+                    and identity_pair[1]
+                    and field_name in {"线索名称", "联系人"}
+                    and AIGateway._is_combined_identity_value(
+                        fields[field_name], identity_pair[0], identity_pair[1]
+                    )
+                ):
+                    # 仅纠正模型已语义拆分、但把公司和联系人拼回单字段的格式错误；不依赖任何分隔符。
+                    fields[field_name] = value
+                    confidence_by_field[field_name] = 1.0
+                    changed = True
+                continue
+            fields[field_name] = value
+            confidence_by_field[field_name] = 1.0
+            changed = True
+        if not changed:
+            return analysis
+        return analysis.model_copy(
+            update={"crm_fields": fields, "confidence_by_field": confidence_by_field}
+        )
+
+    @staticmethod
+    def _verified_customer_reference_fields(
+        customer_reference: dict[str, str], source_text: str
+    ) -> dict[str, str]:
+        """筛选模型按语义识别且能在当前原文中逐字核验的身份引用。
+
+        参数：customer_reference 为模型输出的身份引用；source_text 为脱敏后的当前消息文本。
+        返回值：映射到 CRM 标准字段的可信公司、联系人和联系方式。
+        异常：无；未知键、无原文证据或格式非法的引用被忽略。
+        副作用：无；不调用外部服务。
+        """
+        fields: dict[str, str] = {}
+        for raw_name, raw_value in customer_reference.items():
+            field_name = _CUSTOMER_REFERENCE_FIELD_ALIASES.get(raw_name.strip().lower())
+            value = raw_value.strip()
+            if field_name is None or not value or value not in source_text:
+                continue
+            if field_name in {"手机", "电话"} and not _PHONE_PATTERN.fullmatch(value):
+                continue
+            if field_name == "邮箱" and not _EMAIL_PATTERN.fullmatch(value):
+                continue
+            fields[field_name] = value
+        return fields
+
+    @staticmethod
+    def _extract_verified_title(source_text: str, contact: str) -> str | None:
+        """从联系人附近的明确职位表达中恢复职务字段。
+
+        参数：source_text 为脱敏后的当前消息文本；contact 为已由模型并经原文核验的联系人。
+        返回值：唯一且有明确职位语义的原文职位；无法确认或出现多个冲突职位时返回 None。
+        异常：无。
+        副作用：无；仅执行本地文本匹配，不覆盖模型已经给出的其他字段。
+        """
+        # 先处理带字段标签的写法，避免把后续联系人、需求等内容误认为职位。
+        labeled_match = re.search(
+            r"(?:职务|职位|岗位|职称|身份)\s*[:：]\s*([^，,；;。\n]+)",
+            source_text,
+        )
+        candidates: set[str] = set()
+        if labeled_match:
+            labeled_title = labeled_match.group(1).strip()
+            if labeled_title:
+                candidates.add(labeled_title)
+
+        # 只识别紧邻已核验联系人之前的常见职位词，支持“总经理张总”“采购负责人李工”等连写形式。
+        title_terms = (
+            "副总经理",
+            "总经理",
+            "执行董事",
+            "董事长",
+            "副总裁",
+            "总裁",
+            "采购负责人",
+            "技术负责人",
+            "项目负责人",
+            "销售负责人",
+            "负责人",
+            "副总监",
+            "总监",
+            "工程师",
+            "采购经理",
+            "项目经理",
+            "产品经理",
+            "经理",
+            "主管",
+            "主任",
+            "厂长",
+            "老板",
+        )
+        title_pattern = "|".join(re.escape(term) for term in title_terms)
+        contact_pattern = re.escape(contact.strip())
+        for match in re.finditer(rf"({title_pattern})\s*{contact_pattern}", source_text):
+            candidates.add(match.group(1))
+
+        # 同一联系人若对应多个不同职位，保守留空，交由模型/销售后续确认。
+        return next(iter(candidates)) if len(candidates) == 1 else None
+
+    @staticmethod
+    def _is_combined_identity_value(value: str, company: str, contact: str) -> bool:
+        """判断单字段值是否只是公司与联系人被符号或空白拼接后的组合。
+
+        参数：value 为模型填入单个 CRM 字段的值；company 与 contact 为模型已拆分、
+        经原文核验的身份值。
+        返回值：去除标点和空白后恰好等于公司加联系人的组合时返回 True。
+        异常：无。
+        副作用：无；不按具体分隔符分支处理。
+        """
+        normalized_value = AIGateway._normalize_identity_text(value)
+        normalized_expected = AIGateway._normalize_identity_text(company + contact)
+        return normalized_value == normalized_expected and value.strip() != company.strip()
+
+    @staticmethod
+    def _extract_identity_from_source(source_text: str) -> dict[str, str]:
+        """从明确标签、手机号和邮箱提取可直接证明的身份字段。
+
+        参数：source_text 为脱敏后的当前消息文本。
+        返回值：可由本地确定性规则直接证明的 CRM 身份字段；公司与联系人语义拆分交给模型。
+        异常：无；普通自然语言无法满足标签或格式边界时返回部分或空结果。
+        副作用：无；仅执行本地文本匹配。
+        """
+        fields: dict[str, str] = {}
+        phone_match = _PHONE_SEARCH_PATTERN.search(source_text)
+        if phone_match:
+            fields["手机"] = phone_match.group(1)
+        email_match = _EMAIL_SEARCH_PATTERN.search(source_text)
+        if email_match:
+            fields["邮箱"] = email_match.group(0)
+
+        labeled_patterns = (
+            ("线索名称", r"(?:客户|公司|企业)\s*[:：]\s*([^；;，,、\n]+)"),
+            ("联系人", r"(?:联系人|联系人姓名)\s*[:：]\s*([^；;，,、\n]+)"),
+        )
+        for field_name, pattern in labeled_patterns:
+            match = re.search(pattern, source_text)
+            if match and match.group(1).strip():
+                fields[field_name] = match.group(1).strip().rstrip("\\")
+        return fields
+
+    @staticmethod
+    def _normalize_identity_text(value: str) -> str:
+        """规范化身份文本中的空白和标点，供字段误拼接比较使用。
+
+        参数：value 为待比较的公司、联系人或组合文本。
+        返回值：仅保留字母、数字、下划线和中文等词字符的文本。
+        异常：无。
+        副作用：无。
+        """
+        return re.sub(r"[^\w]+", "", value, flags=re.UNICODE)
 
     def _record_execution(
         self,
@@ -385,6 +662,167 @@ class AIGateway:
             if field_name not in _ENRICHMENT_FIELD_NAMES:
                 raise BusinessValidationError(f"未知补充信息字段：{field_name}")
 
+    @staticmethod
+    def _normalize_communication_candidate(
+        analysis: LeadAnalysis, source_text: str
+    ) -> LeadAnalysis:
+        """在枚举校验前归一化或丢弃不可靠的沟通方式候选。
+
+        参数：analysis 为模型输出分析；source_text 为当前消息原文。
+        返回值：明确匹配时替换为注册枚举；无唯一证据时移除已知别名候选；未知表达保持原样交由业务校验拒绝。
+        异常：无。
+        副作用：记录被丢弃候选的字段类型，不记录客户原文或候选值。
+        """
+        candidate = analysis.crm_fields.get("沟通方式")
+        if candidate is None or candidate in COMMUNICATION_METHOD_OPTIONS:
+            return analysis
+        if candidate not in _COMMUNICATION_ALIASES:
+            # 未注册且不属于有限别名集合的值仍由统一业务校验拦截，避免静默猜测。
+            return analysis
+
+        matched_values = {
+            expected for keyword, expected in _COMMUNICATION_EVIDENCE if keyword in source_text
+        }
+        fields = dict(analysis.crm_fields)
+        confidences = dict(analysis.confidence_by_field)
+        if len(matched_values) == 1:
+            # 只有原文唯一支持一个沟通方式时，才允许把模型自然表达映射成注册值。
+            fields["沟通方式"] = next(iter(matched_values))
+        else:
+            # 没有或同时存在多个证据时，不让不确定的单字段阻塞其他可靠字段。
+            fields.pop("沟通方式", None)
+            confidences.pop("沟通方式", None)
+            logger.warning(
+                "ai_communication_candidate_dropped_invalid_evidence",
+                extra={"error_type": "communication_method_without_unique_evidence"},
+            )
+        return analysis.model_copy(
+            update={"crm_fields": fields, "confidence_by_field": confidences}
+        )
+
+    @staticmethod
+    def _drop_fields_missing_confidence(analysis: LeadAnalysis) -> LeadAnalysis:
+        """丢弃模型未提供置信度的 CRM 字段候选，避免单字段阻塞整条消息。
+
+        参数：analysis 为已完成身份恢复和沟通方式归一化的模型分析结果。
+        返回值：移除置信度缺失字段后的分析结果；其余字段及置信度保持不变。
+        异常：无；置信度越界等非缺失错误仍交由业务校验抛出。
+        副作用：对被丢弃字段记录不含客户原文的结构化告警。
+        """
+        missing_fields = tuple(
+            field_name
+            for field_name in analysis.crm_fields
+            if field_name not in analysis.confidence_by_field
+        )
+        if not missing_fields:
+            return analysis
+        fields = {
+            field_name: value
+            for field_name, value in analysis.crm_fields.items()
+            if field_name not in missing_fields
+        }
+        logger.warning(
+            "ai_fields_dropped_missing_confidence",
+            extra={"field_names": list(missing_fields)},
+        )
+        return analysis.model_copy(update={"crm_fields": fields})
+
+    @staticmethod
+    def _normalize_enrichment_field_placement(
+        analysis: LeadAnalysis, source_text: str
+    ) -> LeadAnalysis:
+        """把模型误放入 crm_fields 的备注素材归回 enrichment。
+
+        参数：analysis 为模型结构化分析结果；source_text 为当前脱敏原文。
+        返回值：仅调整补充信息字段位置、同步移除其无关置信度后的分析结果。
+        异常：无；真正未知的 CRM 字段仍交由业务白名单校验抛出异常。
+        副作用：记录字段归位或冲突告警，不记录客户原文和候选值。
+        """
+        fields = dict(analysis.crm_fields)
+        enrichment = dict(analysis.enrichment)
+        confidences = dict(analysis.confidence_by_field)
+        moved_fields: list[str] = []
+        quarantined_fields: list[str] = []
+        dropped_unknown_fields: list[str] = []
+        conflicted_fields: list[str] = []
+        for field_name in tuple(fields):
+            if field_name in _ENRICHMENT_ONLY_FIELD_NAMES:
+                value = fields.pop(field_name)
+                confidences.pop(field_name, None)
+                existing_value = enrichment.get(field_name)
+                if existing_value is None or existing_value == value:
+                    enrichment[field_name] = value
+                    moved_fields.append(field_name)
+                    continue
+
+                # 两个位置的值冲突时，只保留有唯一原文证据的候选；两者都有证据则宁缺毋滥。
+                value_has_evidence = bool(value and value in source_text)
+                existing_has_evidence = bool(existing_value and existing_value in source_text)
+                if value_has_evidence and not existing_has_evidence:
+                    enrichment[field_name] = value
+                    moved_fields.append(field_name)
+                elif value_has_evidence == existing_has_evidence:
+                    enrichment.pop(field_name, None)
+                    conflicted_fields.append(field_name)
+                continue
+
+            # 注册 CRM 字段交给后续枚举、格式和置信度校验；只有未知业务字段进入保守隔离。
+            if (
+                field_name in CRM_BUSINESS_FIELD_NAMES
+                or field_name in _NON_QUARANTINABLE_AI_FIELD_NAMES
+            ):
+                continue
+
+            value = fields.pop(field_name)
+            confidences.pop(field_name, None)
+            if not value or value not in source_text:
+                # 未知字段没有原文证据时只丢弃候选，避免模型幻觉阻塞整条线索。
+                dropped_unknown_fields.append(field_name)
+                continue
+
+            # 未知业务字段不能新增智能表格列，统一带原字段名保留到备注的“特殊要求”素材。
+            detail = f"{field_name}：{value}"
+            existing_requirement = enrichment.get("特殊要求")
+            if not existing_requirement or not AIGateway._has_enrichment_source_evidence(
+                "特殊要求", existing_requirement, source_text
+            ):
+                enrichment["特殊要求"] = detail
+            elif detail not in existing_requirement:
+                enrichment["特殊要求"] = f"{existing_requirement}；{detail}"
+            quarantined_fields.append(field_name)
+
+        if moved_fields:
+            logger.warning(
+                "ai_enrichment_fields_relocated",
+                extra={"field_names": moved_fields},
+            )
+        if conflicted_fields:
+            logger.warning(
+                "ai_enrichment_field_conflict_dropped",
+                extra={"field_names": conflicted_fields},
+            )
+        if quarantined_fields:
+            logger.warning(
+                "ai_unknown_fields_quarantined_to_enrichment",
+                extra={"field_names": quarantined_fields},
+            )
+        if dropped_unknown_fields:
+            logger.warning(
+                "ai_unknown_fields_dropped_without_evidence",
+                extra={"field_names": dropped_unknown_fields},
+            )
+        if not (
+            moved_fields or quarantined_fields or dropped_unknown_fields or conflicted_fields
+        ):
+            return analysis
+        return analysis.model_copy(
+            update={
+                "crm_fields": fields,
+                "enrichment": enrichment,
+                "confidence_by_field": confidences,
+            }
+        )
+
     def _apply_confidence(
         self, analysis: LeadAnalysis, source_text: str
     ) -> tuple[dict[str, str], tuple[str, ...], dict[str, str]]:
@@ -416,27 +854,75 @@ class AIGateway:
         return fields, tuple(pending), low_candidates
 
     @staticmethod
-    def _validate_enrichment_evidence(analysis: LeadAnalysis, source_text: str) -> None:
-        """确认每项补充信息均为当前原文中可逐字定位的事实片段。
+    def _validate_enrichment_evidence(
+        analysis: LeadAnalysis, source_text: str
+    ) -> dict[str, str]:
+        """确认并筛选可由当前原文逐字定位的补充信息事实。
 
         参数：analysis 为已通过字段业务校验的模型建议；source_text 为当前脱敏原文。
-        返回值：无。
-        异常：补充信息不是原文连续片段时抛出 BusinessValidationError。
-        副作用：无；禁止由模型摘要、扩写或猜测补充备注事实。
+        返回值：仅包含有原文证据且通过分类校验的补充信息。
+        异常：无；不合格的可选补充信息被丢弃，不阻塞核心 CRM 字段。
+        副作用：对被丢弃的补充信息记录脱敏告警；禁止模型摘要、扩写或猜测进入备注。
         """
+        valid_enrichment: dict[str, str] = {}
         for field_name, value in analysis.enrichment.items():
-            if value not in source_text:
-                raise BusinessValidationError(f"补充信息缺少原文证据：{field_name}")
+            if (
+                field_name in ENUM_FIELDS_WITH_OTHER
+                and analysis.crm_fields.get(field_name) != "其他"
+            ):
+                # 枚举实际说明只能附着在同名“其他”字段上，避免无关文本进入备注。
+                logger.warning(
+                    "ai_enrichment_dropped_invalid_evidence",
+                    extra={"error_type": f"enum_other_without_other_value:{field_name}"},
+                )
+                continue
+            if not AIGateway._has_enrichment_source_evidence(field_name, value, source_text):
+                logger.warning(
+                    "ai_enrichment_dropped_invalid_evidence",
+                    extra={"error_type": f"missing_source_evidence:{field_name}"},
+                )
+                continue
             if field_name == "年销售额" and not AIGateway._has_enrichment_category_evidence(
                 source_text, value, ("收入", "营收", "销售额")
             ):
                 # 金额本身不表示经营规模，避免预算被错误写入年销售额事实。
-                raise BusinessValidationError("年销售额缺少明确经营规模表达")
+                logger.warning(
+                    "ai_enrichment_dropped_invalid_evidence",
+                    extra={"error_type": "missing_revenue_category_evidence"},
+                )
+                continue
             if field_name == "预算" and not AIGateway._has_enrichment_category_evidence(
                 source_text, value, ("预算", "投入金额", "项目金额")
             ):
-                # 金额本身不表示项目预算，避免经营规模被错误写入预算事实。
-                raise BusinessValidationError("预算缺少明确预算表达")
+                # 金额本身不表示项目预算，避免经营规模被错误写入备注事实。
+                logger.warning(
+                    "ai_enrichment_dropped_invalid_evidence",
+                    extra={"error_type": "missing_budget_category_evidence"},
+                )
+                continue
+            valid_enrichment[field_name] = value
+        return valid_enrichment
+
+    @staticmethod
+    def _has_enrichment_source_evidence(
+        field_name: str, value: str, source_text: str
+    ) -> bool:
+        """判断补充信息值或系统包装后的未知字段内容是否来自当前原文。
+
+        参数：field_name 为补充信息字段名；value 为候选内容；source_text 为当前脱敏原文。
+        返回值：候选整体或其每个“字段名：内容”片段均有原文证据时返回 True。
+        异常：无。
+        副作用：无；不调用外部服务。
+        """
+        if value in source_text:
+            return True
+        if field_name != "特殊要求":
+            return False
+        parts = [part.strip() for part in re.split(r"[；;]", value) if part.strip()]
+        return bool(parts) and all(
+            "：" in part and part.split("：", 1)[1].strip() in source_text
+            for part in parts
+        )
 
     @staticmethod
     def _has_enrichment_category_evidence(
@@ -469,37 +955,58 @@ class AIGateway:
         异常：无。
         副作用：无。
         """
-        evidence = (
-            ("线上会议", "线上会议"),
-            ("电话", "打电话"),
-            ("邮件", "发邮件"),
-            ("微信", "微信"),
-            ("拜访", "见面拜访"),
-            ("现场", "见面拜访"),
+        return any(
+            keyword in text and value == expected
+            for keyword, expected in _COMMUNICATION_EVIDENCE
         )
-        return any(keyword in text and value == expected for keyword, expected in evidence)
 
     def _messages(
-        self, safe_text: str, json_schema: dict[str, object]
+        self,
+        safe_text: str,
+        json_schema: dict[str, object],
+        context_fields: Mapping[str, str] | None = None,
     ) -> tuple[dict[str, str], ...]:
-        """构造仅包含当前文本和受控输出规则的最小化提取提示。
+        """构造包含当前文本、可选当前客户上下文和受控规则的提取提示。
 
-        参数：safe_text 为已移除无关高敏感号码的当前消息文本；json_schema 为输出约束。
+        参数：safe_text 为已移除无关高敏感信息的当前消息文本；json_schema 为输出约束；
+        context_fields 为已脱敏的当前销售最近线索字段，仅用于判断消息关系。
         返回：供应商无关的聊天消息序列。
         异常：无。
         副作用：无。
         """
+        context_instruction = self._context_instructions(context_fields)
         return (
             {
                 "role": "system",
                 "content": (
                     "仅提取线索建议 JSON；不得决定提交、删除、负责人、"
                     "CRM 合并或覆盖人工值。"
+                    "intent 只用于判断当前消息与销售会话的关系：明确介绍另一个客户时返回 "
+                    "NEW_LEAD；名片、OCR、语音转写或碎片补充属于当前客户时返回 "
+                    "UPDATE_LEAD；无法可靠判断时不要伪造公司名。"
+                    f"{context_instruction}"
                     f"必须符合此 JSON Schema：{json.dumps(json_schema, ensure_ascii=False)}"
                     f"{self._field_contract_instructions()}"
                 ),
             },
             {"role": "user", "content": safe_text},
+        )
+
+    @staticmethod
+    def _context_instructions(context_fields: Mapping[str, str] | None) -> str:
+        """生成当前销售线索上下文的受控提示，防止模型把历史值当作新事实。
+
+        参数：context_fields 为已脱敏的后台上下文字段。
+        返回值：无上下文时返回空字符串，否则返回带边界说明的 JSON 文本。
+        异常：无；调用方已保证字段值为字符串。
+        副作用：无；只生成模型提示文本。
+        """
+        if not context_fields:
+            return ""
+        return (
+            "当前销售最近一条线索上下文如下（仅用于判断 UPDATE_LEAD/NEW_LEAD，"
+            "不是本条消息事实；本条消息没有证据的字段不得从上下文复制）："
+            f"{json.dumps(dict(context_fields), ensure_ascii=False)}。"
         )
 
     @staticmethod
@@ -525,6 +1032,26 @@ class AIGateway:
             "客户名称（个人语境）-> 联系人；"
             "联系人姓名 -> 联系人；手机号 -> 手机。"
             "公司或个人语义不明确时省略字段，不得猜测或输出未注册字段。"
+            "必须先按语义区分公司主体与联系人个人，不依赖波浪线、短横线、空格、斜线等特定分隔符；"
+            "即使公司名和联系人连写，也只能在语义足够明确时分别输出。"
+            "线索名称只能填写公司主体，联系人只能填写个人姓名；禁止把公司和联系人拼接后写入任一单字段。"
+            "职务是与联系人对应的职位或身份称谓，必须独立写入职务字段；"
+            "例如‘总经理张总’应输出职务=总经理、联系人=张总，‘老板李总’应输出职务=老板、联系人=李总；"
+            "仅出现‘张总’等称呼而没有明确职位关系时，不得仅凭‘总’猜测职务。"
+            "customer_reference 可使用 company、contact、title、phone、email 五类身份引用，"
+            "分别填写已识别的公司、联系人、职务、手机号和邮箱；"
+            "这些引用也必须来自当前原文，不确定时留空。"
+            "对所有 CRM 字段都必须先理解整条消息的语义，再独立提取字段；"
+            "不得按换行、逗号、短横线、波浪线或其他符号机械切段。"
+            "每个 crm_fields value 只能填写该字段自身的单个事实值，"
+            "不能带字段标签、解释文字、其他字段值或整句原文。"
+            "业务线、客户行业、工艺、客户级别和沟通方式必须根据上下文映射到注册表合法选项；"
+            "语义不足以区分候选时省略，不得用相邻字段或关键词强行推断。"
+            "手机号、电话、邮箱、日期和地点分别按各自格式识别，不能把姓名、职位、公司名或说明文字混入。"
+            "主营产品、客户需求/痛点、预算、年销售额和特殊要求属于 enrichment，"
+            "按语义归类但 value 必须保留当前原文中的连续事实片段；模型摘要或扩写不得写入。"
+            "一条消息包含多个不同候选时，必须先判断是否为多个客户；"
+            "无法可靠拆分时返回 MULTI_LEAD 或省略不确定字段。"
             "允许输出的只有 CRM 注册业务字段（不含备注）及 enrichment 冻结字段。"
             "禁止输出 JSON key：备注、comment、remark、notes、description；"
             "也禁止输出 AI待确认、缺失字段、审核状态、provenance 或其他系统计算字段。"
@@ -534,7 +1061,10 @@ class AIGateway:
             "confidence_by_field 的 key 必须与 crm_fields 的 key 完全一一对应，"
             "并使用相同中文字段名。"
             f"枚举字段只能使用以下注册表选项：{enum_options}。"
-            "enrichment 的 key 只能是城市/地区、主营产品、年销售额、客户需求/痛点、预算、特殊要求；"
+            "enrichment 的 key 只能是城市/地区、主营产品、年销售额、客户需求/痛点、预算、特殊要求，"
+            f"以及取值为“其他”的枚举字段（{'、'.join(sorted(ENUM_FIELDS_WITH_OTHER))}）；"
+            "当枚举字段取值为“其他”且原文存在明确实际内容时，必须使用同名 key 保存原文连续片段；"
+            "实际内容无法确定时省略该 enrichment，由备注生成器写入“字段名：其他（请补充）”；"
             "每个 value 必须是当前原文中连续出现的单个字符串片段，没有证据时省略。"
             "年销售额仅提取含收入、营收或销售额等明确经营规模表达的原文片段；"
             "预算仅提取含预算、投入金额或项目金额等明确预算表达的原文片段；"

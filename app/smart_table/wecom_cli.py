@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import subprocess
 import time
@@ -34,7 +35,7 @@ WriteAction = Literal["list", "add", "update"]
 
 _FIELD_TYPES = {
     "text": SmartTableFieldType.TEXT,
-    "phone_number": SmartTableFieldType.TEXT,
+    "phone_number": SmartTableFieldType.PHONE_NUMBER,
     "email": SmartTableFieldType.EMAIL,
     "single_select": SmartTableFieldType.SINGLE_SELECT,
     "select": SmartTableFieldType.MULTI_SELECT,
@@ -43,6 +44,7 @@ _FIELD_TYPES = {
     "location": SmartTableFieldType.LOCATION,
     "user": SmartTableFieldType.MEMBER,
 }
+_RECENT_WRITE_VISIBILITY_SECONDS = 30.0
 
 
 class WecomCliSmartTableAdapterError(RuntimeError):
@@ -55,6 +57,10 @@ class WecomCliTransportError(WecomCliSmartTableAdapterError, RetryableTaskFailur
 
 class WecomCliProtocolError(WecomCliSmartTableAdapterError, PermanentTaskFailure):
     """表示 wecom-cli 返回结构、参数或权限业务失败，不应自动重试。"""
+
+
+class WecomCliProcessError(WecomCliProtocolError):
+    """表示 wecom-cli 子进程非零退出，具体动作由调用层判断是否可重试。"""
 
 
 class WecomCliSmartTableAdapter:
@@ -95,6 +101,7 @@ class WecomCliSmartTableAdapter:
         self._retry_count = retry_count
         self._runner = runner or self._run_subprocess
         self._schema: SmartTableSchema | None = None
+        self._recent_written_records: dict[str, tuple[float, SmartTableRecord]] = {}
 
     def get_schema(self) -> SmartTableSchema:
         """分页读取真实字段、类型和枚举选项。
@@ -141,7 +148,15 @@ class WecomCliSmartTableAdapter:
             # records list 没有按记录标识读取的独立接口，先按原始标识定位。
             # 这样历史异常行不会阻断目标行回读。
             if item.get("record_id") == record_id:
-                return self._parse_record(item, schema)
+                record = self._parse_record(item, schema)
+                self._recent_written_records.pop(record_id, None)
+                return record
+        # 企业微信写入响应已确认成功但列表可能短暂未反映；仅在短窗口使用本进程快照，
+        # 防止 T09 把刚创建的行误判为已删除并重复新增。
+        recent = self._recent_written_records.get(record_id)
+        if recent is not None and time.monotonic() - recent[0] <= _RECENT_WRITE_VISIBILITY_SECONDS:
+            return recent[1]
+        self._recent_written_records.pop(record_id, None)
         return None
 
     def find_records(self, filters: Mapping[str, object]) -> list[SmartTableRecord]:
@@ -190,7 +205,10 @@ class WecomCliSmartTableAdapter:
         response = self._call(
             "records", "add", {"records": [{"values": self._to_cli_fields(fields, schema)}]}
         )
-        return self._parse_written_record(response, schema)
+        record = self._parse_written_record(response, schema)
+        # 新增响应的 values 在短暂最终一致性窗口内可能是旧行快照；只缓存本次确认提交的字段。
+        self._remember_written_record(record.record_id, fields)
+        return record
 
     def update_record(self, record_id: str, fields: Mapping[str, object]) -> SmartTableRecord:
         """对指定记录执行单次字段补丁更新。
@@ -200,7 +218,8 @@ class WecomCliSmartTableAdapter:
         异常：记录不存在或 CLI 写入失败时抛出异常。
         副作用：只修改目标记录的传入字段，不传递任何旧字段。
         """
-        if self.get_record(record_id) is None:
+        current_record = self.get_record(record_id)
+        if current_record is None:
             raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
 
         schema = self.get_schema()
@@ -213,7 +232,25 @@ class WecomCliSmartTableAdapter:
                 ]
             },
         )
-        return self._parse_written_record(response, schema)
+        record = self._parse_written_record(response, schema)
+        if record.record_id != record_id:
+            raise WecomCliProtocolError("wecom-cli 更新响应的记录标识与请求不一致")
+        # 更新响应同样不作为字段真相；远端已读快照叠加本次补丁才是安全的短期兜底。
+        self._remember_written_record(record_id, {**current_record.fields, **fields})
+        return record
+
+    def _remember_written_record(self, record_id: str, fields: Mapping[str, object]) -> None:
+        """暂存刚由本进程确认写入的记录，覆盖企业微信列表的短暂可见性延迟。
+
+        参数：record_id 为写入响应确认的记录标识；fields 为本次请求已明确写入的规范字段。
+        返回值：无。
+        异常：无。
+        副作用：写入仅存活于当前适配器进程的短期快照。
+        """
+        self._recent_written_records[record_id] = (
+            time.monotonic(),
+            SmartTableRecord(record_id=record_id, fields=dict(fields)),
+        )
 
     def _list_pages(self, resource: ReadResource) -> list[Mapping[str, object]]:
         """按 CLI next_cursor 读取 fields 或 records 的所有分页响应。
@@ -285,6 +322,16 @@ class WecomCliSmartTableAdapter:
         for attempt in range(self._retry_count + 1):
             try:
                 response = self._runner(arguments)
+            except WecomCliProcessError as error:
+                # records list/update 是幂等操作，进程异常可以安全重放；records add
+                # 可能已经在服务端成功，不能因客户端退出异常再次创建重复记录。
+                if action == "add":
+                    raise
+                if attempt == self._retry_count:
+                    raise WecomCliTransportError("wecom-cli 进程调用失败") from error
+                self._log_retry(resource, action, attempt, "ProcessExit")
+                time.sleep(0.2 * (attempt + 1))
+                continue
             except (OSError, subprocess.TimeoutExpired) as error:
                 if attempt == self._retry_count:
                     # 最后一次仍失败时隐藏底层请求和响应，避免异常泄露表格数据。
@@ -326,8 +373,16 @@ class WecomCliSmartTableAdapter:
             timeout=self._timeout_seconds,
         )
         if completed.returncode != 0:
-            # 非零退出不解析可能包含敏感上下文的标准错误输出。
-            raise WecomCliProtocolError(
+            # 保留有限的 stderr 诊断信息，便于区分网络、权限和参数错误；不记录请求 JSON。
+            stderr_preview = " ".join(completed.stderr.split())[:512]
+            logger.error(
+                "wecom_cli_process_failed",
+                extra={
+                    "returncode": completed.returncode,
+                    "stderr_preview": stderr_preview or None,
+                },
+            )
+            raise WecomCliProcessError(
                 f"wecom-cli 退出失败，退出码：{completed.returncode}"
             )
         try:
@@ -446,9 +501,37 @@ class WecomCliSmartTableAdapter:
             field = schema.get_field(canonical_name)
             if field is None:
                 raise WecomCliProtocolError(f"智能表格未配置字段：{canonical_name}")
+            # 地理位置必须包含企业微信地图对象；普通地址字符串不能伪造地图标识。
+            # 无法构造地图对象时跳过该字段，留给人工补充。
+            if (
+                field.field_type is SmartTableFieldType.LOCATION
+                and not self._is_writable_location(value)
+            ):
+                logger.warning("wecom_cli_location_value_skipped")
+                continue
             # 字段名称唯一由 schema 解析，业务层绝不拼接管理员维护的必填前缀。
             converted[field.name] = self._to_cli_value(canonical_name, field, value)
         return converted
+
+    @staticmethod
+    def _is_writable_location(value: object) -> bool:
+        """判断值是否符合智能表格地理位置列的最小写入契约。
+
+        参数：value 为业务层准备写入的地理位置值。
+        返回：值为包含地图 UID 和来源类型的非空对象列表时返回 True，否则返回 False。
+        异常：不抛出异常；无法确认合法性时返回 False，避免阻断整条线索写入。
+        副作用：无。
+        """
+        if not isinstance(value, list) or not value:
+            return False
+        # 只有企业微信地图对象才能被 LOCATION 列接受，普通地址文本不具备可写入的地图 UID。
+        return all(
+            isinstance(item, Mapping)
+            and isinstance(item.get("id"), str)
+            and bool(item["id"])
+            and item.get("source_type") == 1
+            for item in value
+        )
 
     def _to_cli_value(
         self, canonical_name: str, field: SmartTableField, value: object
@@ -465,6 +548,11 @@ class WecomCliSmartTableAdapter:
                 raise ValueError(f"MEMBER 字段必须传入非空 sales_user_id：{canonical_name}")
             # CLI 的 CellUserValue 写入格式为数组；业务层只保留企业微信销售身份字符串。
             return [{"userId": value}]
+        if field.field_type is SmartTableFieldType.PHONE_NUMBER:
+            if isinstance(value, str):
+                # 企微电话列接受标准字符串；去除常见空格、短横线和括号，保留号码本身及国际区号加号。
+                return re.sub(r"[\s()\-]+", "", value.strip())
+            return value
         if canonical_name == "AI待确认":
             if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
                 raise ValueError("AI待确认必须传入规范字段名列表")
@@ -533,6 +621,7 @@ class WecomCliSmartTableAdapter:
             )
         if field is not None and field.field_type in {
             SmartTableFieldType.TEXT,
+            SmartTableFieldType.PHONE_NUMBER,
             SmartTableFieldType.EMAIL,
             SmartTableFieldType.SINGLE_SELECT,
         }:

@@ -14,7 +14,7 @@ from app.core.config import get_settings
 from app.leads.models import Lead, LeadFieldProvenance, UserConfirmationEvent
 from app.leads.remarks import RemarksBuilder
 from app.messaging.models import BusinessAuditEvent, IncomingMessage
-from app.smart_table.adapter import SmartTableAdapter
+from app.smart_table.adapter import SmartTableAdapter, SmartTableRecordNotFoundError
 from app.smart_table.models import SmartTableRecord
 
 logger = logging.getLogger(__name__)
@@ -122,7 +122,7 @@ class LeadReviewService:
         # 每次 AI 写入前都从 T03 Adapter 重读，不能使用过期的后台字段快照判断人工编辑。
         record = self._smart_table_adapter.get_record(record_id)
         if record is None:
-            raise ValueError(f"智能表格记录不存在：{record_id}")
+            raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
         current_fields = dict(record.fields)
         plan = self._plan_safe_patch(
             lead_id, source_message_id, patch, current_fields, protected_supplement
@@ -131,7 +131,7 @@ class LeadReviewService:
         # 在外部写入前再读一次表格；并发的后续消息若已提交，必须基于最新状态重算补丁。
         latest_record = self._smart_table_adapter.get_record(record_id)
         if latest_record is None:
-            raise ValueError(f"智能表格记录不存在：{record_id}")
+            raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
         if dict(latest_record.fields) != current_fields:
             current_fields = dict(latest_record.fields)
             plan = self._plan_safe_patch(

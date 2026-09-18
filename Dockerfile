@@ -28,6 +28,7 @@ RUN pip install --no-cache-dir ".[dev]"
 # 运行时使用非 root 账号，避免 Worker 以高权限执行任务。
 RUN groupadd --system appuser \
     && useradd --system --gid appuser --create-home appuser \
-    && chown -R appuser:appuser /app
+    && mkdir -p /var/lib/crm-lead/media \
+    && chown -R appuser:appuser /app /var/lib/crm-lead
 
 USER appuser
