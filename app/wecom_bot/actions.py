@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 from collections.abc import Callable, Mapping
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 CARD_EVENT_KEY_CRM_FIELD_CONFIRM = "crm.field_confirmation.confirm"
 CARD_EVENT_KEY_DISCARD_CONFIRM = "lead.discard.confirm"
 CARD_EVENT_KEY_REASSIGN_CONFIRM = "lead.reassignment.confirm"
+CARD_TYPE_BUTTON_INTERACTION = "button_interaction"
 ALLOWED_CARD_EVENT_KEYS = frozenset(
     {
         CARD_EVENT_KEY_CRM_FIELD_CONFIRM,
@@ -59,6 +61,35 @@ ACTION_EXPECTED_EVENT_KEYS = {
 
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _ACTION_LEASE = timedelta(minutes=5)
+_ACTION_DEFAULT_EXPIRY = timedelta(minutes=10)
+_MAX_CARD_PAYLOAD_BYTES = 8192
+_PII_EMAIL = re.compile(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b")
+_PII_PHONE = re.compile(r"(?<!\d)\+?\d[\d ()-]{6,}\d(?!\d)")
+
+_ACTION_TRANSITIONS: dict[str, frozenset[str]] = {
+    WecomActionStatus.PENDING.value: frozenset(
+        {
+            WecomActionStatus.PROCESSING.value,
+            WecomActionStatus.DENIED.value,
+            WecomActionStatus.EXPIRED.value,
+        }
+    ),
+    WecomActionStatus.PROCESSING.value: frozenset(
+        {
+            WecomActionStatus.SUCCEEDED.value,
+            WecomActionStatus.DENIED.value,
+            WecomActionStatus.FAILED.value,
+            WecomActionStatus.PENDING_RECOVERY.value,
+        }
+    ),
+    WecomActionStatus.PENDING_RECOVERY.value: frozenset(
+        {WecomActionStatus.SUCCEEDED.value, WecomActionStatus.FAILED.value}
+    ),
+    WecomActionStatus.FAILED.value: frozenset(),
+    WecomActionStatus.SUCCEEDED.value: frozenset(),
+    WecomActionStatus.DENIED.value: frozenset(),
+    WecomActionStatus.EXPIRED.value: frozenset(),
+}
 
 
 class CallbackParseError(ValueError):
@@ -67,6 +98,14 @@ class CallbackParseError(ValueError):
 
 class CardCapabilityUnavailable(RuntimeError):
     """表示当前进程没有经过 readiness 验证的卡片/回调能力。"""
+
+
+class StaleActionClaim(RuntimeError):
+    """表示 Worker 的 claim token 已被 takeover 或 lease 已过期。"""
+
+
+class InvalidActionTransition(RuntimeError):
+    """表示试图绕过集中定义的 action 状态转移。"""
 
 
 @dataclass(frozen=True)
@@ -78,6 +117,7 @@ class TemplateCardCallback:
     task_id: str
     provider_msgid: str
     req_id: str
+    card_type: str
 
 
 @dataclass(frozen=True)
@@ -117,6 +157,7 @@ class ActionSnapshot:
     target_type: str
     target_id: str
     context: dict[str, object]
+    claim_token: str
 
 
 @dataclass(frozen=True)
@@ -126,6 +167,43 @@ class ActionExecutionResult:
     code: str
     summary: str
     executed: bool
+
+
+@dataclass(frozen=True)
+class DeterministicActionCommand:
+    """描述消息接入层已严格解析的 T18 machine command。"""
+
+    action_type: str
+    target_id: str
+    message_id: str | None = None
+    segment_index: int | None = None
+
+
+def parse_deterministic_action_command(text: str) -> DeterministicActionCommand | None:
+    """只解析 T18 固定 machine command，不做自然语言或 LLM 意图推断。
+
+    参数：text 为销售消息原文。
+    返回值：严格匹配时返回服务端动作发行参数，否则返回 None。
+    异常：无；格式错误按普通消息处理。
+    副作用：无。
+    """
+
+    command_id = r"[A-Za-z0-9._-]{1,128}"
+    discard = re.fullmatch(rf"t18\.discard:({command_id})", text)
+    if discard is not None:
+        return DeterministicActionCommand(ACTION_TYPE_DISCARD_CONFIRMATION, discard.group(1))
+    reassign = re.fullmatch(
+        rf"t18\.reassign:({command_id}):(\d{{1,6}}):({command_id})",
+        text,
+    )
+    if reassign is not None:
+        return DeterministicActionCommand(
+            ACTION_TYPE_REASSIGN_CONFIRMATION,
+            reassign.group(3),
+            message_id=reassign.group(1),
+            segment_index=int(reassign.group(2)),
+        )
+    return None
 
 
 class TemplateCardCallbackParser:
@@ -156,9 +234,12 @@ class TemplateCardCallbackParser:
         actor = cls._identifier(cls._mapping(body.get("from"), "from").get("userid"), "actor")
         event_key = cls._identifier(card_event.get("event_key"), "event_key")
         task_id = cls._identifier(card_event.get("task_id"), "task_id")
+        card_type = cls._identifier(card_event.get("card_type"), "card_type")
+        if card_type != CARD_TYPE_BUTTON_INTERACTION:
+            raise CallbackParseError("callback card_type 不符合真实契约")
         provider_msgid = cls._identifier(body.get("msgid"), "msgid")
         req_id = cls._identifier(headers.get("req_id"), "req_id")
-        return TemplateCardCallback(actor, event_key, task_id, provider_msgid, req_id)
+        return TemplateCardCallback(actor, event_key, task_id, provider_msgid, req_id, card_type)
 
     @staticmethod
     def _mapping(value: object, name: str) -> dict[str, object]:
@@ -197,7 +278,7 @@ class WecomActionService:
         session_factory: sessionmaker[Session],
         *,
         card_callback_ready: bool = False,
-        action_expiry: timedelta = timedelta(minutes=10),
+        action_expiry: timedelta = _ACTION_DEFAULT_EXPIRY,
     ) -> None:
         """保存 T18 持久化边界和已验证卡片能力。
 
@@ -255,6 +336,9 @@ class WecomActionService:
         normalized_expiry = expires_at or (utc_now() + self._action_expiry)
         if normalized_expiry.tzinfo is None:
             normalized_expiry = normalized_expiry.replace(tzinfo=UTC)
+        issuance_key = _issuance_key(
+            actor_user_id, action_type, target_type, target_id, safe_context
+        )
         task_id = f"t18_{uuid4().hex}"
         action_id = str(uuid4())
 
@@ -267,29 +351,17 @@ class WecomActionService:
                 or not authorization.is_authorized
             ):
                 raise PermissionError("卡片动作操作者未授权")
-            # 同一确定性命令重试时复用未完成动作；不会因为通知 retry 重新发行第二张业务卡。
-            request_message_id = safe_context.get("request_message_id")
-            if isinstance(request_message_id, str):
-                existing_actions = session.scalars(
-                    select(WecomAction).where(
-                        WecomAction.action_type == action_type,
-                        WecomAction.target_id == target_id,
-                        WecomAction.bound_actor_wecom_user_id == actor_user_id,
-                        WecomAction.status.in_(
-                            (
-                                WecomActionStatus.PENDING.value,
-                                WecomActionStatus.PROCESSING.value,
-                            )
-                        ),
-                    )
-                ).all()
-                for existing in existing_actions:
-                    if existing.context.get("request_message_id") == request_message_id:
-                        session.expunge(existing)
-                        return existing
+            # 发行幂等键由服务端业务事实生成；并发发行由数据库唯一约束收敛。
+            existing = session.scalar(
+                select(WecomAction).where(WecomAction.issuance_key == issuance_key)
+            )
+            if existing is not None:
+                session.expunge(existing)
+                return existing
             action = WecomAction(
                 id=action_id,
                 task_id=task_id,
+                issuance_key=issuance_key,
                 action_type=action_type,
                 bound_actor_wecom_user_id=actor_user_id,
                 target_type=target_type,
@@ -299,8 +371,19 @@ class WecomActionService:
                 expires_at=normalized_expiry,
                 context=safe_context,
             )
-            session.add(action)
-            session.flush()
+            try:
+                with session.begin_nested():
+                    session.add(action)
+                    session.flush()
+            except IntegrityError:
+                # 另一个发行者已提交唯一键；重新读取同一个服务端 action，不生成第二张卡。
+                existing = session.scalar(
+                    select(WecomAction).where(WecomAction.issuance_key == issuance_key)
+                )
+                if existing is None:
+                    raise
+                session.expunge(existing)
+                return existing
             # 事务提交前先把完整卡片 body 固化；通知重试只重发卡片，不重建 action。
             notification_key = hashlib.sha256(f"wecom_action_card:{action_id}".encode()).hexdigest()
             session.add(
@@ -320,6 +403,10 @@ class WecomActionService:
                         ),
                     },
                 )
+            )
+            logger.info(
+                "wecom_action_issued",
+                extra={"action_id": action.id, "event": "action_issued"},
             )
             # 调用方只需要把服务端 task_id 写入测试/日志上下文；脱离事务前显式分离以保留已生成字段。
             session.expunge(action)
@@ -351,6 +438,10 @@ class WecomActionService:
                 )
             )
             if previous is not None:
+                logger.info(
+                    "wecom_callback_duplicate",
+                    extra={"action_id": previous.action_id, "event": "callback_duplicate"},
+                )
                 return CallbackClaimResult(
                     code="duplicate_delivery",
                     task_id=callback.task_id,
@@ -360,9 +451,7 @@ class WecomActionService:
                 )
 
             action = session.scalar(
-                select(WecomAction)
-                .where(WecomAction.task_id == callback.task_id)
-                .with_for_update()
+                select(WecomAction).where(WecomAction.task_id == callback.task_id).with_for_update()
             )
             delivery = WecomCallbackDelivery(
                 action_id=action.id if action is not None else None,
@@ -429,20 +518,39 @@ class WecomActionService:
                     True,
                 )
 
+            if action.action_type == ACTION_TYPE_CRM_FIELD_CONFIRMATION:
+                # 字段确认在 callback claim 前就锁定并核对当前表格负责人，避免先创建 outbox 再拒绝。
+                from app.leads.models import Lead
+
+                lead = session.scalar(
+                    select(Lead).where(Lead.id == action.target_id).with_for_update()
+                )
+                if lead is None or lead.smart_table_owner_user_id != callback.actor_user_id:
+                    return self._deny_action(
+                        action,
+                        delivery,
+                        "owner_mismatch",
+                        "当前账号已不是智能表格负责人",
+                    )
+
             if _as_utc(now) >= _as_utc(action.expires_at):
-                action.status = WecomActionStatus.EXPIRED.value
+                _transition_action(action, WecomActionStatus.EXPIRED.value)
                 action.processed_at = now
                 action.result_code = "expired"
                 action.result_summary = "卡片已过期，请重新发起操作"
                 delivery.processing_status = WecomCallbackProcessingStatus.REJECTED.value
                 delivery.result_code = "expired"
                 delivery.processed_at = now
+                logger.info(
+                    "wecom_action_expired",
+                    extra={"action_id": action.id, "event": "action_expired"},
+                )
                 return CallbackClaimResult(
                     "expired", action.task_id, action.id, action.result_summary, True
                 )
 
             # 行锁保护下仅 pending 可以变为 processing；Outbox 与 claim 在同一事务中提交。
-            action.status = WecomActionStatus.PROCESSING.value
+            _transition_action(action, WecomActionStatus.PROCESSING.value)
             action.claimed_at = now
             action.processing_lease_expires_at = now + _ACTION_LEASE
             session.add(
@@ -454,6 +562,10 @@ class WecomActionService:
             delivery.processing_status = WecomCallbackProcessingStatus.CLAIMED.value
             delivery.result_code = "claimed"
             delivery.processed_at = now
+            logger.info(
+                "wecom_callback_received",
+                extra={"action_id": action.id, "event": "callback_received"},
+            )
             return CallbackClaimResult(
                 "claimed", action.task_id, action.id, "已受理，后台正在处理", True
             )
@@ -481,7 +593,6 @@ class WecomActionService:
             )
             if outbox is None or action is None:
                 raise ValueError("T18 动作执行事实不存在")
-            # Beat 的调度租约只防止重复投递；真正的业务执行租约仍由 processing 字段控制。
             outbox.dispatch_claimed_at = None
             outbox.dispatch_lease_expires_at = None
             if outbox.status == WecomActionOutboxStatus.SUCCEEDED.value or action.status == (
@@ -490,14 +601,33 @@ class WecomActionService:
                 return ActionExecutionResult(
                     "already_succeeded", action.result_summary or "已处理", False
                 )
-            if outbox.status == WecomActionOutboxStatus.PROCESSING.value:
-                lease = outbox.processing_lease_expires_at
-                if lease is not None and _as_utc(lease) > _as_utc(utc_now()):
-                    return ActionExecutionResult("already_processing", "已在处理中", False)
             if action.status != WecomActionStatus.PROCESSING.value:
                 return ActionExecutionResult(
                     f"action_{action.status}", action.result_summary or "动作不可执行", False
                 )
+
+            now = utc_now()
+            lease_expired = outbox.processing_lease_expires_at is not None and _as_utc(
+                outbox.processing_lease_expires_at
+            ) <= _as_utc(now)
+            if outbox.status == WecomActionOutboxStatus.PROCESSING.value and not lease_expired:
+                return ActionExecutionResult("already_processing", "已在处理中", False)
+            if lease_expired and outbox.domain_started_at is not None:
+                # 领域调用已经取得不可逆 operation 事实，不能自动 takeover 再调用一次。
+                _transition_action(action, WecomActionStatus.PENDING_RECOVERY.value)
+                action.processed_at = now
+                action.result_code = "domain_operation_recovery_required"
+                action.result_summary = "领域操作已开始但 Worker 失联，需要恢复核对"
+                outbox.status = WecomActionOutboxStatus.FAILED.value
+                outbox.processing_started_at = None
+                outbox.processing_lease_expires_at = None
+                self._add_result_notification(session, action, action.result_summary)
+                logger.warning(
+                    "wecom_action_recovery_required",
+                    extra={"action_id": action.id, "event": "action_recovery"},
+                )
+                return ActionExecutionResult("recovery_required", action.result_summary, False)
+
             # Worker 可能在 callback claim 后延迟执行；执行前再次读取授权，避免撤销后仍产生副作用。
             authorization = session.get(SalesAuthorization, action.bound_actor_wecom_user_id)
             if (
@@ -505,8 +635,8 @@ class WecomActionService:
                 or not authorization.is_active
                 or not authorization.is_authorized
             ):
-                action.status = WecomActionStatus.DENIED.value
-                action.processed_at = utc_now()
+                _transition_action(action, WecomActionStatus.DENIED.value)
+                action.processed_at = now
                 action.result_code = "actor_unauthorized"
                 action.result_summary = "操作人授权已撤销，未执行该动作"
                 outbox.status = WecomActionOutboxStatus.FAILED.value
@@ -514,10 +644,15 @@ class WecomActionService:
                 outbox.processing_lease_expires_at = None
                 self._add_result_notification(session, action, action.result_summary)
                 return ActionExecutionResult("actor_unauthorized", action.result_summary, False)
+
+            # 每次初次执行或 takeover 都生成新 token；旧 Worker 的 token 随即失效。
+            claim_token = uuid4().hex
             outbox.status = WecomActionOutboxStatus.PROCESSING.value
+            outbox.claim_token = claim_token
             outbox.attempts += 1
-            outbox.processing_started_at = utc_now()
-            outbox.processing_lease_expires_at = outbox.processing_started_at + _ACTION_LEASE
+            outbox.processing_started_at = now
+            outbox.processing_lease_expires_at = now + _ACTION_LEASE
+            action.processing_lease_expires_at = outbox.processing_lease_expires_at
             snapshot = ActionSnapshot(
                 id=action.id,
                 action_type=action.action_type,
@@ -525,15 +660,34 @@ class WecomActionService:
                 target_type=action.target_type,
                 target_id=action.target_id,
                 context=dict(action.context),
+                claim_token=claim_token,
+            )
+            logger.info(
+                "wecom_action_claimed",
+                extra={"action_id": action.id, "event": "action_claimed"},
             )
 
         try:
             # 外部业务调用在事务之外执行；业务动作状态已锁定，通知重试不会再次到这里。
             result_code, result_summary = domain_executor(snapshot)
+        except StaleActionClaim:
+            logger.info(
+                "wecom_action_stale_worker_ignored",
+                extra={"action_id": action_id, "event": "action_recovery"},
+            )
+            return ActionExecutionResult("stale_claim", "Worker claim 已失效", False)
         except Exception as error:
-            logger.exception("wecom_action_domain_execution_failed")
+            logger.warning(
+                "wecom_action_domain_execution_failed",
+                extra={
+                    "action_id": action_id,
+                    "event": "action_recovery",
+                    "error_type": type(error).__name__,
+                },
+            )
             return self._finish_action(
                 action_id,
+                claim_token=claim_token,
                 status=WecomActionStatus.PENDING_RECOVERY.value,
                 outbox_status=WecomActionOutboxStatus.FAILED.value,
                 result_code="domain_failed",
@@ -541,11 +695,194 @@ class WecomActionService:
             )
         return self._finish_action(
             action_id,
+            claim_token=claim_token,
             status=WecomActionStatus.SUCCEEDED.value,
             outbox_status=WecomActionOutboxStatus.SUCCEEDED.value,
             result_code=result_code,
             result_summary=result_summary,
         )
+
+    def begin_domain_operation(
+        self,
+        action_id: str,
+        claim_token: str,
+        payload: Mapping[str, object] | None = None,
+    ) -> None:
+        """以 claim token 原子登记领域副作用开始事实。
+
+        参数：action_id 为内部动作标识；claim_token 为当前 Worker token；payload 为白名单操作快照。
+        返回值：无。
+        异常：claim 失效、lease 过期或领域操作已开始时抛出 StaleActionClaim；数据库错误传播。
+        副作用：持久化不可重复的 operation key，阻止 takeover 再次进入领域服务。
+        """
+
+        with self._session_factory.begin() as session:
+            action, outbox = self._lock_action_and_outbox(session, action_id)
+            self._assert_locked_claim(action, outbox, claim_token)
+            if outbox.domain_started_at is not None:
+                raise StaleActionClaim("领域 operation 已由其他 Worker 开始")
+            outbox.domain_started_at = utc_now()
+            outbox.domain_operation_key = action.id
+            outbox.domain_operation_payload = (
+                _safe_operation_payload(payload) if payload is not None else None
+            )
+            outbox.remote_effect_status = "unknown"
+            logger.info(
+                "wecom_action_domain_started",
+                extra={"action_id": action.id, "event": "action_claimed"},
+            )
+
+    def mark_remote_effect_succeeded(
+        self,
+        action_id: str,
+        claim_token: str,
+        payload: Mapping[str, object] | None = None,
+    ) -> None:
+        """保存外部 Smart Table 写入成功事实，供字段确认恢复使用。
+
+        参数：action_id 与 claim_token 定位当前合法领域操作；payload 为已脱敏的远端结果事实。
+        返回值：无。
+        异常：Worker 已失去 fencing 时抛出 StaleActionClaim；数据库错误传播。
+        副作用：只更新 operation recovery metadata，不改变业务 action 状态。
+        """
+
+        with self._session_factory.begin() as session:
+            action, outbox = self._lock_action_and_outbox(session, action_id)
+            self._assert_locked_claim(action, outbox, claim_token)
+            outbox.remote_effect_status = "succeeded"
+            outbox.remote_effect_at = utc_now()
+            if payload is not None:
+                outbox.domain_operation_payload = _safe_operation_payload(payload)
+
+    def record_callback_transport_failure(
+        self, provider_msgid: str, failure: BaseException
+    ) -> None:
+        """持久化 callback card update 失败，不改变已认领的业务动作。
+
+        参数：provider_msgid 为已保存的 callback transport id；failure 为 SDK/网络异常。
+        返回值：无。
+        异常：数据库错误传播；异常摘要只保存类型，不保存原始 payload 或 secret。
+        副作用：更新 delivery transport evidence，供 Console/审计查询。
+        """
+
+        with self._session_factory.begin() as session:
+            delivery = session.scalar(
+                select(WecomCallbackDelivery)
+                .where(WecomCallbackDelivery.provider_msgid == provider_msgid)
+                .with_for_update()
+            )
+            if delivery is None:
+                return
+            delivery.transport_stage = "callback_card_update"
+            delivery.transport_status = "failed"
+            delivery.transport_failure_code = type(failure).__name__[:64]
+            delivery.transport_failure_summary = "企业微信 callback card update 传输失败"
+            delivery.transport_failed_at = utc_now()
+            logger.warning(
+                "wecom_callback_card_update_failed",
+                extra={
+                    "action_id": delivery.action_id,
+                    "event": "callback_card_update_failed",
+                },
+            )
+
+    def reconcile_field_confirmation(
+        self,
+        action_id: str,
+        smart_table_adapter: SmartTableAdapter,
+    ) -> ActionExecutionResult:
+        """核对远端字段确认已成功但本地 finalize 失败的 pending recovery 动作。
+
+        参数：action_id 为待恢复动作；smart_table_adapter 用于读取当前远端事实。
+        返回值：恢复成功或仍需人工处理的确定性结果。
+        异常：远端状态不匹配时保留 pending_recovery 并返回 recovery_required。
+        副作用：成功时只补写本地 provenance/confirmation event，不再次 update Smart Table。
+        """
+
+        from app.leads.review import LeadReviewService
+
+        with self._session_factory() as session:
+            action = session.get(WecomAction, action_id)
+            outbox = session.scalar(
+                select(WecomActionOutbox).where(WecomActionOutbox.action_id == action_id)
+            )
+            if action is None or outbox is None:
+                raise ValueError("字段确认恢复事实不存在")
+            if (
+                action.action_type != ACTION_TYPE_CRM_FIELD_CONFIRMATION
+                or action.status != WecomActionStatus.PENDING_RECOVERY.value
+                or outbox.remote_effect_status not in {None, "unknown", "succeeded"}
+            ):
+                return ActionExecutionResult(
+                    "recovery_not_ready", "当前动作没有可核对的远端事实", False
+                )
+            payload = dict(outbox.domain_operation_payload or {})
+            field_values = payload.get("field_values")
+            actor = action.bound_actor_wecom_user_id
+            lead_id = action.target_id
+        if not isinstance(field_values, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in field_values.items()
+        ):
+            return ActionExecutionResult(
+                "recovery_required", "确认值快照不完整，需要人工处理", False
+            )
+        review = LeadReviewService(self._session_factory, smart_table_adapter)
+        try:
+            review.finalize_submission_confirmation(
+                lead_id, actor, field_values, operation_id=action_id
+            )
+        except ValueError:
+            return ActionExecutionResult("recovery_required", "远端确认事实与当前表格不一致", False)
+        with self._session_factory.begin() as session:
+            action, outbox = self._lock_action_and_outbox(session, action_id)
+            if action.status != WecomActionStatus.PENDING_RECOVERY.value:
+                return ActionExecutionResult(
+                    "action_not_recoverable", "动作已被其他恢复流程处理", False
+                )
+            _transition_action(action, WecomActionStatus.SUCCEEDED.value)
+            action.processed_at = utc_now()
+            action.result_code = "confirmation_recovered"
+            action.result_summary = "字段确认事实已从智能表格恢复"
+            outbox.status = WecomActionOutboxStatus.SUCCEEDED.value
+            outbox.remote_effect_status = "succeeded"
+            outbox.remote_effect_at = utc_now()
+            outbox.processing_started_at = None
+            outbox.processing_lease_expires_at = None
+            self._add_result_notification(session, action, action.result_summary)
+        return ActionExecutionResult("confirmation_recovered", "字段确认事实已从智能表格恢复", True)
+
+    @staticmethod
+    def _lock_action_and_outbox(
+        session: Session, action_id: str
+    ) -> tuple[WecomAction, WecomActionOutbox]:
+        """在同一事务内锁定动作和其唯一 execution outbox。"""
+
+        action = session.scalar(
+            select(WecomAction).where(WecomAction.id == action_id).with_for_update()
+        )
+        outbox = session.scalar(
+            select(WecomActionOutbox)
+            .where(WecomActionOutbox.action_id == action_id)
+            .with_for_update()
+        )
+        if action is None or outbox is None:
+            raise ValueError("T18 动作 execution 事实不存在")
+        return action, outbox
+
+    @staticmethod
+    def _assert_locked_claim(
+        action: WecomAction, outbox: WecomActionOutbox, claim_token: str
+    ) -> None:
+        """校验锁内 Worker token、状态与 processing lease 仍然有效。"""
+
+        if (
+            action.status != WecomActionStatus.PROCESSING.value
+            or outbox.status != WecomActionOutboxStatus.PROCESSING.value
+            or outbox.claim_token != claim_token
+            or outbox.processing_lease_expires_at is None
+            or _as_utc(outbox.processing_lease_expires_at) <= _as_utc(utc_now())
+        ):
+            raise StaleActionClaim("当前 Worker 已失去 action fencing")
 
     def issue_field_confirmation_action(
         self,
@@ -555,6 +892,7 @@ class WecomActionService:
         field_names: tuple[str, ...],
         command_text: str,
         request_message_id: str,
+        field_values: Mapping[str, str] | None = None,
     ) -> WecomAction:
         """发行 CRM 提交前字段确认动作卡。
 
@@ -574,6 +912,7 @@ class WecomActionService:
                 "field_names": list(field_names),
                 "command_text": command_text,
                 "request_message_id": request_message_id,
+                **({"field_values": dict(field_values)} if field_values is not None else {}),
             },
             title="提交前确认字段",
             description=f"请确认：{'、'.join(field_names)}",
@@ -653,6 +992,7 @@ class WecomActionService:
         self,
         action_id: str,
         *,
+        claim_token: str,
         status: str,
         outbox_status: str,
         result_code: str,
@@ -677,7 +1017,14 @@ class WecomActionService:
             )
             if action is None or outbox is None:
                 raise ValueError("T18 动作终态事实不存在")
-            action.status = status
+            if (
+                action.status != WecomActionStatus.PROCESSING.value
+                or outbox.status != WecomActionOutboxStatus.PROCESSING.value
+                or outbox.claim_token != claim_token
+            ):
+                # 旧 Worker 只能丢弃自己的晚到结果，不能覆盖 takeover 或 terminal 结果。
+                return ActionExecutionResult("stale_claim", "Worker claim 已失效", False)
+            _transition_action(action, status)
             action.processed_at = utc_now()
             action.processing_lease_expires_at = None
             action.result_code = result_code
@@ -697,12 +1044,14 @@ class WecomActionService:
                 delivery.processing_status = WecomCallbackProcessingStatus.COMPLETED.value
                 delivery.result_code = result_code
             self._add_result_notification(session, action, result_summary)
+            logger.info(
+                "wecom_action_completed",
+                extra={"action_id": action.id, "event": "action_completed"},
+            )
         return ActionExecutionResult(result_code, result_summary, True)
 
     @staticmethod
-    def _add_result_notification(
-        session: Session, action: WecomAction, summary: str
-    ) -> None:
+    def _add_result_notification(session: Session, action: WecomAction, summary: str) -> None:
         """把最终动作结果写入可靠通知，不与业务动作共用状态。
 
         参数：session 为当前事务，action 为动作，summary 为脱敏摘要。
@@ -786,13 +1135,23 @@ class WecomActionService:
         """
 
         now = utc_now()
-        action.status = WecomActionStatus.DENIED.value
+        if action.status != WecomActionStatus.PENDING.value:
+            # processing 或 terminal action 不能被另一 callback 改写，只记录本次 delivery 拒绝。
+            delivery.processing_status = WecomCallbackProcessingStatus.REJECTED.value
+            delivery.result_code = code
+            delivery.processed_at = now
+            return CallbackClaimResult(code, action.task_id, action.id, summary, False)
+        _transition_action(action, WecomActionStatus.DENIED.value)
         action.processed_at = now
         action.result_code = code
         action.result_summary = summary
         delivery.processing_status = WecomCallbackProcessingStatus.REJECTED.value
         delivery.result_code = code
         delivery.processed_at = now
+        logger.info(
+            "wecom_action_denied",
+            extra={"action_id": action.id, "event": "action_denied"},
+        )
         return CallbackClaimResult(code, action.task_id, action.id, summary, True)
 
 
@@ -808,12 +1167,15 @@ def build_action_card(
     """
 
     # 卡片只携带 opaque task_id 与固定 action key；Lead/owner/message 不从客户端回传。
-    return {
+    payload: dict[str, object] = {
         "card_type": "button_interaction",
         "task_id": task_id,
         "main_title": {"title": title, "desc": description},
         "button_list": [{"text": "确认", "style": 1, "key": event_key}],
     }
+    if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > _MAX_CARD_PAYLOAD_BYTES:
+        raise ValueError("动作卡片 payload 超出大小限制")
+    return payload
 
 
 def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
@@ -827,6 +1189,7 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
 
     allowed_keys = {
         "field_names",
+        "field_values",
         "command_text",
         "request_message_id",
         "message_id",
@@ -840,7 +1203,7 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
         if isinstance(value, str):
             if len(value) > 512 or "\n" in value or "\r" in value:
                 raise ValueError("动作 context 文本非法")
-            safe[key] = value
+            safe[key] = _redact_text(value, 256 if key == "reason" else 512)
         elif isinstance(value, int) and key in {"segment_index"} and value >= 0:
             safe[key] = value
         elif (
@@ -855,9 +1218,84 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
             )
         ):
             safe[key] = list(value)
+        elif (
+            key == "field_values"
+            and isinstance(value, dict)
+            and len(value) <= 16
+            and all(
+                isinstance(field_name, str)
+                and 0 < len(field_name) <= 64
+                and isinstance(field_value, str)
+                and 0 < len(field_value) <= 512
+                and "\n" not in field_value
+                and "\r" not in field_value
+                for field_name, field_value in value.items()
+            )
+        ):
+            safe[key] = {key: _safe_snapshot_value(value) for key, value in value.items()}
         else:
             raise ValueError("动作 context 值类型非法")
     return safe
+
+
+def _redact_text(value: str, limit: int) -> str:
+    """对持久化摘要移除邮箱、电话号码和换行注入并限制长度。"""
+
+    redacted = _PII_EMAIL.sub("[email]", value)
+    redacted = _PII_PHONE.sub("[phone]", redacted)
+    return redacted[:limit]
+
+
+def _safe_operation_payload(payload: Mapping[str, object]) -> dict[str, object]:
+    """限制领域 operation recovery payload 为小型字段值白名单。"""
+
+    if set(payload) - {"field_values"}:
+        raise ValueError("operation payload 含未允许字段")
+    field_values = payload.get("field_values")
+    if not isinstance(field_values, dict) or len(field_values) > 16:
+        raise ValueError("operation payload 字段值非法")
+    safe_values: dict[str, str] = {}
+    for field_name, field_value in field_values.items():
+        if (
+            not isinstance(field_name, str)
+            or not isinstance(field_value, str)
+            or not 0 < len(field_name) <= 64
+            or not 0 < len(field_value) <= 512
+        ):
+            raise ValueError("operation payload 字段值非法")
+        safe_values[field_name] = _safe_snapshot_value(field_value)
+    return {"field_values": safe_values}
+
+
+def _safe_snapshot_value(value: str) -> str:
+    """保存字段确认快照的不可逆表示，不把客户字段原文写入数据库。"""
+
+    return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
+
+
+def _issuance_key(
+    actor_user_id: str,
+    action_type: str,
+    target_type: str,
+    target_id: str,
+    context: Mapping[str, object],
+) -> str:
+    """生成不依赖 provider msgid 的服务端 action issuance 幂等键。"""
+
+    encoded = json.dumps(dict(context), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    material = "|".join((actor_user_id, action_type, target_type, target_id, encoded))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _transition_action(action: WecomAction, new_status: str) -> None:
+    """按集中状态图执行一次 action 状态转移，阻止旧 Worker 覆盖终态。"""
+
+    current = action.status
+    if current == new_status:
+        return
+    if new_status not in _ACTION_TRANSITIONS.get(current, frozenset()):
+        raise InvalidActionTransition(f"禁止 action 状态转移：{current} -> {new_status}")
+    action.status = new_status
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -880,6 +1318,7 @@ class DeterministicWecomActionExecutor:
         session_factory: sessionmaker[Session],
         smart_table_adapter: SmartTableAdapter,
         crm_adapter: CRMAdapter,
+        action_service: WecomActionService | None = None,
     ) -> None:
         """保存领域服务需要的持久化、智能表格和 CRM 适配器。
 
@@ -892,6 +1331,7 @@ class DeterministicWecomActionExecutor:
         self._session_factory = session_factory
         self._smart_table_adapter = smart_table_adapter
         self._crm_adapter = crm_adapter
+        self._action_service = action_service
 
     def __call__(self, action: ActionSnapshot) -> tuple[str, str]:
         """按已持久化 action_type 调用唯一对应的确定性服务。
@@ -934,12 +1374,37 @@ class DeterministicWecomActionExecutor:
             raise ValueError("字段确认动作 context 不完整")
         review_service = LeadReviewService(self._session_factory, self._smart_table_adapter)
         # 卡片发行后表格可能已被销售处理；只对最新仍 pending 的字段继续确认，旧字段绝不覆盖。
-        latest_state = review_service.get_submission_confirmation_state(action.target_id)
-        current_fields = tuple(field for field in fields if field in latest_state.blocking_fields)
+        reconciled = review_service.reconcile_submission(action.target_id)
+        current_fields = tuple(field for field in fields if field in reconciled.blocking_fields)
         if not current_fields:
             return "confirmation_stale", "字段已按最新表格状态处理，未覆盖销售修改"
+        field_values = {
+            field: value
+            for field, value in reconciled.fields.items()
+            if field in current_fields and isinstance(value, str)
+        }
+        if set(field_values) != set(current_fields):
+            raise ValueError("字段确认动作缺少服务端冻结值")
+        if self._action_service is not None:
+            self._action_service.begin_domain_operation(
+                action.id,
+                action.claim_token,
+                {"field_values": field_values},
+            )
         state = review_service.confirm_submission_fields(
-            action.target_id, action.bound_actor_wecom_user_id, current_fields
+            action.target_id,
+            action.bound_actor_wecom_user_id,
+            current_fields,
+            on_remote_success=(
+                lambda values: (
+                    self._action_service.mark_remote_effect_succeeded(
+                        action.id, action.claim_token, {"field_values": dict(values)}
+                    )
+                    if self._action_service is not None
+                    else None
+                )
+            ),
+            operation_id=action.id,
         )
         if not state.can_submit:
             return "confirmation_incomplete", "仍有字段待确认，请以最新卡片或智能表格为准"
@@ -967,8 +1432,13 @@ class DeterministicWecomActionExecutor:
         reason = action.context.get("reason")
         if not isinstance(reason, str):
             raise ValueError("废弃动作缺少原因")
+        if self._action_service is not None:
+            self._action_service.begin_domain_operation(action.id, action.claim_token)
         result = LeadDiscardService(self._session_factory).discard(
-            action.target_id, action.bound_actor_wecom_user_id, reason
+            action.target_id,
+            action.bound_actor_wecom_user_id,
+            reason,
+            operation_id=action.id,
         )
         return f"lead_discard_{result.status.value}", f"线索废弃处理结果：{result.status.value}"
 
@@ -992,11 +1462,14 @@ class DeterministicWecomActionExecutor:
             or not isinstance(reason, str)
         ):
             raise ValueError("重归属动作 context 不完整")
+        if self._action_service is not None:
+            self._action_service.begin_domain_operation(action.id, action.claim_token)
         LeadReassignmentService(self._session_factory).reassign(
             message_id,
             segment_index,
             action.target_id,
             action.bound_actor_wecom_user_id,
             reason,
+            operation_id=action.id,
         )
         return "lead_reassignment_succeeded", "消息重新归属已完成"

@@ -163,6 +163,88 @@ def test_current_migration_chain_reaches_single_head() -> None:
         # T18 继续以 0022 revision 作为唯一 head，并保留 0021 父 revision。
         assert heads.stdout.count("0022_ticket18_wecom_actions") == 1
 
+        # 只有 notification payload 的 T18 事实也必须阻止 downgrade，不能因没有 action 行而丢列。
+        payload_seed = _run_compose(
+            project_name,
+            environment,
+            "run",
+            "--rm",
+            "--no-deps",
+            "migrate",
+            "python",
+            "-c",
+            (
+                "from sqlalchemy import create_engine, text; "
+                "from app.core.config import get_settings; "
+                "engine = create_engine(get_settings().database_url); "
+                "connection = engine.connect(); "
+                "connection.execute(text(\"INSERT INTO notification_records "
+                "(notification_key, sales_user_id, source_message_id, notification_type, "
+                "status, attempts, payload) VALUES ('payload-only', 'audit-sales', "
+                "'payload-source', 'wecom_action_card', 'pending', 0, "
+                "'{\\\"msgtype\\\":\\\"template_card\\\"}')\")); "
+                "connection.commit(); connection.close(); engine.dispose()"
+            ),
+        )
+        _assert_compose_success(payload_seed, ("run", "migrate", "python", "-c", "<payload-seed>"))
+        payload_downgrade = _run_compose(
+            project_name,
+            environment,
+            "run",
+            "--rm",
+            "--no-deps",
+            "migrate",
+            "alembic",
+            "downgrade",
+            "0021_ticket16_admin_maintenance",
+        )
+        assert payload_downgrade.returncode != 0
+        assert "notification payload" in (payload_downgrade.stdout + payload_downgrade.stderr)
+        payload_check = _run_compose(
+            project_name,
+            environment,
+            "run",
+            "--rm",
+            "--no-deps",
+            "migrate",
+            "python",
+            "-c",
+            (
+                "from sqlalchemy import create_engine, text; "
+                "from app.core.config import get_settings; "
+                "engine = create_engine(get_settings().database_url); "
+                "connection = engine.connect(); "
+                "assert connection.execute(text(\"SELECT payload FROM notification_records "
+                "WHERE notification_key='payload-only'\")).scalar() is not None; "
+                "connection.close(); engine.dispose()"
+            ),
+        )
+        _assert_compose_success(
+            payload_check, ("run", "migrate", "python", "-c", "<payload-check>")
+        )
+        payload_cleanup = _run_compose(
+            project_name,
+            environment,
+            "run",
+            "--rm",
+            "--no-deps",
+            "migrate",
+            "python",
+            "-c",
+            (
+                "from sqlalchemy import create_engine, text; "
+                "from app.core.config import get_settings; "
+                "engine = create_engine(get_settings().database_url); "
+                "connection = engine.connect(); "
+                "connection.execute(text(\"DELETE FROM notification_records WHERE "
+                "notification_key='payload-only'\")); connection.commit(); "
+                "connection.close(); engine.dispose()"
+            ),
+        )
+        _assert_compose_success(
+            payload_cleanup, ("run", "migrate", "python", "-c", "<payload-cleanup>")
+        )
+
         # T18 action/callback 事实一旦产生，同样禁止通过 downgrade 静默丢失不可变审计。
         t18_seed = _run_compose(
             project_name,

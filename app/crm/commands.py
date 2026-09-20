@@ -136,12 +136,18 @@ def _issue_field_confirmation_cards(
             state = review.get_submission_confirmation_state(lead_id)
             if not state.blocking_fields:
                 continue
+            snapshot = review.reconcile_submission(lead_id)
             action_service.issue_field_confirmation_action(
                 actor_user_id=command.sales_user_id,
                 lead_id=lead_id,
                 field_names=state.blocking_fields,
                 command_text=command.text,
                 request_message_id=command.request_message_id,
+                field_values={
+                    field: value
+                    for field, value in snapshot.fields.items()
+                    if field in state.blocking_fields and isinstance(value, str)
+                },
             )
         except CardCapabilityUnavailable:
             # readiness 在事务间变化时同样 fail closed，销售仍可在表格完成确认。
@@ -180,11 +186,15 @@ def _include_persisted_results(
     副作用：仅读取 CRM 同步记录。
     """
     with session_factory() as session:
-        sync_results = session.execute(
-            select(CrmSyncRecord.status, CrmSyncRecord.failure_code).where(
-                CrmSyncRecord.request_message_id == command.request_message_id
+        sync_results = (
+            session.execute(
+                select(CrmSyncRecord.status, CrmSyncRecord.failure_code).where(
+                    CrmSyncRecord.request_message_id == command.request_message_id
+                )
             )
-        ).tuples().all()
+            .tuples()
+            .all()
+        )
     statuses = [status for status, _ in sync_results]
     # 映射缺失已有独立计数，不能同时归为笼统的待人工处理失败。
     generic_terminal_failure_count = sum(
@@ -199,9 +209,7 @@ def _include_persisted_results(
         incomplete=result.incomplete,
         retrying=max(result.retrying, statuses.count("retrying")),
         processing=max(result.processing, statuses.count("processing")),
-        failed_pending_review=max(
-            result.failed_pending_review, generic_terminal_failure_count
-        ),
+        failed_pending_review=max(result.failed_pending_review, generic_terminal_failure_count),
         updates_not_implemented=result.updates_not_implemented,
         incomplete_lead_ids=result.incomplete_lead_ids,
         updated=result.updated,

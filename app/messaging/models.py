@@ -7,7 +7,16 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -139,6 +148,7 @@ class NotificationRecord(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     processing_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_claim_token: Mapped[str | None] = mapped_column(String(64))
     provider_message_id: Mapped[str | None] = mapped_column(String(128))
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -190,6 +200,7 @@ class WecomAction(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_wecom_action_id)
     task_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    issuance_key: Mapped[str | None] = mapped_column(String(128), unique=True)
     action_type: Mapped[str] = mapped_column(String(64), nullable=False)
     bound_actor_wecom_user_id: Mapped[str] = mapped_column(
         ForeignKey("sales_authorizations.wecom_user_id"), nullable=False, index=True
@@ -214,6 +225,14 @@ class WecomAction(Base):
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )
 
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'processing', 'succeeded', 'denied', 'expired', 'failed', "
+            "'pending_recovery')",
+            name="ck_wecom_actions_status",
+        ),
+    )
+
 
 class WecomActionOutbox(Base):
     """保存 callback claim 后等待 Worker 执行的一次性动作任务。"""
@@ -232,8 +251,21 @@ class WecomActionOutbox(Base):
     dispatch_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     processing_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_token: Mapped[str | None] = mapped_column(String(64))
+    domain_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    domain_operation_key: Mapped[str | None] = mapped_column(String(128))
+    domain_operation_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    remote_effect_status: Mapped[str | None] = mapped_column(String(32))
+    remote_effect_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'processing', 'succeeded', 'failed')",
+            name="ck_wecom_action_outbox_status",
+        ),
     )
 
 
@@ -253,10 +285,22 @@ class WecomCallbackDelivery(Base):
         String(32), default=WecomCallbackProcessingStatus.RECEIVED.value, nullable=False
     )
     result_code: Mapped[str | None] = mapped_column(String(64))
+    transport_stage: Mapped[str | None] = mapped_column(String(64))
+    transport_status: Mapped[str | None] = mapped_column(String(32))
+    transport_failure_code: Mapped[str | None] = mapped_column(String(64))
+    transport_failure_summary: Mapped[str | None] = mapped_column(String(128))
+    transport_failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(
+            "processing_status IN ('received', 'claimed', 'duplicated', 'rejected', 'completed')",
+            name="ck_wecom_callback_delivery_status",
+        ),
+    )
 
 
 class BusinessAuditEvent(Base):

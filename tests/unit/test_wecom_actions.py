@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
@@ -21,6 +22,7 @@ from app.leads.models import (
     LeadFieldProvenance,
     LeadMessageResolution,
     MessageReassignmentAudit,
+    UserConfirmationEvent,
 )
 from app.leads.service import LeadReassignmentService
 from app.messaging.models import (
@@ -41,8 +43,12 @@ from app.wecom_bot.actions import (
     CARD_EVENT_KEY_REASSIGN_CONFIRM,
     CallbackParseError,
     DeterministicWecomActionExecutor,
+    InvalidActionTransition,
     TemplateCardCallbackParser,
     WecomActionService,
+    WecomActionStatus,
+    _transition_action,
+    parse_deterministic_action_command,
 )
 from app.wecom_bot.callback import WecomTemplateCardCallbackHandler
 
@@ -221,6 +227,73 @@ def test_malformed_callback_fields_fail_closed() -> None:
 
 
 @pytest.mark.parametrize(
+    "card_type",
+    (None, "unknown_card"),
+)
+def test_missing_or_unknown_card_type_fails_closed(card_type: str | None) -> None:
+    """验证 callback 只接受真实已验证的 button_interaction 卡片类型。"""
+
+    frame = _fixture_frame()
+    card_event = frame["body"]["event"]["template_card_event"]
+    if card_type is None:
+        del card_event["card_type"]
+    else:
+        card_event["card_type"] = card_type
+    with pytest.raises(CallbackParseError):
+        TemplateCardCallbackParser.parse(frame)
+
+
+def test_t18_machine_commands_are_exact_and_not_natural_language() -> None:
+    """验证废弃/重归属入口只接受固定 machine command。"""
+
+    discard = parse_deterministic_action_command("t18.discard:lead-1")
+    reassign = parse_deterministic_action_command("t18.reassign:message-1:0:lead-2")
+    assert discard is not None and discard.target_id == "lead-1"
+    assert reassign is not None and reassign.message_id == "message-1"
+    assert parse_deterministic_action_command("请帮我废弃 lead-1") is None
+    assert parse_deterministic_action_command("t18.discard:lead-1:extra") is None
+
+
+def test_action_state_transition_guard_rejects_terminal_rewrites() -> None:
+    """验证集中状态图允许处理中的拒绝，并阻止终态复活或回退。"""
+
+    processing = WecomAction(status=WecomActionStatus.PROCESSING.value)
+    _transition_action(processing, WecomActionStatus.DENIED.value)
+    assert processing.status == WecomActionStatus.DENIED.value
+
+    for current, target in (
+        (WecomActionStatus.DENIED.value, WecomActionStatus.SUCCEEDED.value),
+        (WecomActionStatus.SUCCEEDED.value, WecomActionStatus.FAILED.value),
+        (WecomActionStatus.EXPIRED.value, WecomActionStatus.PROCESSING.value),
+    ):
+        action = WecomAction(status=current)
+        with pytest.raises(InvalidActionTransition):
+            _transition_action(action, target)
+        assert action.status == current
+
+
+def test_action_context_does_not_persist_field_value_or_contact_pii(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证动作 context 只保留字段确认值的不可逆摘要。"""
+
+    _authorize(session_factory)
+    action = _service(session_factory).issue_field_confirmation_action(
+        actor_user_id="sales-a",
+        lead_id="lead-pii",
+        field_names=("邮箱",),
+        command_text="提交今天的线索",
+        request_message_id="message-pii",
+        field_values={"邮箱": "customer@example.com"},
+    )
+
+    stored_values = action.context["field_values"]
+    assert isinstance(stored_values, dict)
+    assert "customer@example.com" not in str(action.context)
+    assert str(stored_values["邮箱"]).startswith("sha256:")
+
+
+@pytest.mark.parametrize(
     "field_path",
     ("req_id", "task_id", "event_key"),
 )
@@ -304,6 +377,38 @@ def test_unknown_task_and_actor_mismatch_have_no_domain_execution(
     result = _service(session_factory).claim_callback(frame)
 
     assert result.code == "actor_mismatch"
+    with session_factory() as session:
+        stored = session.get(WecomAction, action.id)
+        assert stored is not None and stored.status == "denied"
+        assert session.scalars(select(WecomActionOutbox)).all() == []
+
+
+def test_field_confirmation_owner_is_checked_before_callback_claim(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证字段确认卡在 callback claim 前发现负责人变化时不创建执行 outbox。"""
+
+    _authorize(session_factory, "sales-a")
+    _authorize(session_factory, "sales-b")
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _seed_confirmable_lead(session_factory, adapter)
+    action = _service(session_factory).issue_field_confirmation_action(
+        actor_user_id="sales-a",
+        lead_id=lead_id,
+        field_names=("业务线",),
+        command_text="提交今天的线索",
+        request_message_id="message-owner-precheck",
+    )
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.smart_table_owner_user_id = "sales-b"
+
+    result = _service(session_factory).claim_callback(
+        _frame_for_action(action, msgid="provider-owner-mismatch", actor="sales-a")
+    )
+
+    assert result.code == "owner_mismatch"
     with session_factory() as session:
         stored = session.get(WecomAction, action.id)
         assert stored is not None and stored.status == "denied"
@@ -455,6 +560,15 @@ def test_callback_response_failure_does_not_repeat_business_action(
 
     assert updates == 2
     assert calls == 1
+    with session_factory() as session:
+        deliveries = session.scalars(
+            select(WecomCallbackDelivery).where(WecomCallbackDelivery.action_id == action.id)
+        ).all()
+        assert all(
+            delivery.transport_stage == "callback_card_update"
+            and delivery.transport_status == "failed"
+            for delivery in deliveries
+        )
 
 
 def test_final_notification_retry_does_not_repeat_domain_action(
@@ -609,6 +723,56 @@ def test_stale_field_confirmation_card_cannot_overwrite_latest_table_state(
         ).first() is not None
 
 
+def test_field_confirmation_remote_success_reconciles_without_blind_table_replay(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证远端已清除 AI待确认 而本地 finalize 失败时只读核对并补事实。"""
+
+    _authorize(session_factory)
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _seed_confirmable_lead(session_factory, adapter)
+    service = _service(session_factory)
+    action = service.issue_field_confirmation_action(
+        actor_user_id="sales-a",
+        lead_id=lead_id,
+        field_names=("业务线",),
+        command_text="提交今天的线索",
+        request_message_id="message-recovery",
+        field_values={"业务线": "协作机器人"},
+    )
+    service.claim_callback(_frame_for_action(action, msgid="provider-msg-recovery"))
+    record_id = next(iter(adapter.get_records())).record_id
+    adapter.update_record(record_id, {"AI待确认": []})
+    with session_factory.begin() as session:
+        stored = session.get(WecomAction, action.id)
+        outbox = session.scalar(
+            select(WecomActionOutbox).where(WecomActionOutbox.action_id == action.id)
+        )
+        assert stored is not None and outbox is not None
+        stored.status = "pending_recovery"
+        outbox.status = "failed"
+        outbox.remote_effect_status = "unknown"
+        outbox.domain_operation_payload = {
+            "field_values": {
+                "业务线": "sha256:"
+                + hashlib.sha256("协作机器人".encode("utf-8")).hexdigest()
+            }
+        }
+    result = service.reconcile_field_confirmation(action.id, adapter)
+
+    assert result.code == "confirmation_recovered"
+    with session_factory() as session:
+        assert session.scalars(
+            select(UserConfirmationEvent).where(UserConfirmationEvent.lead_id == lead_id)
+        ).first() is not None
+        stored = session.get(WecomAction, action.id)
+        assert stored is not None and stored.status == "succeeded"
+        outbox = session.scalar(
+            select(WecomActionOutbox).where(WecomActionOutbox.action_id == action.id)
+        )
+        assert outbox is not None and outbox.remote_effect_status == "succeeded"
+
+
 def test_discard_confirmation_double_click_calls_existing_service_once(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -647,7 +811,7 @@ def test_discard_confirmation_double_click_calls_existing_service_once(
         nonlocal calls
         calls += 1
         current = LeadDiscardService(session_factory).discard(
-            action.target_id, "sales-a", "客户明确不再跟进"
+            action.target_id, "sales-a", "客户明确不再跟进", operation_id=action.id
         )
         return current.status.value, "废弃完成"
 
@@ -685,7 +849,12 @@ def test_reassignment_confirmation_uses_server_frozen_target_once(
         nonlocal calls
         calls += 1
         LeadReassignmentService(session_factory).reassign(
-            "message-source", 0, action.target_id, "sales-a", "销售明确选择目标线索"
+            "message-source",
+            0,
+            action.target_id,
+            "sales-a",
+            "销售明确选择目标线索",
+            operation_id=action.id,
         )
         return "reassigned", "重新归属完成"
 

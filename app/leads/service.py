@@ -2593,6 +2593,8 @@ class LeadReassignmentService:
         new_lead_id: str,
         operator_user_id: str,
         reason: str,
+        *,
+        operation_id: str | None = None,
     ) -> None:
         """将销售自己的消息分段重新归属，并只安全补充来源字段。
 
@@ -2606,7 +2608,12 @@ class LeadReassignmentService:
         if not reason.strip():
             raise ValueError("人工重归属必须填写原因")
         request = self._prepare_reassignment(
-            message_id, segment_index, new_lead_id, operator_user_id, reason.strip()
+            message_id,
+            segment_index,
+            new_lead_id,
+            operator_user_id,
+            reason.strip(),
+            operation_id=operation_id,
         )
         with self._session_factory.begin() as session:
             # T07 尚未读取表格人工编辑状态，因此重归属绝不直接写入表格字段。
@@ -2615,6 +2622,8 @@ class LeadReassignmentService:
             audit = session.get(MessageReassignmentAudit, request.audit_id)
             if resolution is None or target is None or audit is None:
                 raise ValueError("重归属完成时缺少归属结论、目标线索或审计事实")
+            if audit.status == "succeeded":
+                return
             safe_fields = {
                 field_name: value
                 for field_name, value in request.safe_fields.items()
@@ -2649,6 +2658,8 @@ class LeadReassignmentService:
         new_lead_id: str,
         operator_user_id: str,
         reason: str,
+        *,
+        operation_id: str | None = None,
     ) -> ReassignmentRequest:
         """校验权限并持久化一条可恢复的人工重归属请求。
 
@@ -2678,6 +2689,20 @@ class LeadReassignmentService:
             ):
                 # 普通销售必须同时拥有来源消息、原目标和新目标；管理员由授权目录显式放行。
                 raise PermissionError("销售只能重新归属自己的消息和线索")
+            if operation_id is not None:
+                existing_audit = session.scalar(
+                    select(MessageReassignmentAudit)
+                    .where(MessageReassignmentAudit.operation_id == operation_id)
+                    .with_for_update()
+                )
+                if existing_audit is not None:
+                    return ReassignmentRequest(
+                        audit_id=existing_audit.id,
+                        message_id=message_id,
+                        segment_index=segment_index,
+                        new_lead_id=existing_audit.new_lead_id,
+                        safe_fields={},
+                    )
             safe_fields = self._safe_provenance_fields(
                 session, message_id, resolution.lead_id, target
             )
@@ -2689,6 +2714,7 @@ class LeadReassignmentService:
                 operator_user_id=operator_user_id,
                 operator_role="administrator" if operator.is_administrator else "sales",
                 reason=reason,
+                operation_id=operation_id,
             )
             session.add(audit)
             session.flush()

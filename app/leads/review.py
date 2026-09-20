@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -341,9 +342,7 @@ class LeadReviewService:
         pending = self._confirmation_names(record.fields.get(AI_CONFIRMATION_FIELD))
         pending.difference_update(protected)
         fields = {
-            name: value
-            for name, value in record.fields.items()
-            if name != AI_CONFIRMATION_FIELD
+            name: value for name, value in record.fields.items() if name != AI_CONFIRMATION_FIELD
         }
         return SubmissionReconcileResult(
             fields=fields,
@@ -351,7 +350,13 @@ class LeadReviewService:
         )
 
     def confirm_submission_fields(
-        self, lead_id: str, sales_user_id: str, field_names: tuple[str, ...]
+        self,
+        lead_id: str,
+        sales_user_id: str,
+        field_names: tuple[str, ...],
+        *,
+        on_remote_success: Callable[[Mapping[str, str]], None] | None = None,
+        operation_id: str | None = None,
     ) -> SubmissionConfirmationState:
         """记录销售对机器人列出的待确认字段的显式确认，并移除相应表格元数据。
 
@@ -372,31 +377,116 @@ class LeadReviewService:
             raise ValueError("确认字段必须是当前阻塞的 AI待确认 字段")
 
         remaining = sorted(current_pending - requested)
+        confirmed_values: dict[str, str] = {}
+        for field_name in sorted(requested):
+            value = record.fields.get(field_name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"确认字段缺少合法表格值：{field_name}")
+            confirmed_values[field_name] = value
         self._smart_table_adapter.update_record(
             record.record_id, {AI_CONFIRMATION_FIELD: remaining}
         )
+        if on_remote_success is not None:
+            # 远端事实已发生后先写 recovery evidence；本地 finalize 失败不能盲目重放表格更新。
+            on_remote_success(confirmed_values)
         with self._session_factory.begin() as session:
             provenance = self._latest_provenance_by_field(session, lead_id)
             for field_name in sorted(requested):
-                value = record.fields.get(field_name)
-                if not isinstance(value, str) or not value:
-                    raise ValueError(f"确认字段缺少合法表格值：{field_name}")
+                value = confirmed_values[field_name]
                 source = provenance.get(field_name)
                 if source is not None:
                     source.is_user_confirmed = True
-                session.add(
-                    UserConfirmationEvent(
-                        lead_id=lead_id,
-                        field_name=field_name,
-                        confirmed_value=value,
-                        operator_sales_user_id=sales_user_id,
+                existing = session.scalar(
+                    select(UserConfirmationEvent).where(
+                        UserConfirmationEvent.lead_id == lead_id,
+                        UserConfirmationEvent.field_name == field_name,
+                        UserConfirmationEvent.confirmed_value == value,
+                        UserConfirmationEvent.operator_sales_user_id == sales_user_id,
+                        UserConfirmationEvent.confirmation_source == "robot",
                     )
                 )
+                if existing is None:
+                    session.add(
+                        UserConfirmationEvent(
+                            lead_id=lead_id,
+                            field_name=field_name,
+                            confirmed_value=value,
+                            operator_sales_user_id=sales_user_id,
+                            operation_id=operation_id,
+                        )
+                    )
             self._record_audit(
                 session,
                 lead.source_message_id,
                 sales_user_id,
                 "submission_ai_fields_confirmed",
+            )
+        return self.get_submission_confirmation_state(lead_id)
+
+    def finalize_submission_confirmation(
+        self,
+        lead_id: str,
+        sales_user_id: str,
+        field_values: Mapping[str, str],
+        *,
+        operation_id: str | None = None,
+    ) -> SubmissionConfirmationState:
+        """只根据已核对的远端事实补写本地确认审计，不再次更新智能表格。
+
+        参数：lead_id、sales_user_id 定位业务动作；field_values 为动作开始时冻结的字段值。
+        返回值：补写后的当前阻塞状态。
+        异常：负责人变化、字段值变化或 AI待确认 未清除时抛出 ValueError。
+        副作用：幂等写入 provenance 与 UserConfirmationEvent，不调用远端写接口。
+        """
+
+        record, lead = self._read_record_for_lead(lead_id)
+        if lead.smart_table_owner_user_id != sales_user_id:
+            raise ValueError("当前销售已不是智能表格负责人")
+        pending = self._confirmation_names(record.fields.get(AI_CONFIRMATION_FIELD))
+        if pending.intersection(field_values):
+            raise ValueError("智能表格仍保留待确认标记")
+        confirmed_values: dict[str, str] = {}
+        for field_name, expected_value in field_values.items():
+            current_value = record.fields.get(field_name)
+            if not isinstance(current_value, str) or not current_value:
+                raise ValueError("智能表格字段已被后续人工修改")
+            if expected_value.startswith("sha256:"):
+                current_digest = hashlib.sha256(current_value.encode("utf-8")).hexdigest()
+                if expected_value != f"sha256:{current_digest}":
+                    raise ValueError("智能表格字段已被后续人工修改")
+            elif current_value != expected_value:
+                raise ValueError("智能表格字段已被后续人工修改")
+            confirmed_values[field_name] = current_value
+        with self._session_factory.begin() as session:
+            provenance = self._latest_provenance_by_field(session, lead_id)
+            for field_name, value in confirmed_values.items():
+                source = provenance.get(field_name)
+                if source is not None:
+                    source.is_user_confirmed = True
+                existing = session.scalar(
+                    select(UserConfirmationEvent).where(
+                        UserConfirmationEvent.lead_id == lead_id,
+                        UserConfirmationEvent.field_name == field_name,
+                        UserConfirmationEvent.confirmed_value == value,
+                        UserConfirmationEvent.operator_sales_user_id == sales_user_id,
+                        UserConfirmationEvent.confirmation_source == "robot",
+                    )
+                )
+                if existing is None:
+                    session.add(
+                        UserConfirmationEvent(
+                            lead_id=lead_id,
+                            field_name=field_name,
+                            confirmed_value=value,
+                            operator_sales_user_id=sales_user_id,
+                            operation_id=operation_id,
+                        )
+                    )
+            self._record_audit(
+                session,
+                lead.source_message_id,
+                sales_user_id,
+                "submission_ai_fields_confirmed_recovered",
             )
         return self.get_submission_confirmation_state(lead_id)
 

@@ -12,6 +12,7 @@
     "event": {
       "eventtype": "template_card_event",
       "template_card_event": {
+        "card_type": "button_interaction",
         "event_key": "crm.field_confirmation.confirm",
         "task_id": "task-fixture-001"
       }

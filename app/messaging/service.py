@@ -20,8 +20,10 @@ from app.messaging.models import (
     OutboxEvent,
     SalesAuthorization,
 )
+from app.wecom_bot.actions import parse_deterministic_action_command
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class IncomingMessageCommand:
@@ -117,14 +119,17 @@ class MessageIntakeService:
                         message_id=command.message_id,
                         sales_user_id=command.sales_user_id,
                         sequence=authorization.next_message_sequence,
-                        # 命令在持久化时确定性分类，Worker 因此绝不把它送入 AI 线索提取。
+                        # 固定命令在持久化时分类，Worker 因此绝不把它送入 AI 意图推断。
                         event_type=(
                             "crm_submission_command"
-                            if (
-                                parse_crm_submission_command(command.normalized_text or "")
+                            if parse_crm_submission_command(command.normalized_text or "")
+                            is not None
+                            else (
+                                "wecom_action_command"
+                                if parse_deterministic_action_command(command.normalized_text or "")
                                 is not None
+                                else "message_received"
                             )
-                            else "message_received"
                         ),
                     )
                 )

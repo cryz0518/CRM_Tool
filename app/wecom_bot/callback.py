@@ -7,7 +7,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
-from app.wecom_bot.actions import CallbackParseError, WecomActionService
+from app.wecom_bot.actions import CallbackParseError, TemplateCardCallbackParser, WecomActionService
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +35,7 @@ class WecomTemplateCardCallbackHandler:
     async def handle(
         self,
         frame: Mapping[str, object],
-        update_template_card: Callable[
-            [Mapping[str, object], dict[str, object]], Awaitable[Any]
-        ],
+        update_template_card: Callable[[Mapping[str, object], dict[str, object]], Awaitable[Any]],
     ) -> None:
         """解析并认领 callback，最多调用一次 update_template_card。
 
@@ -76,5 +74,22 @@ class WecomTemplateCardCallbackHandler:
             )
         except asyncio.TimeoutError:
             logger.error("wecom_template_card_callback_response_timeout")
-        except Exception:
-            logger.exception("wecom_template_card_callback_response_failed")
+            self._record_update_failure(frame, TimeoutError("callback response timeout"))
+        except Exception as error:
+            logger.warning(
+                "wecom_template_card_callback_response_failed",
+                extra={
+                    "event": "callback_card_update_failed",
+                    "error_type": type(error).__name__,
+                },
+            )
+            self._record_update_failure(frame, error)
+
+    def _record_update_failure(self, frame: Mapping[str, object], error: BaseException) -> None:
+        """按白名单 msgid 保存 card update transport failure，不重做业务 action。"""
+
+        try:
+            callback = TemplateCardCallbackParser.parse(frame)
+        except CallbackParseError:
+            return
+        self._action_service.record_callback_transport_failure(callback.provider_msgid, error)

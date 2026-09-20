@@ -17,11 +17,11 @@ from app.companies.service import CompanyLeadService, MockQCCAdapter
 from app.core.config import get_settings
 from app.crm.commands import consume_submission_command
 from app.crm.dependencies import get_crm_adapter
-from app.crm.mock import MockCRMAdapter
 from app.leads.review import LeadReviewService
 from app.leads.service import COMPLETED_CHECKPOINT_STATUSES, FirstTextLeadWorkspaceService
 from app.media.dependencies import get_media_attachment_service
 from app.messaging.models import (
+    IncomingMessage,
     OutboxEvent,
     SalesAuthorization,
     WecomActionOutbox,
@@ -29,7 +29,12 @@ from app.messaging.models import (
     utc_now,
 )
 from app.smart_table.dependencies import get_smart_table_adapter
-from app.wecom_bot.actions import DeterministicWecomActionExecutor, WecomActionService
+from app.wecom_bot.actions import (
+    CardCapabilityUnavailable,
+    DeterministicWecomActionExecutor,
+    WecomActionService,
+    parse_deterministic_action_command,
+)
 from workers.celery_app import celery_app
 
 
@@ -69,16 +74,48 @@ def consume_lead_outbox_event(
         if _is_submission_command(factory, outbox_event_id):
             # 命令已在 T02 确定性分类；只编排现有 T12 服务，绝不进入 AI 线索路径。
             return consume_submission_command(
-                factory, smart_table_adapter, MockCRMAdapter(), outbox_event_id
+                factory, smart_table_adapter, get_crm_adapter(), outbox_event_id
             )
+        if _is_wecom_action_command(factory, outbox_event_id):
+            with factory() as session:
+                event = session.get(OutboxEvent, outbox_event_id)
+                message = session.get(IncomingMessage, event.message_id) if event else None
+            if message is None:
+                raise ValueError("T18 machine command 缺少来源消息")
+            parsed = parse_deterministic_action_command(message.normalized_text or "")
+            if parsed is None:
+                raise ValueError("T18 machine command 解析失败")
+            action_service = WecomActionService(
+                factory, card_callback_ready=get_settings().wecom_card_callback_ready()
+            )
+            try:
+                if parsed.action_type == "lead_discard_confirmation":
+                    action_service.issue_discard_action(
+                        actor_user_id=message.sales_user_id,
+                        lead_id=parsed.target_id,
+                        reason="销售通过固定 T18 命令请求废弃",
+                        source_message_id=message.message_id,
+                    )
+                else:
+                    if parsed.message_id is None or parsed.segment_index is None:
+                        raise ValueError("T18 重归属命令缺少服务端候选参数")
+                    action_service.issue_reassignment_action(
+                        actor_user_id=message.sales_user_id,
+                        message_id=parsed.message_id,
+                        segment_index=parsed.segment_index,
+                        target_lead_id=parsed.target_id,
+                        reason="销售通过固定 T18 命令请求重归属",
+                        source_message_id=message.message_id,
+                    )
+            except CardCapabilityUnavailable:
+                return "card_callback_unavailable"
+            return "action_issued"
         # T10 首期明确只接入 Mock QCC；真实企查查 API 留给 T21 的专用适配器。
         service = FirstTextLeadWorkspaceService(
             factory,
             smart_table_adapter,
             ai_gateway=get_ai_gateway(execution_recorder=DatabaseAIExecutionRecorder(factory)),
-            company_lead_service=CompanyLeadService(
-                factory, smart_table_adapter, MockQCCAdapter()
-            ),
+            company_lead_service=CompanyLeadService(factory, smart_table_adapter, MockQCCAdapter()),
             robot_submission_confirmation_available=get_settings().wecom_card_callback_ready(),
         )
         if recover_expired_lease:
@@ -353,11 +390,14 @@ def consume_wecom_action(action_id: str) -> str:
     """
     engine, factory = _session_factory()
     try:
-        service = WecomActionService(factory, card_callback_ready=True)
+        service = WecomActionService(
+            factory, card_callback_ready=get_settings().wecom_card_callback_ready()
+        )
         executor = DeterministicWecomActionExecutor(
             factory,
             get_smart_table_adapter(),
             get_crm_adapter(),
+            service,
         )
         return service.execute_action(action_id, executor).code
     finally:
@@ -384,8 +424,7 @@ def consume_pending_wecom_actions() -> int:
                     .where(
                         and_(
                             or_(
-                                WecomActionOutbox.status
-                                == WecomActionOutboxStatus.PENDING.value,
+                                WecomActionOutbox.status == WecomActionOutboxStatus.PENDING.value,
                                 and_(
                                     WecomActionOutbox.status
                                     == WecomActionOutboxStatus.PROCESSING.value,
@@ -413,3 +452,11 @@ def consume_pending_wecom_actions() -> int:
         # Outbox 记录仍是唯一业务动作 claim，重复投递不会重复 domain side effect。
         consume_wecom_action.delay(action_id)
     return len(action_ids)
+
+
+def _is_wecom_action_command(session_factory: sessionmaker[Session], outbox_event_id: int) -> bool:
+    """判断 Outbox 是否为确定性 T18 machine command。"""
+
+    with session_factory() as session:
+        event = session.get(OutboxEvent, outbox_event_id)
+        return event is not None and event.event_type == "wecom_action_command"

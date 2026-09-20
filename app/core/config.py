@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     wecom_bot_id: str | None = None
     wecom_bot_secret: str | None = None
     wecom_card_callback_enabled: bool = False
+    wecom_card_transport_configured: bool = False
+    wecom_card_callback_handler_configured: bool = False
     wecom_card_callback_timeout_seconds: float = 4.0
     wecom_smart_table_doc_id: str | None = None
     wecom_smart_table_sheet_id: str | None = None
@@ -163,7 +165,11 @@ class Settings(BaseSettings):
         副作用：无；该方法只读取配置，不执行网络探测。
         """
         # 该开关由部署在真实 provider 已验证后设置；非 Bot Worker 不需要复制密钥。
-        return self.wecom_card_callback_enabled
+        return bool(
+            self.wecom_card_callback_enabled
+            and self.wecom_card_transport_configured
+            and self.wecom_card_callback_handler_configured
+        )
 
 
 @lru_cache

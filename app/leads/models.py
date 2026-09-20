@@ -104,6 +104,7 @@ class UserConfirmationEvent(Base):
     operator_sales_user_id: Mapped[str] = mapped_column(
         ForeignKey("sales_authorizations.wecom_user_id"), nullable=False
     )
+    operation_id: Mapped[str | None] = mapped_column(String(128), unique=True)
     confirmation_source: Mapped[str] = mapped_column(String(32), default="robot", nullable=False)
     confirmed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
@@ -162,6 +163,7 @@ class MessageReassignmentAudit(Base):
         ForeignKey("sales_authorizations.wecom_user_id"), nullable=False
     )
     operator_role: Mapped[str] = mapped_column(String(32), nullable=False)
+    operation_id: Mapped[str | None] = mapped_column(String(128), unique=True)
     reason: Mapped[str] = mapped_column(String(512), nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="processing", nullable=False)
     error_summary: Mapped[str | None] = mapped_column(String(256))
@@ -295,6 +297,7 @@ class LeadDiscardRequest(Base):
         ForeignKey("sales_authorizations.wecom_user_id"), nullable=False
     )
     operator_role: Mapped[str] = mapped_column(String(32), nullable=False)
+    operation_id: Mapped[str | None] = mapped_column(String(128), unique=True)
     reason: Mapped[str] = mapped_column(String(512), nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
