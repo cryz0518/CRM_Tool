@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -132,6 +134,7 @@ class NotificationRecord(Base):
     source_message_id: Mapped[str] = mapped_column(String(128), nullable=False)
     notification_type: Mapped[str] = mapped_column(String(64), nullable=False)
     content: Mapped[str | None] = mapped_column(String(512))
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -141,6 +144,119 @@ class NotificationRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
+
+
+class WecomActionStatus(StrEnum):
+    """集中定义 T18 业务动作的生命周期状态。"""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    SUCCEEDED = "succeeded"
+    DENIED = "denied"
+    EXPIRED = "expired"
+    FAILED = "failed"
+    PENDING_RECOVERY = "pending_recovery"
+
+
+class WecomActionOutboxStatus(StrEnum):
+    """集中定义 T18 动作执行 Outbox 的任务状态。"""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class WecomCallbackProcessingStatus(StrEnum):
+    """集中定义 callback delivery evidence 的处理结果。"""
+
+    RECEIVED = "received"
+    CLAIMED = "claimed"
+    DUPLICATED = "duplicated"
+    REJECTED = "rejected"
+    COMPLETED = "completed"
+
+
+def new_wecom_action_id() -> str:
+    """生成服务端内部业务 action UUID。"""
+
+    return str(uuid4())
+
+
+class WecomAction(Base):
+    """保存一张服务端生成、不可由 callback 客户端重构的企业微信业务动作。"""
+
+    __tablename__ = "wecom_actions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_wecom_action_id)
+    task_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    action_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    bound_actor_wecom_user_id: Mapped[str] = mapped_column(
+        ForeignKey("sales_authorizations.wecom_user_id"), nullable=False, index=True
+    )
+    target_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    expected_action_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), default=WecomActionStatus.PENDING.value, nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    result_code: Mapped[str | None] = mapped_column(String(64))
+    result_summary: Mapped[str | None] = mapped_column(String(256))
+    context: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class WecomActionOutbox(Base):
+    """保存 callback claim 后等待 Worker 执行的一次性动作任务。"""
+
+    __tablename__ = "wecom_action_outbox"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    action_id: Mapped[str] = mapped_column(
+        ForeignKey("wecom_actions.id"), nullable=False, unique=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), default=WecomActionOutboxStatus.PENDING.value, nullable=False
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    dispatch_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dispatch_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class WecomCallbackDelivery(Base):
+    """保存企业微信 callback 的白名单传输证据，不保存原始 payload。"""
+
+    __tablename__ = "wecom_callback_deliveries"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    action_id: Mapped[str | None] = mapped_column(ForeignKey("wecom_actions.id"), index=True)
+    provider_msgid: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    req_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    actor_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    event_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    task_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    processing_status: Mapped[str] = mapped_column(
+        String(32), default=WecomCallbackProcessingStatus.RECEIVED.value, nullable=False
+    )
+    result_code: Mapped[str | None] = mapped_column(String(64))
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class BusinessAuditEvent(Base):

@@ -1,4 +1,4 @@
-"""T15 migration 链升级、head 和 current 验证。"""
+"""历史 migration 链升级、head 和 current 验证。"""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def _assert_compose_success(
     )
 
 
-def test_ticket17_migration_chain_reaches_single_current_head() -> None:
+def test_current_migration_chain_reaches_single_head() -> None:
     """在独立临时 PostgreSQL 容器中执行真实 Alembic upgrade、heads 和 current。"""
     if shutil.which("docker") is None:
         pytest.fail("T15 migration 验证需要可用的 docker 命令，禁止静默跳过真实验证")
@@ -160,8 +160,54 @@ def test_ticket17_migration_chain_reaches_single_current_head() -> None:
         _assert_compose_success(
             heads, ("run", "--rm", "--no-deps", "migrate", "alembic", "heads")
         )
-        # T16 继续以 0021 revision 作为唯一 head，并保留 T17 父 revision。
-        assert heads.stdout.count("0021_ticket16_admin_maintenance") == 1
+        # T18 继续以 0022 revision 作为唯一 head，并保留 0021 父 revision。
+        assert heads.stdout.count("0022_ticket18_wecom_actions") == 1
+
+        # T18 action/callback 事实一旦产生，同样禁止通过 downgrade 静默丢失不可变审计。
+        t18_seed = _run_compose(
+            project_name,
+            environment,
+            "run",
+            "--rm",
+            "--no-deps",
+            "migrate",
+            "python",
+            "-c",
+            (
+                "from sqlalchemy import create_engine, text; "
+                "from app.core.config import get_settings; "
+                "engine = create_engine(get_settings().database_url); "
+                "connection = engine.connect(); "
+                "connection.execute(text(\"INSERT INTO wecom_actions "
+                "(id, task_id, action_type, bound_actor_wecom_user_id, target_type, target_id, "
+                "expected_action_key, status, expires_at, context, created_at, updated_at) "
+                "VALUES ('t18-action-1', 't18-task-1', 'lead.discard.confirmation', 'audit-sales', "
+                "'lead', 'lead-1', 'lead.discard.confirm', 'pending', CURRENT_TIMESTAMP, '{}', "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)\")); "
+                "connection.execute(text(\"INSERT INTO wecom_callback_deliveries "
+                "(action_id, provider_msgid, req_id, actor_user_id, event_key, task_id, "
+                "processing_status, received_at) VALUES ('t18-action-1', 'provider-1', 'req-1', "
+                "'audit-sales', 'lead.discard.confirm', 't18-task-1', 'claimed', "
+                "CURRENT_TIMESTAMP)\")); "
+                "connection.commit(); connection.close(); engine.dispose()"
+            ),
+        )
+        _assert_compose_success(t18_seed, ("run", "migrate", "python", "-c", "<t18-seed>"))
+        t18_downgrade = _run_compose(
+            project_name,
+            environment,
+            "run",
+            "--rm",
+            "--no-deps",
+            "migrate",
+            "alembic",
+            "downgrade",
+            "0021_ticket16_admin_maintenance",
+        )
+        assert t18_downgrade.returncode != 0
+        assert "存在 T18 企业微信动作或 callback 事实" in (
+            t18_downgrade.stdout + t18_downgrade.stderr
+        )
     finally:
         if compose_started:
             # 只清理本测试生成的项目、网络和 Volume，不触碰默认 Compose 资源。

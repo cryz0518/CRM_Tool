@@ -35,3 +35,16 @@ def test_ai_gateway_timeout_environment_variable_overrides_default(monkeypatch) 
     settings = Settings(_env_file=None)
 
     assert settings.ai_gateway_timeout_seconds == 30.0
+
+
+def test_wecom_card_callback_readiness_fails_closed_when_disabled() -> None:
+    """验证部署未声明真实 card/callback provider 时能力保持关闭。"""
+
+    settings = Settings(
+        _env_file=None,
+        wecom_card_callback_enabled=False,
+        wecom_bot_id=None,
+        wecom_bot_secret=None,
+    )
+
+    assert settings.wecom_card_callback_ready() is False

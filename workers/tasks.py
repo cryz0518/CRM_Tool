@@ -16,12 +16,20 @@ from app.ai.persistence import DatabaseAIExecutionRecorder
 from app.companies.service import CompanyLeadService, MockQCCAdapter
 from app.core.config import get_settings
 from app.crm.commands import consume_submission_command
+from app.crm.dependencies import get_crm_adapter
 from app.crm.mock import MockCRMAdapter
 from app.leads.review import LeadReviewService
 from app.leads.service import COMPLETED_CHECKPOINT_STATUSES, FirstTextLeadWorkspaceService
 from app.media.dependencies import get_media_attachment_service
-from app.messaging.models import OutboxEvent, SalesAuthorization, utc_now
+from app.messaging.models import (
+    OutboxEvent,
+    SalesAuthorization,
+    WecomActionOutbox,
+    WecomActionOutboxStatus,
+    utc_now,
+)
 from app.smart_table.dependencies import get_smart_table_adapter
+from app.wecom_bot.actions import DeterministicWecomActionExecutor, WecomActionService
 from workers.celery_app import celery_app
 
 
@@ -71,6 +79,7 @@ def consume_lead_outbox_event(
             company_lead_service=CompanyLeadService(
                 factory, smart_table_adapter, MockQCCAdapter()
             ),
+            robot_submission_confirmation_available=get_settings().wecom_card_callback_ready(),
         )
         if recover_expired_lease:
             # 失联处理只进入既有人工复核路径，绝不重放媒体、模型或智能表格调用。
@@ -118,9 +127,11 @@ def sync_ai_lead_patch(
     )
     engine, factory = _session_factory()
     try:
-        result = LeadReviewService(factory, get_smart_table_adapter()).sync_ai_patch(
-            lead_id, source_message_id, patch
-        )
+        result = LeadReviewService(
+            factory,
+            get_smart_table_adapter(),
+            robot_submission_confirmation_available=get_settings().wecom_card_callback_ready(),
+        ).sync_ai_patch(lead_id, source_message_id, patch)
         return {
             "updated_fields": list(result.updated_fields),
             "protected_fields": list(result.protected_fields),
@@ -329,3 +340,76 @@ def consume_pending_lead_outbox_events() -> int:
             claim.recover_expired_lease,
         )
     return len(claims)
+
+
+@celery_app.task(name="workers.consume_wecom_action")  # type: ignore[untyped-decorator]
+def consume_wecom_action(action_id: str) -> str:
+    """消费一条已经由 callback 原子认领的 T18 动作 Outbox。
+
+    参数：action_id 为服务端内部 action UUID，不接受 callback 客户端业务字段。
+    返回值：确定性的动作执行状态摘要。
+    异常：数据库异常向 Celery 传播；domain 异常由动作服务收敛为 pending_recovery。
+    副作用：复用字段确认、废弃、重归属或 CRM 提交领域服务，并创建最终通知。
+    """
+    engine, factory = _session_factory()
+    try:
+        service = WecomActionService(factory, card_callback_ready=True)
+        executor = DeterministicWecomActionExecutor(
+            factory,
+            get_smart_table_adapter(),
+            get_crm_adapter(),
+        )
+        return service.execute_action(action_id, executor).code
+    finally:
+        # Worker 每次动作使用短生命周期连接池，避免通知或动作重试泄漏连接。
+        engine.dispose()
+
+
+@celery_app.task(name="workers.consume_pending_wecom_actions")  # type: ignore[untyped-decorator]
+def consume_pending_wecom_actions() -> int:
+    """扫描待执行或租约已过期的 callback 动作，并投递独立 Worker 任务。
+
+    参数：无。
+    返回值：本轮投递的动作数量。
+    异常：数据库读取失败时向 Celery 传播。
+    副作用：仅投递任务，不直接调用任何业务服务；租约恢复仍由动作服务行锁决定。
+    """
+    engine, factory = _session_factory()
+    now = utc_now()
+    try:
+        with factory.begin() as session:
+            outboxes = list(
+                session.scalars(
+                    select(WecomActionOutbox)
+                    .where(
+                        and_(
+                            or_(
+                                WecomActionOutbox.status
+                                == WecomActionOutboxStatus.PENDING.value,
+                                and_(
+                                    WecomActionOutbox.status
+                                    == WecomActionOutboxStatus.PROCESSING.value,
+                                    WecomActionOutbox.processing_lease_expires_at.is_not(None),
+                                    WecomActionOutbox.processing_lease_expires_at <= now,
+                                ),
+                            ),
+                            or_(
+                                WecomActionOutbox.dispatch_lease_expires_at.is_(None),
+                                WecomActionOutbox.dispatch_lease_expires_at <= now,
+                            ),
+                        )
+                    )
+                    .with_for_update(skip_locked=True)
+                )
+            )
+            for outbox in outboxes:
+                # 调度租约与业务 processing 租约分离，Celery 任务迟到时仍可安全执行。
+                outbox.dispatch_claimed_at = now
+                outbox.dispatch_lease_expires_at = now + timedelta(minutes=5)
+            action_ids = [outbox.action_id for outbox in outboxes]
+    finally:
+        engine.dispose()
+    for action_id in action_ids:
+        # Outbox 记录仍是唯一业务动作 claim，重复投递不会重复 domain side effect。
+        consume_wecom_action.delay(action_id)
+    return len(action_ids)

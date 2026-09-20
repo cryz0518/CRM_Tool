@@ -89,7 +89,7 @@ class LeadReviewService:
         self._smart_table_adapter = smart_table_adapter
         settings = get_settings()
         self._robot_submission_confirmation_available = (
-            settings.robot_submission_confirmation_available
+            settings.wecom_card_callback_ready()
             if robot_submission_confirmation_available is None
             else robot_submission_confirmation_available
         )

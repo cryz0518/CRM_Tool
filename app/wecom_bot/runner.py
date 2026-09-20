@@ -20,7 +20,9 @@ from app.media.dependencies import get_media_attachment_service
 from app.media.service import MediaAttachmentService
 from app.messaging.service import MessageIntakeService
 from app.notifications.outbound import WecomOutboundNotificationSender
+from app.wecom_bot.actions import WecomActionService
 from app.wecom_bot.adapter import WecomMediaMessageAdapter, WecomTextMessageAdapter
+from app.wecom_bot.callback import WecomTemplateCardCallbackHandler
 
 logger = logging.getLogger(__name__)
 
@@ -83,11 +85,13 @@ class WecomBotRuntime:
         media_attachment_service: MediaAttachmentService,
         bot_id: str,
         bot_secret: str,
+        action_service: WecomActionService | None = None,
+        callback_timeout_seconds: float = 4.0,
     ) -> None:
         """创建使用官方 SDK 的机器人运行时。
 
         参数：engine 为当前进程持有的数据库引擎，message_intake_service 为 T02 边界，
-        bot_id 和 bot_secret 为企业微信机器人凭据。
+        bot_id 和 bot_secret 为企业微信机器人凭据；callback_timeout_seconds 为卡片回调总响应预算。
         返回值：无。
         异常：SDK 构造异常向上抛出。
         副作用：注册 SDK 连接与文本事件回调，但尚未建立网络连接。
@@ -96,6 +100,12 @@ class WecomBotRuntime:
         self._text_adapter = WecomTextMessageAdapter(message_intake_service)
         self._media_adapter = WecomMediaMessageAdapter(message_intake_service)
         self._media_attachment_service = media_attachment_service
+        # callback 只依赖动作持久化边界；缺省实例仍 fail closed，不会凭空发行新卡片。
+        self._action_service = action_service or WecomActionService(sessionmaker(engine))
+        self._callback_handler = WecomTemplateCardCallbackHandler(
+            self._action_service,
+            response_timeout_seconds=callback_timeout_seconds,
+        )
         self._ready_file = Path("/tmp/wecom-bot-ready")
         self._shutdown_event: asyncio.Event | None = None
         self._fatal_intake_error: Exception | None = None
@@ -132,6 +142,8 @@ class WecomBotRuntime:
         self._client.on("message.text", self._receive_text_frame)
         self._client.on("message.image", self._receive_media_frame)
         self._client.on("message.voice", self._receive_media_frame)
+        # 仅注册真实验证的事件名，不能用猜测性的 message.template_card_event。
+        self._client.on("event.template_card_event", self._receive_template_card_event)
 
     def _handle_connected(self) -> None:
         """记录 WebSocket 已建立但尚未完成认证的状态。
@@ -269,6 +281,15 @@ class WecomBotRuntime:
             # 下载器异常可能带短期 URL 或 AES key，日志仅保留固定事件名。
             logger.error("wecom_bot_media_intake_failed")
 
+    async def _receive_template_card_event(self, frame: dict[str, Any]) -> None:
+        """在 callback 5 秒窗口内完成动作认领和唯一卡片响应。"""
+
+        try:
+            await self._callback_handler.handle(frame, self._client.update_template_card)
+        except Exception:
+            # 数据库不可用时不伪造 callback 成功，也不在 SDK 事件层重复调用旧 request。
+            logger.exception("wecom_template_card_callback_failed")
+
     async def run(self) -> None:
         """建立 SDK 长连接并等待进程终止信号。
 
@@ -336,6 +357,10 @@ def create_runtime(settings: Settings) -> WecomBotRuntime:
         media_attachment_service=get_media_attachment_service(session_factory),
         bot_id=settings.wecom_bot_id,
         bot_secret=settings.wecom_bot_secret,
+        action_service=WecomActionService(
+            session_factory, card_callback_ready=settings.wecom_card_callback_ready()
+        ),
+        callback_timeout_seconds=settings.wecom_card_callback_timeout_seconds,
     )
 
 

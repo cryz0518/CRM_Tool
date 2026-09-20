@@ -106,3 +106,37 @@ def test_expired_processing_notification_is_reclaimed() -> None:
         )
     sender = WecomOutboundNotificationSender(factory, FakeClient())
     assert asyncio.run(sender.send_pending_once()) == 1
+
+
+def test_action_card_payload_is_sent_without_creating_business_retry() -> None:
+    """验证 T18 template card 通知走主动 send_message，重试只影响通知状态。"""
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    factory = sessionmaker(engine)
+    Base.metadata.create_all(engine)
+    with factory.begin() as session:
+        session.add(
+            NotificationRecord(
+                notification_key="card-notice",
+                sales_user_id="sales-card",
+                source_message_id="action-1",
+                notification_type="wecom_action_card",
+                content="请确认",
+                payload={
+                    "msgtype": "template_card",
+                    "template_card": {"task_id": "t18_1", "card_type": "text_notice"},
+                },
+            )
+        )
+    client = FakeClient()
+
+    assert asyncio.run(WecomOutboundNotificationSender(factory, client).send_pending_once()) == 1
+    assert client.calls == [
+        (
+            "sales-card",
+            {
+                "msgtype": "template_card",
+                "template_card": {"task_id": "t18_1", "card_type": "text_notice"},
+            },
+        )
+    ]

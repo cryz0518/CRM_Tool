@@ -19,8 +19,11 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://crm:crm_local_only@postgres:5432/crm_lead"
     redis_url: str = "redis://redis:6379/0"
     smart_table_adapter: Literal["mock", "unconfigured", "wecom_cli"] = "unconfigured"
+    crm_adapter: Literal["mock", "unconfigured"] = "unconfigured"
     wecom_bot_id: str | None = None
     wecom_bot_secret: str | None = None
+    wecom_card_callback_enabled: bool = False
+    wecom_card_callback_timeout_seconds: float = 4.0
     wecom_smart_table_doc_id: str | None = None
     wecom_smart_table_sheet_id: str | None = None
     wecom_smart_table_sales_can_create_records: bool | None = None
@@ -40,7 +43,6 @@ class Settings(BaseSettings):
     ai_gateway_retry_count: int = 1
     ai_high_confidence_threshold: float = 0.85
     ai_medium_confidence_threshold: float = 0.60
-    robot_submission_confirmation_available: bool = True
     crm_create_retry_count: int = 3
     media_storage_path: str = "/var/lib/crm-lead/media"
     media_image_mime_types: tuple[str, ...] = ("image/png", "image/jpeg", "image/webp")
@@ -142,6 +144,26 @@ class Settings(BaseSettings):
         if value <= 0:
             raise ValueError("CRM_CREATE_RETRY_COUNT 必须大于 0")
         return value
+
+    @field_validator("wecom_card_callback_timeout_seconds")
+    @classmethod
+    def wecom_card_callback_timeout_must_fit_window(cls, value: float) -> float:
+        """限制 callback 内部总响应预算必须为正且小于真实五秒窗口。"""
+
+        if value <= 0 or value >= 5:
+            raise ValueError("WECOM_CARD_CALLBACK_TIMEOUT_SECONDS 必须在 0 和 5 秒之间")
+        return value
+
+    def wecom_card_callback_ready(self) -> bool:
+        """返回部署声明的卡片动作 capability/readiness。
+
+        返回值：只有显式启用的非敏感 readiness 开关为 True 时返回 True；Bot 进程自身
+        仍必须单独校验 bot id/secret，Worker 不复制机器人密钥。
+        异常：无。
+        副作用：无；该方法只读取配置，不执行网络探测。
+        """
+        # 该开关由部署在真实 provider 已验证后设置；非 Bot Worker 不需要复制密钥。
+        return self.wecom_card_callback_enabled
 
 
 @lru_cache

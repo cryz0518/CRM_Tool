@@ -10,6 +10,16 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.messaging.models import NotificationRecord, utc_now
 
+_SUPPORTED_NOTIFICATION_TYPES = frozenset(
+    {
+        "crm_submission_summary",
+        "sales_authorization_denied",
+        "media_text_input_required",
+        "wecom_action_card",
+        "wecom_action_result",
+    }
+)
+
 
 class WecomMessageClient(Protocol):
     """描述已认证 WSClient 的最小主动发送能力。"""
@@ -32,7 +42,7 @@ class WecomOutboundNotificationSender:
         with self._session_factory() as session:
             notices = session.scalars(
                 select(NotificationRecord).where(
-                    NotificationRecord.notification_type == "crm_submission_summary",
+                    NotificationRecord.notification_type.in_(_SUPPORTED_NOTIFICATION_TYPES),
                     or_(
                         NotificationRecord.status.in_(("pending", "retrying")),
                         and_(
@@ -67,10 +77,12 @@ class WecomOutboundNotificationSender:
                     minutes=5
                 )
             try:
-                await self._client.send_message(
-                    notice.sales_user_id,
-                    {"msgtype": "text", "text": {"content": notice.content or "系统通知"}},
-                )
+                # payload 仅保存已构造的白名单消息 body；旧通知没有 payload 时继续发送普通文本。
+                body = notice.payload or {
+                    "msgtype": "text",
+                    "text": {"content": notice.content or "系统通知"},
+                }
+                await self._client.send_message(notice.sales_user_id, body)
             except Exception:
                 with self._session_factory.begin() as session:
                     current = session.get(NotificationRecord, notice.notification_key)

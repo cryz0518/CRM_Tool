@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -11,8 +12,29 @@ from app.core.config import get_settings
 from app.crm.adapter import CRMAdapter
 from app.crm.service import CrmSubmissionService, SubmissionBatchResult, SubmissionCommand
 from app.leads.models import CrmSyncRecord
+from app.leads.review import LeadReviewService
 from app.messaging.models import IncomingMessage, NotificationRecord, OutboxEvent
 from app.smart_table.adapter import SmartTableAdapter
+from app.wecom_bot.actions import (
+    CardCapabilityUnavailable,
+    WecomActionService,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+CRM_SUBMISSION_COMMANDS = frozenset({"提交今天的线索", "提交我的更新"})
+
+
+def parse_crm_submission_command(text: str) -> str | None:
+    """只识别两个完整、逐字匹配的 CRM 提交命令。
+
+    参数：text 为销售消息正文；不自动 trim、不做模糊匹配、不调用 LLM。
+    返回值：合法命令原文；其他文本返回 None。
+    异常：无。
+    副作用：无。
+    """
+    # 精确相等是 CRM 写操作授权边界，任何相似自然语言都不能触发提交。
+    return text if text in CRM_SUBMISSION_COMMANDS else None
 
 
 def consume_submission_command(
@@ -41,13 +63,19 @@ def consume_submission_command(
             request_message_id=message.message_id,
         )
     try:
-        service = CrmSubmissionService(session_factory, smart_table_adapter, crm_adapter)
+        service = CrmSubmissionService(
+            session_factory,
+            smart_table_adapter,
+            crm_adapter,
+            robot_submission_confirmation_available=get_settings().wecom_card_callback_ready(),
+        )
         result = service.submit(command)
     except Exception:
         # 命令编排失败需要有界结束，不能永久占住同销售的消息顺序检查点。
         return _record_command_failure(session_factory, outbox_event_id, command)
     # 重放时必须将本请求已成功的同步事实重新计入汇总，不能因 Lead 已 synced 漏报成功。
     result = _include_persisted_results(session_factory, command, result)
+    _issue_field_confirmation_cards(session_factory, smart_table_adapter, command, result)
     reply = format_submission_reply(result)
     with session_factory.begin() as session:
         event = session.get(OutboxEvent, outbox_event_id)
@@ -74,6 +102,53 @@ def consume_submission_command(
                 )
             )
     return reply
+
+
+def _issue_field_confirmation_cards(
+    session_factory: sessionmaker[Session],
+    smart_table_adapter: SmartTableAdapter,
+    command: SubmissionCommand,
+    result: SubmissionBatchResult,
+) -> None:
+    """为 CRM 必填 AI待确认 字段发行服务端动作卡，不调用 LLM 或直接写 CRM。
+
+    参数：session_factory 与 smart_table_adapter 提供最新审核快照；command 为精确提交命令；
+    result 提供本轮待完善线索集合。
+    返回值：无。
+    异常：卡片能力未就绪时静默保留现有表格 fallback；其他数据库错误向 Worker 传播。
+    副作用：能力就绪时持久化 field-confirmation action 与可靠 template-card 通知。
+    """
+    settings = get_settings()
+    if not settings.wecom_card_callback_ready():
+        # 未配置 provider 时必须走 T09 既有 Smart Table 人工确认，不生成不可点击的旧卡。
+        return
+    review = LeadReviewService(
+        session_factory,
+        smart_table_adapter,
+        robot_submission_confirmation_available=True,
+    )
+    action_service = WecomActionService(
+        session_factory,
+        card_callback_ready=True,
+    )
+    for lead_id in result.incomplete_lead_ids:
+        try:
+            state = review.get_submission_confirmation_state(lead_id)
+            if not state.blocking_fields:
+                continue
+            action_service.issue_field_confirmation_action(
+                actor_user_id=command.sales_user_id,
+                lead_id=lead_id,
+                field_names=state.blocking_fields,
+                command_text=command.text,
+                request_message_id=command.request_message_id,
+            )
+        except CardCapabilityUnavailable:
+            # readiness 在事务间变化时同样 fail closed，销售仍可在表格完成确认。
+            return
+        except ValueError:
+            # 线索状态已在重读期间变化时不发行过期卡；最终摘要仍由既有命令通知发送。
+            _LOGGER.info("wecom_field_confirmation_card_skipped", extra={"lead_id": lead_id})
 
 
 def notification_key_for_message(message_id: str) -> str:
