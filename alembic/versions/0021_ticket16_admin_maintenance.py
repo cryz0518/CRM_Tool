@@ -119,6 +119,11 @@ def downgrade() -> None:
     ):
         if connection.execute(sa.text(f"SELECT 1 FROM {table_name} LIMIT 1")).first() is not None:
             raise RuntimeError("存在 T16 管理维护事实，禁止回退 T16 迁移")
+    # 即使 operation 表被人工清空，也不能把管理员创建的无来源 Lead 静默改回非空约束。
+    if connection.execute(
+        sa.text("SELECT 1 FROM leads WHERE source_message_id IS NULL LIMIT 1")
+    ).first() is not None:
+        raise RuntimeError("存在无来源 Lead，禁止回退 T16 迁移")
     op.drop_index(
         "ix_console_maintenance_audits_operation_id", table_name="console_maintenance_audits"
     )

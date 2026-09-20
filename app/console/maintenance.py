@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -10,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.console.auth import AdminPrincipal
-from app.core.failures import safe_failure_summary
+from app.core.failures import safe_audit_text, safe_failure_summary
 from app.leads.admin_create import AdminLeadCreationResult, AdminLeadCreationService
 from app.leads.discard import LeadDiscardResult, LeadDiscardService
 from app.leads.models import ConsoleMaintenanceAudit, Lead
@@ -70,6 +71,12 @@ class ConsoleMaintenanceService:
 
         self._require_request_id(request_id)
         self.require_admin(principal)
+        replay = self._begin_audit(
+            request_id, "retry", "message", message_id, principal,
+            before={"segment_index": segment_index}, reason=None,
+        )
+        if replay is not None:
+            return replay
         try:
             result = self._retry.retry_failed_message(
                 message_id,
@@ -127,7 +134,13 @@ class ConsoleMaintenanceService:
 
         self._require_request_id(request_id)
         self.require_admin(principal)
-        self._require_reason(reason)
+        reason = self._require_reason(reason)
+        replay = self._begin_audit(
+            request_id, "reassign", "message", message_id, principal,
+            before={"segment_index": segment_index}, reason=reason,
+        )
+        if replay is not None:
+            return replay
         try:
             self._reassignment.reassign(
                 message_id,
@@ -176,8 +189,14 @@ class ConsoleMaintenanceService:
 
         self._require_request_id(request_id)
         self.require_admin(principal)
-        self._require_reason(reason)
+        reason = self._require_reason(reason)
         before_state = self._lead_state(lead_id)
+        replay = self._begin_audit(
+            request_id, "discard", "lead", lead_id, principal,
+            before=before_state, reason=reason,
+        )
+        if replay is not None:
+            return replay
         try:
             result: LeadDiscardResult = self._discard.discard(lead_id, principal.subject, reason)
         except Exception as exc:
@@ -204,7 +223,7 @@ class ConsoleMaintenanceService:
             lead_id,
             principal,
             before=before_state,
-            after={"status": status},
+            after={**self._lead_state(lead_id), "status": status},
             reason=reason,
         )
         return ConsoleMaintenanceResult(None, status, lead_id=lead_id)
@@ -223,7 +242,13 @@ class ConsoleMaintenanceService:
 
         self._require_request_id(request_id)
         self.require_admin(principal)
-        self._require_reason(reason)
+        reason = self._require_reason(reason)
+        replay = self._begin_audit(
+            request_id, "create", "lead", "pending", principal,
+            before={}, reason=reason,
+        )
+        if replay is not None:
+            return replay
         try:
             result: AdminLeadCreationResult = self._admin_create.create(
                 original_capturing_sales_user_id=original_capturing_sales_user_id,
@@ -258,7 +283,11 @@ class ConsoleMaintenanceService:
             result.lead_id,
             principal,
             before={},
-            after={"status": result.status, "operation_id": result.operation_id},
+            after={
+                **self._lead_state(result.lead_id),
+                "status": result.status,
+                "operation_id": result.operation_id,
+            },
             reason=reason,
             result=result.status,
             operation_id=result.operation_id,
@@ -284,8 +313,14 @@ class ConsoleMaintenanceService:
 
         self._require_request_id(request_id)
         self.require_admin(principal)
-        self._require_reason(reason)
+        reason = self._require_reason(reason)
         before_state = self._lead_state(lead_id)
+        replay = self._begin_audit(
+            request_id, "transfer", "lead", lead_id, principal,
+            before=before_state, reason=reason,
+        )
+        if replay is not None:
+            return replay
         try:
             result: SmartTableOwnerTransferResult = self._transfer.transfer(
                 lead_id=lead_id,
@@ -320,6 +355,7 @@ class ConsoleMaintenanceService:
             principal,
             before=before_state,
             after={
+                **self._lead_state(lead_id),
                 "smart_table_owner_user_id": new_owner_user_id,
                 "status": result.status,
                 "operation_id": result.operation_id,
@@ -332,6 +368,136 @@ class ConsoleMaintenanceService:
             result.operation_id,
             result.status,
             lead_id=lead_id,
+            detail=result.failure_summary,
+        )
+
+    def reconcile_transfer(
+        self,
+        principal: AdminPrincipal,
+        *,
+        operation_id: str,
+        reason: str,
+        request_id: str,
+    ) -> ConsoleMaintenanceResult:
+        """通过受控 recovery 入口核验远端负责人并恢复既有 transfer operation。"""
+
+        self._require_request_id(request_id)
+        self.require_admin(principal)
+        reason = self._require_reason(reason)
+        replay = self._begin_audit(
+            request_id, "transfer_reconcile", "transfer_operation", operation_id, principal,
+            before={"operation_id": operation_id}, reason=reason,
+        )
+        if replay is not None:
+            return replay
+        try:
+            result: SmartTableOwnerTransferResult = self._transfer.reconcile(
+                operation_id=operation_id,
+                operator_subject=principal.subject,
+                operator_role="administrator",
+                auth_source=principal.auth_source,
+                request_id=request_id,
+                reason=reason,
+            )
+        except Exception as exc:
+            self._audit_failure(
+                request_id,
+                "transfer_reconcile",
+                "transfer_operation",
+                operation_id,
+                principal,
+                reason,
+                safe_failure_summary(exc),
+            )
+            logger.error(
+                "console_maintenance_transfer_reconcile_failed",
+                extra={"operation_id": operation_id, "request_id": request_id},
+                exc_info=True,
+            )
+            raise
+        self._audit_success(
+            request_id,
+            "transfer_reconcile",
+            "transfer_operation",
+            operation_id,
+            principal,
+            before={"operation_id": operation_id},
+            after={
+                **self._lead_state(result.lead_id),
+                "status": result.status,
+                "operation_id": result.operation_id,
+            },
+            reason=reason,
+            result=result.status,
+            operation_id=result.operation_id,
+        )
+        return ConsoleMaintenanceResult(
+            result.operation_id,
+            result.status,
+            lead_id=result.lead_id,
+            detail=result.failure_summary,
+        )
+
+    def reconcile_create(
+        self,
+        principal: AdminPrincipal,
+        *,
+        operation_id: str,
+        reason: str,
+        request_id: str,
+    ) -> ConsoleMaintenanceResult:
+        """通过受控 recovery 入口核验管理员补建的远端记录。"""
+
+        self._require_request_id(request_id)
+        self.require_admin(principal)
+        reason = self._require_reason(reason)
+        replay = self._begin_audit(
+            request_id, "create_reconcile", "creation_operation", operation_id, principal,
+            before={"operation_id": operation_id}, reason=reason,
+        )
+        if replay is not None:
+            return replay
+        try:
+            result: AdminLeadCreationResult = self._admin_create.reconcile(
+                operation_id=operation_id,
+                operator_subject=principal.subject,
+                operator_role="administrator",
+                auth_source=principal.auth_source,
+                request_id=request_id,
+                reason=reason,
+            )
+        except Exception as exc:
+            self._audit_failure(
+                request_id,
+                "create_reconcile",
+                "creation_operation",
+                operation_id,
+                principal,
+                reason,
+                safe_failure_summary(exc),
+            )
+            logger.error(
+                "console_maintenance_create_reconcile_failed",
+                extra={"operation_id": operation_id, "request_id": request_id},
+                exc_info=True,
+            )
+            raise
+        self._audit_success(
+            request_id,
+            "create_reconcile",
+            "creation_operation",
+            operation_id,
+            principal,
+            before={"operation_id": operation_id},
+            after={"status": result.status, "operation_id": result.operation_id},
+            reason=reason,
+            result=result.status,
+            operation_id=result.operation_id,
+        )
+        return ConsoleMaintenanceResult(
+            result.operation_id,
+            result.status,
+            lead_id=result.lead_id,
             detail=result.failure_summary,
         )
 
@@ -383,8 +549,8 @@ class ConsoleMaintenanceService:
             object_type,
             object_id,
             principal,
-            {},
-            {},
+            {"object_type": object_type, "object_id": object_id},
+            {"status": "failed"},
             "failed",
             reason,
             summary[:256],
@@ -407,12 +573,23 @@ class ConsoleMaintenanceService:
         """幂等写入 ConsoleMaintenanceAudit，统一保留 auth source 和 request id。"""
 
         with self._session_factory.begin() as session:
-            if session.scalar(
+            existing = session.scalar(
                 select(ConsoleMaintenanceAudit).where(
                     ConsoleMaintenanceAudit.request_id == request_id
-                )
-            ):
+                ).with_for_update()
+            )
+            if existing is not None:
+                existing.operation_id = operation_id or existing.operation_id
+                existing.object_type = object_type
+                existing.object_id = safe_audit_text(object_id, max_length=128)
+                existing.before_state = before
+                existing.after_state = after
+                existing.result = result
+                existing.reason = safe_audit_text(reason) if reason else None
+                existing.failure_code = "maintenance_failed" if result == "failed" else None
+                existing.failure_summary = failure_summary
                 return
+            safe_object_id = safe_audit_text(object_id, max_length=128)
             session.add(
                 ConsoleMaintenanceAudit(
                     id=str(uuid4()),
@@ -420,11 +597,11 @@ class ConsoleMaintenanceService:
                     request_id=request_id,
                     operation_type=operation_type,
                     object_type=object_type,
-                    object_id=object_id,
+                    object_id=safe_object_id,
                     operator_subject=principal.subject,
                     operator_role="administrator",
-                    auth_source=principal.auth_source,
-                    reason=reason,
+                    auth_source=safe_audit_text(principal.auth_source, max_length=128),
+                    reason=safe_audit_text(reason) if reason else None,
                     before_state=before,
                     after_state=after,
                     result=result,
@@ -433,18 +610,67 @@ class ConsoleMaintenanceService:
                 )
             )
 
+    def _begin_audit(
+        self,
+        request_id: str,
+        operation_type: str,
+        object_type: str,
+        object_id: str,
+        principal: AdminPrincipal,
+        *,
+        before: dict[str, object],
+        reason: str | None,
+    ) -> ConsoleMaintenanceResult | None:
+        """在领域副作用前写入 processing 审计，并返回重复请求的冻结结果。"""
+
+        with self._session_factory.begin() as session:
+            existing = session.scalar(
+                select(ConsoleMaintenanceAudit)
+                .where(ConsoleMaintenanceAudit.request_id == request_id)
+                .with_for_update()
+            )
+            if existing is not None:
+                return ConsoleMaintenanceResult(
+                    existing.operation_id,
+                    existing.result,
+                    lead_id=existing.object_id if existing.object_type == "lead" else None,
+                    message_id=existing.object_id if existing.object_type == "message" else None,
+                    detail=existing.failure_summary,
+                )
+            session.add(
+                ConsoleMaintenanceAudit(
+                    id=str(uuid4()),
+                    request_id=request_id,
+                    operation_type=operation_type,
+                    object_type=object_type,
+                    object_id=safe_audit_text(object_id, max_length=128),
+                    operator_subject=principal.subject,
+                    operator_role="administrator",
+                    auth_source=safe_audit_text(principal.auth_source, max_length=128),
+                    reason=safe_audit_text(reason) if reason else None,
+                    before_state=before,
+                    after_state={},
+                    result="processing",
+                )
+            )
+        return None
+
     @staticmethod
-    def _require_reason(reason: str) -> None:
+    def _require_reason(reason: str) -> str:
         """统一拒绝空管理原因。"""
 
-        if not reason.strip():
+        normalized = safe_audit_text(reason)
+        if not normalized:
             raise ValueError("管理写操作必须填写原因")
+        return normalized
 
     @staticmethod
     def _require_request_id(request_id: str) -> None:
         """统一拒绝缺失的管理请求幂等标识。"""
 
-        if not request_id.strip():
+        if not request_id.strip() or re.fullmatch(
+            r"[A-Za-z0-9._:-]{1,128}", request_id.strip()
+        ) is None:
             raise ValueError("管理写操作必须填写 request_id")
 
     def _lead_state(self, lead_id: str) -> dict[str, object]:

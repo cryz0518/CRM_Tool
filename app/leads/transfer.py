@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.core.failures import safe_failure_summary
+from app.core.failures import safe_audit_text, safe_failure_summary, validate_request_id
 from app.leads.models import (
     CrmCompanyIdentity,
     CrmSyncRecord,
@@ -16,8 +17,8 @@ from app.leads.models import (
     SalesLeadContext,
     SmartTableOwnerTransferOperation,
 )
-from app.messaging.models import SalesAuthorization
-from app.smart_table.adapter import SmartTableAdapter
+from app.messaging.models import SalesAuthorization, utc_now
+from app.smart_table.adapter import SmartTableAdapter, SmartTableDefiniteRemoteFailure
 from app.smart_table.permissions import (
     SmartTablePermissionVerificationProvider,
     SmartTablePermissionVerificationUnavailable,
@@ -37,8 +38,23 @@ class SmartTableOwnerTransferResult:
     failure_summary: str | None = None
 
 
+@dataclass(frozen=True)
+class _TransferOperationSnapshot:
+    """承载一次转交 recovery 所需的不可变 operation 快照。"""
+
+    operation_id: str
+    lead_id: str
+    record_id: str
+    old_owner: str
+    new_owner: str
+    final_status: str
+    remote_state: str
+
+
 class SmartTableOwnerTransferService:
     """只改变 Smart Table Owner，并在权限验证后收敛本地身份事实。"""
+
+    _RECOVERY_LEASE = timedelta(minutes=5)
 
     def __init__(
         self,
@@ -72,13 +88,15 @@ class SmartTableOwnerTransferService:
         副作用：只写智能表格负责人字段；验证成功后更新 Lead owner 并清理旧上下文。
         """
 
-        normalized_reason = reason.strip()
+        normalized_reason = safe_audit_text(reason)
         if not normalized_reason:
             raise ValueError("智能表格负责人转交必须填写原因")
-        if not request_id.strip():
-            raise ValueError("智能表格负责人转交必须填写 request_id")
+        request_id = validate_request_id(request_id)
+        auth_source = safe_audit_text(auth_source, max_length=128)
+        if not auth_source:
+            raise ValueError("智能表格负责人转交必须填写 auth_source")
 
-        operation_id, old_owner, record_id, existing_status = self._prepare_operation(
+        operation_id, old_owner, record_id, existing_status, is_new = self._prepare_operation(
             lead_id=lead_id,
             new_owner_user_id=new_owner_user_id,
             operator_subject=operator_subject,
@@ -87,9 +105,175 @@ class SmartTableOwnerTransferService:
             request_id=request_id,
             reason=normalized_reason,
         )
-        # 相同 request_id 重试只返回已持久化状态，绝不重复写远端或制造本地冲突。
-        if existing_status != "processing":
+        # 已完成或已明确失败的 operation 只返回冻结事实，绝不重复产生外部副作用。
+        if not is_new and existing_status == "succeeded":
             return SmartTableOwnerTransferResult(operation_id, lead_id, existing_status)
+        if not is_new and existing_status == "remote_update_failed":
+            self._claim_definite_retry(operation_id, operator_subject, operator_role)
+            return self._execute_remote_transfer(
+                operation_id=operation_id,
+                lead_id=lead_id,
+                record_id=record_id,
+                old_owner=old_owner,
+                new_owner=new_owner_user_id,
+                request_id=request_id,
+            )
+
+        # 旧请求重新进入 processing/pending_recovery 时统一走事实核验，不能盲目重放。
+        if not is_new:
+            return self.reconcile(
+                operation_id=operation_id,
+                operator_subject=operator_subject,
+                operator_role=operator_role,
+                auth_source=auth_source,
+                request_id=request_id,
+                reason=normalized_reason,
+            )
+
+        return self._execute_remote_transfer(
+            operation_id=operation_id,
+            lead_id=lead_id,
+            record_id=record_id,
+            old_owner=old_owner,
+            new_owner=new_owner_user_id,
+            request_id=request_id,
+        )
+
+    def reconcile(
+        self,
+        *,
+        operation_id: str,
+        operator_subject: str,
+        operator_role: str,
+        auth_source: str,
+        request_id: str,
+        reason: str,
+    ) -> SmartTableOwnerTransferResult:
+        """先读取远端负责人事实，再安全恢复一个未完成转交 operation。
+
+        参数：operation_id 为待恢复 operation；其余参数为当前管理员认证和审计事实。
+        返回值：恢复后的成功、处理中或待人工核验状态；不会在远端事实未知时重复写入。
+        异常：管理员、原因或 operation 不合法时抛出 ValueError/PermissionError。
+        副作用：只在远端明确仍为旧负责人且本地事实允许时重试一次负责人更新。
+        """
+
+        self._validate_recovery_input(auth_source, request_id, reason, operator_role)
+        snapshot, claimed = self._claim_operation(
+            operation_id=operation_id,
+            operator_subject=operator_subject,
+            operator_role=operator_role,
+        )
+        if snapshot.final_status in {"succeeded", "remote_update_failed"}:
+            return SmartTableOwnerTransferResult(
+                operation_id, snapshot.lead_id, snapshot.final_status
+            )
+        if not claimed:
+            # 新鲜 processing 仍可能由另一执行者持有；只报告状态，不抢占其副作用。
+            return SmartTableOwnerTransferResult(operation_id, snapshot.lead_id, "processing")
+
+        try:
+            record = self._smart_table.get_record(snapshot.record_id)
+        except Exception as exc:
+            summary = self._safe_summary(exc)
+            self._mark_pending_recovery(
+                operation_id,
+                remote_update_state="unknown",
+                permission_state="pending",
+                failure_code="remote_read_failed",
+                failure_summary=summary,
+            )
+            return SmartTableOwnerTransferResult(
+                operation_id, snapshot.lead_id, "pending_recovery", "remote_read_failed", summary
+            )
+
+        if record is None:
+            summary = "无法读取远端负责人事实"
+            self._mark_pending_recovery(
+                operation_id,
+                remote_update_state="unknown",
+                permission_state="pending",
+                failure_code="remote_read_missing",
+                failure_summary=summary,
+            )
+            return SmartTableOwnerTransferResult(
+                operation_id, snapshot.lead_id, "pending_recovery", "remote_read_missing", summary
+            )
+
+        remote_owner = record.fields.get("负责人")
+        if remote_owner == snapshot.new_owner:
+            # 读取到目标负责人即冻结远端成功事实，再进行权限验证和本地收敛。
+            self._mark_remote_succeeded(operation_id)
+            return self._verify_and_finalize(snapshot, request_id)
+        if remote_owner != snapshot.old_owner:
+            summary = "远端负责人既不是原负责人也不是目标负责人"
+            self._mark_pending_recovery(
+                operation_id,
+                remote_update_state="unknown",
+                permission_state="pending",
+                failure_code="unexpected_remote_owner",
+                failure_summary=summary,
+            )
+            return SmartTableOwnerTransferResult(
+                operation_id,
+                snapshot.lead_id,
+                "pending_recovery",
+                "unexpected_remote_owner",
+                summary,
+            )
+
+        # 只有远端仍是旧负责人时，才允许一次新的合法更新尝试。
+        try:
+            self._smart_table.update_record(
+                snapshot.record_id, {"负责人": snapshot.new_owner}
+            )
+        except SmartTableDefiniteRemoteFailure as exc:
+            summary = self._safe_summary(exc)
+            self._finish_operation(
+                operation_id,
+                remote_update_state="failed",
+                permission_verification_state="not_started",
+                final_status="remote_update_failed",
+                failure_code="definite_remote_failure",
+                failure_summary=summary,
+            )
+            return SmartTableOwnerTransferResult(
+                operation_id,
+                snapshot.lead_id,
+                "remote_update_failed",
+                "definite_remote_failure",
+                summary,
+            )
+        except Exception as exc:
+            summary = self._safe_summary(exc)
+            self._mark_pending_recovery(
+                operation_id,
+                remote_update_state="unknown",
+                permission_state="pending",
+                failure_code="remote_outcome_unknown",
+                failure_summary=summary,
+            )
+            return SmartTableOwnerTransferResult(
+                operation_id,
+                snapshot.lead_id,
+                "pending_recovery",
+                "remote_outcome_unknown",
+                summary,
+            )
+
+        self._mark_remote_succeeded(operation_id)
+        return self._verify_and_finalize(snapshot, request_id)
+
+    def _execute_remote_transfer(
+        self,
+        *,
+        operation_id: str,
+        lead_id: str,
+        record_id: str,
+        old_owner: str,
+        new_owner: str,
+        request_id: str,
+    ) -> SmartTableOwnerTransferResult:
+        """执行首次远端负责人补丁，并将未知结果保留为待恢复事实。"""
 
         try:
             # 远端只写负责人字段，绝不把当前整行快照提交回去。
@@ -100,11 +284,11 @@ class SmartTableOwnerTransferService:
                     "lead_id": lead_id,
                     "request_id": request_id,
                     "old_owner_user_id": old_owner,
-                    "new_owner_user_id": new_owner_user_id,
+                    "new_owner_user_id": new_owner,
                 },
             )
-            self._smart_table.update_record(record_id, {"负责人": new_owner_user_id})
-        except Exception as exc:
+            self._smart_table.update_record(record_id, {"负责人": new_owner})
+        except SmartTableDefiniteRemoteFailure as exc:
             summary = self._safe_summary(exc)
             logger.error(
                 "smart_table_owner_transfer_remote_failed",
@@ -121,31 +305,67 @@ class SmartTableOwnerTransferService:
                 remote_update_state="failed",
                 permission_verification_state="not_started",
                 final_status="remote_update_failed",
-                failure_code="remote_update_failed",
+                failure_code="definite_remote_failure",
                 failure_summary=summary,
             )
             return SmartTableOwnerTransferResult(
-                operation_id, lead_id, "remote_update_failed", "remote_update_failed", summary
+                operation_id, lead_id, "remote_update_failed", "definite_remote_failure", summary
+            )
+        except Exception as exc:
+            summary = self._safe_summary(exc)
+            logger.error(
+                "smart_table_owner_transfer_remote_unknown",
+                extra={
+                    "operation_id": operation_id,
+                    "lead_id": lead_id,
+                    "request_id": request_id,
+                    "error_type": type(exc).__name__,
+                },
+                exc_info=True,
+            )
+            self._mark_pending_recovery(
+                operation_id,
+                remote_update_state="unknown",
+                permission_state="pending",
+                failure_code="remote_outcome_unknown",
+                failure_summary=summary,
+            )
+            return SmartTableOwnerTransferResult(
+                operation_id,
+                lead_id,
+                "pending_recovery",
+                "remote_outcome_unknown",
+                summary,
             )
 
         self._mark_remote_succeeded(operation_id)
+        snapshot = _TransferOperationSnapshot(
+            operation_id, lead_id, record_id, old_owner, new_owner, "processing", "succeeded"
+        )
+        return self._verify_and_finalize(snapshot, request_id)
+
+    def _verify_and_finalize(
+        self, snapshot: _TransferOperationSnapshot, request_id: str
+    ) -> SmartTableOwnerTransferResult:
+        """验证 A/B 权限后再收敛本地 owner/context。"""
+
         try:
             verification = self._permission_verifier.verify_owner_transfer(
-                record_id, old_owner, new_owner_user_id
+                snapshot.record_id, snapshot.old_owner, snapshot.new_owner
             )
         except SmartTablePermissionVerificationUnavailable as exc:
             summary = self._safe_summary(exc)
             logger.error(
                 "smart_table_owner_transfer_permission_unavailable",
                 extra={
-                    "operation_id": operation_id,
-                    "lead_id": lead_id,
+                    "operation_id": snapshot.operation_id,
+                    "lead_id": snapshot.lead_id,
                     "request_id": request_id,
                 },
                 exc_info=True,
             )
             self._finish_operation(
-                operation_id,
+                snapshot.operation_id,
                 remote_update_state="succeeded",
                 permission_verification_state="unavailable",
                 # 远端负责人已不可逆写入，但本地尚未证明新旧负责人权限；
@@ -155,8 +375,8 @@ class SmartTableOwnerTransferService:
                 failure_summary=summary,
             )
             return SmartTableOwnerTransferResult(
-                operation_id,
-                lead_id,
+                snapshot.operation_id,
+                snapshot.lead_id,
                 "permission_verification_unavailable",
                 "permission_verification_unavailable",
                 summary,
@@ -166,15 +386,15 @@ class SmartTableOwnerTransferService:
             logger.error(
                 "smart_table_owner_transfer_permission_failed",
                 extra={
-                    "operation_id": operation_id,
-                    "lead_id": lead_id,
+                    "operation_id": snapshot.operation_id,
+                    "lead_id": snapshot.lead_id,
                     "request_id": request_id,
                     "error_type": type(exc).__name__,
                 },
                 exc_info=True,
             )
             self._finish_operation(
-                operation_id,
+                snapshot.operation_id,
                 remote_update_state="succeeded",
                 permission_verification_state="failed",
                 final_status="pending_recovery",
@@ -182,8 +402,8 @@ class SmartTableOwnerTransferService:
                 failure_summary=summary,
             )
             return SmartTableOwnerTransferResult(
-                operation_id,
-                lead_id,
+                snapshot.operation_id,
+                snapshot.lead_id,
                 "permission_verification_failed",
                 "permission_verification_failed",
                 summary,
@@ -194,14 +414,14 @@ class SmartTableOwnerTransferService:
             logger.error(
                 "smart_table_owner_transfer_permission_rejected",
                 extra={
-                    "operation_id": operation_id,
-                    "lead_id": lead_id,
+                    "operation_id": snapshot.operation_id,
+                    "lead_id": snapshot.lead_id,
                     "request_id": request_id,
                 },
                 exc_info=True,
             )
             self._finish_operation(
-                operation_id,
+                snapshot.operation_id,
                 remote_update_state="succeeded",
                 permission_verification_state="failed",
                 final_status="pending_recovery",
@@ -209,30 +429,35 @@ class SmartTableOwnerTransferService:
                 failure_summary=summary,
             )
             return SmartTableOwnerTransferResult(
-                operation_id,
-                lead_id,
+                snapshot.operation_id,
+                snapshot.lead_id,
                 "permission_verification_failed",
                 "permission_verification_failed",
                 summary,
             )
 
         try:
-            self._finalize_local_transfer(operation_id, lead_id, old_owner, new_owner_user_id)
+            self._finalize_local_transfer(
+                snapshot.operation_id,
+                snapshot.lead_id,
+                snapshot.old_owner,
+                snapshot.new_owner,
+            )
         except Exception as exc:
             # 远端事实不可逆，不能反向写回；仅保留待恢复事实。
             summary = self._safe_summary(exc)
             logger.error(
                 "smart_table_owner_transfer_local_finalize_failed",
                 extra={
-                    "operation_id": operation_id,
-                    "lead_id": lead_id,
+                    "operation_id": snapshot.operation_id,
+                    "lead_id": snapshot.lead_id,
                     "request_id": request_id,
                     "error_type": type(exc).__name__,
                 },
                 exc_info=True,
             )
             self._finish_operation(
-                operation_id,
+                snapshot.operation_id,
                 remote_update_state="succeeded",
                 permission_verification_state="verified",
                 final_status="pending_recovery",
@@ -240,10 +465,14 @@ class SmartTableOwnerTransferService:
                 failure_summary=summary,
             )
             return SmartTableOwnerTransferResult(
-                operation_id, lead_id, "pending_recovery", "local_finalize_failed", summary
+                snapshot.operation_id,
+                snapshot.lead_id,
+                "pending_recovery",
+                "local_finalize_failed",
+                summary,
             )
 
-        return SmartTableOwnerTransferResult(operation_id, lead_id, "succeeded")
+        return SmartTableOwnerTransferResult(snapshot.operation_id, snapshot.lead_id, "succeeded")
 
     def _prepare_operation(
         self,
@@ -255,7 +484,7 @@ class SmartTableOwnerTransferService:
         auth_source: str,
         request_id: str,
         reason: str,
-    ) -> tuple[str, str, str, str]:
+    ) -> tuple[str, str, str, str, bool]:
         """锁定线索并持久化远端调用前的 operation 快照。"""
 
         with self._session_factory.begin() as session:
@@ -265,11 +494,24 @@ class SmartTableOwnerTransferService:
                 )
             )
             if existing is not None:
+                if existing.lead_id != lead_id:
+                    raise ValueError("request_id 已绑定另一笔负责人转交")
+                operator = session.get(SalesAuthorization, operator_subject)
+                if operator is None or not operator.is_active or not operator.is_administrator:
+                    raise PermissionError("只有活跃管理员可以恢复智能表格负责人转交")
+                if operator_role != "administrator" or not auth_source.strip():
+                    raise PermissionError("维护恢复必须使用 administrator 和有效 auth_source")
+                if (
+                    existing.new_owner_user_id != new_owner_user_id
+                    and existing.final_status != "succeeded"
+                ):
+                    raise ValueError("该线索已有进行中的另一目标负责人的转交")
                 return (
                     existing.id,
                     existing.old_owner_user_id,
                     existing.smart_table_record_id,
                     existing.final_status,
+                    False,
                 )
             lead = session.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
             operator = session.get(SalesAuthorization, operator_subject)
@@ -294,7 +536,6 @@ class SmartTableOwnerTransferService:
                     Lead.smart_table_owner_user_id == new_owner_user_id,
                     Lead.standard_company_name == lead.standard_company_name,
                     Lead.id != lead.id,
-                    Lead.lifecycle_state != "discarded",
                 )
             )
             if duplicate is not None:
@@ -310,7 +551,15 @@ class SmartTableOwnerTransferService:
                 .with_for_update()
             )
             if active is not None:
-                raise ValueError("该线索已有进行中的负责人转交")
+                if active.new_owner_user_id != new_owner_user_id:
+                    raise ValueError("该线索已有进行中的另一目标负责人的转交")
+                return (
+                    active.id,
+                    active.old_owner_user_id,
+                    active.smart_table_record_id,
+                    active.final_status,
+                    False,
+                )
             identity = None
             if lead.standard_company_name:
                 identity = session.get(CrmCompanyIdentity, lead.standard_company_name)
@@ -345,7 +594,114 @@ class SmartTableOwnerTransferService:
             )
             session.add(operation)
             session.flush()
-            return operation.id, old_owner, lead.smart_table_record_id, operation.final_status
+            return operation.id, old_owner, lead.smart_table_record_id, operation.final_status, True
+
+    def _claim_operation(
+        self, *, operation_id: str, operator_subject: str, operator_role: str
+    ) -> tuple[_TransferOperationSnapshot, bool]:
+        """以行锁和 updated_at lease claim 未完成 operation，防止并发重复外部写入。"""
+
+        with self._session_factory.begin() as session:
+            operation = session.scalar(
+                select(SmartTableOwnerTransferOperation)
+                .where(SmartTableOwnerTransferOperation.id == operation_id)
+                .with_for_update()
+            )
+            operator = session.get(SalesAuthorization, operator_subject)
+            if operation is None:
+                raise ValueError("转交 operation 不存在")
+            if operator is None or not operator.is_active or not operator.is_administrator:
+                raise PermissionError("只有活跃管理员可以恢复智能表格负责人转交")
+            if operator_role != "administrator":
+                raise PermissionError("维护恢复角色必须是 administrator")
+            snapshot = _TransferOperationSnapshot(
+                operation.id,
+                operation.lead_id,
+                operation.smart_table_record_id,
+                operation.old_owner_user_id,
+                operation.new_owner_user_id,
+                operation.final_status,
+                operation.remote_update_state,
+            )
+            if operation.final_status in {"succeeded", "remote_update_failed"}:
+                return snapshot, False
+            if (
+                operation.final_status == "processing"
+                and operation.remote_update_state == "pending"
+                and not self._operation_lease_expired(operation.updated_at)
+            ):
+                return snapshot, False
+            # pending_recovery 或过期 processing 获得新的短 lease。
+            operation.final_status = "processing"
+            operation.updated_at = utc_now()
+            return snapshot, True
+
+    def _claim_definite_retry(
+        self, operation_id: str, operator_subject: str, operator_role: str
+    ) -> None:
+        """只允许明确未发生远端写入的失败 operation 安全重试。"""
+
+        with self._session_factory.begin() as session:
+            operation = session.scalar(
+                select(SmartTableOwnerTransferOperation)
+                .where(SmartTableOwnerTransferOperation.id == operation_id)
+                .with_for_update()
+            )
+            operator = session.get(SalesAuthorization, operator_subject)
+            if operation is None or operator is None:
+                raise ValueError("转交 operation 或管理员不存在")
+            if not operator.is_active or not operator.is_administrator:
+                raise PermissionError("只有活跃管理员可以重试智能表格负责人转交")
+            if operator_role != "administrator":
+                raise PermissionError("维护重试角色必须是 administrator")
+            if operation.final_status != "remote_update_failed":
+                raise ValueError("只有明确未产生远端副作用的失败才允许重试")
+            operation.final_status = "processing"
+            operation.remote_update_state = "pending"
+            operation.permission_verification_state = "pending"
+            operation.failure_code = None
+            operation.failure_summary = None
+            operation.updated_at = utc_now()
+
+    def _operation_lease_expired(self, updated_at: datetime | None) -> bool:
+        """判断 operation 的现有更新时间是否已经超过 recovery lease。"""
+
+        if updated_at is None:
+            return True
+        normalized = updated_at.replace(tzinfo=UTC) if updated_at.tzinfo is None else updated_at
+        return utc_now() - normalized >= self._RECOVERY_LEASE
+
+    @staticmethod
+    def _validate_recovery_input(
+        auth_source: str, request_id: str, reason: str, operator_role: str
+    ) -> None:
+        """校验 recovery 必须携带的审计与认证字段。"""
+
+        if operator_role != "administrator":
+            raise PermissionError("维护恢复角色必须是 administrator")
+        validate_request_id(request_id)
+        if not safe_audit_text(auth_source, max_length=128) or not safe_audit_text(reason):
+            raise ValueError("负责人转交恢复必须填写 auth_source、request_id 和 reason")
+
+    def _mark_pending_recovery(
+        self,
+        operation_id: str,
+        *,
+        remote_update_state: str,
+        permission_state: str,
+        failure_code: str,
+        failure_summary: str,
+    ) -> None:
+        """保存远端事实不足或本地未收敛的待恢复状态。"""
+
+        self._finish_operation(
+            operation_id,
+            remote_update_state=remote_update_state,
+            permission_verification_state=permission_state,
+            final_status="pending_recovery",
+            failure_code=failure_code,
+            failure_summary=failure_summary,
+        )
 
     def _mark_remote_succeeded(self, operation_id: str) -> None:
         """将不可逆远端负责人写入记录为已成功，等待权限结论。"""
@@ -388,6 +744,7 @@ class SmartTableOwnerTransferService:
             operation.final_status = "succeeded"
             operation.failure_code = None
             operation.failure_summary = None
+            operation.updated_at = utc_now()
 
     def _finish_operation(
         self,
@@ -405,11 +762,17 @@ class SmartTableOwnerTransferService:
             operation = session.get(SmartTableOwnerTransferOperation, operation_id)
             if operation is None:
                 raise ValueError("转交 operation 不存在")
+            # 旧 worker 在 recovery lease 之后返回时，不能把已收敛或待人工核验事实降级覆盖。
+            if operation.final_status == "succeeded":
+                return
+            if operation.final_status == "pending_recovery" and final_status == "processing":
+                return
             operation.remote_update_state = remote_update_state
             operation.permission_verification_state = permission_verification_state
             operation.final_status = final_status
             operation.failure_code = failure_code
             operation.failure_summary = failure_summary
+            operation.updated_at = utc_now()
 
     @staticmethod
     def _safe_summary(error: Exception) -> str:

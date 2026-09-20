@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 
 
@@ -54,3 +55,26 @@ def safe_failure_summary(error: BaseException) -> str:
     副作用：无。
     """
     return type(error).__name__[:128]
+
+
+def safe_audit_text(value: str, *, max_length: int = 512) -> str:
+    """规范化管理原因，移除控制字符并遮蔽联系方式和凭据。"""
+
+    normalized = " ".join(value.split())[:max_length]
+    normalized = re.sub(
+        r"(?i)(?:password|token|secret|密码|口令)\s*[:：]?\s*\S+",
+        "[已遮蔽]",
+        normalized,
+    )
+    normalized = re.sub(r"[^\s@]+@[^\s@]+", "[已遮蔽邮箱]", normalized)
+    normalized = re.sub(r"(?<!\d)\+?[0-9][0-9 -]{6,22}[0-9](?!\d)", "[已遮蔽电话]", normalized)
+    return normalized
+
+
+def validate_request_id(value: str) -> str:
+    """校验并返回可安全写入日志和审计的幂等请求标识。"""
+
+    normalized = value.strip()
+    if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", normalized) is None:
+        raise ValueError("管理写操作必须填写合法 request_id")
+    return normalized

@@ -18,6 +18,7 @@ from app.leads.models import (
 )
 from app.leads.transfer import SmartTableOwnerTransferService
 from app.messaging.models import Base, IncomingMessage, SalesAuthorization, utc_now
+from app.smart_table.adapter import SmartTableDefiniteRemoteFailure
 from app.smart_table.models import SmartTableRecord
 from app.smart_table.permissions import (
     SmartTablePermissionVerification,
@@ -46,6 +47,11 @@ class FakeSmartTableAdapter:
         )
         return self.record
 
+    def get_record(self, record_id: str) -> SmartTableRecord | None:
+        """返回当前远端负责人事实，供 recovery 先核验再决定是否写入。"""
+
+        return self.record if record_id == self.record.record_id else None
+
 
 class FakePermissionVerifier:
     """返回可测试的双销售记录级权限结论。"""
@@ -65,6 +71,24 @@ class FakePermissionVerifier:
             old_owner_can_view=False,
             old_owner_can_edit=False,
         )
+
+
+class DefiniteFailureAdapter(FakeSmartTableAdapter):
+    """首次明确失败、后续成功的适配器，验证安全 retry。"""
+
+    def __init__(self) -> None:
+        """初始化失败计数。"""
+
+        super().__init__()
+        self.failed = False
+
+    def update_record(self, record_id: str, fields: dict[str, object]) -> SmartTableRecord:
+        """首次抛出确定未写入异常，第二次应用补丁。"""
+
+        if not self.failed:
+            self.failed = True
+            raise SmartTableDefiniteRemoteFailure("definite remote rejection")
+        return super().update_record(record_id, fields)
 
 
 @pytest.fixture
@@ -207,10 +231,42 @@ def test_transfer_changes_only_smart_table_owner_and_clears_old_context(
         assert crm_sync.crm_lead_owner_user_id == "crm-owner-old"
         assert identity is not None and identity.crm_lead_owner_user_id == "crm-owner-old"
         operation = session.get(SmartTableOwnerTransferOperation, result.operation_id)
-        assert operation is not None
-        assert operation.final_status == "succeeded"
-        assert operation.original_capturing_sales_user_id == "sales-old"
-        assert operation.crm_lead_owner_user_id == "crm-owner-old"
+    assert operation is not None
+    assert operation.final_status == "succeeded"
+    assert operation.original_capturing_sales_user_id == "sales-old"
+    assert operation.crm_lead_owner_user_id == "crm-owner-old"
+
+
+def test_definite_remote_failure_can_be_retried_without_identity_rewrite(
+    session_factory: sessionmaker[Session], seeded_lead: str
+) -> None:
+    """明确远端未写入时，同一 request_id 可安全重试一次。"""
+
+    adapter = DefiniteFailureAdapter()
+    service = SmartTableOwnerTransferService(
+        session_factory, adapter, FakePermissionVerifier()
+    )
+    first = service.transfer(
+        lead_id=seeded_lead,
+        new_owner_user_id="sales-new",
+        operator_subject="admin-1",
+        operator_role="administrator",
+        auth_source="unit",
+        request_id="request-transfer-definite-retry",
+        reason="网络拒绝后重试",
+    )
+    assert first.status == "remote_update_failed"
+    second = service.transfer(
+        lead_id=seeded_lead,
+        new_owner_user_id="sales-new",
+        operator_subject="admin-1",
+        operator_role="administrator",
+        auth_source="unit",
+        request_id="request-transfer-definite-retry",
+        reason="网络拒绝后重试",
+    )
+    assert second.status == "succeeded"
+    assert len(adapter.update_calls) == 1
 
 
 def test_transfer_requires_permission_verification_before_success(
@@ -335,4 +391,132 @@ def test_transfer_rejects_same_company_target_before_remote_write(
             reason="冲突测试",
         )
 
+    assert adapter.update_calls == []
+
+
+def test_transfer_reconcile_remote_target_does_not_update_again(
+    session_factory: sessionmaker[Session], seeded_lead: str
+) -> None:
+    """远端已是目标负责人时，reconcile 只验证权限并收敛本地事实。"""
+
+    class UnavailableVerifier(FakePermissionVerifier):
+        """首次转交时模拟权限验证尚不可用。"""
+
+        def verify_owner_transfer(
+            self, record_id: str, old_owner_user_id: str, new_owner_user_id: str
+        ) -> SmartTablePermissionVerification:
+            """令首次调用进入待恢复状态。"""
+
+            del record_id, old_owner_user_id, new_owner_user_id
+            raise SmartTablePermissionVerificationUnavailable("等待权限验证")
+
+    adapter = FakeSmartTableAdapter()
+    service = SmartTableOwnerTransferService(session_factory, adapter, UnavailableVerifier())
+    first = service.transfer(
+        lead_id=seeded_lead,
+        new_owner_user_id="sales-new",
+        operator_subject="admin-1",
+        operator_role="administrator",
+        auth_source="test",
+        request_id="request-transfer-reconcile",
+        reason="等待权限验证",
+    )
+    assert first.status == "permission_verification_unavailable"
+    assert len(adapter.update_calls) == 1
+
+    adapter.record = SmartTableRecord(
+        record_id="record-1",
+        fields={**adapter.record.fields, "负责人": "sales-new"},
+    )
+    result = SmartTableOwnerTransferService(
+        session_factory, adapter, FakePermissionVerifier()
+    ).reconcile(
+        operation_id=first.operation_id,
+        operator_subject="admin-1",
+        operator_role="administrator",
+        auth_source="test",
+        request_id="request-transfer-reconcile-resume",
+        reason="恢复已完成的远端转交",
+    )
+
+    assert result.status == "succeeded"
+    assert len(adapter.update_calls) == 1
+    with session_factory() as session:
+        lead = session.get(Lead, seeded_lead)
+        assert lead is not None and lead.smart_table_owner_user_id == "sales-new"
+
+
+def test_transfer_unknown_remote_exception_enters_recovery_not_failed(
+    session_factory: sessionmaker[Session], seeded_lead: str
+) -> None:
+    """无法证明远端未写入时不得标为可安全重试的 definite failure。"""
+
+    class UnknownFailureAdapter(FakeSmartTableAdapter):
+        """模拟 update 请求结果未知。"""
+
+        def update_record(self, record_id: str, fields: dict[str, object]) -> SmartTableRecord:
+            """记录调用后抛出未知结果异常。"""
+
+            self.update_calls.append((record_id, dict(fields)))
+            raise RuntimeError("transport outcome unknown")
+
+    adapter = UnknownFailureAdapter()
+    result = SmartTableOwnerTransferService(
+        session_factory, adapter, FakePermissionVerifier()
+    ).transfer(
+        lead_id=seeded_lead,
+        new_owner_user_id="sales-new",
+        operator_subject="admin-1",
+        operator_role="administrator",
+        auth_source="test",
+        request_id="request-transfer-unknown",
+        reason="未知远端结果",
+    )
+
+    assert result.status == "pending_recovery"
+    with session_factory() as session:
+        operation = session.get(SmartTableOwnerTransferOperation, result.operation_id)
+        assert operation is not None
+        assert operation.remote_update_state == "unknown"
+        assert operation.final_status == "pending_recovery"
+
+
+def test_transfer_discarded_same_company_conflict_is_checked_before_remote(
+    session_factory: sessionmaker[Session], seeded_lead: str
+) -> None:
+    """数据库唯一约束包含 discarded 时，预检也必须把该记录视为冲突。"""
+
+    with session_factory.begin() as session:
+        session.add(
+            IncomingMessage(
+                message_id="message-discarded-duplicate",
+                sales_user_id="sales-new",
+                sequence=1,
+                raw_payload={},
+            )
+        )
+        session.add(
+            Lead(
+                id="lead-discarded-duplicate",
+                source_message_id="message-discarded-duplicate",
+                original_capturing_sales_user_id="sales-new",
+                smart_table_owner_user_id="sales-new",
+                lifecycle_state="discarded",
+                field_values={"线索名称": "星海科技"},
+                standard_company_name="星海科技",
+            )
+        )
+    adapter = FakeSmartTableAdapter()
+    with pytest.raises(ValueError, match="同公司"):
+        SmartTableOwnerTransferService(
+            session_factory, adapter, FakePermissionVerifier()
+        ).transfer(
+            lead_id=seeded_lead,
+            new_owner_user_id="sales-new",
+            operator_subject="admin-1",
+            operator_role="administrator",
+            auth_source="test",
+            request_id="request-transfer-discarded-conflict",
+            reason="废弃记录冲突回归",
+        )
     assert adapter.update_calls == []

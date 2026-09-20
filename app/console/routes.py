@@ -105,6 +105,14 @@ class TransferOwnerBody(BaseModel):
     reason: str = Field(min_length=1, max_length=512)
 
 
+class MaintenanceRecoveryBody(BaseModel):
+    """定义恢复未知远端结果所需的受审计原因。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=512)
+
+
 def _require_console_admin(
     request: Request,
     provider: Annotated[AdminIdentityProvider, Depends(get_admin_identity_provider)],
@@ -166,7 +174,15 @@ def _request_id(request: Request) -> str:
     """读取或生成不可为空的管理请求幂等标识。"""
 
     request_id = request.headers.get("X-Request-ID")
-    return request_id.strip() if request_id and request_id.strip() else str(uuid4())
+    normalized = request_id.strip() if request_id else ""
+    if not normalized:
+        return str(uuid4())
+    if len(normalized) > 128 or any(
+        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
+        for character in normalized
+    ):
+        raise HTTPException(status_code=400, detail="X-Request-ID 格式非法")
+    return normalized
 
 
 def _maintenance_dto(result: ConsoleMaintenanceResult) -> ConsoleMaintenanceResultDTO:
@@ -536,6 +552,60 @@ def maintenance_transfer_owner(
                 principal,
                 lead_id=lead_id,
                 new_owner_user_id=body.new_owner_user_id,
+                reason=body.reason,
+                request_id=_request_id(request),
+            )
+        )
+    except (ValueError, PermissionError) as error:
+        _raise_maintenance_error(error)
+        raise AssertionError("unreachable")
+
+
+@console_api.post(
+    "/maintenance/transfer-operations/{operation_id}/reconcile",
+    response_model=ConsoleMaintenanceResultDTO,
+)
+def maintenance_reconcile_transfer(
+    operation_id: str,
+    body: MaintenanceRecoveryBody,
+    request: Request,
+    principal: Annotated[AdminPrincipal, Depends(_require_console_maintenance_admin)],
+    service: Annotated[ConsoleMaintenanceService, Depends(get_console_maintenance_service)],
+) -> ConsoleMaintenanceResultDTO:
+    """核验远端负责人事实并恢复待处理转交 operation。"""
+
+    try:
+        return _maintenance_dto(
+            service.reconcile_transfer(
+                principal,
+                operation_id=operation_id,
+                reason=body.reason,
+                request_id=_request_id(request),
+            )
+        )
+    except (ValueError, PermissionError) as error:
+        _raise_maintenance_error(error)
+        raise AssertionError("unreachable")
+
+
+@console_api.post(
+    "/maintenance/creation-operations/{operation_id}/reconcile",
+    response_model=ConsoleMaintenanceResultDTO,
+)
+def maintenance_reconcile_create(
+    operation_id: str,
+    body: MaintenanceRecoveryBody,
+    request: Request,
+    principal: Annotated[AdminPrincipal, Depends(_require_console_maintenance_admin)],
+    service: Annotated[ConsoleMaintenanceService, Depends(get_console_maintenance_service)],
+) -> ConsoleMaintenanceResultDTO:
+    """核验远端记录事实并恢复管理员补建 operation。"""
+
+    try:
+        return _maintenance_dto(
+            service.reconcile_create(
+                principal,
+                operation_id=operation_id,
                 reason=body.reason,
                 request_id=_request_id(request),
             )

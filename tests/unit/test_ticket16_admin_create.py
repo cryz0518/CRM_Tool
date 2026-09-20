@@ -12,6 +12,7 @@ from sqlalchemy.pool import StaticPool
 from app.leads.admin_create import AdminLeadCreationService
 from app.leads.models import AdminLeadCreationOperation, Lead
 from app.messaging.models import Base, SalesAuthorization
+from app.smart_table.adapter import SmartTableDefiniteRemoteFailure
 from app.smart_table.models import SmartTableRecord
 
 
@@ -22,12 +23,38 @@ class FakeAdminCreateTable:
         """初始化调用记录。"""
 
         self.calls: list[tuple[dict[str, object], object]] = []
+        self.records: dict[str, SmartTableRecord] = {}
+        self.raise_after_create = False
+        self.definite_failures = 0
 
     def create_record(self, fields: dict[str, object], *, actor: object) -> SmartTableRecord:
         """返回远端创建快照。"""
 
         self.calls.append((dict(fields), actor))
-        return SmartTableRecord(record_id="record-admin-1", fields=dict(fields))
+        record = SmartTableRecord(
+            record_id=f"record-admin-{len(self.calls)}", fields=dict(fields)
+        )
+        self.records[record.record_id] = record
+        if self.definite_failures:
+            self.definite_failures -= 1
+            raise SmartTableDefiniteRemoteFailure("adapter confirmed no remote write")
+        if self.raise_after_create:
+            raise RuntimeError("remote result unknown after create")
+        return record
+
+    def get_record(self, record_id: str) -> SmartTableRecord | None:
+        """按记录标识读取远端已创建事实。"""
+
+        return self.records.get(record_id)
+
+    def find_records(self, filters: dict[str, object]) -> list[SmartTableRecord]:
+        """按冻结字段返回可证明属于 operation 的候选记录。"""
+
+        return [
+            record
+            for record in self.records.values()
+            if all(record.fields.get(name) == value for name, value in filters.items())
+        ]
 
 
 @pytest.fixture
@@ -150,3 +177,123 @@ def test_admin_create_requires_reason_and_authorized_target(
             request_id="request-create-target",
             reason="补录",
         )
+
+
+def test_admin_create_unknown_remote_result_reconciles_without_duplicate_create(
+    session_factory: sessionmaker[Session], seeded_admin: None
+) -> None:
+    """远端已创建但响应未知时，重复 request 先核验事实而不再次 create。"""
+
+    table = FakeAdminCreateTable()
+    table.raise_after_create = True
+    service = AdminLeadCreationService(session_factory, table)
+    first = service.create(
+        original_capturing_sales_user_id="sales-capture",
+        smart_table_owner_user_id="sales-owner",
+        field_values={"线索名称": "未知结果公司", "业务线": "协作机器人", "手机": "13800000000"},
+        operator_subject="admin-1",
+        operator_role="administrator",
+        auth_source="console",
+        request_id="request-create-unknown",
+        reason="模拟远端响应未知",
+    )
+    assert first.status == "pending_recovery"
+    assert len(table.calls) == 1
+
+    table.raise_after_create = False
+    second = service.create(
+        original_capturing_sales_user_id="sales-capture",
+        smart_table_owner_user_id="sales-owner",
+        field_values={"线索名称": "未知结果公司", "业务线": "协作机器人", "手机": "13800000000"},
+        operator_subject="admin-1",
+        operator_role="administrator",
+        auth_source="console",
+        request_id="request-create-unknown",
+        reason="恢复已创建远端记录",
+    )
+    assert second.status == "succeeded"
+    assert len(table.calls) == 1
+
+
+def test_admin_create_definite_remote_failure_can_retry_safely(
+    session_factory: sessionmaker[Session], seeded_admin: None
+) -> None:
+    """适配器明确未写入时，同一 frozen request 可以安全重试。"""
+
+    table = FakeAdminCreateTable()
+    table.definite_failures = 1
+    service = AdminLeadCreationService(session_factory, table)
+    first = service.create(
+        original_capturing_sales_user_id="sales-capture",
+        smart_table_owner_user_id="sales-owner",
+        field_values={"线索名称": "确定失败公司", "业务线": "协作机器人", "手机": "13800000000"},
+        operator_subject="admin-1",
+        operator_role="administrator",
+        auth_source="console",
+        request_id="request-create-definite-failure",
+        reason="模拟明确失败",
+    )
+    assert first.status == "remote_create_failed"
+
+    second = service.create(
+        original_capturing_sales_user_id="sales-capture",
+        smart_table_owner_user_id="sales-owner",
+        field_values={"线索名称": "确定失败公司", "业务线": "协作机器人", "手机": "13800000000"},
+        operator_subject="admin-1",
+        operator_role="administrator",
+        auth_source="console",
+        request_id="request-create-definite-failure",
+        reason="重试明确失败",
+    )
+    assert second.status == "succeeded"
+    assert len(table.calls) == 2
+
+
+def test_admin_create_remote_success_local_finalize_failure_recovers_without_create(
+    session_factory: sessionmaker[Session], seeded_admin: None
+) -> None:
+    """远端已成功但本地 finalize 崩溃时，恢复只读取远端，不重复创建。"""
+
+    table = FakeAdminCreateTable()
+    service = AdminLeadCreationService(session_factory, table)
+    original_finalize = service._finalize_local_creation
+
+    def fail_finalize(operation_id: str, lead_id: str, record_id: str) -> None:
+        """模拟本地提交异常。"""
+
+        del operation_id, lead_id, record_id
+        raise RuntimeError("local finalize failed")
+
+    service._finalize_local_creation = fail_finalize  # type: ignore[method-assign]
+    first = service.create(
+        original_capturing_sales_user_id="sales-capture",
+        smart_table_owner_user_id="sales-owner",
+        field_values={
+            "线索名称": "本地提交失败公司",
+            "业务线": "协作机器人",
+            "手机": "13800000000",
+        },
+        operator_subject="admin-1",
+        operator_role="administrator",
+        auth_source="console",
+        request_id="request-create-local-failure",
+        reason="模拟本地提交失败",
+    )
+    assert first.status == "pending_recovery"
+    service._finalize_local_creation = original_finalize  # type: ignore[method-assign]
+    second = service.create(
+        original_capturing_sales_user_id="sales-capture",
+        smart_table_owner_user_id="sales-owner",
+        field_values={
+            "线索名称": "本地提交失败公司",
+            "业务线": "协作机器人",
+            "手机": "13800000000",
+        },
+        operator_subject="admin-1",
+        operator_role="administrator",
+        auth_source="console",
+        request_id="request-create-local-failure",
+        reason="恢复本地提交",
+    )
+    assert second.status == "succeeded"
+    assert len(table.calls) == 1
