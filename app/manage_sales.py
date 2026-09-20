@@ -11,7 +11,9 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
-from app.messaging.models import SalesAuthorization
+from app.messaging.sales_authorization import SalesAuthorizationDirectoryService
+
+_LOCAL_DIRECTORY_OPERATOR = "local_sales_authorization_cli"
 
 logger = logging.getLogger(__name__)
 
@@ -36,19 +38,10 @@ def authorize_salesperson(settings: Settings, wecom_user_id: str) -> None:
     try:
         session_factory = sessionmaker(engine)
         with session_factory.begin() as session:
-            # 已存在成员仅恢复授权与启用状态，重复运行不会创建第二条目录记录。
-            authorization = session.get(SalesAuthorization, normalized_user_id)
-            if authorization is None:
-                session.add(
-                    SalesAuthorization(
-                        wecom_user_id=normalized_user_id,
-                        is_authorized=True,
-                        is_active=True,
-                    )
-                )
-            else:
-                authorization.is_authorized = True
-                authorization.is_active = True
+            # 所有目录写入经统一边界记录服务主体，避免本地入口绕过审计字段。
+            SalesAuthorizationDirectoryService().authorize_salesperson(
+                session, normalized_user_id, _LOCAL_DIRECTORY_OPERATOR
+            )
     finally:
         engine.dispose()
 

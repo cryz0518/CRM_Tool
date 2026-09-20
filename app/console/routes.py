@@ -35,6 +35,7 @@ from app.console.dto import (
     ConsoleMessageDTO,
     ConsoleOverviewDTO,
     ConsolePage,
+    ConsoleSalesAuthorizationDTO,
     ConsoleSyncDTO,
     ConsoleTaskDTO,
 )
@@ -262,6 +263,47 @@ def config(
     return service.list_config()
 
 
+@console_api.get(
+    "/sales-authorizations", response_model=ConsolePage[ConsoleSalesAuthorizationDTO]
+)
+def sales_authorizations(
+    _: Annotated[AdminPrincipal, Depends(_require_console_admin)],
+    service: Annotated[ConsoleQueryService, Depends(get_console_query_service)],
+    limit: int = Query(50, ge=1, le=100),
+    cursor: str | None = None,
+) -> ConsolePage[ConsoleSalesAuthorizationDTO]:
+    """返回销售授权范围、启用状态和 CRM 映射异常。
+
+    参数：认证主体仅用于执行 Console 读取授权；service 提供只读查询；limit 和 cursor 控制分页。
+    返回值：不包含 CRM 用户标识的目录分页结果。
+    异常：无效查询参数由 FastAPI 返回 422；读取失败由框架转换为服务错误。
+    副作用：无，不修改销售授权、CRM 映射或线索。
+    """
+    return service.list_sales_authorizations(limit=limit, cursor=cursor)
+
+
+@console_api.get(
+    "/sales-authorizations/{sales_user_id}/affected-leads",
+    response_model=ConsolePage[ConsoleLeadDTO],
+)
+def sales_authorization_affected_leads(
+    sales_user_id: str,
+    _: Annotated[AdminPrincipal, Depends(_require_console_admin)],
+    service: Annotated[ConsoleQueryService, Depends(get_console_query_service)],
+    limit: int = Query(50, ge=1, le=100),
+    cursor: str | None = None,
+) -> ConsolePage[ConsoleLeadDTO]:
+    """返回指定 CRM 映射缺失销售当前受阻的脱敏线索。
+
+    参数：sales_user_id 为企业微信销售用户标识；认证主体用于读取授权；service 执行查询；
+    limit 和 cursor 控制分页。
+    返回值：仅含 pending_create 或 pending_update 的脱敏线索分页结果。
+    异常：无效查询参数由 FastAPI 返回 422；读取失败由框架转换为服务错误。
+    副作用：无，不修改目录、线索或 CRM 同步事实。
+    """
+    return service.list_mapping_missing_leads(sales_user_id, limit=limit, cursor=cursor)
+
+
 @console_api.post("/break-glass/access")
 def break_glass_access(
     body: BreakGlassRequestBody,
@@ -330,6 +372,7 @@ def console_shell(_: Annotated[AdminPrincipal, Depends(_require_console_admin)])
               <button data-path="conflicts">Conflicts</button>
               <button data-path="audits">Audit</button>
               <button data-path="config">Config</button>
+              <button data-path="sales-authorizations">Sales Authorization</button>
             </nav>
             <pre id="result">选择一个查询页面。</pre>
             <script>

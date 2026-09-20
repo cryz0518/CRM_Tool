@@ -49,6 +49,8 @@ class SalesAuthorization(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_administrator: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     next_message_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_by: Mapped[str | None] = mapped_column(String(128))
+    updated_by: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

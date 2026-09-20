@@ -105,13 +105,19 @@ def _include_persisted_results(
     副作用：仅读取 CRM 同步记录。
     """
     with session_factory() as session:
-        statuses = session.scalars(
-            select(CrmSyncRecord.status).where(
+        sync_results = session.execute(
+            select(CrmSyncRecord.status, CrmSyncRecord.failure_code).where(
                 CrmSyncRecord.request_message_id == command.request_message_id
             )
-        ).all()
+        ).tuples().all()
+    statuses = [status for status, _ in sync_results]
+    # 映射缺失已有独立计数，不能同时归为笼统的待人工处理失败。
+    generic_terminal_failure_count = sum(
+        status == "failed_pending_review" and failure_code != "mapping_missing"
+        for status, failure_code in sync_results
+    )
     # 本轮实际成功已经在 result 中，不应被同一持久化记录再次累计。
-    if result.succeeded:
+    if result.succeeded or result.updated:
         return result
     return SubmissionBatchResult(
         succeeded=statuses.count("succeeded"),
@@ -119,10 +125,14 @@ def _include_persisted_results(
         retrying=max(result.retrying, statuses.count("retrying")),
         processing=max(result.processing, statuses.count("processing")),
         failed_pending_review=max(
-            result.failed_pending_review, statuses.count("failed_pending_review")
+            result.failed_pending_review, generic_terminal_failure_count
         ),
         updates_not_implemented=result.updates_not_implemented,
         incomplete_lead_ids=result.incomplete_lead_ids,
+        updated=result.updated,
+        unchanged=result.unchanged,
+        company_identity_review=result.company_identity_review,
+        mapping_missing=result.mapping_missing,
     )
 
 
@@ -188,6 +198,7 @@ def format_submission_reply(result: SubmissionBatchResult) -> str:
         f"无变化 {result.unchanged} 条；"
         f"公司身份变化待人工审查 {result.company_identity_review} 条；"
         f"待完善或待明确确认 {result.incomplete} 条；"
+        f"CRM 用户映射缺失 {result.mapping_missing} 条；"
         f"提交处理中 {result.processing} 条；可重试失败 {result.retrying} 条；"
         f"需人工处理失败 {result.failed_pending_review} 条。"
     )

@@ -15,7 +15,12 @@ from app.console.dependencies import (
     get_break_glass_access_service,
     get_console_query_service,
 )
-from app.console.dto import ConsoleOverviewDTO
+from app.console.dto import (
+    ConsoleLeadDTO,
+    ConsoleOverviewDTO,
+    ConsolePage,
+    ConsoleSalesAuthorizationDTO,
+)
 from app.main import app
 
 
@@ -25,6 +30,32 @@ class StubConsoleQueryService:
     def get_overview(self) -> ConsoleOverviewDTO:
         """返回没有敏感数据的首页结果。"""
         return ConsoleOverviewDTO(services=[], counts={}, readiness_issues=[])
+
+    def list_sales_authorizations(
+        self, *, limit: int = 50, cursor: str | None = None
+    ) -> ConsolePage[ConsoleSalesAuthorizationDTO]:
+        """返回固定的授权目录只读结果。"""
+        del limit, cursor
+        return ConsolePage(
+            items=[
+                ConsoleSalesAuthorizationDTO(
+                    wecom_user_id="sales-1",
+                    display_name="销售一",
+                    department_id="sales",
+                    is_authorized=True,
+                    is_active=True,
+                    crm_mapping_status="mapping_missing",
+                    affected_pending_lead_count=2,
+                )
+            ]
+        )
+
+    def list_mapping_missing_leads(
+        self, sales_user_id: str, *, limit: int = 50, cursor: str | None = None
+    ) -> ConsolePage[ConsoleLeadDTO]:
+        """返回固定的映射缺失受影响线索。"""
+        del sales_user_id, limit, cursor
+        return ConsolePage(items=[])
 
 
 class StubBreakGlassService:
@@ -106,6 +137,45 @@ def test_admin_can_read_overview_and_console_shell() -> None:
     assert shell.status_code == 200
     assert "Operations Console" in shell.text
     assert 'data-path="conflicts"' in shell.text
+
+
+def test_admin_can_read_sales_authorization_mapping_status() -> None:
+    """验证管理员可读取销售授权范围和 CRM 映射异常。"""
+    response = request(
+        "GET",
+        "/api/console/sales-authorizations",
+        headers={"X-Console-Admin-Token": "admin-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": [
+            {
+                "wecom_user_id": "sales-1",
+                "display_name": "销售一",
+                "department_id": "sales",
+                "is_authorized": True,
+                "is_active": True,
+                "crm_mapping_status": "mapping_missing",
+                "affected_pending_lead_count": 2,
+                "created_by": None,
+                "updated_by": None,
+            }
+        ],
+        "next_cursor": None,
+    }
+
+
+def test_admin_can_read_mapping_missing_affected_leads() -> None:
+    """验证管理员可通过只读端点定位映射缺失受影响线索。"""
+    response = request(
+        "GET",
+        "/api/console/sales-authorizations/sales-1/affected-leads",
+        headers={"X-Console-Admin-Token": "admin-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"items": [], "next_cursor": None}
 
 
 def test_break_glass_requires_reason_and_rejects_batch_fields() -> None:

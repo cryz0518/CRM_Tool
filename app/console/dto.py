@@ -66,6 +66,8 @@ class ConsoleTaskDTO(ConsoleDTO):
     status: str
     attempts: int | None = None
     failure_category: str | None = None
+    failure_kind: str | None = None
+    failure_code: str | None = None
     error_summary: str | None = None
     created_at: datetime
     completed_at: datetime | None = None
@@ -103,6 +105,8 @@ class ConsoleSyncDTO(ConsoleDTO):
     record_id: str | None = None
     attempts: int | None = None
     failure_category: str | None = None
+    failure_kind: str | None = None
+    failure_code: str | None = None
     error_summary: str | None = None
     snapshot_hash: str | None = None
     created_at: datetime
@@ -170,6 +174,20 @@ class ConsoleConfigIssueDTO(ConsoleDTO):
     source: str
     status: str
     issues: list[str] = Field(default_factory=list)
+
+
+class ConsoleSalesAuthorizationDTO(ConsoleDTO):
+    """展示销售授权目录和 CRM 映射状态，不暴露 CRM 用户标识。"""
+
+    wecom_user_id: str
+    display_name: str | None = None
+    department_id: str | None = None
+    is_authorized: bool
+    is_active: bool
+    crm_mapping_status: str
+    affected_pending_lead_count: int = 0
+    created_by: str | None = None
+    updated_by: str | None = None
 
 
 T = TypeVar("T", bound=ConsoleDTO)

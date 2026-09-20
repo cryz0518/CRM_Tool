@@ -340,3 +340,61 @@ def test_audit_and_config_queries_keep_security_facts_and_mapping_status(
     mapping = next(item for item in config.items if item.source == "sales_authorization")
     assert mapping.status == "not_ready"
     assert "CRM 映射缺失 1 条" in mapping.issues[0]
+
+
+def test_sales_authorization_query_exposes_mapping_status_and_affected_leads(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证目录查询展示授权范围与映射异常关联的待同步线索数。"""
+    with session_factory.begin() as session:
+        session.add_all(
+            [
+                SalesAuthorization(
+                    wecom_user_id="sales-missing",
+                    display_name="销售缺映射",
+                    department_id="sales",
+                    is_authorized=True,
+                    is_active=True,
+                ),
+                SalesAuthorization(
+                    wecom_user_id="sales-mapped",
+                    is_authorized=True,
+                    is_active=True,
+                    crm_user_id="crm-1",
+                ),
+                SalesAuthorization(
+                    wecom_user_id="sales-inactive",
+                    is_authorized=True,
+                    is_active=False,
+                ),
+                IncomingMessage(
+                    message_id="mapping-message",
+                    sales_user_id="sales-missing",
+                    sequence=1,
+                    raw_payload={},
+                ),
+                Lead(
+                    id="mapping-lead",
+                    source_message_id="mapping-message",
+                    original_capturing_sales_user_id="sales-missing",
+                    smart_table_owner_user_id="sales-missing",
+                    lifecycle_state="pending_create",
+                    field_values={},
+                ),
+            ]
+        )
+
+    result = ConsoleQueryService(session_factory, FakeHealthProvider()).list_sales_authorizations()
+
+    missing = next(item for item in result.items if item.wecom_user_id == "sales-missing")
+    mapped = next(item for item in result.items if item.wecom_user_id == "sales-mapped")
+    inactive = next(item for item in result.items if item.wecom_user_id == "sales-inactive")
+    assert missing.crm_mapping_status == "mapping_missing"
+    assert missing.affected_pending_lead_count == 1
+    assert mapped.crm_mapping_status == "mapped"
+    assert mapped.affected_pending_lead_count == 0
+    assert inactive.crm_mapping_status == "not_required"
+
+    query_service = ConsoleQueryService(session_factory, FakeHealthProvider())
+    affected = query_service.list_mapping_missing_leads("sales-missing")
+    assert [item.lead_id for item in affected.items] == ["mapping-lead"]

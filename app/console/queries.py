@@ -24,6 +24,7 @@ from app.console.dto import (
     ConsoleMessageDTO,
     ConsoleOverviewDTO,
     ConsolePage,
+    ConsoleSalesAuthorizationDTO,
     ConsoleSyncDTO,
     ConsoleTaskDTO,
 )
@@ -164,11 +165,17 @@ class ConsoleQueryService:
         return self._page(items, limit, offset)
 
     def list_leads(
-        self, *, limit: int = 50, cursor: str | None = None, status: str | None = None
+        self,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+        status: str | None = None,
+        smart_table_owner_user_id: str | None = None,
     ) -> ConsolePage[ConsoleLeadDTO]:
         """查询线索生命周期和脱敏字段摘要。
 
-        参数：limit、cursor 控制分页；status 可按线索生命周期筛选。
+        参数：limit、cursor 控制分页；status 可按线索生命周期筛选；
+        smart_table_owner_user_id 可按当前智能表格负责人筛选。
         返回值：线索 DTO 分页结果。
         异常：非法游标抛出 ValueError；数据库异常向上传播。
         副作用：仅读取 Lead 事实。
@@ -176,6 +183,10 @@ class ConsoleQueryService:
         statement = select(Lead)
         if status:
             statement = statement.where(Lead.lifecycle_state == status)
+        if smart_table_owner_user_id:
+            statement = statement.where(
+                Lead.smart_table_owner_user_id == smart_table_owner_user_id
+            )
         statement = statement.order_by(Lead.updated_at.desc(), Lead.id.desc())
         with self._session_factory() as session:
             leads = session.scalars(
@@ -315,6 +326,8 @@ class ConsoleQueryService:
                     record_id=item.crm_lead_id,
                     attempts=item.attempts,
                     failure_category=item.failure_category,
+                    failure_kind=item.failure_kind,
+                    failure_code=item.failure_code,
                     error_summary=self._safe_text(item.failure_summary or item.response_summary),
                     snapshot_hash=item.snapshot_hash,
                     created_at=item.created_at,
@@ -347,7 +360,10 @@ class ConsoleQueryService:
                 select(func.count(SalesAuthorization.wecom_user_id)).where(
                     SalesAuthorization.is_authorized.is_(True),
                     SalesAuthorization.is_active.is_(True),
-                    SalesAuthorization.crm_user_id.is_(None),
+                    or_(
+                        SalesAuthorization.crm_user_id.is_(None),
+                        func.trim(SalesAuthorization.crm_user_id) == "",
+                    ),
                 )
             ) or 0
         items.append(
@@ -360,6 +376,92 @@ class ConsoleQueryService:
             )
         )
         return ConsolePage(items=items)
+
+    def list_sales_authorizations(
+        self, *, limit: int = 50, cursor: str | None = None
+    ) -> ConsolePage[ConsoleSalesAuthorizationDTO]:
+        """分页返回销售授权目录及其 CRM 映射异常影响范围。
+
+        参数：limit 与 cursor 控制只读分页。
+        返回值：不含 CRM 用户标识的销售授权目录 DTO 分页结果。
+        异常：非法游标抛出 ValueError；数据库读取失败时向上传播。
+        副作用：仅读取授权目录和待同步线索，不修改任何业务状态。
+        """
+        offset = self._parse_cursor(cursor)
+        bounded_limit = self._bounded_limit(limit)
+        with self._session_factory() as session:
+            # 目录和待同步线索均为既有事实；聚合不回填 CRM 映射，也不改写负责人。
+            authorizations = session.scalars(
+                select(SalesAuthorization)
+                .order_by(SalesAuthorization.updated_at.desc(), SalesAuthorization.wecom_user_id)
+                .offset(offset)
+                .limit(bounded_limit + 1)
+            ).all()
+            pending_counts: dict[str, int] = {
+                owner_user_id: count
+                for owner_user_id, count in session.execute(
+                    select(Lead.smart_table_owner_user_id, func.count())
+                    .where(Lead.lifecycle_state.in_(("pending_create", "pending_update")))
+                    .group_by(Lead.smart_table_owner_user_id)
+                ).tuples()
+            }
+        return self._page(
+            [
+                # 仅把待处理线索归因给实际阻塞 CRM 提交的有效销售映射异常。
+                ConsoleSalesAuthorizationDTO(
+                    wecom_user_id=item.wecom_user_id,
+                    display_name=item.display_name,
+                    department_id=item.department_id,
+                    is_authorized=item.is_authorized,
+                    is_active=item.is_active,
+                    crm_mapping_status=self._crm_mapping_status(
+                        item.crm_user_id, item.is_authorized, item.is_active
+                    ),
+                    affected_pending_lead_count=(
+                        pending_counts.get(item.wecom_user_id, 0)
+                        if self._crm_mapping_status(
+                            item.crm_user_id, item.is_authorized, item.is_active
+                        )
+                        == "mapping_missing"
+                        else 0
+                    ),
+                    created_by=item.created_by,
+                    updated_by=item.updated_by,
+                )
+                for item in authorizations
+            ],
+            limit,
+            offset,
+        )
+
+    def list_mapping_missing_leads(
+        self, sales_user_id: str, *, limit: int = 50, cursor: str | None = None
+    ) -> ConsolePage[ConsoleLeadDTO]:
+        """返回指定映射异常销售名下、当前等待 CRM 提交的脱敏线索。
+
+        参数：sales_user_id 为授权目录中的企业微信用户标识；limit 与 cursor 控制分页。
+        返回值：仅含 pending_create 与 pending_update 的线索 DTO。
+        异常：非法游标抛出 ValueError；数据库读取失败时向上传播。
+        副作用：仅读取目录和线索，不修改授权、映射或线索状态。
+        """
+        with self._session_factory() as session:
+            authorization = session.get(SalesAuthorization, sales_user_id)
+            if authorization is None or self._crm_mapping_status(
+                authorization.crm_user_id, authorization.is_authorized, authorization.is_active
+            ) != "mapping_missing":
+                return ConsolePage(items=[])
+            offset = self._parse_cursor(cursor)
+            leads = session.scalars(
+                select(Lead)
+                .where(
+                    Lead.smart_table_owner_user_id == sales_user_id,
+                    Lead.lifecycle_state.in_(("pending_create", "pending_update")),
+                )
+                .order_by(Lead.updated_at.desc(), Lead.id.desc())
+                .offset(offset)
+                .limit(self._bounded_limit(limit) + 1)
+            ).all()
+        return self._page([self._lead_dto(lead) for lead in leads], limit, offset)
 
     def list_conflicts(
         self,
@@ -666,6 +768,21 @@ class ConsoleQueryService:
         return masked[:256] if masked is not None else None
 
     @staticmethod
+    def _crm_mapping_status(
+        crm_user_id: str | None, is_authorized: bool, is_active: bool
+    ) -> str:
+        """将 CRM 用户标识和销售有效状态转换为控制台可展示的非敏感映射状态。
+
+        参数：crm_user_id 为目录中的 CRM 用户标识；is_authorized 和 is_active 为销售有效状态。
+        返回值：mapped、mapping_missing 或不要求 CRM 映射的 not_required。
+        异常：无。
+        副作用：无，不修改授权目录或 CRM 映射。
+        """
+        if not is_authorized or not is_active:
+            return "not_required"
+        return "mapped" if crm_user_id is not None and crm_user_id.strip() else "mapping_missing"
+
+    @staticmethod
     def _normalise_datetime(value: datetime) -> datetime:
         """将数据库返回的有无时区时间统一为 UTC，供游标稳定比较。
 
@@ -889,6 +1006,8 @@ class ConsoleQueryService:
                 status=item.status,
                 attempts=item.attempts,
                 failure_category=item.failure_category,
+                failure_kind=item.failure_kind,
+                failure_code=item.failure_code,
                 error_summary=self._safe_text(item.failure_summary or item.response_summary),
                 created_at=item.created_at,
                 completed_at=item.completed_at,

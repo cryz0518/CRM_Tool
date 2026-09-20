@@ -51,15 +51,15 @@ def _assert_compose_success(
     )
 
 
-def test_ticket15_migration_chain_reaches_single_current_head() -> None:
+def test_ticket17_migration_chain_reaches_single_current_head() -> None:
     """在独立临时 PostgreSQL 容器中执行真实 Alembic upgrade、heads 和 current。"""
     if shutil.which("docker") is None:
         pytest.fail("T15 migration 验证需要可用的 docker 命令，禁止静默跳过真实验证")
 
-    project_name = f"t15-migration-{uuid4().hex[:12]}"
-    database_user = "t15_migration"
+    project_name = f"t17-migration-{uuid4().hex[:12]}"
+    database_user = "t17_migration"
     database_name = "crm_lead"
-    database_password = "t15_migration_password"
+    database_password = "t17_migration_password"
     environment = {
         **os.environ,
         # Compose 项目名和数据库 Volume 均为本测试独立生成，不触碰默认 crm-lead 环境。
@@ -68,7 +68,7 @@ def test_ticket15_migration_chain_reaches_single_current_head() -> None:
         "POSTGRES_PASSWORD": database_password,
         "APP_ENV": "test",
         "SMART_TABLE_ADAPTER": "mock",
-        "CONSOLE_DEV_ADMIN_TOKEN": "t15-migration-test-token",
+        "CONSOLE_DEV_ADMIN_TOKEN": "t17-migration-test-token",
     }
     compose_started = False
     try:
@@ -109,6 +109,44 @@ def test_ticket15_migration_chain_reaches_single_current_head() -> None:
             completed = _run_compose(project_name, environment, *arguments)
             _assert_compose_success(completed, arguments)
 
+        # 已写入的目录操作人属于 T17 审计事实，回退不能静默删除该字段数据。
+        audit_seed = _run_compose(
+            project_name,
+            environment,
+            "run",
+            "--rm",
+            "--no-deps",
+            "migrate",
+            "python",
+            "-c",
+            (
+                "from sqlalchemy import create_engine, text; "
+                "from app.core.config import get_settings; "
+                "engine = create_engine(get_settings().database_url); "
+                "connection = engine.connect(); "
+                "connection.execute(text(\"INSERT INTO sales_authorizations "
+                "(wecom_user_id, is_authorized, is_active, is_administrator, "
+                "next_message_sequence, created_by, updated_by, created_at, updated_at) "
+                "VALUES ('audit-sales', true, true, false, 0, 'test-operator', "
+                "'test-operator', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)\")); "
+                "connection.commit(); connection.close(); engine.dispose()"
+            ),
+        )
+        _assert_compose_success(audit_seed, ("run", "migrate", "python", "-c", "<audit-seed>"))
+        downgrade = _run_compose(
+            project_name,
+            environment,
+            "run",
+            "--rm",
+            "--no-deps",
+            "migrate",
+            "alembic",
+            "downgrade",
+            "0019_ticket15_console_observability",
+        )
+        assert downgrade.returncode != 0
+        assert "存在 T17 审计数据" in (downgrade.stdout + downgrade.stderr)
+
         heads = _run_compose(
             project_name,
             environment,
@@ -122,8 +160,8 @@ def test_ticket15_migration_chain_reaches_single_current_head() -> None:
         _assert_compose_success(
             heads, ("run", "--rm", "--no-deps", "migrate", "alembic", "heads")
         )
-        # T15 链必须继续存在，并由当前 0019 revision 作为唯一 head 收束。
-        assert heads.stdout.count("0019_ticket15_console_observability") == 1
+        # T17 链必须继续存在，并由当前 0020 revision 作为唯一 head 收束。
+        assert heads.stdout.count("0020_ticket17_crm_user_mapping") == 1
     finally:
         if compose_started:
             # 只清理本测试生成的项目、网络和 Volume，不触碰默认 Compose 资源。
