@@ -180,9 +180,9 @@ def test_current_migration_chain_reaches_single_head() -> None:
                 "connection = engine.connect(); "
                 "connection.execute(text(\"INSERT INTO notification_records "
                 "(notification_key, sales_user_id, source_message_id, notification_type, "
-                "status, attempts, payload) VALUES ('payload-only', 'audit-sales', "
+                "status, attempts, payload, created_at) VALUES ('payload-only', 'audit-sales', "
                 "'payload-source', 'wecom_action_card', 'pending', 0, "
-                "'{\\\"msgtype\\\":\\\"template_card\\\"}')\")); "
+                "'{\\\"msgtype\\\":\\\"template_card\\\"}', CURRENT_TIMESTAMP)\")); "
                 "connection.commit(); connection.close(); engine.dispose()"
             ),
         )
