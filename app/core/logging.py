@@ -52,7 +52,12 @@ class ContextFilter(logging.Filter):
         """补齐约定链路字段，使日志消费者无需处理缺失键。"""
         context = LOG_CONTEXT.get()
         for field in CONTEXT_FIELDS:
-            setattr(record, field, context.get(field))
+            # HTTP/Worker 上下文优先；没有上下文时保留领域服务通过 extra
+            # 提供的 request_id/lead_id/record_id，避免管理操作丢失链路字段。
+            if field in context:
+                setattr(record, field, context[field])
+            elif not hasattr(record, field):
+                setattr(record, field, None)
         return True
 
 

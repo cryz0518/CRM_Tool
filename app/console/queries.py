@@ -32,6 +32,7 @@ from app.console.health import ConsoleHealthProvider
 from app.console.masking import MaskingPolicy
 from app.console.models import AIExecutionRecord, BreakGlassAccessAudit
 from app.leads.models import (
+    ConsoleMaintenanceAudit,
     CrmSyncRecord,
     Lead,
     LeadDiscardRequest,
@@ -657,6 +658,14 @@ class ConsoleQueryService:
                 .order_by(BreakGlassAccessAudit.created_at.desc(), BreakGlassAccessAudit.id.desc())
                 .limit(self._bounded_limit(limit))
             ).all()
+            maintenance = session.scalars(
+                select(ConsoleMaintenanceAudit)
+                .order_by(
+                    ConsoleMaintenanceAudit.created_at.desc(),
+                    ConsoleMaintenanceAudit.id.desc(),
+                )
+                .limit(self._bounded_limit(limit))
+            ).all()
         items = [
             ConsoleAuditEventDTO(
                 audit_id=str(item.id),
@@ -689,6 +698,23 @@ class ConsoleQueryService:
                 created_at=item.created_at,
             )
             for item in break_glass
+        )
+        items.extend(
+            ConsoleAuditEventDTO(
+                audit_id=item.id,
+                audit_kind="maintenance",
+                event_type=item.operation_type,
+                operator_subject=item.operator_subject,
+                operator_role=item.operator_role,
+                object_type=item.object_type,
+                object_id=item.object_id,
+                reason=self._masking_policy.mask_text(item.reason or ""),
+                request_context={"auth_source": item.auth_source, "request_id": item.request_id},
+                outcome=item.result,
+                detail=item.failure_summary or f"管理维护结果：{item.result}",
+                created_at=item.created_at,
+            )
+            for item in maintenance
         )
         items.sort(key=lambda item: (item.created_at, item.audit_id), reverse=True)
         return self._page(items, limit)

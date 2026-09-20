@@ -420,7 +420,7 @@ class LeadReviewService:
         return record, lead
 
     def _reconcile_user_edits(
-        self, lead: Lead, current_fields: Mapping[str, object], source_message_id: str
+        self, lead: Lead, current_fields: Mapping[str, object], source_message_id: str | None
     ) -> set[str]:
         """将提交前重读发现的人工编辑持久化，并移除对应待确认元数据。
 
@@ -451,7 +451,7 @@ class LeadReviewService:
         provenance: Mapping[str, LeadFieldProvenance],
         current_fields: Mapping[str, object],
         pending: set[str],
-        source_message_id: str,
+        source_message_id: str | None,
     ) -> set[str]:
         """识别与最后 AI 同步值不同的字段并永久标记人工修改和确认。
 
@@ -576,7 +576,7 @@ class LeadReviewService:
             raise ValueError(f"来源消息不存在：{message_id}")
 
     def _record_audit(
-        self, session: Session, message_id: str, sales_user_id: str, event_type: str
+        self, session: Session, message_id: str | None, sales_user_id: str, event_type: str
     ) -> None:
         """保存可查询且幂等的 T09 人工保护或确认业务审计事件。
 
@@ -585,6 +585,10 @@ class LeadReviewService:
         异常：数据库读写失败时由 SQLAlchemy 抛出。
         副作用：首次事件写入业务审计表。
         """
+        # 管理员补建线索没有来源消息；ConsoleMaintenanceAudit 已记录该管理事实，
+        # 这里不能为了 T09 审计再制造一条虚假 IncomingMessage 关联。
+        if message_id is None:
+            return
         existing = session.scalar(
             select(BusinessAuditEvent).where(
                 BusinessAuditEvent.message_id == message_id,

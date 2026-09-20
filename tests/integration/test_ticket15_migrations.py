@@ -160,8 +160,8 @@ def test_ticket17_migration_chain_reaches_single_current_head() -> None:
         _assert_compose_success(
             heads, ("run", "--rm", "--no-deps", "migrate", "alembic", "heads")
         )
-        # T17 链必须继续存在，并由当前 0020 revision 作为唯一 head 收束。
-        assert heads.stdout.count("0020_ticket17_crm_user_mapping") == 1
+        # T16 继续以 0021 revision 作为唯一 head，并保留 T17 父 revision。
+        assert heads.stdout.count("0021_ticket16_admin_maintenance") == 1
     finally:
         if compose_started:
             # 只清理本测试生成的项目、网络和 Volume，不触碰默认 Compose 资源。

@@ -29,6 +29,10 @@ class SmartTableRecordNotFoundError(LookupError):
     """表示请求的智能表格记录不存在。"""
 
 
+class SmartTableDefiniteRemoteFailure(RuntimeError):
+    """表示适配器已明确证明远端没有应用本次写入。"""
+
+
 class SmartTableAdapterConfigurationError(PermanentTaskFailure):
     """表示部署尚未提供可读取管理员配置的智能表格适配器。"""
 

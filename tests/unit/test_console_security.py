@@ -65,3 +65,21 @@ def test_development_admin_provider_requires_explicit_token_and_admin_role() -> 
     ).authenticate(AdminCredentials(token="console-test-token"))
     assert non_admin is not None
     assert not provider.authorize(non_admin, ConsoleCapability.CONSOLE_READ)
+
+
+def test_only_administrator_role_has_maintenance_write_capability() -> None:
+    """验证 operations_admin 与 auditor 不会继承管理写入口。"""
+    for role in ("operations_admin", "auditor"):
+        provider = DevelopmentAdminIdentityProvider(
+            token="console-test-token", subject="operator-1", roles=frozenset({role})
+        )
+        principal = provider.authenticate(AdminCredentials(token="console-test-token"))
+        assert principal is not None
+        assert not provider.authorize(principal, ConsoleCapability.CONSOLE_MAINTENANCE_WRITE)
+
+    provider = DevelopmentAdminIdentityProvider(
+        token="console-test-token", subject="admin-1", roles=frozenset({"administrator"})
+    )
+    principal = provider.authenticate(AdminCredentials(token="console-test-token"))
+    assert principal is not None
+    assert provider.authorize(principal, ConsoleCapability.CONSOLE_MAINTENANCE_WRITE)

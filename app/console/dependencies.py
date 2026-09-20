@@ -14,9 +14,15 @@ from app.console.auth import (
 )
 from app.console.break_glass import BreakGlassAccessService
 from app.console.health import DefaultConsoleHealthProvider
+from app.console.maintenance import ConsoleMaintenanceService
 from app.console.queries import ConsoleQueryService
 from app.core.config import get_settings
+from app.leads.admin_create import AdminLeadCreationService
+from app.leads.discard import LeadDiscardService
+from app.leads.service import FirstTextLeadWorkspaceService, LeadReassignmentService
+from app.leads.transfer import SmartTableOwnerTransferService
 from app.smart_table.dependencies import get_smart_table_adapter
+from app.smart_table.permissions import UnconfiguredSmartTablePermissionVerifier
 
 
 @lru_cache
@@ -74,3 +80,21 @@ def get_break_glass_access_service() -> BreakGlassAccessService:
     """
     # T15 不实现生产对象存储；没有签名提供器时禁止退化为直接返回附件二进制。
     return BreakGlassAccessService(get_console_session_factory(), signed_url_provider=None)
+
+
+@lru_cache
+def get_console_maintenance_service() -> ConsoleMaintenanceService:
+    """组装 Console 管理写入口及其领域服务。"""
+
+    session_factory = get_console_session_factory()
+    smart_table = get_smart_table_adapter()
+    return ConsoleMaintenanceService(
+        session_factory,
+        FirstTextLeadWorkspaceService(session_factory, smart_table),
+        LeadReassignmentService(session_factory),
+        LeadDiscardService(session_factory),
+        AdminLeadCreationService(session_factory, smart_table),
+        SmartTableOwnerTransferService(
+            session_factory, smart_table, UnconfiguredSmartTablePermissionVerifier()
+        ),
+    )

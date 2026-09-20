@@ -23,6 +23,7 @@ from app.console.break_glass import (
 from app.console.dependencies import (
     get_admin_identity_provider,
     get_break_glass_access_service,
+    get_console_maintenance_service,
     get_console_query_service,
 )
 from app.console.dto import (
@@ -32,6 +33,7 @@ from app.console.dto import (
     ConsoleConfigIssueDTO,
     ConsoleConflictDTO,
     ConsoleLeadDTO,
+    ConsoleMaintenanceResultDTO,
     ConsoleMessageDTO,
     ConsoleOverviewDTO,
     ConsolePage,
@@ -39,6 +41,7 @@ from app.console.dto import (
     ConsoleSyncDTO,
     ConsoleTaskDTO,
 )
+from app.console.maintenance import ConsoleMaintenanceResult, ConsoleMaintenanceService
 from app.console.queries import ConsoleQueryService
 
 router = APIRouter()
@@ -53,6 +56,60 @@ class BreakGlassRequestBody(BaseModel):
     object_type: str
     object_id: str
     access_type: str
+    reason: str = Field(min_length=1, max_length=512)
+
+
+class RetryMaintenanceBody(BaseModel):
+    """定义失败消息重试的受控分段输入。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    segment_index: int = Field(default=0, ge=0)
+
+
+class ReassignMaintenanceBody(BaseModel):
+    """定义消息分段重新归属输入。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    segment_index: int = Field(default=0, ge=0)
+    new_lead_id: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=512)
+
+
+class DiscardMaintenanceBody(BaseModel):
+    """定义线索逻辑废弃输入。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=512)
+
+
+class AdminCreateLeadBody(BaseModel):
+    """定义管理员补建线索的显式四种身份和最小业务字段。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    original_capturing_sales_user_id: str = Field(min_length=1, max_length=128)
+    smart_table_owner_user_id: str = Field(min_length=1, max_length=128)
+    field_values: dict[str, str]
+    reason: str = Field(min_length=1, max_length=512)
+
+
+class TransferOwnerBody(BaseModel):
+    """定义 Smart Table Owner 转交输入。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    new_owner_user_id: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=512)
+
+
+class MaintenanceRecoveryBody(BaseModel):
+    """定义恢复未知远端结果所需的受审计原因。"""
+
+    model_config = ConfigDict(extra="forbid")
+
     reason: str = Field(min_length=1, max_length=512)
 
 
@@ -90,6 +147,67 @@ def _require_audit_admin(
     if not provider.authorize(principal, ConsoleCapability.AUDIT_READ):
         raise HTTPException(status_code=403, detail="没有审计读取权限")
     return principal
+
+
+def _require_console_maintenance_admin(
+    request: Request,
+    provider: Annotated[AdminIdentityProvider, Depends(get_admin_identity_provider)],
+    service: Annotated[ConsoleMaintenanceService, Depends(get_console_maintenance_service)],
+) -> AdminPrincipal:
+    """认证 Console maintenance capability，并核对持久化管理员目录。"""
+
+    principal = provider.authenticate(
+        AdminCredentials(token=request.headers.get("X-Console-Admin-Token"))
+    )
+    if principal is None:
+        raise HTTPException(status_code=401, detail="需要管理员认证")
+    if not provider.authorize(principal, ConsoleCapability.CONSOLE_MAINTENANCE_WRITE):
+        raise HTTPException(status_code=403, detail="没有 Console 管理写权限")
+    try:
+        service.require_admin(principal)
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
+    return principal
+
+
+def _request_id(request: Request) -> str:
+    """读取或生成不可为空的管理请求幂等标识。"""
+
+    request_id = request.headers.get("X-Request-ID")
+    normalized = request_id.strip() if request_id else ""
+    if not normalized:
+        return str(uuid4())
+    if len(normalized) > 128 or any(
+        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
+        for character in normalized
+    ):
+        raise HTTPException(status_code=400, detail="X-Request-ID 格式非法")
+    return normalized
+
+
+def _maintenance_dto(result: ConsoleMaintenanceResult) -> ConsoleMaintenanceResultDTO:
+    """将领域结果投影为不含敏感业务载荷的 HTTP DTO。"""
+
+    return ConsoleMaintenanceResultDTO(
+        operation_id=result.operation_id,
+        status=result.status,
+        lead_id=result.lead_id,
+        message_id=result.message_id,
+        attempt_id=result.attempt_id,
+        record_id=result.record_id,
+        detail=result.detail,
+    )
+
+
+def _raise_maintenance_error(error: Exception) -> None:
+    """把领域服务输入、权限和冲突异常映射为 HTTP 状态。"""
+
+    if isinstance(error, PermissionError):
+        raise HTTPException(status_code=403, detail=str(error)) from error
+    message = str(error)
+    if "已有进行中" in message or "同公司" in message:
+        raise HTTPException(status_code=409, detail=message) from error
+    raise HTTPException(status_code=400, detail=message) from error
 
 
 def _require_break_glass_capability(
@@ -302,6 +420,199 @@ def sales_authorization_affected_leads(
     副作用：无，不修改目录、线索或 CRM 同步事实。
     """
     return service.list_mapping_missing_leads(sales_user_id, limit=limit, cursor=cursor)
+
+
+@console_api.post(
+    "/maintenance/messages/{message_id}/retry",
+    response_model=ConsoleMaintenanceResultDTO,
+)
+def maintenance_retry(
+    message_id: str,
+    body: RetryMaintenanceBody,
+    request: Request,
+    principal: Annotated[AdminPrincipal, Depends(_require_console_maintenance_admin)],
+    service: Annotated[ConsoleMaintenanceService, Depends(get_console_maintenance_service)],
+) -> ConsoleMaintenanceResultDTO:
+    """复用 T14 失败消息受保护重试。"""
+
+    try:
+        return _maintenance_dto(
+            service.retry_failed_message(
+                principal,
+                message_id=message_id,
+                segment_index=body.segment_index,
+                request_id=_request_id(request),
+            )
+        )
+    except (ValueError, PermissionError) as error:
+        _raise_maintenance_error(error)
+        raise AssertionError("unreachable")
+
+
+@console_api.post(
+    "/maintenance/messages/{message_id}/reassign",
+    response_model=ConsoleMaintenanceResultDTO,
+)
+def maintenance_reassign(
+    message_id: str,
+    body: ReassignMaintenanceBody,
+    request: Request,
+    principal: Annotated[AdminPrincipal, Depends(_require_console_maintenance_admin)],
+    service: Annotated[ConsoleMaintenanceService, Depends(get_console_maintenance_service)],
+) -> ConsoleMaintenanceResultDTO:
+    """复用 T14 消息分段人工重新归属。"""
+
+    try:
+        return _maintenance_dto(
+            service.reassign(
+                principal,
+                message_id=message_id,
+                segment_index=body.segment_index,
+                new_lead_id=body.new_lead_id,
+                reason=body.reason,
+                request_id=_request_id(request),
+            )
+        )
+    except (ValueError, PermissionError) as error:
+        _raise_maintenance_error(error)
+        raise AssertionError("unreachable")
+
+
+@console_api.post(
+    "/maintenance/leads/{lead_id}/discard",
+    response_model=ConsoleMaintenanceResultDTO,
+)
+def maintenance_discard(
+    lead_id: str,
+    body: DiscardMaintenanceBody,
+    request: Request,
+    principal: Annotated[AdminPrincipal, Depends(_require_console_maintenance_admin)],
+    service: Annotated[ConsoleMaintenanceService, Depends(get_console_maintenance_service)],
+) -> ConsoleMaintenanceResultDTO:
+    """复用 T14 线索逻辑废弃。"""
+
+    try:
+        return _maintenance_dto(
+            service.discard(
+                principal,
+                lead_id=lead_id,
+                reason=body.reason,
+                request_id=_request_id(request),
+            )
+        )
+    except (ValueError, PermissionError) as error:
+        _raise_maintenance_error(error)
+        raise AssertionError("unreachable")
+
+
+@console_api.post(
+    "/maintenance/leads",
+    response_model=ConsoleMaintenanceResultDTO,
+)
+def maintenance_create_lead(
+    body: AdminCreateLeadBody,
+    request: Request,
+    principal: Annotated[AdminPrincipal, Depends(_require_console_maintenance_admin)],
+    service: Annotated[ConsoleMaintenanceService, Depends(get_console_maintenance_service)],
+) -> ConsoleMaintenanceResultDTO:
+    """通过独立 domain service 补建管理员线索。"""
+
+    try:
+        return _maintenance_dto(
+            service.create_lead(
+                principal,
+                original_capturing_sales_user_id=body.original_capturing_sales_user_id,
+                smart_table_owner_user_id=body.smart_table_owner_user_id,
+                field_values=body.field_values,
+                reason=body.reason,
+                request_id=_request_id(request),
+            )
+        )
+    except (ValueError, PermissionError) as error:
+        _raise_maintenance_error(error)
+        raise AssertionError("unreachable")
+
+
+@console_api.post(
+    "/maintenance/leads/{lead_id}/smart-table-owner-transfer",
+    response_model=ConsoleMaintenanceResultDTO,
+)
+def maintenance_transfer_owner(
+    lead_id: str,
+    body: TransferOwnerBody,
+    request: Request,
+    principal: Annotated[AdminPrincipal, Depends(_require_console_maintenance_admin)],
+    service: Annotated[ConsoleMaintenanceService, Depends(get_console_maintenance_service)],
+) -> ConsoleMaintenanceResultDTO:
+    """通过权限验证 seam 转交 Smart Table Owner。"""
+
+    try:
+        return _maintenance_dto(
+            service.transfer_owner(
+                principal,
+                lead_id=lead_id,
+                new_owner_user_id=body.new_owner_user_id,
+                reason=body.reason,
+                request_id=_request_id(request),
+            )
+        )
+    except (ValueError, PermissionError) as error:
+        _raise_maintenance_error(error)
+        raise AssertionError("unreachable")
+
+
+@console_api.post(
+    "/maintenance/transfer-operations/{operation_id}/reconcile",
+    response_model=ConsoleMaintenanceResultDTO,
+)
+def maintenance_reconcile_transfer(
+    operation_id: str,
+    body: MaintenanceRecoveryBody,
+    request: Request,
+    principal: Annotated[AdminPrincipal, Depends(_require_console_maintenance_admin)],
+    service: Annotated[ConsoleMaintenanceService, Depends(get_console_maintenance_service)],
+) -> ConsoleMaintenanceResultDTO:
+    """核验远端负责人事实并恢复待处理转交 operation。"""
+
+    try:
+        return _maintenance_dto(
+            service.reconcile_transfer(
+                principal,
+                operation_id=operation_id,
+                reason=body.reason,
+                request_id=_request_id(request),
+            )
+        )
+    except (ValueError, PermissionError) as error:
+        _raise_maintenance_error(error)
+        raise AssertionError("unreachable")
+
+
+@console_api.post(
+    "/maintenance/creation-operations/{operation_id}/reconcile",
+    response_model=ConsoleMaintenanceResultDTO,
+)
+def maintenance_reconcile_create(
+    operation_id: str,
+    body: MaintenanceRecoveryBody,
+    request: Request,
+    principal: Annotated[AdminPrincipal, Depends(_require_console_maintenance_admin)],
+    service: Annotated[ConsoleMaintenanceService, Depends(get_console_maintenance_service)],
+) -> ConsoleMaintenanceResultDTO:
+    """核验远端记录事实并恢复管理员补建 operation。"""
+
+    try:
+        return _maintenance_dto(
+            service.reconcile_create(
+                principal,
+                operation_id=operation_id,
+                reason=body.reason,
+                request_id=_request_id(request),
+            )
+        )
+    except (ValueError, PermissionError) as error:
+        _raise_maintenance_error(error)
+        raise AssertionError("unreachable")
 
 
 @console_api.post("/break-glass/access")
