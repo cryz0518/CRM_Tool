@@ -190,6 +190,18 @@ class ConsoleSalesAuthorizationDTO(ConsoleDTO):
     updated_by: str | None = None
 
 
+class ConsoleMaintenanceResultDTO(ConsoleDTO):
+    """返回管理写操作的安全状态摘要，不暴露业务载荷。"""
+
+    operation_id: str | None = None
+    status: str
+    lead_id: str | None = None
+    message_id: str | None = None
+    attempt_id: int | None = None
+    record_id: str | None = None
+    detail: str | None = None
+
+
 T = TypeVar("T", bound=ConsoleDTO)
 
 

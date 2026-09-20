@@ -37,8 +37,8 @@ class Lead(Base):
     __tablename__ = "leads"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_lead_id)
-    source_message_id: Mapped[str] = mapped_column(
-        ForeignKey("incoming_messages.message_id"), nullable=False
+    source_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("incoming_messages.message_id"), nullable=True
     )
     source_segment_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     original_capturing_sales_user_id: Mapped[str] = mapped_column(
@@ -258,6 +258,7 @@ class MessageRetryAttempt(Base):
     operator_user_id: Mapped[str] = mapped_column(
         ForeignKey("sales_authorizations.wecom_user_id"), nullable=False
     )
+    request_id: Mapped[str | None] = mapped_column(String(128), index=True)
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="processing", nullable=False)
     failure_category: Mapped[str | None] = mapped_column(String(32))
@@ -318,4 +319,88 @@ class CrmCompanyIdentity(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class AdminLeadCreationOperation(Base):
+    """保存管理员人工补建线索的本地与远端协调状态。"""
+
+    __tablename__ = "admin_lead_creation_operations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_lead_id)
+    lead_id: Mapped[str] = mapped_column(ForeignKey("leads.id"), nullable=False, unique=True)
+    smart_table_record_id: Mapped[str | None] = mapped_column(String(128))
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    operator_subject: Mapped[str] = mapped_column(String(128), nullable=False)
+    operator_role: Mapped[str] = mapped_column(String(64), nullable=False)
+    auth_source: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    original_capturing_sales_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    smart_table_owner_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    remote_update_state: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    final_status: Mapped[str] = mapped_column(String(64), default="processing", nullable=False)
+    failure_code: Mapped[str | None] = mapped_column(String(64))
+    failure_summary: Mapped[str | None] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class SmartTableOwnerTransferOperation(Base):
+    """保存智能表格负责人转交的不可逆远端事实与本地收敛状态。"""
+
+    __tablename__ = "smart_table_owner_transfer_operations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_lead_id)
+    lead_id: Mapped[str] = mapped_column(ForeignKey("leads.id"), nullable=False, index=True)
+    smart_table_record_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    operator_subject: Mapped[str] = mapped_column(String(128), nullable=False)
+    operator_role: Mapped[str] = mapped_column(String(64), nullable=False)
+    auth_source: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    old_owner_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    new_owner_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    original_capturing_sales_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    crm_lead_owner_user_id: Mapped[str | None] = mapped_column(String(128))
+    remote_update_state: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    permission_verification_state: Mapped[str] = mapped_column(
+        String(32), default="pending", nullable=False
+    )
+    final_status: Mapped[str] = mapped_column(String(64), default="processing", nullable=False)
+    failure_code: Mapped[str | None] = mapped_column(String(64))
+    failure_summary: Mapped[str | None] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class ConsoleMaintenanceAudit(Base):
+    """记录 Console 管理写操作的统一操作者、原因、前后状态和结果。"""
+
+    __tablename__ = "console_maintenance_audits"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_lead_id)
+    operation_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    operation_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    object_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    object_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    operator_subject: Mapped[str] = mapped_column(String(128), nullable=False)
+    operator_role: Mapped[str] = mapped_column(String(64), nullable=False)
+    auth_source: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(512))
+    before_state: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
+    after_state: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
+    result: Mapped[str] = mapped_column(String(64), nullable=False)
+    failure_code: Mapped[str | None] = mapped_column(String(64))
+    failure_summary: Mapped[str | None] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
     )

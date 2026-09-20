@@ -227,6 +227,9 @@ class LeadDiscardService:
         异常：数据库写入失败时由 SQLAlchemy 抛出。
         副作用：首次出现的审计事件写入业务审计表。
         """
+        # 管理员补建线索没有来源消息；统一 Console 审计已覆盖该操作，不伪造消息审计键。
+        if lead.source_message_id is None:
+            return
         existing = session.scalar(
             select(BusinessAuditEvent).where(
                 BusinessAuditEvent.message_id == lead.source_message_id,

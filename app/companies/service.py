@@ -210,6 +210,8 @@ class CompanyLeadService:
             self._ensure_sales_boundary(lead, sales_user_id)
             if lead.lifecycle_state != "temporary":
                 raise ValueError("仅 temporary Lead 可以进行公司确认")
+            if lead.source_message_id is None:
+                raise ValueError("管理员补建线索不支持来源消息公司的确认流程")
             fields = {**lead.field_values, "线索名称": normalized_company_name}
             source_message_id = lead.source_message_id
         return self.upsert(

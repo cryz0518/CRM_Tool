@@ -345,6 +345,7 @@ class FirstTextLeadWorkspaceService:
         operator_user_id: str | None = None,
         *,
         segment_index: int = 0,
+        request_id: str | None = None,
     ) -> ProtectedSupplementResult:
         """在当前线索状态上重试失败消息，禁止回放失败消息之后的历史消息。
 
@@ -460,6 +461,7 @@ class FirstTextLeadWorkspaceService:
                     segment_index=segment_index,
                     lead_id=target.id if target is not None else None,
                     operator_user_id=operator_id,
+                    request_id=request_id,
                     attempt_number=attempt_number,
                     status="processing",
                     processing_started_at=now,
@@ -479,6 +481,7 @@ class FirstTextLeadWorkspaceService:
                         "segment_index": segment_index,
                         "operator_user_id": operator_id,
                         "operator_role": operator_role,
+                        "request_id": request_id,
                     },
                 )
                 if target is None:
@@ -674,6 +677,8 @@ class FirstTextLeadWorkspaceService:
             lead = session.get(Lead, company_result.lead_id)
             if lead is None:
                 raise ValueError(f"公司确认目标线索不存在：{company_result.lead_id}")
+            if lead.source_message_id is None:
+                raise ValueError("管理员补建线索不支持来源消息公司的确认流程")
             event_id = session.scalar(
                 select(OutboxEvent.id).where(OutboxEvent.message_id == lead.source_message_id)
             )

@@ -12,6 +12,7 @@ class ConsoleCapability(StrEnum):
     """定义 Console 可授予的最小能力集合。"""
 
     CONSOLE_READ = "console_read"
+    CONSOLE_MAINTENANCE_WRITE = "console_maintenance_write"
     AUDIT_READ = "audit_read"
     BREAK_GLASS_RAW_MESSAGE = "break_glass_raw_message"
     BREAK_GLASS_FULL_CONTACT = "break_glass_full_contact"
@@ -50,6 +51,8 @@ class DevelopmentAdminIdentityProvider:
 
     _CAPABILITY_ROLES = {
         ConsoleCapability.CONSOLE_READ: frozenset({"administrator", "operations_admin", "auditor"}),
+        # 维护写入不能由只读运维或审计角色继承，业务层还会再次核对 SalesAuthorization。
+        ConsoleCapability.CONSOLE_MAINTENANCE_WRITE: frozenset({"administrator"}),
         ConsoleCapability.AUDIT_READ: frozenset({"administrator", "operations_admin", "auditor"}),
         ConsoleCapability.BREAK_GLASS_RAW_MESSAGE: frozenset({"administrator", "operations_admin"}),
         ConsoleCapability.BREAK_GLASS_FULL_CONTACT: frozenset(
