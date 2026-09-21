@@ -34,6 +34,8 @@ class BreakGlassAccessAudit(Base):
     phase: Mapped[str] = mapped_column(String(32), nullable=False)
     outcome: Mapped[str] = mapped_column(String(32), nullable=False)
     data_returned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    signed_url_ttl_seconds: Mapped[int | None] = mapped_column()
+    signed_url_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     request_context: Mapped[dict[str, str]] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False

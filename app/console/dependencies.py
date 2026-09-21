@@ -21,6 +21,7 @@ from app.leads.admin_create import AdminLeadCreationService
 from app.leads.discard import LeadDiscardService
 from app.leads.service import FirstTextLeadWorkspaceService, LeadReassignmentService
 from app.leads.transfer import SmartTableOwnerTransferService
+from app.media.dependencies import get_media_storage_provider, get_media_storage_signer
 from app.smart_table.dependencies import get_smart_table_adapter
 from app.smart_table.permissions import UnconfiguredSmartTablePermissionVerifier
 
@@ -78,8 +79,20 @@ def get_break_glass_access_service() -> BreakGlassAccessService:
     异常：无。
     副作用：仅构造服务；T22 对象存储 Adapter 接入前，附件访问会被安全拒绝。
     """
-    # T15 不实现生产对象存储；没有签名提供器时禁止退化为直接返回附件二进制。
-    return BreakGlassAccessService(get_console_session_factory(), signed_url_provider=None)
+    settings = get_settings()
+    # T15 身份与 capability 不变；T22 只注入显式 provider，失败时保持附件访问关闭。
+    signer = get_media_storage_signer(settings)
+    try:
+        storage = get_media_storage_provider(settings)
+    except RuntimeError:
+        storage = None
+    return BreakGlassAccessService(
+        get_console_session_factory(),
+        signed_url_provider=signer,
+        storage_provider=storage,
+        signed_url_ttl_seconds=settings.media_signed_url_ttl_seconds or 300,
+        signed_url_max_ttl_seconds=settings.media_signed_url_max_ttl_seconds,
+    )
 
 
 @lru_cache

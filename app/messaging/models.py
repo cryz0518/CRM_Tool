@@ -341,10 +341,24 @@ class MessageAttachment(Base):
     size_bytes: Mapped[int | None] = mapped_column(Integer)
     sha256: Mapped[str | None] = mapped_column(String(64), index=True)
     storage_key: Mapped[str | None] = mapped_column(String(256), unique=True)
+    storage_provider: Mapped[str | None] = mapped_column(String(32))
+    storage_encryption_mode: Mapped[str | None] = mapped_column(String(64))
+    storage_etag: Mapped[str | None] = mapped_column(String(256))
     scan_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    scan_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    scan_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    quarantined_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     processing_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     recognized_text: Mapped[str | None] = mapped_column(String)
     error_summary: Mapped[str | None] = mapped_column(String(128))
+    retention_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    retention_policy_version: Mapped[str | None] = mapped_column(String(64))
+    deletion_status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deletion_reason: Mapped[str | None] = mapped_column(String(128))
+    cleanup_operation_id: Mapped[str | None] = mapped_column(String(36), index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -368,3 +382,71 @@ class MediaProcessingTask(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (UniqueConstraint("attachment_id", "task_type"),)
+
+
+class StorageIngestOperation(Base):
+    """保存媒体写入后数据库 finalize 失败时的可恢复外部事实。"""
+
+    __tablename__ = "storage_ingest_operations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    operation_key: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    attachment_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    message_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    storage_provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    storage_key: Mapped[str | None] = mapped_column(String(256))
+    storage_key_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="reconcile_required", nullable=False)
+    failure_summary: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class StorageCleanupOperation(Base):
+    """保存一次冻结 retention policy 的媒体清理和远端删除恢复事实。"""
+
+    __tablename__ = "storage_cleanup_operations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    operation_key: Mapped[str] = mapped_column(String(192), unique=True, nullable=False)
+    data_class: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    storage_provider: Mapped[str | None] = mapped_column(String(32))
+    storage_key: Mapped[str | None] = mapped_column(String(256))
+    storage_key_digest: Mapped[str | None] = mapped_column(String(64))
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    retention_cutoff: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    claim_token: Mapped[str | None] = mapped_column(String(64))
+    generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    remote_outcome: Mapped[str | None] = mapped_column(String(32))
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    failure_kind: Mapped[str | None] = mapped_column(String(64))
+    failure_summary: Mapped[str | None] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'processing', 'retrying', 'reconcile_required', "
+            "'succeeded', 'failed_pending_review')",
+            name="ck_storage_cleanup_operation_status",
+        ),
+        CheckConstraint(
+            "remote_outcome IS NULL OR remote_outcome IN "
+            "('confirmed_deleted', 'not_found', 'unknown')",
+            name="ck_storage_cleanup_remote_outcome",
+        ),
+    )

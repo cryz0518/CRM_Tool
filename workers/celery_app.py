@@ -30,5 +30,9 @@ celery_app.conf.update(
             "task": "workers.consume_pending_wecom_actions",
             "schedule": settings.lead_outbox_poll_seconds,
         },
+        "issue-retention-cleanup-operations": {
+            "task": "workers.issue_retention_cleanup_operations",
+            "schedule": settings.lead_outbox_poll_seconds,
+        },
     },
 )

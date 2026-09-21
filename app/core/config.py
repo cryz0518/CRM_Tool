@@ -52,6 +52,30 @@ class Settings(BaseSettings):
     media_max_image_bytes: int = 10 * 1024 * 1024
     media_max_audio_bytes: int = 20 * 1024 * 1024
     media_processing_timeout_seconds: float = 20.0
+    media_storage_provider: Literal["unconfigured", "local", "fake", "production"] = (
+        "unconfigured"
+    )
+    media_storage_endpoint: str | None = None
+    media_storage_bucket: str | None = None
+    media_storage_access_key: str | None = None
+    media_storage_secret_key: str | None = None
+    media_storage_private: bool = False
+    media_storage_tls: bool = False
+    media_storage_encryption: bool = False
+    media_storage_signed_url: bool = False
+    media_storage_head: bool = False
+    media_storage_delete: bool = False
+    media_signed_url_ttl_seconds: int | None = None
+    media_signed_url_max_ttl_seconds: int = 900
+    media_scanner_provider: Literal["unconfigured", "noop", "fake", "production"] = (
+        "unconfigured"
+    )
+    media_retention_policy_version: str | None = None
+    media_retention_days: int | None = None
+    message_payload_retention_days: int | None = None
+    notification_payload_retention_days: int | None = None
+    retention_cleanup_batch_size: int = 100
+    retention_cleanup_lease_seconds: int = 300
     ocr_provider: Literal["mock", "qwen"] = "qwen"
     asr_provider: Literal["mock", "qwen"] = "qwen"
     qwen_ocr_model: str = "qwen3.5-ocr"
@@ -75,6 +99,23 @@ class Settings(BaseSettings):
         副作用：防止未配置权限时因空字符串导致应用无法启动。
         """
         # 当前 CLI 不能读取权限，空值必须保留为 None 而不是错误地视作 false。
+        return None if value == "" else value
+
+    @field_validator(
+        "media_storage_endpoint",
+        "media_storage_bucket",
+        "media_storage_access_key",
+        "media_storage_secret_key",
+        "media_signed_url_ttl_seconds",
+        "media_retention_policy_version",
+        "media_retention_days",
+        "message_payload_retention_days",
+        "notification_payload_retention_days",
+        mode="before",
+    )
+    @classmethod
+    def empty_t22_optional_value_is_unset(cls, value: object) -> object:
+        """将 Compose 空占位符转换为缺失值，让 production readiness 明确失败。"""
         return None if value == "" else value
 
     @field_validator("lead_context_ttl_minutes")
@@ -154,6 +195,38 @@ class Settings(BaseSettings):
 
         if value <= 0 or value >= 5:
             raise ValueError("WECOM_CARD_CALLBACK_TIMEOUT_SECONDS 必须在 0 和 5 秒之间")
+        return value
+
+    @field_validator(
+        "media_retention_days",
+        "message_payload_retention_days",
+        "notification_payload_retention_days",
+        "media_signed_url_ttl_seconds",
+        "media_signed_url_max_ttl_seconds",
+        "retention_cleanup_batch_size",
+        "retention_cleanup_lease_seconds",
+    )
+    @classmethod
+    def t22_positive_values_must_be_bounded(cls, value: int | None, info: object) -> int | None:
+        """拒绝 T22 时长和批量配置的歧义值或失控上限。"""
+        if value is None:
+            return None
+        if value <= 0:
+            raise ValueError(f"{getattr(info, 'field_name', 'T22 配置')} 必须大于 0")
+        if value > 36500 and getattr(info, "field_name", "") in {
+            "media_retention_days",
+            "message_payload_retention_days",
+            "notification_payload_retention_days",
+        }:
+            raise ValueError("保留期不能超过 36500 天")
+        return value
+
+    @field_validator("media_signed_url_max_ttl_seconds")
+    @classmethod
+    def signed_url_max_ttl_must_fit_security_budget(cls, value: int) -> int:
+        """限制签名 URL 技术最大有效期，避免配置成永久公开地址。"""
+        if value > 86400:
+            raise ValueError("MEDIA_SIGNED_URL_MAX_TTL_SECONDS 不能超过 86400 秒")
         return value
 
     def wecom_card_callback_ready(self) -> bool:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -10,8 +11,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.console.models import BreakGlassAccessAudit
 from app.leads.models import Lead
-from app.media.storage import SignedURLProvider
-from app.messaging.models import IncomingMessage, MessageAttachment
+from app.media.storage import SignedURLProvider, StorageProvider
+from app.messaging.models import IncomingMessage, MessageAttachment, utc_now
 
 
 class BreakGlassAccessError(RuntimeError):
@@ -59,16 +60,25 @@ class BreakGlassAccessService:
         self,
         session_factory: sessionmaker[Session],
         signed_url_provider: SignedURLProvider | None = None,
+        storage_provider: StorageProvider | None = None,
+        *,
+        signed_url_ttl_seconds: int = 300,
+        signed_url_max_ttl_seconds: int = 900,
     ) -> None:
         """注入数据库会话工厂和可选附件存储提供器。
 
-        参数：session_factory 为审计和对象读取事务工厂；signed_url_provider 为私有附件签名边界。
+        参数：session_factory 为审计和对象读取事务工厂；signed_url_provider 为私有附件签名边界；
+        storage_provider 为对象 head/reconcile 边界；TTL 参数由配置注入并受最大值限制。
         返回值：无。
         异常：无。
         副作用：仅保存依赖，不发起读取。
         """
         self._session_factory = session_factory
         self._signed_url_provider = signed_url_provider
+        self._storage_provider = storage_provider
+        if signed_url_ttl_seconds <= 0 or signed_url_max_ttl_seconds <= 0:
+            raise ValueError("signed URL TTL 必须大于 0")
+        self._signed_url_ttl_seconds = min(signed_url_ttl_seconds, signed_url_max_ttl_seconds)
 
     def access(self, request: BreakGlassAccessRequest) -> BreakGlassAccessResult:
         """先提交授权审计，再读取单个原始消息、联系人或附件。
@@ -79,6 +89,9 @@ class BreakGlassAccessService:
         副作用：至少追加授权审计和完成/失败审计各一条。
         """
         self._validate_request(request)
+        # 附件必须先完成对象存在、扫描和删除状态校验，才允许形成授权审计事实。
+        if request.object_type == "attachment":
+            self._validate_attachment_access(request)
         access_id = str(uuid4())
         self._record_audit(
             request,
@@ -136,6 +149,34 @@ class BreakGlassAccessService:
         if (request.object_type, request.access_type) not in cls._ACCESS_TYPES:
             raise BreakGlassAccessError("Break-glass 访问类型不受支持")
 
+    def _validate_attachment_access(self, request: BreakGlassAccessRequest) -> None:
+        """在授权审计前校验附件存在、扫描终态、删除状态和远端对象状态。
+
+        参数：request 为已通过基础校验的附件访问请求。
+        返回值：无。
+        异常：附件不存在、未扫描、已删除、签名器缺失或远端状态不可确认时抛出 BreakGlassAccessError。
+        副作用：只读取数据库和对象存储，不写入审计或生成 URL。
+        """
+        with self._session_factory() as session:
+            attachment = session.get(MessageAttachment, request.object_id)
+            if attachment is None or not attachment.storage_key:
+                raise BreakGlassAccessError("附件不存在或尚未落盘")
+            if self._storage_provider is not None and attachment.scan_status not in {
+                "clean",
+            }:
+                raise BreakGlassAccessError("附件尚未通过安全扫描")
+            if self._storage_provider is not None and attachment.deletion_status != "active":
+                raise BreakGlassAccessError("附件已删除或正在清理")
+            if self._signed_url_provider is None:
+                raise BreakGlassAccessError("附件签名提供器未配置")
+            if self._storage_provider is not None:
+                try:
+                    metadata = self._storage_provider.head(attachment.storage_key)
+                except Exception as error:
+                    raise BreakGlassAccessError("附件对象状态检查失败") from error
+                if metadata is None:
+                    raise BreakGlassAccessError("附件对象不存在")
+
     def _record_audit(
         self,
         request: BreakGlassAccessRequest,
@@ -168,6 +209,16 @@ class BreakGlassAccessService:
                         phase=phase,
                         outcome=outcome,
                         data_returned=data_returned,
+                        signed_url_ttl_seconds=(
+                            self._signed_url_ttl_seconds
+                            if request.object_type == "attachment"
+                            else None
+                        ),
+                        signed_url_expires_at=(
+                            utc_now() + timedelta(seconds=self._signed_url_ttl_seconds)
+                            if request.object_type == "attachment"
+                            else None
+                        ),
                         request_context=dict(request.request_context),
                     )
                 )
@@ -210,12 +261,27 @@ class BreakGlassAccessService:
             attachment = session.get(MessageAttachment, request.object_id)
             if attachment is None or not attachment.storage_key:
                 raise BreakGlassAccessError("附件不存在或尚未落盘")
+            # 传入生产 storage provider 时严格校验扫描终态；旧的仅签名单元 Seam
+            # 没有对象状态能力，只保留 T15 的签名行为兼容性。
+            if self._storage_provider is not None and attachment.scan_status not in {
+                "clean",
+            }:
+                raise BreakGlassAccessError("附件尚未通过安全扫描")
+            if self._storage_provider is not None and attachment.deletion_status != "active":
+                raise BreakGlassAccessError("附件已删除或正在清理")
             if self._signed_url_provider is None:
                 raise BreakGlassAccessError("附件签名提供器未配置")
+            if self._storage_provider is not None:
+                try:
+                    metadata = self._storage_provider.head(attachment.storage_key)
+                except Exception as error:
+                    raise BreakGlassAccessError("附件对象状态检查失败") from error
+                if metadata is None:
+                    raise BreakGlassAccessError("附件对象不存在")
             # Break-glass 只取得短期签名地址，避免应用响应或日志承载二进制内容。
             signed_url = self._signed_url_provider.create_signed_url(
                 attachment.storage_key,
-                expires_in_seconds=300,
+                expires_in_seconds=self._signed_url_ttl_seconds,
                 download=request.access_type == "download_attachment",
             )
             return BreakGlassAccessResult(

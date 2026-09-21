@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass
 from typing import Literal
 from uuid import uuid4
@@ -18,8 +19,11 @@ from app.messaging.models import (
     MediaProcessingTask,
     MessageAttachment,
     NotificationRecord,
+    StorageIngestOperation,
     utc_now,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class MediaValidationError(ValueError):
@@ -152,32 +156,52 @@ class MediaAttachmentService:
                 mime_type=validated.detected_mime_type,
                 timeout_seconds=self._timeout_seconds,
             )
-            if scan_status not in {"clean", "not_required"}:
+            if scan_status in {"infected", "quarantined"}:
+                raise MediaValidationError("media_infected")
+            if scan_status in {"failed", "scan_failed", "timeout", "unknown"}:
+                raise MediaValidationError("media_scan_failed")
+            if scan_status not in {"clean", "not_required", "pending_scan", "scanning"}:
                 raise MediaValidationError(f"scan_{scan_status}")
         except (MediaValidationError, RuntimeError) as error:
             return self._record_ingest_failure(message_id, media_kind, declared_mime_type, error)
 
         # 存储成功后才写入可处理元数据；失败不保存部分键，也不暴露内容到日志。
-        stored = self._storage.put(content, suffix=self._suffix_for(validated.detected_mime_type))
         attachment_id = str(uuid4())
-        with self._session_factory.begin() as session:
-            session.add(
-                MessageAttachment(
-                    id=attachment_id,
-                    message_id=message_id,
-                    media_kind=media_kind,
-                    declared_mime_type=declared_mime_type,
-                    detected_mime_type=validated.detected_mime_type,
-                    size_bytes=validated.size_bytes,
-                    sha256=validated.sha256,
-                    storage_key=stored.storage_key,
-                    scan_status=scan_status,
+        stored = self._storage.put(
+            content,
+            suffix=self._suffix_for(validated.detected_mime_type),
+            content_type=validated.detected_mime_type,
+            sha256=validated.sha256,
+        )
+        try:
+            with self._session_factory.begin() as session:
+                session.add(
+                    MessageAttachment(
+                        id=attachment_id,
+                        message_id=message_id,
+                        media_kind=media_kind,
+                        declared_mime_type=declared_mime_type,
+                        detected_mime_type=validated.detected_mime_type,
+                        size_bytes=validated.size_bytes,
+                        sha256=validated.sha256,
+                        storage_key=stored.storage_key,
+                        storage_provider=getattr(self._storage, "provider_name", "configured"),
+                        storage_encryption_mode=stored.encryption_mode,
+                        storage_etag=stored.etag,
+                        scan_status=scan_status,
+                        scan_completed_at=(
+                            utc_now() if scan_status in {"clean", "not_required"} else None
+                        ),
+                    )
                 )
-            )
-            # 显式先落附件，避免没有 ORM 关系时任务插入顺序触发外键约束。
-            session.flush()
-            session.add(MediaProcessingTask(attachment_id=attachment_id, task_type=media_kind))
-            self._audit(session, message_id, "media_attachment_stored")
+                # 显式先落附件，避免没有 ORM 关系时任务插入顺序触发外键约束。
+                session.flush()
+                session.add(MediaProcessingTask(attachment_id=attachment_id, task_type=media_kind))
+                self._audit(session, message_id, "media_attachment_stored")
+        except Exception as error:
+            # DB finalize 失败时保留独立 recovery fact，下一次可先 HEAD 再决定删除。
+            self._record_ingest_recovery(message_id, attachment_id, stored.storage_key, error)
+            raise
         return attachment_id
 
     def process_pending_for_message(self, message_id: str) -> None:
@@ -187,10 +211,40 @@ class MediaAttachmentService:
                 select(MessageAttachment).where(
                     MessageAttachment.message_id == message_id,
                     MessageAttachment.processing_status == "pending",
+                    MessageAttachment.scan_status == "clean",
+                    MessageAttachment.deletion_status == "active",
                 )
             ).all()
         for attachment in attachments:
             self._process_attachment(attachment.id)
+
+    def apply_scan_result(self, attachment_id: str, scan_status: str) -> None:
+        """应用异步扫描终态，只有 clean 才重新打开 OCR/ASR 下游任务。"""
+        if scan_status not in {"clean", "infected", "scan_failed", "quarantined"}:
+            raise ValueError("scan_status_invalid")
+        with self._session_factory.begin() as session:
+            attachment = session.get(MessageAttachment, attachment_id)
+            if attachment is None:
+                raise ValueError("attachment_not_found")
+            attachment.scan_status = scan_status
+            attachment.scan_completed_at = utc_now()
+            if scan_status in {"infected", "quarantined"}:
+                attachment.deletion_status = "quarantined"
+                attachment.quarantined_at = utc_now()
+                attachment.processing_status = "failed_pending_review"
+            elif scan_status == "scan_failed":
+                attachment.processing_status = "failed_pending_review"
+            else:
+                attachment.processing_status = "pending"
+            task = session.scalar(
+                select(MediaProcessingTask).where(
+                    MediaProcessingTask.attachment_id == attachment_id
+                )
+            )
+            if task is not None and scan_status != "clean":
+                task.status = "failed_pending_review"
+                task.completed_at = utc_now()
+            self._audit(session, attachment.message_id, f"media_scan_{scan_status}")
 
     def record_download_failure(self, message_id: str, *, media_kind: str) -> None:
         """保存下载失败的独立媒体任务，并要求销售以文字补充。"""
@@ -209,6 +263,8 @@ class MediaAttachmentService:
                 attachment is None
                 or attachment.storage_key is None
                 or attachment.detected_mime_type is None
+                or attachment.scan_status != "clean"
+                or attachment.deletion_status != "active"
             ):
                 return
             try:
@@ -263,6 +319,7 @@ class MediaAttachmentService:
         attachment_id = str(uuid4())
         # 外部扫描器异常可能包含下载地址或媒体片段，只持久化受控失败码。
         summary = self._safe_ingest_failure_summary(error)
+        scan_status = self._scan_status_for_failure(error)
         with self._session_factory.begin() as session:
             session.add(
                 MessageAttachment(
@@ -270,9 +327,15 @@ class MediaAttachmentService:
                     message_id=message_id,
                     media_kind=media_kind,
                     declared_mime_type=declared_mime_type,
-                    scan_status="failed",
+                    scan_status=scan_status,
                     processing_status="failed_pending_review",
                     error_summary=summary,
+                    quarantined_at=(
+                        utc_now() if scan_status in {"infected", "quarantined"} else None
+                    ),
+                    deletion_status="quarantined"
+                    if scan_status in {"infected", "quarantined"}
+                    else "active",
                     completed_at=utc_now(),
                 )
             )
@@ -291,6 +354,39 @@ class MediaAttachmentService:
             self._audit(session, message_id, "media_validation_failed")
             self._notice(session, message_id)
         return attachment_id
+
+    @staticmethod
+    def _scan_status_for_failure(error: Exception) -> str:
+        """把受控扫描错误映射到可审计且 fail-closed 的生命周期状态。"""
+        detail = str(error)
+        if "infected" in detail:
+            return "infected"
+        return "scan_failed"
+
+    def _record_ingest_recovery(
+        self, message_id: str, attachment_id: str, storage_key: str, error: Exception
+    ) -> None:
+        """在附件 finalize 失败后独立保存远端对象恢复事实。"""
+        operation_key = f"media-ingest:{attachment_id}"
+        try:
+            with self._session_factory.begin() as session:
+                session.add(
+                    StorageIngestOperation(
+                        operation_key=operation_key,
+                        attachment_id=attachment_id,
+                        message_id=message_id,
+                        storage_provider=getattr(self._storage, "provider_name", "configured"),
+                        storage_key=storage_key,
+                        storage_key_digest=hashlib.sha256(storage_key.encode()).hexdigest(),
+                        status="reconcile_required",
+                        failure_summary=self._safe_ingest_failure_summary(error),
+                    )
+                )
+        except Exception:
+            # 恢复事实自身不可写时只记录受控错误，绝不伪装原始 finalize 成功。
+            logger.exception(
+                "media_ingest_recovery_fact_failed", extra={"operation_key": operation_key}
+            )
 
     @staticmethod
     def _safe_ingest_failure_summary(error: Exception) -> str:
