@@ -84,10 +84,12 @@ class CrmSubmissionService:
         crm_adapter: CRMAdapter,
         crm_create_retry_count: int | None = None,
         crm_user_mapper: CRMUserMapper | None = None,
+        robot_submission_confirmation_available: bool | None = None,
     ) -> None:
         """保存数据库、表格、CRM 与重试上限依赖。
 
-        参数：前三项分别提供持久化、规范表格回读和唯一 create 调用；最后一项可覆盖配置。
+        参数：前三项分别提供持久化、规范表格回读和唯一 create 调用；最后参数可覆盖重试、映射
+        与卡片确认能力配置。
         返回值：无。
         异常：无。
         副作用：只保存依赖，不读取数据库或调用外部系统。
@@ -101,6 +103,11 @@ class CrmSubmissionService:
             else crm_create_retry_count
         )
         self._crm_user_mapper = crm_user_mapper or DatabaseCRMUserMapper()
+        self._robot_submission_confirmation_available = (
+            get_settings().wecom_card_callback_ready()
+            if robot_submission_confirmation_available is None
+            else robot_submission_confirmation_available
+        )
 
     def submit(self, command: SubmissionCommand) -> SubmissionBatchResult:
         """解析固定命令并逐条提交当日本人待创建 Lead，保持批次部分成功。
@@ -217,7 +224,9 @@ class CrmSubmissionService:
             if unfinished is not None:
                 return self._claim_and_call(unfinished.id, command.sales_user_id)
         reconciled = LeadReviewService(
-            self._session_factory, self._smart_table_adapter
+            self._session_factory,
+            self._smart_table_adapter,
+            robot_submission_confirmation_available=self._robot_submission_confirmation_available,
         ).reconcile_submission(lead_id)
         if reconciled.blocking_fields:
             return "incomplete"
@@ -344,7 +353,9 @@ class CrmSubmissionService:
                 return self._claim_and_call(existing.id, command.sales_user_id)
 
         reconciled = LeadReviewService(
-            self._session_factory, self._smart_table_adapter
+            self._session_factory,
+            self._smart_table_adapter,
+            robot_submission_confirmation_available=self._robot_submission_confirmation_available,
         ).reconcile_submission(lead_id)
         missing_business = self._missing_business_fields(reconciled.fields)
         missing_minimum = self._missing_crm_minimum(reconciled.fields)

@@ -339,7 +339,9 @@ def test_medium_confidence_same_value_still_enters_confirmation_queue(
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead_with_record(session_factory, adapter)
 
-    LeadReviewService(session_factory, adapter).sync_ai_patch(
+    LeadReviewService(
+        session_factory, adapter, robot_submission_confirmation_available=True
+    ).sync_ai_patch(
         lead_id,
         "message-9",
         _patch(fields={"业务线": "协作机器人"}, pending=("业务线",)),

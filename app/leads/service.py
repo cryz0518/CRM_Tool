@@ -284,12 +284,14 @@ class FirstTextLeadWorkspaceService:
         lead_context_ttl_minutes: int | None = None,
         ai_gateway: AIGateway | None = None,
         company_lead_service: CompanyLeadService | None = None,
+        robot_submission_confirmation_available: bool | None = None,
     ) -> None:
         """注入数据库、表格和销售身份边界，避免业务层依赖真实 CLI 或 Qwen。
 
         参数：session_factory 创建事务；smart_table_adapter 写销售审核表；身份提供器可替换测试实现；
         lead_context_ttl_minutes 可覆盖环境中的上下文有效期；
-        ai_gateway 为可替换的 T08 网关；company_lead_service 负责 T10 公司核验与销售内去重。
+        ai_gateway 为可替换的 T08 网关；company_lead_service 负责 T10 公司核验与销售内去重；
+        robot_submission_confirmation_available 表示真实卡片回调 capability/readiness。
         返回值：无。
         异常：无；依赖错误在消费时按其真实类型处理。
         副作用：仅保存依赖引用，不读写数据库或智能表格。
@@ -300,6 +302,11 @@ class FirstTextLeadWorkspaceService:
         self._ai_gateway = ai_gateway
         self._company_lead_service = company_lead_service
         settings = get_settings()
+        self._robot_submission_confirmation_available = (
+            settings.wecom_card_callback_ready()
+            if robot_submission_confirmation_available is None
+            else robot_submission_confirmation_available
+        )
         configured_ttl_minutes = (
             settings.lead_context_ttl_minutes
             if lead_context_ttl_minutes is None
@@ -1517,7 +1524,9 @@ class FirstTextLeadWorkspaceService:
         while True:
             try:
                 return LeadReviewService(
-                    self._session_factory, self._smart_table_adapter
+                    self._session_factory,
+                    self._smart_table_adapter,
+                    robot_submission_confirmation_available=self._robot_submission_confirmation_available,
                 ).sync_ai_patch(
                     request.lead_id,
                     request.source_message_id,
@@ -2223,7 +2232,11 @@ class FirstTextLeadWorkspaceService:
         logger.info("smart_table_context_update_started")
         try:
             # 确定性补充也必须复用 T09：它负责人工保护、字段来源和基于安全快照的备注重建。
-            LeadReviewService(self._session_factory, self._smart_table_adapter).sync_ai_patch(
+            LeadReviewService(
+                self._session_factory,
+                self._smart_table_adapter,
+                robot_submission_confirmation_available=self._robot_submission_confirmation_available,
+            ).sync_ai_patch(
                 request.lead_id,
                 request.source_message_id,
                 ExtractedLeadPatch(
@@ -2420,7 +2433,11 @@ class FirstTextLeadWorkspaceService:
             sync.status = "processing"
         try:
             # 显式标签路径不调用 Qwen，仍必须经 T09 生成受人工保护的冻结备注和字段来源。
-            LeadReviewService(self._session_factory, self._smart_table_adapter).sync_ai_patch(
+            LeadReviewService(
+                self._session_factory,
+                self._smart_table_adapter,
+                robot_submission_confirmation_available=self._robot_submission_confirmation_available,
+            ).sync_ai_patch(
                 lead_id,
                 self._source_message_id(outbox_event_id),
                 ExtractedLeadPatch(
@@ -2576,6 +2593,8 @@ class LeadReassignmentService:
         new_lead_id: str,
         operator_user_id: str,
         reason: str,
+        *,
+        operation_id: str | None = None,
     ) -> None:
         """将销售自己的消息分段重新归属，并只安全补充来源字段。
 
@@ -2589,7 +2608,12 @@ class LeadReassignmentService:
         if not reason.strip():
             raise ValueError("人工重归属必须填写原因")
         request = self._prepare_reassignment(
-            message_id, segment_index, new_lead_id, operator_user_id, reason.strip()
+            message_id,
+            segment_index,
+            new_lead_id,
+            operator_user_id,
+            reason.strip(),
+            operation_id=operation_id,
         )
         with self._session_factory.begin() as session:
             # T07 尚未读取表格人工编辑状态，因此重归属绝不直接写入表格字段。
@@ -2598,6 +2622,8 @@ class LeadReassignmentService:
             audit = session.get(MessageReassignmentAudit, request.audit_id)
             if resolution is None or target is None or audit is None:
                 raise ValueError("重归属完成时缺少归属结论、目标线索或审计事实")
+            if audit.status == "succeeded":
+                return
             safe_fields = {
                 field_name: value
                 for field_name, value in request.safe_fields.items()
@@ -2632,6 +2658,8 @@ class LeadReassignmentService:
         new_lead_id: str,
         operator_user_id: str,
         reason: str,
+        *,
+        operation_id: str | None = None,
     ) -> ReassignmentRequest:
         """校验权限并持久化一条可恢复的人工重归属请求。
 
@@ -2661,6 +2689,20 @@ class LeadReassignmentService:
             ):
                 # 普通销售必须同时拥有来源消息、原目标和新目标；管理员由授权目录显式放行。
                 raise PermissionError("销售只能重新归属自己的消息和线索")
+            if operation_id is not None:
+                existing_audit = session.scalar(
+                    select(MessageReassignmentAudit)
+                    .where(MessageReassignmentAudit.operation_id == operation_id)
+                    .with_for_update()
+                )
+                if existing_audit is not None:
+                    return ReassignmentRequest(
+                        audit_id=existing_audit.id,
+                        message_id=message_id,
+                        segment_index=segment_index,
+                        new_lead_id=existing_audit.new_lead_id,
+                        safe_fields={},
+                    )
             safe_fields = self._safe_provenance_fields(
                 session, message_id, resolution.lead_id, target
             )
@@ -2672,6 +2714,7 @@ class LeadReassignmentService:
                 operator_user_id=operator_user_id,
                 operator_role="administrator" if operator.is_administrator else "sales",
                 reason=reason,
+                operation_id=operation_id,
             )
             session.add(audit)
             session.flush()

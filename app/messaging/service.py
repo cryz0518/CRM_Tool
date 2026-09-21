@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.logging import bind_log_context, reset_log_context
+from app.crm.commands import parse_crm_submission_command
 from app.messaging.models import (
     BusinessAuditEvent,
     IncomingMessage,
@@ -19,10 +20,9 @@ from app.messaging.models import (
     OutboxEvent,
     SalesAuthorization,
 )
+from app.wecom_bot.actions import parse_deterministic_action_command
 
 logger = logging.getLogger(__name__)
-
-CRM_SUBMISSION_COMMANDS = frozenset({"提交今天的线索", "提交我的更新"})
 
 
 @dataclass(frozen=True)
@@ -119,11 +119,17 @@ class MessageIntakeService:
                         message_id=command.message_id,
                         sales_user_id=command.sales_user_id,
                         sequence=authorization.next_message_sequence,
-                        # 命令在持久化时确定性分类，Worker 因此绝不把它送入 AI 线索提取。
+                        # 固定命令在持久化时分类，Worker 因此绝不把它送入 AI 意图推断。
                         event_type=(
                             "crm_submission_command"
-                            if command.normalized_text in CRM_SUBMISSION_COMMANDS
-                            else "message_received"
+                            if parse_crm_submission_command(command.normalized_text or "")
+                            is not None
+                            else (
+                                "wecom_action_command"
+                                if parse_deterministic_action_command(command.normalized_text or "")
+                                is not None
+                                else "message_received"
+                            )
                         ),
                     )
                 )

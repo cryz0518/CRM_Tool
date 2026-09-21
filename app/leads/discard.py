@@ -48,7 +48,12 @@ class LeadDiscardService:
         self._session_factory = session_factory
 
     def discard(
-        self, lead_id: str, operator_user_id: str, reason: str
+        self,
+        lead_id: str,
+        operator_user_id: str,
+        reason: str,
+        *,
+        operation_id: str | None = None,
     ) -> LeadDiscardResult:
         """受控废弃未同步线索，并在 CRM create 在途时等待外部最终事实。
 
@@ -79,6 +84,23 @@ class LeadDiscardService:
                 raise PermissionError("普通销售只能废弃自己负责的线索")
             operator_role = "administrator" if operator.is_administrator else "sales"
             previous_lifecycle_state = lead.lifecycle_state
+            if operation_id is not None:
+                operation_request = session.scalar(
+                    select(LeadDiscardRequest)
+                    .where(LeadDiscardRequest.operation_id == operation_id)
+                    .with_for_update()
+                )
+                if operation_request is not None:
+                    operation_status = {
+                        "effective": LeadDiscardStatus.DISCARDED,
+                        "not_effective": LeadDiscardStatus.NOT_EFFECTIVE,
+                        "pending": LeadDiscardStatus.WAITING_FOR_CRM,
+                    }.get(operation_request.status, LeadDiscardStatus.WAITING_FOR_CRM)
+                    return LeadDiscardResult(
+                        operation_status,
+                        lead_id,
+                        operation_request.id,
+                    )
             request = session.scalar(
                 select(LeadDiscardRequest)
                 .where(LeadDiscardRequest.lead_id == lead_id)
@@ -106,6 +128,7 @@ class LeadDiscardService:
                 operator_user_id=operator_user_id,
                 operator_role="administrator" if operator.is_administrator else "sales",
                 reason=normalized_reason,
+                operation_id=operation_id,
                 status="pending",
             )
             session.add(request)

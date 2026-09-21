@@ -25,6 +25,10 @@ celery_app.conf.update(
         "consume-pending-lead-outbox-events": {
             "task": "workers.consume_pending_lead_outbox_events",
             "schedule": settings.lead_outbox_poll_seconds,
-        }
+        },
+        "consume-pending-wecom-actions": {
+            "task": "workers.consume_pending_wecom_actions",
+            "schedule": settings.lead_outbox_poll_seconds,
+        },
     },
 )

@@ -1,0 +1,21 @@
+{
+  "cmd": "aibot_event_callback",
+  "headers": {
+    "req_id": "request-001"
+  },
+  "body": {
+    "msgtype": "event",
+    "msgid": "provider-msg-001",
+    "from": {
+      "userid": "sales-a"
+    },
+    "event": {
+      "eventtype": "template_card_event",
+      "template_card_event": {
+        "card_type": "button_interaction",
+        "event_key": "crm.field_confirmation.confirm",
+        "task_id": "task-fixture-001"
+      }
+    }
+  }
+}

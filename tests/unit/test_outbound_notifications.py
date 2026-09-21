@@ -106,3 +106,79 @@ def test_expired_processing_notification_is_reclaimed() -> None:
         )
     sender = WecomOutboundNotificationSender(factory, FakeClient())
     assert asyncio.run(sender.send_pending_once()) == 1
+
+
+def test_stale_sender_completion_cannot_overwrite_takeover() -> None:
+    """验证通知 sender 租约被接管后，旧 sender 的晚到成功不能覆盖新 owner。"""
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    factory = sessionmaker(engine)
+    Base.metadata.create_all(engine)
+    with factory.begin() as session:
+        session.add(
+            NotificationRecord(
+                notification_key="n-stale",
+                sales_user_id="sales-stale",
+                source_message_id="message-stale",
+                notification_type="crm_submission_summary",
+                content="完成",
+            )
+        )
+
+    class TakeoverClient(FakeClient):
+        """在旧 sender 外部发送期间模拟新 sender 接管数据库租约。"""
+
+        async def send_message(
+            self, userid_or_chatid: str, body: dict[str, object]
+        ) -> dict[str, str]:
+            """记录发送后把同一通知标记为新 claimant。"""
+
+            self.calls.append((userid_or_chatid, body))
+            with factory.begin() as session:
+                current = session.get(NotificationRecord, "n-stale")
+                assert current is not None
+                current.processing_claim_token = "new-sender-token"
+            return {"status": "ok"}
+
+    assert asyncio.run(
+        WecomOutboundNotificationSender(factory, TakeoverClient()).send_pending_once()
+    ) == 1
+    with factory() as session:
+        notice = session.get(NotificationRecord, "n-stale")
+        assert notice is not None
+        assert notice.status == "processing"
+        assert notice.processing_claim_token == "new-sender-token"
+
+
+def test_action_card_payload_is_sent_without_creating_business_retry() -> None:
+    """验证 T18 template card 通知走主动 send_message，重试只影响通知状态。"""
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    factory = sessionmaker(engine)
+    Base.metadata.create_all(engine)
+    with factory.begin() as session:
+        session.add(
+            NotificationRecord(
+                notification_key="card-notice",
+                sales_user_id="sales-card",
+                source_message_id="action-1",
+                notification_type="wecom_action_card",
+                content="请确认",
+                payload={
+                    "msgtype": "template_card",
+                    "template_card": {"task_id": "t18_1", "card_type": "text_notice"},
+                },
+            )
+        )
+    client = FakeClient()
+
+    assert asyncio.run(WecomOutboundNotificationSender(factory, client).send_pending_once()) == 1
+    assert client.calls == [
+        (
+            "sales-card",
+            {
+                "msgtype": "template_card",
+                "template_card": {"task_id": "t18_1", "card_type": "text_notice"},
+            },
+        )
+    ]

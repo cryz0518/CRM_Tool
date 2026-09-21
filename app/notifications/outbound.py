@@ -2,13 +2,28 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
+from uuid import uuid4
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.messaging.models import NotificationRecord, utc_now
+
+logger = logging.getLogger(__name__)
+_NOTIFICATION_LEASE = timedelta(minutes=5)
+
+_SUPPORTED_NOTIFICATION_TYPES = frozenset(
+    {
+        "crm_submission_summary",
+        "sales_authorization_denied",
+        "media_text_input_required",
+        "wecom_action_card",
+        "wecom_action_result",
+    }
+)
 
 
 class WecomMessageClient(Protocol):
@@ -32,7 +47,7 @@ class WecomOutboundNotificationSender:
         with self._session_factory() as session:
             notices = session.scalars(
                 select(NotificationRecord).where(
-                    NotificationRecord.notification_type == "crm_submission_summary",
+                    NotificationRecord.notification_type.in_(_SUPPORTED_NOTIFICATION_TYPES),
                     or_(
                         NotificationRecord.status.in_(("pending", "retrying")),
                         and_(
@@ -61,33 +76,60 @@ class WecomOutboundNotificationSender:
                 ):
                     continue
                 # 先原子认领，避免多个 Bot 循环重复发送同一通知。
+                claim_token = uuid4().hex
                 current.status = "processing"
                 current.processing_started_at = utc_now()
-                current.processing_lease_expires_at = current.processing_started_at + timedelta(
-                    minutes=5
+                current.processing_lease_expires_at = (
+                    current.processing_started_at + _NOTIFICATION_LEASE
                 )
+                current.processing_claim_token = claim_token
             try:
-                await self._client.send_message(
-                    notice.sales_user_id,
-                    {"msgtype": "text", "text": {"content": notice.content or "系统通知"}},
-                )
+                # payload 仅保存已构造的白名单消息 body；旧通知没有 payload 时继续发送普通文本。
+                body = notice.payload or {
+                    "msgtype": "text",
+                    "text": {"content": notice.content or "系统通知"},
+                }
+                await self._client.send_message(notice.sales_user_id, body)
             except Exception:
                 with self._session_factory.begin() as session:
                     current = session.get(NotificationRecord, notice.notification_key)
-                    if current is not None:
+                    if current is not None and current.processing_claim_token == claim_token:
                         current.status = "retrying"
                         current.processing_started_at = None
                         current.processing_lease_expires_at = None
+                        current.processing_claim_token = None
                         current.attempts += 1
+                        logger.warning(
+                            "notification_send_failed",
+                            extra={
+                                "notification_key": notice.notification_key,
+                                "event": "notification_send_failed",
+                            },
+                        )
+                        logger.info(
+                            "notification_retry",
+                            extra={
+                                "notification_key": notice.notification_key,
+                                "event": "notification_retry",
+                            },
+                        )
                 continue
             with self._session_factory.begin() as session:
                 current = session.get(NotificationRecord, notice.notification_key)
-                if current is not None:
+                if current is not None and current.processing_claim_token == claim_token:
                     current.status = "succeeded"
                     current.processing_started_at = None
                     current.processing_lease_expires_at = None
+                    current.processing_claim_token = None
                     current.attempts += 1
                     current.sent_at = utc_now()
+                    logger.info(
+                        "notification_sent",
+                        extra={
+                            "notification_key": notice.notification_key,
+                            "event": "notification_sent",
+                        },
+                    )
             sent += 1
         return sent
 
