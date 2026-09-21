@@ -89,6 +89,8 @@ class IncomingMessage(Base):
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     normalized_text: Mapped[str | None] = mapped_column(String)
     requires_media_enrichment: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    scrubbed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retention_policy_version: Mapped[str | None] = mapped_column(String(64))
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -151,6 +153,8 @@ class NotificationRecord(Base):
     processing_claim_token: Mapped[str | None] = mapped_column(String(64))
     provider_message_id: Mapped[str | None] = mapped_column(String(128))
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    scrubbed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retention_policy_version: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -359,6 +363,7 @@ class MessageAttachment(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deletion_reason: Mapped[str | None] = mapped_column(String(128))
     cleanup_operation_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    ingest_operation_id: Mapped[str | None] = mapped_column(String(36), index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -385,7 +390,7 @@ class MediaProcessingTask(Base):
 
 
 class StorageIngestOperation(Base):
-    """保存媒体写入后数据库 finalize 失败时的可恢复外部事实。"""
+    """保存外部上传前已提交的 intent 及其可恢复远端事实。"""
 
     __tablename__ = "storage_ingest_operations"
 
@@ -396,7 +401,17 @@ class StorageIngestOperation(Base):
     storage_provider: Mapped[str] = mapped_column(String(32), nullable=False)
     storage_key: Mapped[str | None] = mapped_column(String(256))
     storage_key_digest: Mapped[str] = mapped_column(String(64), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), default="reconcile_required", nullable=False)
+    content_sha256: Mapped[str | None] = mapped_column(String(64))
+    content_type: Mapped[str | None] = mapped_column(String(128))
+    expected_size_bytes: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    remote_outcome: Mapped[str | None] = mapped_column(String(32))
+    remote_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_token: Mapped[str | None] = mapped_column(String(64))
+    generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failure_summary: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
@@ -404,6 +419,7 @@ class StorageIngestOperation(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class StorageCleanupOperation(Base):
@@ -427,6 +443,7 @@ class StorageCleanupOperation(Base):
     processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     remote_outcome: Mapped[str | None] = mapped_column(String(32))
+    remote_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     failure_kind: Mapped[str | None] = mapped_column(String(64))
     failure_summary: Mapped[str | None] = mapped_column(String(256))

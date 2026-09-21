@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
@@ -62,6 +63,15 @@ class StorageObjectMetadata:
 
 
 @dataclass(frozen=True)
+class SignedDownloadURL:
+    """描述签名器实际采用的短时 URL 及其有效期事实。"""
+
+    url: str
+    effective_expires_at: datetime
+    effective_ttl_seconds: int
+
+
+@dataclass(frozen=True)
 class StorageDeleteResult:
     """描述删除调用的可确认结果，不把 unknown 伪装成成功。"""
 
@@ -104,7 +114,7 @@ class StorageProvider(Protocol):
 
     def generate_signed_download_url(
         self, storage_key: str, *, expires_in_seconds: int, download: bool
-    ) -> str:
+    ) -> SignedDownloadURL:
         """为私有对象生成短时下载地址。"""
 
 
@@ -117,7 +127,7 @@ class SignedURLProvider(Protocol):
         *,
         expires_in_seconds: int,
         download: bool,
-    ) -> str:
+    ) -> SignedDownloadURL:
         """为单个私有对象生成带有效期的签名地址。"""
 
 
@@ -202,7 +212,7 @@ class LocalVolumeStorageProvider:
 
     def generate_signed_download_url(
         self, storage_key: str, *, expires_in_seconds: int, download: bool
-    ) -> str:
+    ) -> SignedDownloadURL:
         """拒绝本地 Volume 生成伪造的生产下载地址。"""
         del storage_key, expires_in_seconds, download
         raise RuntimeError("local_storage_signed_url_unsupported")
@@ -239,11 +249,16 @@ class FakeStorageProvider(LocalVolumeStorageProvider):
 
     def generate_signed_download_url(
         self, storage_key: str, *, expires_in_seconds: int, download: bool
-    ) -> str:
+    ) -> SignedDownloadURL:
         """返回不写入数据库或日志的测试签名地址。"""
         self._validate_key(storage_key)
         disposition = "attachment" if download else "inline"
-        return f"https://fake-storage.invalid/{storage_key}?ttl={expires_in_seconds}&mode={disposition}"
+        effective_ttl = expires_in_seconds
+        return SignedDownloadURL(
+            url=f"https://fake-storage.invalid/{storage_key}?ttl={effective_ttl}&mode={disposition}",
+            effective_expires_at=datetime.now(UTC) + timedelta(seconds=effective_ttl),
+            effective_ttl_seconds=effective_ttl,
+        )
 
     def create_signed_url(
         self,
@@ -251,7 +266,7 @@ class FakeStorageProvider(LocalVolumeStorageProvider):
         *,
         expires_in_seconds: int,
         download: bool,
-    ) -> str:
+    ) -> SignedDownloadURL:
         """适配 T15 Break-glass 的现有签名接口。"""
         return self.generate_signed_download_url(
             storage_key, expires_in_seconds=expires_in_seconds, download=download

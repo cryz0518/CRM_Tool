@@ -82,15 +82,17 @@ def get_break_glass_access_service() -> BreakGlassAccessService:
     settings = get_settings()
     # T15 身份与 capability 不变；T22 只注入显式 provider，失败时保持附件访问关闭。
     signer = get_media_storage_signer(settings)
-    try:
-        storage = get_media_storage_provider(settings)
-    except RuntimeError:
-        storage = None
+    storage = get_media_storage_provider(settings)
+    ttl = settings.media_signed_url_ttl_seconds
+    if ttl is None and settings.app_env in {"production", "prod"}:
+        raise RuntimeError("生产 signed URL TTL 未显式配置")
+    if ttl is None:
+        ttl = 300
     return BreakGlassAccessService(
         get_console_session_factory(),
         signed_url_provider=signer,
         storage_provider=storage,
-        signed_url_ttl_seconds=settings.media_signed_url_ttl_seconds or 300,
+        signed_url_ttl_seconds=ttl,
         signed_url_max_ttl_seconds=settings.media_signed_url_max_ttl_seconds,
     )
 

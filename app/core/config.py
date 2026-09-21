@@ -52,13 +52,18 @@ class Settings(BaseSettings):
     media_max_image_bytes: int = 10 * 1024 * 1024
     media_max_audio_bytes: int = 20 * 1024 * 1024
     media_processing_timeout_seconds: float = 20.0
-    media_storage_provider: Literal["unconfigured", "local", "fake", "production"] = (
-        "unconfigured"
-    )
+    media_storage_provider: Literal["unconfigured", "local", "fake", "production"] = "unconfigured"
     media_storage_endpoint: str | None = None
     media_storage_bucket: str | None = None
     media_storage_access_key: str | None = None
     media_storage_secret_key: str | None = None
+    # 生产 Adapter 可按 capability 注入独立凭据；空值不自动继承全权限账号。
+    media_storage_ingest_access_key: str | None = None
+    media_storage_ingest_secret_key: str | None = None
+    media_storage_cleanup_access_key: str | None = None
+    media_storage_cleanup_secret_key: str | None = None
+    media_storage_signer_access_key: str | None = None
+    media_storage_signer_secret_key: str | None = None
     media_storage_private: bool = False
     media_storage_tls: bool = False
     media_storage_encryption: bool = False
@@ -67,9 +72,7 @@ class Settings(BaseSettings):
     media_storage_delete: bool = False
     media_signed_url_ttl_seconds: int | None = None
     media_signed_url_max_ttl_seconds: int = 900
-    media_scanner_provider: Literal["unconfigured", "noop", "fake", "production"] = (
-        "unconfigured"
-    )
+    media_scanner_provider: Literal["unconfigured", "noop", "fake", "production"] = "unconfigured"
     media_retention_policy_version: str | None = None
     media_retention_days: int | None = None
     message_payload_retention_days: int | None = None
@@ -106,6 +109,12 @@ class Settings(BaseSettings):
         "media_storage_bucket",
         "media_storage_access_key",
         "media_storage_secret_key",
+        "media_storage_ingest_access_key",
+        "media_storage_ingest_secret_key",
+        "media_storage_cleanup_access_key",
+        "media_storage_cleanup_secret_key",
+        "media_storage_signer_access_key",
+        "media_storage_signer_secret_key",
         "media_signed_url_ttl_seconds",
         "media_retention_policy_version",
         "media_retention_days",

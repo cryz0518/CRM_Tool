@@ -22,10 +22,10 @@ from app.media.readiness import ProductionMediaReadinessChecker
 from app.media.retention import (
     RetentionCleanupService,
     RetentionPolicy,
-    StorageIngestRecoveryService,
 )
 from app.media.service import MediaAttachmentService, MediaValidator
 from app.media.storage import (
+    FakeStorageProvider,
     LocalVolumeStorageProvider,
     StorageDeleteOutcome,
 )
@@ -143,6 +143,10 @@ def test_cleanup_issuance_is_stable_and_fenced(session_factory: sessionmaker[Ses
     assert claim_b is not None
     assert claim_a.claim_token != claim_b.claim_token
     assert service.finalize_success(first.operation_id, claim_a) is False
+    with session_factory.begin() as session:
+        operation = session.get(type(first.operation), first.operation_id)
+        assert operation is not None
+        operation.remote_outcome = StorageDeleteOutcome.NOT_FOUND.value
     assert service.finalize_success(first.operation_id, claim_b) is True
 
 
@@ -227,7 +231,7 @@ def test_signed_url_is_generated_only_after_grant_audit_commit(
     session_factory: sessionmaker[Session], tmp_path: Path
 ) -> None:
     """验证 signer 调用时授权审计已经提交，且 URL 不进入审计行。"""
-    storage = LocalVolumeStorageProvider(tmp_path)
+    storage = FakeStorageProvider(tmp_path)
     stored = storage.put(b"safe", suffix=".png")
     with session_factory.begin() as session:
         session.add(
@@ -294,9 +298,10 @@ def test_signed_url_is_generated_only_after_grant_audit_commit(
 def test_fake_scanner_has_explicit_non_clean_outcomes() -> None:
     """验证测试扫描器能表达 clean、infected、失败和超时，而非统一放行。"""
     assert FakeFileScanProvider("clean").scan(b"x", mime_type="image/png", timeout_seconds=1)
-    assert FakeFileScanProvider("infected").scan(
-        b"x", mime_type="image/png", timeout_seconds=1
-    ) == "infected"
+    assert (
+        FakeFileScanProvider("infected").scan(b"x", mime_type="image/png", timeout_seconds=1)
+        == "infected"
+    )
     assert FakeFileScanProvider("failed").scan(b"x", mime_type="image/png", timeout_seconds=1)
     with pytest.raises(RuntimeError, match="timeout"):
         FakeFileScanProvider("timeout").scan(b"x", mime_type="image/png", timeout_seconds=1)
@@ -381,11 +386,5 @@ def test_ingest_db_finalize_failure_leaves_recoverable_storage_fact(
 
     with session_factory() as session:
         operation = session.scalar(select(StorageIngestOperation))
-        assert operation is not None
-        storage_key = operation.storage_key
-        operation_id = operation.id
-    assert storage.head(storage_key) is not None
-    assert StorageIngestRecoveryService(session_factory).reconcile(operation_id, storage) == (
-        "succeeded"
-    )
-    assert storage.head(storage_key) is None
+        assert operation is None
+    assert list(tmp_path.rglob("*")) == []

@@ -34,5 +34,9 @@ celery_app.conf.update(
             "task": "workers.issue_retention_cleanup_operations",
             "schedule": settings.lead_outbox_poll_seconds,
         },
+        "reconcile-storage-ingest-operations": {
+            "task": "workers.reconcile_storage_ingest_operations",
+            "schedule": settings.lead_outbox_poll_seconds,
+        },
     },
 )

@@ -17,6 +17,7 @@ from app.media.providers import (
     QwenOCRProvider,
     UnconfiguredFileScanProvider,
 )
+from app.media.retention import RetentionPolicy
 from app.media.service import MediaAttachmentService, MediaValidator
 from app.media.storage import (
     FakeStorageProvider,
@@ -29,6 +30,11 @@ from app.media.storage import (
 def get_media_storage_provider(settings: Settings | None = None) -> StorageProvider:
     """按显式配置返回 local/fake provider，生产未安装 vendor Adapter 时 fail closed。"""
     selected = settings or get_settings()
+    if (
+        selected.app_env in {"production", "prod"}
+        and selected.media_storage_provider != "production"
+    ):
+        raise RuntimeError("生产环境禁止使用 local/fake/unconfigured 媒体存储 provider")
     if selected.media_storage_provider == "local":
         return LocalVolumeStorageProvider(Path(selected.media_storage_path))
     if selected.media_storage_provider == "fake":
@@ -41,10 +47,7 @@ def get_media_storage_signer(
 ) -> SignedURLProvider | None:
     """只返回显式具备签名能力的开发/fake provider，不伪造生产签名 Adapter。"""
     selected = settings or get_settings()
-    try:
-        provider = get_media_storage_provider(selected)
-    except RuntimeError:
-        return None
+    provider = get_media_storage_provider(selected)
     if not provider.capabilities.signed_url or not hasattr(provider, "create_signed_url"):
         return None
     return provider  # type: ignore[return-value]
@@ -72,6 +75,9 @@ def get_media_attachment_service(
 ) -> MediaAttachmentService:
     """依据显式 provider 配置组装媒体服务，禁止生产静默回退到本地 Volume。"""
     settings = get_settings()
+    retention_policy = None
+    if settings.app_env in {"production", "prod"}:
+        retention_policy = RetentionPolicy.from_settings(settings)
     api_key = settings.qwen_api_key or ""
     ocr = (
         MockOCRProvider([])
@@ -100,4 +106,5 @@ def get_media_attachment_service(
         ocr,
         asr,
         timeout_seconds=settings.media_processing_timeout_seconds,
+        retention_policy=retention_policy,
     )

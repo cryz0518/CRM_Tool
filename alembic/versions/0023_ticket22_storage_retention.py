@@ -28,6 +28,7 @@ def upgrade() -> None:
         sa.Column("deleted_at", sa.DateTime(timezone=True)),
         sa.Column("deletion_reason", sa.String(length=128)),
         sa.Column("cleanup_operation_id", sa.String(length=36)),
+        sa.Column("ingest_operation_id", sa.String(length=36)),
     ):
         op.add_column("message_attachments", column)
     op.create_index(
@@ -39,6 +40,17 @@ def upgrade() -> None:
         "ix_message_attachments_cleanup_operation_id",
         "message_attachments",
         ["cleanup_operation_id"],
+    )
+    op.create_index(
+        "ix_message_attachments_ingest_operation_id",
+        "message_attachments",
+        ["ingest_operation_id"],
+    )
+    op.add_column("incoming_messages", sa.Column("scrubbed_at", sa.DateTime(timezone=True)))
+    op.add_column("incoming_messages", sa.Column("retention_policy_version", sa.String(length=64)))
+    op.add_column("notification_records", sa.Column("scrubbed_at", sa.DateTime(timezone=True)))
+    op.add_column(
+        "notification_records", sa.Column("retention_policy_version", sa.String(length=64))
     )
     op.create_check_constraint(
         "ck_message_attachments_scan_status",
@@ -68,14 +80,31 @@ def upgrade() -> None:
         sa.Column("storage_provider", sa.String(length=32), nullable=False),
         sa.Column("storage_key", sa.String(length=256)),
         sa.Column("storage_key_digest", sa.String(length=64), nullable=False),
+        sa.Column("content_sha256", sa.String(length=64)),
+        sa.Column("content_type", sa.String(length=128)),
+        sa.Column("expected_size_bytes", sa.Integer()),
         sa.Column("status", sa.String(length=32), nullable=False),
+        sa.Column("remote_outcome", sa.String(length=32)),
+        sa.Column("remote_started_at", sa.DateTime(timezone=True)),
+        sa.Column("claim_token", sa.String(length=64)),
+        sa.Column("generation", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("attempt_count", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("processing_started_at", sa.DateTime(timezone=True)),
+        sa.Column("lease_expires_at", sa.DateTime(timezone=True)),
         sa.Column("failure_summary", sa.String(length=128)),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("completed_at", sa.DateTime(timezone=True)),
         sa.UniqueConstraint("operation_key"),
         sa.CheckConstraint(
-            "status IN ('reconcile_required', 'succeeded', 'failed_pending_review')",
+            "status IN ('pending', 'processing', 'retrying', 'reconcile_required', "
+            "'succeeded', 'failed_pending_review')",
             name="ck_storage_ingest_operation_status",
+        ),
+        sa.CheckConstraint(
+            "remote_outcome IS NULL OR remote_outcome IN "
+            "('not_started', 'put_succeeded', 'exists', 'not_found', 'unknown')",
+            name="ck_storage_ingest_remote_outcome",
         ),
     )
     op.create_index(
@@ -106,6 +135,7 @@ def upgrade() -> None:
         sa.Column("processing_started_at", sa.DateTime(timezone=True)),
         sa.Column("lease_expires_at", sa.DateTime(timezone=True)),
         sa.Column("remote_outcome", sa.String(length=32)),
+        sa.Column("remote_started_at", sa.DateTime(timezone=True)),
         sa.Column("attempt_count", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("failure_kind", sa.String(length=64)),
         sa.Column("failure_summary", sa.String(length=256)),
@@ -137,28 +167,60 @@ def downgrade() -> None:
     for table_name in ("storage_cleanup_operations", "storage_ingest_operations"):
         if connection.execute(sa.text(f"SELECT 1 FROM {table_name} LIMIT 1")).first() is not None:
             raise RuntimeError("存在 T22 storage recovery 事实，禁止回退迁移")
-    if connection.execute(
-        sa.text(
-            "SELECT 1 FROM message_attachments "
-            "WHERE deletion_status <> 'active' OR cleanup_operation_id IS NOT NULL LIMIT 1"
-        )
-    ).first() is not None:
+    if (
+        connection.execute(
+            sa.text(
+                "SELECT 1 FROM message_attachments "
+                "WHERE deletion_status <> 'active' OR cleanup_operation_id IS NOT NULL LIMIT 1"
+            )
+        ).first()
+        is not None
+    ):
         raise RuntimeError("存在 T22 media tombstone 事实，禁止回退迁移")
-    if connection.execute(
-        sa.text(
-            "SELECT 1 FROM break_glass_access_audits "
-            "WHERE signed_url_ttl_seconds IS NOT NULL LIMIT 1"
-        )
-    ).first() is not None:
+    if (
+        connection.execute(
+            sa.text(
+                "SELECT 1 FROM break_glass_access_audits "
+                "WHERE signed_url_ttl_seconds IS NOT NULL LIMIT 1"
+            )
+        ).first()
+        is not None
+    ):
         raise RuntimeError("存在 T22 signed URL 审计事实，禁止回退迁移")
+    irreversible_checks = (
+        (
+            "incoming_messages",
+            "scrubbed_at IS NOT NULL OR retention_policy_version IS NOT NULL",
+        ),
+        (
+            "notification_records",
+            "scrubbed_at IS NOT NULL OR retention_policy_version IS NOT NULL",
+        ),
+        (
+            "message_attachments",
+            "retention_expires_at IS NOT NULL OR retention_policy_version IS NOT NULL "
+            "OR storage_provider IS NOT NULL OR storage_encryption_mode IS NOT NULL "
+            "OR storage_etag IS NOT NULL OR scan_status NOT IN ('pending', 'pending_scan')",
+        ),
+        (
+            "break_glass_access_audits",
+            "signed_url_expires_at IS NOT NULL",
+        ),
+    )
+    for table_name, predicate in irreversible_checks:
+        if (
+            connection.execute(
+                sa.text(f"SELECT 1 FROM {table_name} WHERE {predicate} LIMIT 1")
+            ).first()
+            is not None
+        ):
+            raise RuntimeError("存在 T22 不可逆事实，禁止回退迁移")
 
     op.drop_index(
         "ix_storage_cleanup_operations_target_id", table_name="storage_cleanup_operations"
     )
     op.drop_table("storage_cleanup_operations")
-    op.drop_index(
-        "ix_storage_ingest_operations_message_id", table_name="storage_ingest_operations"
-    )
+    op.drop_index("ix_storage_ingest_operations_message_id", table_name="storage_ingest_operations")
     op.drop_index(
         "ix_storage_ingest_operations_attachment_id", table_name="storage_ingest_operations"
     )
@@ -166,18 +228,14 @@ def downgrade() -> None:
     op.drop_constraint(
         "ck_message_attachments_deletion_status", "message_attachments", type_="check"
     )
-    op.drop_constraint(
-        "ck_message_attachments_scan_status", "message_attachments", type_="check"
-    )
+    op.drop_constraint("ck_message_attachments_scan_status", "message_attachments", type_="check")
     op.drop_column("break_glass_access_audits", "signed_url_expires_at")
     op.drop_column("break_glass_access_audits", "signed_url_ttl_seconds")
-    op.drop_index(
-        "ix_message_attachments_cleanup_operation_id", table_name="message_attachments"
-    )
-    op.drop_index(
-        "ix_message_attachments_retention_expires_at", table_name="message_attachments"
-    )
+    op.drop_index("ix_message_attachments_cleanup_operation_id", table_name="message_attachments")
+    op.drop_index("ix_message_attachments_ingest_operation_id", table_name="message_attachments")
+    op.drop_index("ix_message_attachments_retention_expires_at", table_name="message_attachments")
     for column_name in (
+        "ingest_operation_id",
         "cleanup_operation_id",
         "deletion_reason",
         "deleted_at",
@@ -192,3 +250,7 @@ def downgrade() -> None:
         "storage_provider",
     ):
         op.drop_column("message_attachments", column_name)
+    op.drop_column("notification_records", "retention_policy_version")
+    op.drop_column("notification_records", "scrubbed_at")
+    op.drop_column("incoming_messages", "retention_policy_version")
+    op.drop_column("incoming_messages", "scrubbed_at")
