@@ -23,7 +23,6 @@ from app.console.auth import (
     LocalCapabilityAuthorizer,
 )
 from app.console.break_glass import (
-    BreakGlassAccessError,
     BreakGlassAccessRequest,
     BreakGlassAccessService,
 )
@@ -96,14 +95,23 @@ def test_authenticated_principal_normalizes_claims_and_groups_without_credential
         frozenset({"administrator"}),
         "Development",
         authenticated_at=datetime.now(UTC),
-        claims={" Groups ": "administrator"},
+        claims={
+            " Groups ": "administrator",
+            "access_token": "token-value",
+            "jwt": "header.payload.signature",
+            "authorization": "Bearer token-value",
+            "role": "admin",
+        },
         groups=frozenset({" administrator ", "operations_admin"}),
     )
 
     assert principal.subject == "admin-1"
     assert principal.provider == "development"
     assert principal.groups == frozenset({"administrator", "operations_admin"})
-    assert principal.claims == {"groups": "administrator"}
+    assert principal.claims == {"groups": "administrator", "role": "admin"}
+    assert "access_token" not in principal.claims
+    assert "jwt" not in principal.claims
+    assert "authorization" not in principal.claims
     assert not hasattr(principal, "token")
     assert not hasattr(principal, "secret")
 
@@ -242,23 +250,21 @@ def test_break_glass_body_cannot_override_verified_actor_or_role() -> None:
 def test_break_glass_service_rejects_arbitrary_principal(
     authorization_session_factory: sessionmaker[Session],
 ) -> None:
-    """验证 Break-glass service 不能仅凭调用方手工构造的管理员主体放行。"""
-    service = BreakGlassAccessService(authorization_session_factory)
-    request = BreakGlassAccessRequest(
-        principal=AdminPrincipal(
-            "forged-admin",
-            frozenset({"administrator"}),
-            "external-test",
-        ),
-        object_type="message",
-        object_id="message-1",
-        access_type="view_raw_message",
-        reason="安全排查",
-        request_id="request-forged",
-    )
-
-    with pytest.raises(BreakGlassAccessError, match="本地授权"):
-        service.access(request)
+    """验证 Break-glass request 不再接受调用方手工构造的管理员主体。"""
+    del authorization_session_factory
+    with pytest.raises(TypeError):
+        BreakGlassAccessRequest(
+            principal=AdminPrincipal(
+                "forged-admin",
+                frozenset({"administrator"}),
+                "external-test",
+            ),
+            object_type="message",
+            object_id="message-1",
+            access_type="view_raw_message",
+            reason="安全排查",
+            request_id="request-forged",
+        )  # type: ignore[call-arg]
 
 
 def test_capability_decision_uses_verified_role_not_set_sorting() -> None:
@@ -314,6 +320,17 @@ def test_unsupported_provider_and_missing_production_credential_are_not_ready() 
     assert result.reason_code == "provider_configuration_missing"
 
 
+@pytest.mark.parametrize("app_env", [" production ", "PRODUCTION"])
+def test_provider_credential_check_uses_normalized_environment(app_env: str) -> None:
+    """验证环境空白和大小写不会绕过生产 credential 检查。"""
+    settings = Settings(_env_file=None, app_env=app_env, llm_provider="qwen")
+
+    result = ProviderPolicy(settings.app_env).evaluate("llm", "qwen", settings=settings)
+
+    assert result.status == "not_ready"
+    assert result.reason_code == "provider_configuration_missing"
+
+
 def test_production_ai_and_media_factories_fail_closed_without_credential(
     authorization_session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
@@ -358,6 +375,30 @@ def test_readiness_reports_stable_reason_code_without_exception_details() -> Non
     }
     assert "token" not in str(payload).lower()
     assert "secret" not in str(payload).lower()
+
+
+def test_verified_context_requires_authorizer_seal_and_service_rejects_authorizer_injection(
+) -> None:
+    """验证 Break-glass 上下文不能由调用方伪造，服务也不接受任意授权器。"""
+    from app.console.auth import VerifiedAuthorizationContext
+
+    with pytest.raises(TypeError):
+        VerifiedAuthorizationContext(
+            "admin-1",
+            ConsoleCapability.BREAK_GLASS_RAW_MESSAGE,
+            "forged",
+            "external-test",
+            "administrator",
+            _seal=object(),
+        )
+
+    with pytest.raises(TypeError):
+        BreakGlassAccessService(
+            object(),  # type: ignore[arg-type]
+            capability_authorizer=DevelopmentAdminIdentityProvider(
+                token=None, subject="admin-1", roles=frozenset({"administrator"})
+            ),
+        )
 
 
 def test_worker_scheduler_heartbeat_requires_fresh_ttl_and_instance() -> None:

@@ -14,7 +14,12 @@ from app.ai.gateway import AIGateway
 from app.ai.models import LLMResponse
 from app.ai.persistence import AIExecutionRecorderEvent, DatabaseAIExecutionRecorder
 from app.ai.provider import MockLLMProvider
-from app.console.auth import AdminPrincipal, DevelopmentAdminIdentityProvider
+from app.console.auth import (
+    AdminPrincipal,
+    ConsoleCapability,
+    DevelopmentAdminIdentityProvider,
+    LocalCapabilityAuthorizer,
+)
 from app.console.break_glass import (
     BreakGlassAccessError,
     BreakGlassAccessRequest,
@@ -96,8 +101,13 @@ def test_break_glass_requires_reason_audits_before_returning_raw_message(
         )
 
     service = BreakGlassAccessService(session_factory)
+    context = LocalCapabilityAuthorizer(session_factory).verified_context(
+        AdminPrincipal("admin-1", frozenset({"administrator"}), "test"),
+        ConsoleCapability.BREAK_GLASS_RAW_MESSAGE,
+    )
+    assert context is not None
     request = BreakGlassAccessRequest(
-        principal=AdminPrincipal("admin-1", frozenset({"administrator"}), "test"),
+        authorization_context=context,
         object_type="message",
         object_id="message-1",
         access_type="view_raw_message",
@@ -122,7 +132,7 @@ def test_break_glass_requires_reason_audits_before_returning_raw_message(
     with pytest.raises(BreakGlassAccessError, match="必须填写原因"):
         service.access(
             request.__class__(
-                principal=request.principal,
+                authorization_context=request.authorization_context,
                 object_type=request.object_type,
                 object_id=request.object_id,
                 access_type=request.access_type,
@@ -142,14 +152,17 @@ def test_break_glass_audit_failure_blocks_raw_access() -> None:
             """让审计事务在任何读取前失败。"""
             raise RuntimeError("audit database unavailable")
 
-    service = BreakGlassAccessService(
-        FailingSessionFactory(),
-        capability_authorizer=DevelopmentAdminIdentityProvider(
-            token=None, subject="admin-1", roles=frozenset({"administrator"})
-        ),
-    )  # type: ignore[arg-type]
+    provider = DevelopmentAdminIdentityProvider(
+        token=None, subject="admin-1", roles=frozenset({"administrator"})
+    )
+    context = provider.verified_context(
+        AdminPrincipal("admin-1", frozenset({"administrator"}), "test"),
+        ConsoleCapability.BREAK_GLASS_RAW_MESSAGE,
+    )
+    assert context is not None
+    service = BreakGlassAccessService(FailingSessionFactory())  # type: ignore[arg-type]
     request = BreakGlassAccessRequest(
-        principal=AdminPrincipal("admin-1", frozenset({"administrator"}), "test"),
+        authorization_context=context,
         object_type="message",
         object_id="message-1",
         access_type="view_raw_message",
@@ -241,9 +254,14 @@ def test_break_glass_attachment_returns_signed_url_without_bytes(
     service = BreakGlassAccessService(
         session_factory, signed_url_provider=provider, storage_provider=storage
     )
+    context = LocalCapabilityAuthorizer(session_factory).verified_context(
+        AdminPrincipal("admin-1", frozenset({"administrator"}), "test"),
+        ConsoleCapability.BREAK_GLASS_PREVIEW_ATTACHMENT,
+    )
+    assert context is not None
     result = service.access(
         BreakGlassAccessRequest(
-            principal=AdminPrincipal("admin-1", frozenset({"administrator"}), "test"),
+            authorization_context=context,
             object_type="attachment",
             object_id="attachment-1",
             access_type="preview_attachment",

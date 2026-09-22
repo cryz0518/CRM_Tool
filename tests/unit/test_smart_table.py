@@ -116,6 +116,45 @@ def test_readiness_rejects_an_adapter_that_has_not_been_configured() -> None:
     assert report.issues == ("智能表格适配器未配置：需要部署真实 CLI/API 适配器或显式启用 Mock",)
 
 
+class ExplodingSmartTableAdapter:
+    """模拟携带敏感外部响应的智能表格异常。"""
+
+    def get_schema(self) -> SmartTableSchema:
+        """抛出包含敏感字样的异常，验证 readiness 脱敏边界。"""
+        raise RuntimeError("provider token=secret endpoint=https://vendor.invalid")
+
+    def get_permissions(self) -> object:
+        """该方法不会被执行，仅满足最小适配器形状。"""
+        raise AssertionError("get_permissions 不应在 schema 异常后执行")
+
+
+def test_readiness_adapter_exception_is_safe_and_machine_readable() -> None:
+    """验证 Smart Table 异常返回稳定 reason_code，不泄露 traceback 或异常正文。"""
+    from app.main import app
+
+    app.dependency_overrides[get_smart_table_adapter] = ExplodingSmartTableAdapter
+    try:
+        async def request_readiness() -> httpx.Response:
+            """通过 ASGI 调用 readiness 接口。"""
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                return await client.get("/health/ready")
+
+        response = asyncio.run(request_readiness())
+    finally:
+        app.dependency_overrides.clear()
+
+    payload = response.json()
+    assert response.status_code == 503
+    assert {
+        "component": "smart_table",
+        "status": "not_ready",
+        "reason_code": "smart_table_configuration_invalid",
+    } in payload["components"]
+    assert "secret" not in str(payload).lower()
+    assert "traceback" not in str(payload).lower()
+
+
 def test_readiness_rejects_plain_text_for_the_email_field() -> None:
     """验证管理员将邮箱配置为普通文本时，readiness 明确拒绝该核心字段类型。"""
     # 仅篡改邮箱字段类型，其余管理员预配置保持完整，以隔离这一项配置错误。

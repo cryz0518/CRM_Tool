@@ -112,7 +112,6 @@ def get_break_glass_access_service() -> BreakGlassAccessService:
         ttl = 300
     return BreakGlassAccessService(
         get_console_session_factory(),
-        capability_authorizer=get_capability_authorizer(),
         signed_url_provider=signer,
         storage_provider=storage,
         signed_url_ttl_seconds=ttl,

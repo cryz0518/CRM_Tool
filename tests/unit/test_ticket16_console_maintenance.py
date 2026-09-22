@@ -30,6 +30,7 @@ class StubMaintenanceService:
         """初始化调用记录。"""
 
         self.calls: list[tuple[str, str]] = []
+        self.request_ids: list[str] = []
 
     def require_admin(self, principal: object) -> None:
         """接受已经由测试 provider 认证的管理员主体。"""
@@ -57,6 +58,7 @@ class StubMaintenanceService:
 
         del principal
         self.calls.append(("discard", str(kwargs["lead_id"])))
+        self.request_ids.append(str(kwargs["request_id"]))
         return ConsoleMaintenanceResult(None, "discarded", lead_id=str(kwargs["lead_id"]))
 
     def create_lead(self, principal: object, **kwargs: object) -> ConsoleMaintenanceResult:
@@ -185,16 +187,39 @@ def test_recovery_routes_delegate_to_facade(overrides: StubMaintenanceService) -
     ]
 
 
-def test_request_id_rejects_control_or_unbounded_input() -> None:
-    """验证 request id 不允许日志注入和超长持久化。"""
+def test_request_id_is_normalized_by_middleware_for_all_maintenance_requests(
+    overrides: StubMaintenanceService,
+) -> None:
+    """验证非法、超长、缺失和合法 request id 均只使用 middleware 结果。"""
+
+    for value in ("bad\nrequest", "x" * 129):
+        response = request(
+            "POST",
+            "/api/console/maintenance/leads/lead-1/discard",
+            headers={"X-Console-Admin-Token": "admin-token", "X-Request-ID": value},
+            json={"reason": "清理测试线索"},
+        )
+        assert response.status_code == 200
+        assert response.headers["X-Request-ID"] != value
+        assert len(overrides.request_ids[-1]) == 36
 
     response = request(
         "POST",
         "/api/console/maintenance/leads/lead-1/discard",
-        headers={"X-Console-Admin-Token": "admin-token", "X-Request-ID": "bad\nrequest"},
+        headers={"X-Console-Admin-Token": "admin-token", "X-Request-ID": "request-valid"},
         json={"reason": "清理测试线索"},
     )
-    assert response.status_code == 400
+    assert response.status_code == 200
+    assert overrides.request_ids[-1] == "request-valid"
+
+    response = request(
+        "POST",
+        "/api/console/maintenance/leads/lead-1/discard",
+        headers={"X-Console-Admin-Token": "admin-token"},
+        json={"reason": "清理测试线索"},
+    )
+    assert response.status_code == 200
+    assert len(overrides.request_ids[-1]) == 36
 
 
 def test_audit_reason_masks_sensitive_contact_and_credentials() -> None:

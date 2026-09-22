@@ -13,9 +13,9 @@ from app.console.auth import (
     AdminPrincipal,
     AuthenticatedPrincipal,
     AuthenticationProvider,
-    AuthorizationDecision,
     CapabilityAuthorizer,
     ConsoleCapability,
+    VerifiedAuthorizationContext,
 )
 from app.console.break_glass import (
     BreakGlassAccessError,
@@ -204,23 +204,14 @@ def _require_console_maintenance_admin(
 
 
 def _request_id(request: Request) -> str:
-    """保留 T16 maintenance 的严格 request id 输入契约。
+    """只使用 middleware 规范化后的服务端 request id。
 
     参数：request 为当前 HTTP 请求。
-    返回值：合法的管理请求幂等标识；未提供时使用中间件服务端标识。
-    异常：非法客户端值抛出 HTTP 400，保持 T16 maintenance 兼容性。
-    副作用：无；Break-glass 路由使用中间件规范化值，不调用本函数。
+    返回值：middleware 生成或接受的规范化管理请求幂等标识。
+    异常：无；非法、超长或缺失 header 均由 middleware 降级为服务端 UUID。
+    副作用：无；不读取原始 X-Request-ID header。
     """
-    request_id = request.headers.get("X-Request-ID")
-    normalized = request_id.strip() if request_id else ""
-    if not normalized:
-        return normalize_request_id(getattr(request.state, "request_id", None))
-    if len(normalized) > 128 or any(
-        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
-        for character in normalized
-    ):
-        raise HTTPException(status_code=400, detail="X-Request-ID 格式非法")
-    return normalized
+    return normalize_request_id(getattr(request.state, "request_id", None))
 
 
 def _maintenance_dto(result: ConsoleMaintenanceResult) -> ConsoleMaintenanceResultDTO:
@@ -252,11 +243,11 @@ def _require_break_glass_capability(
     authorizer: CapabilityAuthorizer,
     principal: AdminPrincipal,
     access_type: str,
-) -> AuthorizationDecision:
+) -> VerifiedAuthorizationContext:
     """将访问类型映射到最小 Break-glass 能力并返回已验证授权依据。
 
     参数：provider 为认证后的授权 Provider；principal 为已验证主体；access_type 为请求访问类型。
-    返回值：允许时返回带 capability、角色和依据的授权判定。
+    返回值：允许时返回由授权器封装的不可变已验证授权上下文。
     异常：能力未知、Provider 无法提供可审计判定或无权时抛出 HTTP 403。
     副作用：无；不会读取请求体中的 operator 或 role。
     """
@@ -267,10 +258,14 @@ def _require_break_glass_capability(
         "download_attachment": ConsoleCapability.BREAK_GLASS_DOWNLOAD_ATTACHMENT,
     }
     capability = capability_map.get(access_type)
-    decision = authorizer.decide(principal, capability) if capability is not None else None
-    if decision is None or not decision.allowed or not decision.role:
+    context = (
+        authorizer.verified_context(principal, capability)
+        if capability is not None
+        else None
+    )
+    if context is None:
         raise HTTPException(status_code=403, detail="没有 Break-glass 访问权限")
-    return decision
+    return context
 
 
 @console_api.get("/overview", response_model=ConsoleOverviewDTO)
@@ -670,9 +665,11 @@ def break_glass_access(
     service: Annotated[BreakGlassAccessService, Depends(get_break_glass_access_service)],
 ) -> JSONResponse:
     """执行单对象 Break-glass 访问，审计失败时拒绝返回原始数据。"""
-    _require_break_glass_capability(authorizer, principal, body.access_type)
+    authorization_context = _require_break_glass_capability(
+        authorizer, principal, body.access_type
+    )
     access_request = BreakGlassAccessRequest(
-        principal=principal,
+        authorization_context=authorization_context,
         object_type=body.object_type,
         object_id=body.object_id,
         access_type=body.access_type,

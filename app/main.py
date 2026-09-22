@@ -178,16 +178,29 @@ def _smart_table_component(
 
     参数：adapter 为 FastAPI 依赖注入的稳定 Smart Table Adapter。
     返回值：统一组件结果及兼容旧接口的中文问题列表。
-    异常：适配器错误由既有 checker 转换或向上抛出。
+    异常：适配器错误由统一 ReadinessRegistry 转换为稳定原因码。
     副作用：只读取智能表格 schema 和权限。
     """
-    report = SmartTableReadinessChecker().check(adapter)
-    if report.ready:
-        return ready_component("smart_table", "schema_and_permissions_ok"), report.issues
-    reason = "smart_table_provider_missing" if any(
-        "适配器未配置" in issue for issue in report.issues
-    ) else "smart_table_configuration_invalid"
-    return not_ready_component("smart_table", reason), report.issues
+    detail_issues: tuple[str, ...] = ()
+
+    def check() -> ReadinessComponent:
+        """执行智能表格只读检查并转换为组件状态。"""
+        nonlocal detail_issues
+        report = SmartTableReadinessChecker().check(adapter)
+        detail_issues = report.issues
+        if report.ready:
+            return ready_component("smart_table", "schema_and_permissions_ok")
+        reason = "smart_table_provider_missing" if any(
+            "适配器未配置" in issue for issue in report.issues
+        ) else "smart_table_configuration_invalid"
+        return not_ready_component("smart_table", reason)
+
+    registry = ReadinessRegistry({"smart_table": check})
+    report = registry.check()
+    component = report.components[0]
+    if component.reason_code == "dependency_unavailable":
+        detail_issues = ("智能表格依赖不可用",)
+    return component, detail_issues
 
 
 @app.get("/health/ready")

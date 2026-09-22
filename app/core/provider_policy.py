@@ -167,9 +167,8 @@ class ProviderPolicy:
             for component, provider in selections
         )
 
-    @staticmethod
     def _missing_configuration(
-        settings: Settings | None, component: str, provider: str
+        self, settings: Settings | None, component: str, provider: str
     ) -> tuple[str, ...]:
         """返回当前 Provider 缺失的必要配置字段名。
 
@@ -184,7 +183,7 @@ class ProviderPolicy:
         if component in {"llm", "ocr", "asr"} and provider == "qwen":
             required = (
                 ("qwen_api_key",)
-                if settings.app_env.lower() in PRODUCTION_ENVIRONMENTS
+                if self.is_production
                 else ()
             )
         elif component == "smart_table" and provider == "wecom_cli":

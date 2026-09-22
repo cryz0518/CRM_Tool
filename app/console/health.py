@@ -101,8 +101,12 @@ class DefaultConsoleHealthProvider:
                 detail="；".join(report.issues) if report.issues else None,
                 checked_at=checked_at,
             )
-        except Exception:
-            logger.exception("console_smart_table_health_failed")
+        except Exception as error:
+            # 只记录异常类型，避免健康状态日志携带 traceback 或外部响应正文。
+            logger.error(
+                "console_smart_table_health_failed",
+                extra={"error_type": type(error).__name__},
+            )
             return ConsoleHealthStatusDTO(
                 name="smart_table", status="error", detail="智能表格探针失败", checked_at=checked_at
             )

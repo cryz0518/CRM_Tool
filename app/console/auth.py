@@ -17,6 +17,36 @@ from app.messaging.models import SalesAuthorization
 
 logger = logging.getLogger(__name__)
 
+_SENSITIVE_CLAIM_MARKERS = (
+    "token",
+    "secret",
+    "credential",
+    "authorization",
+    "password",
+    "cookie",
+    "jwt",
+)
+
+
+def _normalize_safe_claims(claims: Mapping[str, str]) -> dict[str, str]:
+    """规范化并过滤 Provider 声明，只保留非敏感身份元数据。
+
+    参数：claims 为认证 Provider 提供的声明映射。
+    返回值：不含 token、secret、credential、授权头或 raw JWT 的声明字典。
+    异常：无；无法信任的声明键和值会被丢弃。
+    副作用：不保存原始 Provider payload，也不修改调用方输入。
+    """
+    safe_claims: dict[str, str] = {}
+    for key, value in claims.items():
+        normalized_key = str(key).strip().lower().replace("-", "_")
+        normalized_value = str(value).strip()
+        if not normalized_key or not normalized_value:
+            continue
+        if any(marker in normalized_key for marker in _SENSITIVE_CLAIM_MARKERS):
+            continue
+        safe_claims[normalized_key] = normalized_value
+    return safe_claims
+
 
 class ConsoleCapability(StrEnum):
     """定义 Console 可授予的最小能力集合。"""
@@ -60,11 +90,7 @@ class AuthenticatedPrincipal:
         provider = self.provider.strip().lower()
         if not subject or not provider:
             raise ValueError("authenticated principal 必须包含 subject 和 provider")
-        normalized_claims = {
-            str(key).strip().lower(): str(value).strip()
-            for key, value in self.claims.items()
-            if str(key).strip() and str(value).strip()
-        }
+        normalized_claims = _normalize_safe_claims(self.claims)
         normalized_groups = frozenset(
             group.strip() for group in self.groups if group.strip()
         )
@@ -82,6 +108,63 @@ class AuthorizationDecision:
     capability: ConsoleCapability
     basis: str
     role: str | None = None
+
+
+_VERIFIED_CONTEXT_SEAL = object()
+
+
+@dataclass(frozen=True, init=False)
+class VerifiedAuthorizationContext:
+    """承载本地授权完成后的不可变 Break-glass 授权事实。
+
+    参数：仅由 CapabilityAuthorizer 的已验证实现通过内部 seal 创建。
+    返回值：包含 subject、provider、capability、授权依据和稳定角色的上下文。
+    异常：外部尝试直接构造上下文时抛出 TypeError。
+    副作用：无；不保存原始凭据或 Provider payload。
+    """
+
+    verified_subject: str
+    capability: ConsoleCapability
+    authorization_basis: str
+    provider: str
+    role: str | None
+
+    def __init__(
+        self,
+        verified_subject: str,
+        capability: ConsoleCapability,
+        authorization_basis: str,
+        provider: str,
+        role: str | None,
+        *,
+        _seal: object,
+    ) -> None:
+        """仅允许授权器内部 seal 创建已验证上下文。"""
+        if _seal is not _VERIFIED_CONTEXT_SEAL:
+            raise TypeError("VerifiedAuthorizationContext 只能由授权器创建")
+        if not verified_subject.strip() or not provider.strip() or not authorization_basis.strip():
+            raise ValueError("已验证授权上下文缺少稳定授权事实")
+        object.__setattr__(self, "verified_subject", verified_subject.strip())
+        object.__setattr__(self, "capability", capability)
+        object.__setattr__(self, "authorization_basis", authorization_basis.strip())
+        object.__setattr__(self, "provider", provider.strip().lower())
+        object.__setattr__(self, "role", role.strip() if role and role.strip() else None)
+
+    @classmethod
+    def _from_decision(
+        cls, principal: AuthenticatedPrincipal, decision: AuthorizationDecision
+    ) -> VerifiedAuthorizationContext | None:
+        """把已允许的授权判定封装为服务边界上下文。"""
+        if not decision.allowed or not decision.role:
+            return None
+        return cls(
+            principal.subject,
+            decision.capability,
+            decision.basis,
+            principal.provider,
+            decision.role,
+            _seal=_VERIFIED_CONTEXT_SEAL,
+        )
 
 
 def _principal_roles(principal: AuthenticatedPrincipal) -> frozenset[str]:
@@ -134,11 +217,7 @@ class AdminPrincipal(AuthenticatedPrincipal):
         roles = frozenset(role.strip() for role in roles if role.strip())
         if not subject or not auth_source:
             raise ValueError("AdminPrincipal 必须包含 subject 和 auth_source")
-        claims = {
-            str(key).strip().lower(): str(value).strip()
-            for key, value in (claims or {}).items()
-            if str(key).strip() and str(value).strip()
-        }
+        claims = _normalize_safe_claims(claims or {})
         groups = frozenset(
             group.strip() for group in ((groups or frozenset()) | roles) if group.strip()
         )
@@ -184,6 +263,11 @@ class CapabilityAuthorizer(Protocol):
         self, principal: AuthenticatedPrincipal, capability: ConsoleCapability
     ) -> AuthorizationDecision:
         """返回可写入审计的授权判定及依据。"""
+
+    def verified_context(
+        self, principal: AuthenticatedPrincipal, capability: ConsoleCapability
+    ) -> VerifiedAuthorizationContext | None:
+        """仅在授权成功后生成不可变的已验证授权上下文。"""
 
 
 class AdminIdentityProvider(AuthenticationProvider, CapabilityAuthorizer, Protocol):
@@ -274,6 +358,14 @@ class DevelopmentAdminIdentityProvider:
             role=role,
         )
 
+    def verified_context(
+        self, principal: AuthenticatedPrincipal, capability: ConsoleCapability
+    ) -> VerifiedAuthorizationContext | None:
+        """将开发环境显式角色判定封装为路由适配器所需上下文。"""
+        return VerifiedAuthorizationContext._from_decision(
+            principal, self.decide(principal, capability)
+        )
+
 
 class DenyAllAdminIdentityProvider:
     """生产身份系统尚未接入时使用的安全拒绝实现。"""
@@ -291,6 +383,12 @@ class DenyAllAdminIdentityProvider:
     ) -> AuthorizationDecision:
         """返回生产未接入真实身份 Provider 时的拒绝判定。"""
         return AuthorizationDecision(False, capability, "provider_not_configured")
+
+    def verified_context(
+        self, principal: AuthenticatedPrincipal, capability: ConsoleCapability
+    ) -> VerifiedAuthorizationContext | None:
+        """生产真实身份 Provider 尚未接入时拒绝生成授权上下文。"""
+        return None
 
 
 class LocalCapabilityAuthorizer:
@@ -348,3 +446,11 @@ class LocalCapabilityAuthorizer:
         if not authorization.is_administrator:
             return AuthorizationDecision(False, capability, "local_authorization_not_administrator")
         return AuthorizationDecision(True, capability, "local_sales_authorization", "administrator")
+
+    def verified_context(
+        self, principal: AuthenticatedPrincipal, capability: ConsoleCapability
+    ) -> VerifiedAuthorizationContext | None:
+        """完成本地 SalesAuthorization 校验后生成 Break-glass 授权事实。"""
+        return VerifiedAuthorizationContext._from_decision(
+            principal, self.decide(principal, capability)
+        )
