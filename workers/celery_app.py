@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from celery import Celery
+from celery import Celery, signals
+from redis import Redis
 
 from app.core.config import get_settings
+from app.core.heartbeat import HeartbeatPublisher
 from app.core.logging import configure_logging
 
 settings = get_settings()
@@ -40,3 +42,30 @@ celery_app.conf.update(
         },
     },
 )
+
+
+def _start_runtime_heartbeat(component: str) -> None:
+    """为当前 Celery worker 或 scheduler 启动真实 Redis heartbeat。
+
+    参数：component 为 worker 或 scheduler。
+    返回值：无。
+    异常：Redis 初次写入失败时由启动流程暴露，避免进程假装 ready。
+    副作用：启动 daemon heartbeat 线程并写入带 TTL 的 Redis key。
+    """
+    publisher = HeartbeatPublisher(
+        Redis.from_url(settings.redis_url, socket_connect_timeout=2),
+        component,
+    )
+    publisher.start()
+
+
+@signals.worker_ready.connect  # type: ignore[untyped-decorator]
+def _worker_ready(**_: object) -> None:
+    """在 Celery worker ready 信号后发布 worker heartbeat。"""
+    _start_runtime_heartbeat("worker")
+
+
+@signals.beat_init.connect  # type: ignore[untyped-decorator]
+def _scheduler_ready(**_: object) -> None:
+    """在 Celery beat 初始化后发布 scheduler heartbeat。"""
+    _start_runtime_heartbeat("scheduler")

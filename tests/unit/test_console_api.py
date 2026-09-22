@@ -13,6 +13,7 @@ from app.console.break_glass import BreakGlassAccessResult
 from app.console.dependencies import (
     get_admin_identity_provider,
     get_break_glass_access_service,
+    get_capability_authorizer,
     get_console_query_service,
 )
 from app.console.dto import (
@@ -92,10 +93,14 @@ def console_dependencies() -> Generator[None, None, None]:
         roles=frozenset({"administrator"}),
     )
     app.dependency_overrides[get_admin_identity_provider] = lambda: provider
+    app.dependency_overrides[get_capability_authorizer] = lambda: app.dependency_overrides[
+        get_admin_identity_provider
+    ]()
     app.dependency_overrides[get_console_query_service] = StubConsoleQueryService
     app.dependency_overrides[get_break_glass_access_service] = StubBreakGlassService
     yield
     app.dependency_overrides.pop(get_admin_identity_provider, None)
+    app.dependency_overrides.pop(get_capability_authorizer, None)
     app.dependency_overrides.pop(get_console_query_service, None)
     app.dependency_overrides.pop(get_break_glass_access_service, None)
 

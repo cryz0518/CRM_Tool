@@ -889,7 +889,14 @@ class ConsoleQueryService:
         """只保留 Break-glass 请求上下文中的固定安全字段。"""
         return {
             key: str(context[key])[:128]
-            for key in ("route", "source")
+            for key in (
+                "route",
+                "source",
+                "verified_subject",
+                "provider",
+                "capability",
+                "authorization_basis",
+            )
             if key in context and context[key] is not None
         }
 

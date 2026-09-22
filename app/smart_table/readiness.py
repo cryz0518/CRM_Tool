@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import traceback
 from time import perf_counter
 
 from app.smart_table.adapter import SmartTableAdapter, SmartTableAdapterConfigurationError
@@ -21,7 +20,7 @@ class SmartTableReadinessChecker:
 
         参数：adapter 为业务层注入的稳定智能表格适配器。
         返回：包含是否就绪和全部中文配置问题的报告。
-        异常：仅捕获“未配置适配器”错误；其他意外外部错误继续抛出以供监控。
+        异常：所有适配器异常均转换为稳定 not-ready 报告，不向 API 泄露异常正文。
         副作用：记录结构化的适配器、耗时、结果和问题数量日志。
         """
         adapter_name = type(adapter).__name__
@@ -30,13 +29,14 @@ class SmartTableReadinessChecker:
             # 先读取真实表配置；未配置时必须阻止服务被误判为可接收业务流量。
             schema = adapter.get_schema()
             permissions = adapter.get_permissions()
-        except SmartTableAdapterConfigurationError as error:
-            issue = f"智能表格适配器未配置：{error}"
+        except SmartTableAdapterConfigurationError:
+            # 保留既有中文问题契约，但不插入异常正文，避免携带 endpoint 或 token。
+            issue = "智能表格适配器未配置：需要部署真实 CLI/API 适配器或显式启用 Mock"
             report = SmartTableReadinessReport(ready=False, issues=(issue,))
             self._log_report(adapter_name, started_at, report)
             return report
         except Exception as error:
-            # 只保留不含异常消息的调用栈和异常类型，避免将外部响应 Payload 写入日志。
+            # 只记录异常类型；traceback 和外部响应可能携带 secret/token，禁止进入日志或 API。
             logger.error(
                 "smart_table_readiness_failed",
                 extra={
@@ -44,10 +44,14 @@ class SmartTableReadinessChecker:
                     "readiness_status": "error",
                     "duration_ms": round((perf_counter() - started_at) * 1000, 2),
                     "error_type": type(error).__name__,
-                    "error_traceback": "".join(traceback.format_tb(error.__traceback__)),
                 },
             )
-            raise
+            report = SmartTableReadinessReport(
+                ready=False,
+                issues=("智能表格依赖不可用",),
+            )
+            self._log_report(adapter_name, started_at, report)
+            return report
 
         issues: list[str] = []
 

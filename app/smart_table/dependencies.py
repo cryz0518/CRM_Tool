@@ -5,6 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 
 from app.core.config import get_settings
+from app.core.provider_policy import ProviderPolicyError, get_provider_policy
 from app.smart_table.adapter import SmartTableAdapter
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.registry import build_required_smart_table_schema
@@ -19,12 +20,19 @@ def get_smart_table_adapter() -> SmartTableAdapter:
     返回：开发环境显式启用时返回 Mock；否则返回未配置占位适配器。
     副作用：首次调用时缓存适配器，避免每个请求重复构造依赖。
     """
-    if get_settings().smart_table_adapter == "mock":
+    settings = get_settings()
+    try:
+        # 统一 policy 负责 production 禁止 Mock；工厂不自行读取 APP_ENV。
+        get_provider_policy(settings).require(
+            "smart_table", settings.smart_table_adapter, settings=settings
+        )
+    except ProviderPolicyError:
+        return UnconfiguredSmartTableAdapter()
+    if settings.smart_table_adapter == "mock":
         # Mock 只能由本地 Docker 或测试环境显式启用，不能掩盖生产配置缺失。
         return MockSmartTableAdapter(schema=build_required_smart_table_schema())
-    if get_settings().smart_table_adapter == "wecom_cli":
+    if settings.smart_table_adapter == "wecom_cli":
         # 真实适配器仅接收部署注入的配置，任何缺失均由构造器转换为 readiness 配置错误。
-        settings = get_settings()
         return WecomCliSmartTableAdapter(
             doc_id=settings.wecom_smart_table_doc_id or "",
             sheet_id=settings.wecom_smart_table_sheet_id or "",

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from typing import Annotated
-from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -11,9 +10,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.console.auth import (
     AdminCredentials,
-    AdminIdentityProvider,
     AdminPrincipal,
+    AuthenticatedPrincipal,
+    AuthenticationProvider,
+    CapabilityAuthorizer,
     ConsoleCapability,
+    VerifiedAuthorizationContext,
 )
 from app.console.break_glass import (
     BreakGlassAccessError,
@@ -23,6 +25,7 @@ from app.console.break_glass import (
 from app.console.dependencies import (
     get_admin_identity_provider,
     get_break_glass_access_service,
+    get_capability_authorizer,
     get_console_maintenance_service,
     get_console_query_service,
 )
@@ -43,6 +46,7 @@ from app.console.dto import (
 )
 from app.console.maintenance import ConsoleMaintenanceResult, ConsoleMaintenanceService
 from app.console.queries import ConsoleQueryService
+from app.core.request_id import normalize_request_id
 
 router = APIRouter()
 console_api = APIRouter(prefix="/api/console", tags=["Operations Console"])
@@ -113,9 +117,33 @@ class MaintenanceRecoveryBody(BaseModel):
     reason: str = Field(min_length=1, max_length=512)
 
 
+def _as_legacy_admin_principal(principal: AuthenticatedPrincipal) -> AdminPrincipal:
+    """将稳定认证主体投影为旧维护服务仍使用的 AdminPrincipal。
+
+    参数：principal 为认证 Provider 返回的已验证主体。
+    返回值：保留 T16 maintenance 输入契约的管理员主体。
+    异常：主体不含可用群组时仍返回无角色主体，后续 capability 会拒绝。
+    副作用：只创建内存对象，不保存凭据。
+    """
+    if isinstance(principal, AdminPrincipal):
+        return principal
+    roles = frozenset(getattr(principal, "roles", principal.groups))
+    return AdminPrincipal(
+        principal.subject,
+        roles,
+        principal.provider,
+        authenticated_at=principal.authenticated_at,
+        claims=principal.claims,
+        groups=principal.groups,
+        tenant=principal.tenant,
+        display_name=principal.display_name,
+    )
+
+
 def _require_console_admin(
     request: Request,
-    provider: Annotated[AdminIdentityProvider, Depends(get_admin_identity_provider)],
+    provider: Annotated[AuthenticationProvider, Depends(get_admin_identity_provider)],
+    authorizer: Annotated[CapabilityAuthorizer, Depends(get_capability_authorizer)],
 ) -> AdminPrincipal:
     """认证并授权普通 Console 读取请求。
 
@@ -124,44 +152,49 @@ def _require_console_admin(
     异常：认证缺失返回 401；认证主体无权返回 403。
     副作用：不读取业务数据。
     """
-    principal = provider.authenticate(
+    authenticated = provider.authenticate(
         AdminCredentials(token=request.headers.get("X-Console-Admin-Token"))
     )
-    if principal is None:
+    if authenticated is None:
         raise HTTPException(status_code=401, detail="需要管理员认证")
-    if not provider.authorize(principal, ConsoleCapability.CONSOLE_READ):
+    principal = _as_legacy_admin_principal(authenticated)
+    if not authorizer.authorize(principal, ConsoleCapability.CONSOLE_READ):
         raise HTTPException(status_code=403, detail="没有 Console 读取权限")
     return principal
 
 
 def _require_audit_admin(
     request: Request,
-    provider: Annotated[AdminIdentityProvider, Depends(get_admin_identity_provider)],
+    provider: Annotated[AuthenticationProvider, Depends(get_admin_identity_provider)],
+    authorizer: Annotated[CapabilityAuthorizer, Depends(get_capability_authorizer)],
 ) -> AdminPrincipal:
     """认证并授权审计查询请求。"""
-    principal = provider.authenticate(
+    authenticated = provider.authenticate(
         AdminCredentials(token=request.headers.get("X-Console-Admin-Token"))
     )
-    if principal is None:
+    if authenticated is None:
         raise HTTPException(status_code=401, detail="需要管理员认证")
-    if not provider.authorize(principal, ConsoleCapability.AUDIT_READ):
+    principal = _as_legacy_admin_principal(authenticated)
+    if not authorizer.authorize(principal, ConsoleCapability.AUDIT_READ):
         raise HTTPException(status_code=403, detail="没有审计读取权限")
     return principal
 
 
 def _require_console_maintenance_admin(
     request: Request,
-    provider: Annotated[AdminIdentityProvider, Depends(get_admin_identity_provider)],
+    provider: Annotated[AuthenticationProvider, Depends(get_admin_identity_provider)],
+    authorizer: Annotated[CapabilityAuthorizer, Depends(get_capability_authorizer)],
     service: Annotated[ConsoleMaintenanceService, Depends(get_console_maintenance_service)],
 ) -> AdminPrincipal:
     """认证 Console maintenance capability，并核对持久化管理员目录。"""
 
-    principal = provider.authenticate(
+    authenticated = provider.authenticate(
         AdminCredentials(token=request.headers.get("X-Console-Admin-Token"))
     )
-    if principal is None:
+    if authenticated is None:
         raise HTTPException(status_code=401, detail="需要管理员认证")
-    if not provider.authorize(principal, ConsoleCapability.CONSOLE_MAINTENANCE_WRITE):
+    principal = _as_legacy_admin_principal(authenticated)
+    if not authorizer.authorize(principal, ConsoleCapability.CONSOLE_MAINTENANCE_WRITE):
         raise HTTPException(status_code=403, detail="没有 Console 管理写权限")
     try:
         service.require_admin(principal)
@@ -171,18 +204,14 @@ def _require_console_maintenance_admin(
 
 
 def _request_id(request: Request) -> str:
-    """读取或生成不可为空的管理请求幂等标识。"""
+    """只使用 middleware 规范化后的服务端 request id。
 
-    request_id = request.headers.get("X-Request-ID")
-    normalized = request_id.strip() if request_id else ""
-    if not normalized:
-        return str(uuid4())
-    if len(normalized) > 128 or any(
-        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
-        for character in normalized
-    ):
-        raise HTTPException(status_code=400, detail="X-Request-ID 格式非法")
-    return normalized
+    参数：request 为当前 HTTP 请求。
+    返回值：middleware 生成或接受的规范化管理请求幂等标识。
+    异常：无；非法、超长或缺失 header 均由 middleware 降级为服务端 UUID。
+    副作用：无；不读取原始 X-Request-ID header。
+    """
+    return normalize_request_id(getattr(request.state, "request_id", None))
 
 
 def _maintenance_dto(result: ConsoleMaintenanceResult) -> ConsoleMaintenanceResultDTO:
@@ -211,11 +240,17 @@ def _raise_maintenance_error(error: Exception) -> None:
 
 
 def _require_break_glass_capability(
-    provider: AdminIdentityProvider,
+    authorizer: CapabilityAuthorizer,
     principal: AdminPrincipal,
     access_type: str,
-) -> None:
-    """将访问类型映射到最小 Break-glass 能力并执行授权。"""
+) -> VerifiedAuthorizationContext:
+    """将访问类型映射到最小 Break-glass 能力并返回已验证授权依据。
+
+    参数：provider 为认证后的授权 Provider；principal 为已验证主体；access_type 为请求访问类型。
+    返回值：允许时返回由授权器封装的不可变已验证授权上下文。
+    异常：能力未知、Provider 无法提供可审计判定或无权时抛出 HTTP 403。
+    副作用：无；不会读取请求体中的 operator 或 role。
+    """
     capability_map = {
         "view_raw_message": ConsoleCapability.BREAK_GLASS_RAW_MESSAGE,
         "view_full_contact": ConsoleCapability.BREAK_GLASS_FULL_CONTACT,
@@ -223,8 +258,14 @@ def _require_break_glass_capability(
         "download_attachment": ConsoleCapability.BREAK_GLASS_DOWNLOAD_ATTACHMENT,
     }
     capability = capability_map.get(access_type)
-    if capability is None or not provider.authorize(principal, capability):
+    context = (
+        authorizer.verified_context(principal, capability)
+        if capability is not None
+        else None
+    )
+    if context is None:
         raise HTTPException(status_code=403, detail="没有 Break-glass 访问权限")
+    return context
 
 
 @console_api.get("/overview", response_model=ConsoleOverviewDTO)
@@ -620,21 +661,21 @@ def break_glass_access(
     body: BreakGlassRequestBody,
     request: Request,
     principal: Annotated[AdminPrincipal, Depends(_require_console_admin)],
-    provider: Annotated[AdminIdentityProvider, Depends(get_admin_identity_provider)],
+    authorizer: Annotated[CapabilityAuthorizer, Depends(get_capability_authorizer)],
     service: Annotated[BreakGlassAccessService, Depends(get_break_glass_access_service)],
 ) -> JSONResponse:
     """执行单对象 Break-glass 访问，审计失败时拒绝返回原始数据。"""
-    _require_break_glass_capability(provider, principal, body.access_type)
+    authorization_context = _require_break_glass_capability(
+        authorizer, principal, body.access_type
+    )
     access_request = BreakGlassAccessRequest(
-        operator_subject=principal.subject,
-        operator_role=sorted(principal.roles)[0] if principal.roles else "unknown",
-        auth_source=principal.auth_source,
+        authorization_context=authorization_context,
         object_type=body.object_type,
         object_id=body.object_id,
         access_type=body.access_type,
         reason=body.reason,
-        request_id=request.headers.get("X-Request-ID", str(uuid4())),
-        request_context={"route": str(request.url.path)},
+        # Break-glass 使用 middleware 已规范化的 server id，不直接信任 header。
+        request_id=normalize_request_id(getattr(request.state, "request_id", None)),
     )
     try:
         result = service.access(access_request)

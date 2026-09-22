@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
@@ -10,6 +10,10 @@ from uuid import uuid4
 from sqlalchemy import update
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.console.auth import (
+    ConsoleCapability,
+    VerifiedAuthorizationContext,
+)
 from app.console.models import BreakGlassAccessAudit
 from app.leads.models import Lead
 from app.media.storage import SignedDownloadURL, SignedURLProvider, StorageProvider
@@ -24,15 +28,12 @@ class BreakGlassAccessError(RuntimeError):
 class BreakGlassAccessRequest:
     """定义单次原始数据访问请求，明确禁止批量对象。"""
 
-    operator_subject: str
-    operator_role: str
+    authorization_context: VerifiedAuthorizationContext
     object_type: str
     object_id: str
     access_type: str
     reason: str
     request_id: str
-    auth_source: str = "unknown"
-    request_context: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,12 @@ class BreakGlassAccessService:
         ("attachment", "download_attachment"),
     }
     _ALLOWED_ROLES = frozenset({"administrator", "operations_admin"})
+    _CAPABILITY_BY_ACCESS_TYPE = {
+        "view_raw_message": ConsoleCapability.BREAK_GLASS_RAW_MESSAGE,
+        "view_full_contact": ConsoleCapability.BREAK_GLASS_FULL_CONTACT,
+        "preview_attachment": ConsoleCapability.BREAK_GLASS_PREVIEW_ATTACHMENT,
+        "download_attachment": ConsoleCapability.BREAK_GLASS_DOWNLOAD_ATTACHMENT,
+    }
 
     def __init__(
         self,
@@ -68,7 +75,8 @@ class BreakGlassAccessService:
     ) -> None:
         """注入数据库会话工厂和可选附件存储提供器。
 
-        参数：session_factory 为审计和对象读取事务工厂；signed_url_provider 为私有附件签名边界；
+        参数：session_factory 为审计和对象读取事务工厂；
+        signed_url_provider 为私有附件签名边界；
         storage_provider 为对象 head/reconcile 边界；TTL 参数由配置注入并受最大值限制。
         返回值：无。
         异常：无。
@@ -139,7 +147,7 @@ class BreakGlassAccessService:
     def _validate_request(cls, request: BreakGlassAccessRequest) -> None:
         """校验访问原因、对象数量语义和访问类型组合。
 
-        参数：request 为待校验的访问请求。
+        参数：request 为包含已验证授权上下文的访问请求。
         返回值：无。
         异常：不符合安全约束时抛出 BreakGlassAccessError。
         副作用：无。
@@ -151,11 +159,19 @@ class BreakGlassAccessService:
             raise BreakGlassAccessError("Break-glass 原因过长")
         if not request.object_id or "," in request.object_id or "[" in request.object_id:
             raise BreakGlassAccessError("Break-glass 只允许单对象访问")
-        if request.operator_role not in cls._ALLOWED_ROLES:
+        expected_capability = cls._CAPABILITY_BY_ACCESS_TYPE.get(request.access_type)
+        context = request.authorization_context
+        if not isinstance(context, VerifiedAuthorizationContext):
+            raise BreakGlassAccessError("Break-glass 需要已验证授权上下文")
+        if expected_capability is None or context.capability is not expected_capability:
+            raise BreakGlassAccessError("Break-glass 需要匹配的已验证 capability")
+        if not context.verified_subject or not context.provider or not context.authorization_basis:
+            raise BreakGlassAccessError("Break-glass 缺少已验证授权事实")
+        if context.role not in cls._ALLOWED_ROLES:
             raise BreakGlassAccessError("Break-glass 需要管理员角色")
         if (
             request.access_type == "download_attachment"
-            and request.operator_role != "administrator"
+            and context.role != "administrator"
         ):
             raise BreakGlassAccessError("下载附件需要管理员角色")
         if (request.object_type, request.access_type) not in cls._ACCESS_TYPES:
@@ -213,9 +229,9 @@ class BreakGlassAccessService:
                     BreakGlassAccessAudit(
                         access_id=access_id,
                         request_id=request.request_id,
-                        operator_subject=request.operator_subject,
-                        operator_role=request.operator_role,
-                        auth_source=request.auth_source,
+                        operator_subject=request.authorization_context.verified_subject,
+                        operator_role=request.authorization_context.role or "unknown",
+                        auth_source=request.authorization_context.provider,
                         object_type=request.object_type,
                         object_id=request.object_id,
                         access_type=request.access_type,
@@ -237,7 +253,14 @@ class BreakGlassAccessService:
                             if request.object_type == "attachment"
                             else None
                         ),
-                        request_context=dict(request.request_context),
+                        request_context={
+                            "verified_subject": request.authorization_context.verified_subject,
+                            "provider": request.authorization_context.provider,
+                            "capability": request.authorization_context.capability.value,
+                            "authorization_basis": (
+                                request.authorization_context.authorization_basis
+                            ),
+                        },
                     )
                 )
         except Exception as error:

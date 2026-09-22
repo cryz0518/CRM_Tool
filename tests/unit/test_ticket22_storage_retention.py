@@ -10,6 +10,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.console.auth import AdminPrincipal, ConsoleCapability, LocalCapabilityAuthorizer
 from app.console.break_glass import (
     BreakGlassAccessError,
     BreakGlassAccessRequest,
@@ -180,6 +181,11 @@ def test_break_glass_missing_object_never_calls_signer(
 
     with session_factory.begin() as session:
         session.add(
+            SalesAuthorization(
+                wecom_user_id="admin-1", is_authorized=True, is_active=True, is_administrator=True
+            )
+        )
+        session.add(
             IncomingMessage(
                 message_id="message-attachment",
                 sales_user_id="sales-1",
@@ -203,12 +209,16 @@ def test_break_glass_missing_object_never_calls_signer(
         signed_url_provider=signer,
         storage_provider=FakeStorage(),  # type: ignore[arg-type]
     )
+    context = LocalCapabilityAuthorizer(session_factory).verified_context(
+        AdminPrincipal("admin-1", frozenset({"administrator"}), "test"),
+        ConsoleCapability.BREAK_GLASS_PREVIEW_ATTACHMENT,
+    )
+    assert context is not None
 
     with pytest.raises(BreakGlassAccessError, match="对象不存在"):
         service.access(
             BreakGlassAccessRequest(
-                operator_subject="admin-1",
-                operator_role="administrator",
+                authorization_context=context,
                 object_type="attachment",
                 object_id="attachment-1",
                 access_type="preview_attachment",
@@ -234,6 +244,11 @@ def test_signed_url_is_generated_only_after_grant_audit_commit(
     storage = FakeStorageProvider(tmp_path)
     stored = storage.put(b"safe", suffix=".png")
     with session_factory.begin() as session:
+        session.add(
+            SalesAuthorization(
+                wecom_user_id="admin-1", is_authorized=True, is_active=True, is_administrator=True
+            )
+        )
         session.add(
             IncomingMessage(
                 message_id="message-signed",
@@ -276,10 +291,14 @@ def test_signed_url_is_generated_only_after_grant_audit_commit(
         signed_url_ttl_seconds=120,
         signed_url_max_ttl_seconds=300,
     )
+    context = LocalCapabilityAuthorizer(session_factory).verified_context(
+        AdminPrincipal("admin-1", frozenset({"administrator"}), "test"),
+        ConsoleCapability.BREAK_GLASS_PREVIEW_ATTACHMENT,
+    )
+    assert context is not None
     result = service.access(
         BreakGlassAccessRequest(
-            operator_subject="admin-1",
-            operator_role="administrator",
+            authorization_context=context,
             object_type="attachment",
             object_id="attachment-signed",
             access_type="preview_attachment",

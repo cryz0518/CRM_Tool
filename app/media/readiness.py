@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.core.config import Settings
+from app.core.provider_policy import get_provider_policy
 
 
 @dataclass(frozen=True)
@@ -20,7 +21,7 @@ class ProductionMediaReadinessChecker:
 
     def check(self, settings: Settings) -> MediaReadinessReport:
         """检查生产媒体所需的 provider、能力、签名和 data class 策略。"""
-        if settings.app_env not in {"production", "prod"}:
+        if not get_provider_policy(settings).is_production:
             return MediaReadinessReport(True, ())
 
         issues: list[str] = []
