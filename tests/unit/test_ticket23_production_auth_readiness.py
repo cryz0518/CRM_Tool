@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -13,6 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.ai import dependencies as ai_dependencies
+from app.ai.provider import MockLLMProvider
 from app.console.auth import (
     AdminCredentials,
     AdminPrincipal,
@@ -30,9 +32,11 @@ from app.console.routes import BreakGlassRequestBody
 from app.core.config import Settings
 from app.core.heartbeat import check_heartbeat, heartbeat_key, publish_heartbeat
 from app.core.provider_policy import ProviderPolicy, ProviderPolicyError
-from app.core.readiness import ReadinessRegistry, not_ready_component
+from app.core.readiness import ReadinessComponent, ReadinessRegistry, not_ready_component
 from app.core.request_id import normalize_request_id
 from app.media import dependencies as media_dependencies
+from app.media.providers import MockASRProvider, MockOCRProvider
+from app.media.readiness import MediaReadinessReport
 from app.messaging.models import Base, SalesAuthorization
 
 
@@ -331,6 +335,55 @@ def test_provider_credential_check_uses_normalized_environment(app_env: str) -> 
     assert result.reason_code == "provider_configuration_missing"
 
 
+def test_provider_factories_use_one_normalized_provider_selection(
+    authorization_session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """验证 LLM、OCR、ASR 统一消费 trim/lower 后的 provider 名称。"""
+    settings = Settings(
+        _env_file=None,
+        app_env="development",
+        llm_provider=" MOCK ",
+        ocr_provider=" Mock ",
+        asr_provider="MOCK",
+        media_storage_provider=" local ",
+        media_scanner_provider=" FAKE ",
+        media_storage_path=str(tmp_path),
+    )
+    monkeypatch.setattr(ai_dependencies, "get_settings", lambda: settings)
+    monkeypatch.setattr(media_dependencies, "get_settings", lambda: settings)
+
+    gateway = ai_dependencies.get_ai_gateway()
+    service = media_dependencies.get_media_attachment_service(authorization_session_factory)
+
+    assert settings.llm_provider == "mock"
+    assert settings.ocr_provider == "mock"
+    assert settings.asr_provider == "mock"
+    assert isinstance(gateway._provider, MockLLMProvider)
+    assert isinstance(service._ocr_provider, MockOCRProvider)
+    assert isinstance(service._asr_provider, MockASRProvider)
+
+
+@pytest.mark.parametrize("provider_field", ["llm_provider", "ocr_provider", "asr_provider"])
+def test_production_whitespace_mock_is_rejected_by_policy(provider_field: str) -> None:
+    """验证生产环境中带空白或大小写伪装的 mock 仍 fail closed。"""
+    settings = Settings(
+        _env_file=None,
+        app_env=" production ",
+        **{provider_field: " MOCK "},
+    )
+
+    result = ProviderPolicy(settings.app_env).evaluate(
+        provider_field.removesuffix("_provider"),
+        getattr(settings, provider_field),
+        settings=settings,
+    )
+
+    assert result.status == "not_ready"
+    assert result.reason_code == "production_test_provider_forbidden"
+
+
 def test_production_ai_and_media_factories_fail_closed_without_credential(
     authorization_session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
@@ -375,6 +428,58 @@ def test_readiness_reports_stable_reason_code_without_exception_details() -> Non
     }
     assert "token" not in str(payload).lower()
     assert "secret" not in str(payload).lower()
+
+
+def test_readiness_registry_maps_media_failure_to_storage_and_scanner_components(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证媒体 readiness 失败统一映射到 storage/scanner 稳定组件码。"""
+    import app.main as main_module
+
+    monkeypatch.setattr(
+        main_module.ProductionMediaReadinessChecker,
+        "check",
+        lambda _self, _settings: MediaReadinessReport(False, ("媒体配置不完整",)),
+    )
+
+    report, issues = main_module._readiness_report(object())  # type: ignore[arg-type]
+
+    components: dict[str, ReadinessComponent] = {}
+    for item in report.components:
+        if item.component in {"storage", "scanner"}:
+            components.setdefault(item.component, item)
+    assert components["storage"].reason_code == "media_configuration_invalid"
+    assert components["scanner"].reason_code == "media_configuration_invalid"
+    assert "媒体配置不完整" in issues
+
+
+def test_readiness_registry_hides_media_exception_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证媒体 readiness 异常只返回稳定 reason_code，不泄露外部响应。"""
+    import app.main as main_module
+
+    def raise_media_error(_self: object, _settings: Settings) -> MediaReadinessReport:
+        """模拟携带 token、endpoint 和 secret 的外部异常。"""
+        raise RuntimeError("provider token=secret endpoint=https://vendor.invalid")
+
+    monkeypatch.setattr(main_module.ProductionMediaReadinessChecker, "check", raise_media_error)
+
+    report, _issues = main_module._readiness_report(object())  # type: ignore[arg-type]
+    payload = report.as_dict()
+
+    assert {
+        "component": "storage",
+        "status": "not_ready",
+        "reason_code": "dependency_unavailable",
+    } in payload["components"]
+    assert {
+        "component": "scanner",
+        "status": "not_ready",
+        "reason_code": "dependency_unavailable",
+    } in payload["components"]
+    assert "secret" not in str(payload).lower()
+    assert "vendor.invalid" not in str(payload).lower()
 
 
 def test_verified_context_requires_authorizer_seal_and_service_rejects_authorizer_injection(

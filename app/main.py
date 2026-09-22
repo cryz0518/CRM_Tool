@@ -20,6 +20,7 @@ from app.core.provider_policy import get_provider_policy
 from app.core.readiness import (
     ReadinessComponent,
     ReadinessRegistry,
+    ReadinessReport,
     not_ready_component,
     ready_component,
 )
@@ -203,6 +204,95 @@ def _smart_table_component(
     return component, detail_issues
 
 
+def _readiness_report(
+    adapter: SmartTableAdapter,
+) -> tuple[ReadinessReport, tuple[str, ...]]:
+    """通过统一 Registry 执行 readiness，并保留兼容的详细问题文本。
+
+    参数：adapter 为依赖注入的稳定 Smart Table Adapter。
+    返回值：统一组件报告及 T15/T22 使用的脱敏详细问题列表。
+    异常：单个组件异常由 ReadinessRegistry 转换为稳定 reason_code。
+    副作用：只执行数据库、Redis、heartbeat、schema、策略和媒体配置检查，不执行业务写入。
+    """
+    policy = get_provider_policy(settings)
+    detail_issues: list[str] = []
+    provider_components: tuple[ReadinessComponent, ...] = ()
+    media_report = None
+    runtime_components: tuple[ReadinessComponent, ...] = ()
+
+    def smart_table_check() -> ReadinessComponent:
+        """执行智能表格检查，并缓存旧接口需要的字段级问题。"""
+        component, issues = _smart_table_component(adapter)
+        detail_issues.extend(issues)
+        return component
+
+    def media_check(component: str) -> ReadinessComponent:
+        """把存储和扫描器共享的媒体策略检查映射为单个 readiness 组件。"""
+        nonlocal media_report
+        if media_report is None:
+            media_report = ProductionMediaReadinessChecker().check(settings)
+            detail_issues.extend(media_report.issues)
+        if media_report.issues:
+            return not_ready_component(component, "media_configuration_invalid")
+        return ready_component(component, "media_policy_checked")
+
+    def provider_policy_check() -> ReadinessComponent:
+        """执行集中 Provider policy，并缓存各 provider 的脱敏明细。"""
+        nonlocal provider_components
+        provider_components = _provider_policy_components()
+        return provider_components[0]
+
+    def runtime_check(component: str) -> ReadinessComponent:
+        """从统一运行时探针报告中读取指定组件结果。"""
+        nonlocal runtime_components
+        if not runtime_components:
+            runtime_components = (
+                _runtime_readiness_components()
+                if policy.is_production
+                else tuple(
+                    ready_component(name, "non_production_not_probed")
+                    for name in ("database", "redis", "migration", "worker", "scheduler")
+                )
+            )
+        return next(item for item in runtime_components if item.component == component)
+
+    # 所有 HTTP readiness 组件都先进入同一 Registry；Registry 负责统一异常边界。
+    registry = ReadinessRegistry(
+        {
+            "smart_table": smart_table_check,
+            "storage": lambda: media_check("storage"),
+            "scanner": lambda: media_check("scanner"),
+            "provider_policy": provider_policy_check,
+            "database": lambda: runtime_check("database"),
+            "redis": lambda: runtime_check("redis"),
+            "migration": lambda: runtime_check("migration"),
+            "worker": lambda: runtime_check("worker"),
+            "scheduler": lambda: runtime_check("scheduler"),
+        }
+    )
+    registry_report = registry.check()
+
+    # Provider 明细继续保留，便于 Operations Console 定位具体 provider；其判定已由同一
+    # provider policy 产生，异常时补齐固定组件和固定原因码，绝不暴露异常正文。
+    if not provider_components:
+        provider_components = tuple(
+            not_ready_component(component, "provider_policy_unavailable")
+            for component in (
+                "admin_identity_provider",
+                "smart_table",
+                "crm",
+                "llm",
+                "ocr",
+                "asr",
+                "storage",
+                "scanner",
+            )
+        )
+    return ReadinessReport((*registry_report.components, *provider_components)), tuple(
+        detail_issues
+    )
+
+
 @app.get("/health/ready")
 async def readiness(
     adapter: Annotated[SmartTableAdapter, Depends(get_smart_table_adapter)],
@@ -213,41 +303,24 @@ async def readiness(
     返回：配置正确时返回 200；缺失字段、权限或适配器时返回 503 与脱敏问题摘要。
     副作用：调用适配器读取结构和权限，并写入结构化就绪检查日志。
     """
-    smart_table_component, smart_table_issues = _smart_table_component(adapter)
-    media_report = ProductionMediaReadinessChecker().check(settings)
-    media_components = (
-        ready_component("storage", "media_policy_checked"),
-        ready_component("scanner", "media_policy_checked"),
-    )
-    if media_report.issues:
-        media_components = (
-            not_ready_component("storage", "media_configuration_invalid"),
-            not_ready_component("scanner", "media_configuration_invalid"),
-        )
-    provider_components = _provider_policy_components()
-    # 本地/测试环境不强制连接外部依赖；生产环境才执行真实只读运行探针。
-    runtime_components = (
-        _runtime_readiness_components()
-        if get_provider_policy(settings).is_production
-        else tuple(
-            ready_component(component, "non_production_not_probed")
-            for component in ("database", "redis", "migration", "worker", "scheduler")
-        )
-    )
-    components = (
-        smart_table_component,
-        *media_components,
-        *provider_components,
-        *runtime_components,
-    )
-    # 非生产环境保留 T15/T22 的 issues 文本契约；生产额外返回稳定组件原因码。
-    issues = [*smart_table_issues, *media_report.issues]
-    if get_provider_policy(settings).is_production:
-        issues.extend(
-            f"{item.component}:{item.reason_code}"
-            for item in components
-            if item.status != "ok"
-        )
+    report, detail_issues = _readiness_report(adapter)
+    components = report.components
+    # 非生产环境保留 T15/T22 的详细问题契约，同时把 Registry 捕获的媒体异常转换为稳定码。
+    issues = list(detail_issues)
+    if not get_provider_policy(settings).is_production:
+        media_components_seen: set[str] = set()
+        for item in components:
+            # provider 明细中也有 storage/scanner，同名组件只取 Registry 的首个结果。
+            if item.component not in {"storage", "scanner"}:
+                continue
+            if item.component in media_components_seen:
+                continue
+            media_components_seen.add(item.component)
+            issue = f"{item.component}:{item.reason_code}"
+            if item.status != "ok" and issue not in issues:
+                issues.append(issue)
+    else:
+        issues.extend(item for item in report.issues if item not in issues)
     ready = not issues
     if not ready:
         return JSONResponse(

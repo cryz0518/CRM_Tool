@@ -19,11 +19,12 @@ def get_ai_gateway(*, execution_recorder: AIExecutionRecorder | None = None) -> 
     """
     settings = get_settings()
     # LLM 的测试 Provider 只能在非生产环境显式使用。
-    get_provider_policy(settings).require("llm", settings.llm_provider, settings=settings)
+    policy = get_provider_policy(settings)
+    provider_result = policy.require("llm", settings.llm_provider, settings=settings)
     # Mock 只供测试或显式本地开发；Worker 的默认 qwen 配置始终走真实供应商边界。
     provider = (
         MockLLMProvider([])
-        if settings.llm_provider == "mock"
+        if provider_result.provider == "mock"
         else QwenLLMProvider(
             api_key=settings.qwen_api_key or "",
             base_url=settings.qwen_base_url,

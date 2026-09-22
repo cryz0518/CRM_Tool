@@ -90,6 +90,28 @@ class Settings(BaseSettings):
     console_dev_admin_role: str = "administrator"
 
     @field_validator(
+        "admin_identity_provider",
+        "smart_table_adapter",
+        "crm_adapter",
+        "llm_provider",
+        "media_storage_provider",
+        "media_scanner_provider",
+        "ocr_provider",
+        "asr_provider",
+        mode="before",
+    )
+    @classmethod
+    def normalize_provider_name(cls, value: object) -> object:
+        """在配置边界统一 provider 名称，避免空白和大小写产生不同选择。
+
+        参数：value 为环境变量或调用方传入的 provider 名称。
+        返回值：字符串去除首尾空白并转换为小写；非字符串值原样返回供 Pydantic 校验。
+        异常：无；非法 provider 仍由字段类型或 Provider policy 拒绝。
+        副作用：无。
+        """
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @field_validator(
         "wecom_smart_table_sales_can_create_records",
         "wecom_smart_table_sales_can_delete_records",
         mode="before",
