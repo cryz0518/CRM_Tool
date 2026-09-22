@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Literal
 from uuid import uuid4
 
@@ -11,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.media.providers import ASRProvider, FileScanProvider, OCRProvider
+from app.media.retention import RetentionPolicy, StorageIngestRecoveryService
 from app.media.storage import StorageProvider
 from app.messaging.models import (
     BusinessAuditEvent,
@@ -18,8 +21,34 @@ from app.messaging.models import (
     MediaProcessingTask,
     MessageAttachment,
     NotificationRecord,
+    StorageIngestOperation,
     utc_now,
 )
+
+logger = logging.getLogger(__name__)
+
+SCAN_STATUSES = frozenset(
+    {
+        "pending_scan",
+        "scanning",
+        "clean",
+        "infected",
+        "scan_failed",
+        "quarantined",
+        "not_required",
+    }
+)
+SCAN_TRANSITIONS = {
+    "pending": {"scanning"},
+    "pending_scan": {"scanning"},
+    "scanning": {"clean", "infected", "scan_failed", "quarantined"},
+    "scan_failed": {"scanning"},
+    # 后续扫描/运营隔离允许 clean 进入 quarantine，但禁止回到 clean。
+    "clean": {"infected", "quarantined"},
+    "infected": set(),
+    "quarantined": set(),
+    "not_required": set(),
+}
 
 
 class MediaValidationError(ValueError):
@@ -124,6 +153,7 @@ class MediaAttachmentService:
         asr_provider: ASRProvider,
         *,
         timeout_seconds: float = 20.0,
+        retention_policy: RetentionPolicy | None = None,
     ) -> None:
         """保存所有可替换边界，构造时不读写数据库或媒体。"""
         self._session_factory = session_factory
@@ -133,6 +163,8 @@ class MediaAttachmentService:
         self._ocr_provider = ocr_provider
         self._asr_provider = asr_provider
         self._timeout_seconds = timeout_seconds
+        self._retention_policy = retention_policy
+        self._ingest_recovery = StorageIngestRecoveryService(session_factory)
 
     def ingest(
         self,
@@ -152,14 +184,30 @@ class MediaAttachmentService:
                 mime_type=validated.detected_mime_type,
                 timeout_seconds=self._timeout_seconds,
             )
-            if scan_status not in {"clean", "not_required"}:
+            if scan_status in {"infected", "quarantined"}:
+                raise MediaValidationError("media_infected")
+            if scan_status in {"failed", "scan_failed", "timeout", "unknown"}:
+                raise MediaValidationError("media_scan_failed")
+            if scan_status not in {"clean", "not_required", "pending_scan", "scanning"}:
                 raise MediaValidationError(f"scan_{scan_status}")
         except (MediaValidationError, RuntimeError) as error:
             return self._record_ingest_failure(message_id, media_kind, declared_mime_type, error)
 
-        # 存储成功后才写入可处理元数据；失败不保存部分键，也不暴露内容到日志。
-        stored = self._storage.put(content, suffix=self._suffix_for(validated.detected_mime_type))
+        # 外部 put 前先提交不可变 intent，确保 DB 暂时不可写时不会产生无人跟踪对象。
         attachment_id = str(uuid4())
+        operation_id = str(uuid4())
+        operation_key = f"media-ingest:{attachment_id}"
+        object_key = self._storage.create_object_key(
+            suffix=self._suffix_for(validated.detected_mime_type)
+        )
+        created_at = utc_now()
+        retention_expires_at = None
+        retention_version = None
+        if self._retention_policy is not None:
+            retention_version = self._retention_policy.version
+            retention_expires_at = created_at + timedelta(
+                days=self._retention_policy.media_retention_days
+            )
         with self._session_factory.begin() as session:
             session.add(
                 MessageAttachment(
@@ -170,14 +218,50 @@ class MediaAttachmentService:
                     detected_mime_type=validated.detected_mime_type,
                     size_bytes=validated.size_bytes,
                     sha256=validated.sha256,
-                    storage_key=stored.storage_key,
+                    storage_key=object_key.value,
+                    storage_provider=getattr(self._storage, "provider_name", "configured"),
                     scan_status=scan_status,
+                    scan_started_at=(created_at if scan_status == "scanning" else None),
+                    scan_completed_at=(
+                        created_at if scan_status in {"clean", "not_required"} else None
+                    ),
+                    processing_status="pending_upload",
+                    retention_expires_at=retention_expires_at,
+                    retention_policy_version=retention_version,
+                    ingest_operation_id=operation_id,
                 )
             )
-            # 显式先落附件，避免没有 ORM 关系时任务插入顺序触发外键约束。
-            session.flush()
-            session.add(MediaProcessingTask(attachment_id=attachment_id, task_type=media_kind))
-            self._audit(session, message_id, "media_attachment_stored")
+            session.add(
+                StorageIngestOperation(
+                    id=operation_id,
+                    operation_key=operation_key,
+                    attachment_id=attachment_id,
+                    message_id=message_id,
+                    storage_provider=getattr(self._storage, "provider_name", "configured"),
+                    storage_key=object_key.value,
+                    storage_key_digest=hashlib.sha256(object_key.value.encode()).hexdigest(),
+                    content_sha256=validated.sha256,
+                    content_type=validated.detected_mime_type,
+                    expected_size_bytes=validated.size_bytes,
+                    status="pending",
+                    remote_outcome="not_started",
+                    created_at=created_at,
+                    updated_at=created_at,
+                )
+            )
+            self._audit(session, message_id, "media_ingest_started")
+        logger.info(
+            "media_ingest_started",
+            extra={"media_id": attachment_id, "operation_id": operation_id, "status": "pending"},
+        )
+        # 所有重试都复用 operation 中冻结的 key，未知结果先 HEAD，不重新生成对象。
+        self._ingest_recovery.upload(
+            operation_id,
+            self._storage,
+            content=content,
+            suffix=self._suffix_for(validated.detected_mime_type),
+            timeout_seconds=self._timeout_seconds,
+        )
         return attachment_id
 
     def process_pending_for_message(self, message_id: str) -> None:
@@ -187,10 +271,51 @@ class MediaAttachmentService:
                 select(MessageAttachment).where(
                     MessageAttachment.message_id == message_id,
                     MessageAttachment.processing_status == "pending",
+                    MessageAttachment.scan_status == "clean",
+                    MessageAttachment.deletion_status == "active",
                 )
             ).all()
         for attachment in attachments:
             self._process_attachment(attachment.id)
+
+    def apply_scan_result(self, attachment_id: str, scan_status: str) -> None:
+        """应用异步扫描终态，只有 clean 才重新打开 OCR/ASR 下游任务。"""
+        if scan_status not in SCAN_STATUSES:
+            raise ValueError("scan_status_invalid")
+        with self._session_factory.begin() as session:
+            attachment = session.get(MessageAttachment, attachment_id)
+            if attachment is None:
+                raise ValueError("attachment_not_found")
+            if scan_status not in SCAN_TRANSITIONS.get(attachment.scan_status, set()):
+                raise ValueError("scan_transition_invalid")
+            attachment.scan_status = scan_status
+            transition_time = utc_now()
+            if scan_status == "scanning":
+                attachment.scan_started_at = transition_time
+                attachment.scan_completed_at = None
+            else:
+                attachment.scan_completed_at = transition_time
+            if scan_status in {"infected", "quarantined"}:
+                attachment.deletion_status = "quarantined"
+                attachment.quarantined_at = utc_now()
+                attachment.processing_status = "failed_pending_review"
+            elif scan_status == "scan_failed":
+                attachment.processing_status = "failed_pending_review"
+            elif scan_status == "clean":
+                attachment.processing_status = "pending"
+            task = session.scalar(
+                select(MediaProcessingTask).where(
+                    MediaProcessingTask.attachment_id == attachment_id
+                )
+            )
+            if task is not None and scan_status != "clean":
+                task.status = "failed_pending_review"
+                task.completed_at = utc_now()
+            self._audit(session, attachment.message_id, f"media_scan_{scan_status}")
+            logger.info(
+                "media_scan_transition",
+                extra={"media_id": attachment_id, "status": scan_status},
+            )
 
     def record_download_failure(self, message_id: str, *, media_kind: str) -> None:
         """保存下载失败的独立媒体任务，并要求销售以文字补充。"""
@@ -209,7 +334,12 @@ class MediaAttachmentService:
                 attachment is None
                 or attachment.storage_key is None
                 or attachment.detected_mime_type is None
+                or attachment.scan_status != "clean"
+                or attachment.deletion_status != "active"
             ):
+                return
+            # 对象读取前再次确认，避免 retention 或 scanner 在上一次读取后改变状态。
+            if not self._attachment_is_processable(attachment_id):
                 return
             try:
                 # 存储读取失败也必须停留在该附件任务内，不能阻断来源消息的后续消费。
@@ -219,6 +349,9 @@ class MediaAttachmentService:
                 return
             media_kind = attachment.media_kind
             mime_type = attachment.detected_mime_type
+        # 在外部 OCR/ASR 前第二次读取状态，防止扫描隔离竞态。
+        if not self._attachment_is_processable(attachment_id):
+            return
         try:
             text = (
                 self._ocr_provider.recognize(
@@ -235,6 +368,9 @@ class MediaAttachmentService:
         with self._session_factory.begin() as session:
             attachment = session.get(MessageAttachment, attachment_id)
             if attachment is None:
+                return
+            # 外部识别返回后仍需确认，禁止将已隔离内容写入正文或标记成功。
+            if attachment.scan_status != "clean" or attachment.deletion_status != "active":
                 return
             task = session.scalar(
                 select(MediaProcessingTask).where(
@@ -256,6 +392,16 @@ class MediaAttachmentService:
             task.completed_at = utc_now()
             self._audit(session, attachment.message_id, "media_recognition_succeeded")
 
+    def _attachment_is_processable(self, attachment_id: str) -> bool:
+        """重新读取附件状态，确认它仍可安全进入 OCR/ASR。"""
+        with self._session_factory() as session:
+            attachment = session.get(MessageAttachment, attachment_id)
+            return bool(
+                attachment is not None
+                and attachment.scan_status == "clean"
+                and attachment.deletion_status == "active"
+            )
+
     def _record_ingest_failure(
         self, message_id: str, media_kind: str, declared_mime_type: str | None, error: Exception
     ) -> str:
@@ -263,6 +409,7 @@ class MediaAttachmentService:
         attachment_id = str(uuid4())
         # 外部扫描器异常可能包含下载地址或媒体片段，只持久化受控失败码。
         summary = self._safe_ingest_failure_summary(error)
+        scan_status = self._scan_status_for_failure(error)
         with self._session_factory.begin() as session:
             session.add(
                 MessageAttachment(
@@ -270,9 +417,15 @@ class MediaAttachmentService:
                     message_id=message_id,
                     media_kind=media_kind,
                     declared_mime_type=declared_mime_type,
-                    scan_status="failed",
+                    scan_status=scan_status,
                     processing_status="failed_pending_review",
                     error_summary=summary,
+                    quarantined_at=(
+                        utc_now() if scan_status in {"infected", "quarantined"} else None
+                    ),
+                    deletion_status="quarantined"
+                    if scan_status in {"infected", "quarantined"}
+                    else "active",
                     completed_at=utc_now(),
                 )
             )
@@ -291,6 +444,14 @@ class MediaAttachmentService:
             self._audit(session, message_id, "media_validation_failed")
             self._notice(session, message_id)
         return attachment_id
+
+    @staticmethod
+    def _scan_status_for_failure(error: Exception) -> str:
+        """把受控扫描错误映射到可审计且 fail-closed 的生命周期状态。"""
+        detail = str(error)
+        if "infected" in detail:
+            return "infected"
+        return "scan_failed"
 
     @staticmethod
     def _safe_ingest_failure_summary(error: Exception) -> str:

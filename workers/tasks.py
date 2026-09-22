@@ -19,11 +19,19 @@ from app.crm.commands import consume_submission_command
 from app.crm.dependencies import get_crm_adapter
 from app.leads.review import LeadReviewService
 from app.leads.service import COMPLETED_CHECKPOINT_STATUSES, FirstTextLeadWorkspaceService
-from app.media.dependencies import get_media_attachment_service
+from app.media.dependencies import get_media_attachment_service, get_media_storage_provider
+from app.media.retention import (
+    RetentionCleanupScheduler,
+    RetentionCleanupService,
+    RetentionPayloadScrubService,
+    RetentionPolicy,
+    StorageIngestRecoveryService,
+)
 from app.messaging.models import (
     IncomingMessage,
     OutboxEvent,
     SalesAuthorization,
+    StorageIngestOperation,
     WecomActionOutbox,
     WecomActionOutboxStatus,
     utc_now,
@@ -460,3 +468,102 @@ def _is_wecom_action_command(session_factory: sessionmaker[Session], outbox_even
     with session_factory() as session:
         event = session.get(OutboxEvent, outbox_event_id)
         return event is not None and event.event_type == "wecom_action_command"
+
+
+@celery_app.task(name="workers.issue_retention_cleanup_operations")  # type: ignore[untyped-decorator]
+def issue_retention_cleanup_operations() -> int:
+    """由 Scheduler 扫描到期附件并签发 operation，不执行远端删除。"""
+    engine, factory = _session_factory()
+    try:
+        policy = RetentionPolicy.from_settings(get_settings())
+        scheduler = RetentionCleanupScheduler(factory)
+        operation_ids = scheduler.scan_and_issue(
+            policy,
+            batch_size=get_settings().retention_cleanup_batch_size,
+        )
+        # 同一周期同时重新派发 retry/reconcile 和已过期租约，覆盖 Worker 崩溃恢复。
+        operation_ids = list(
+            dict.fromkeys(
+                operation_ids
+                + scheduler.runnable_operation_ids(
+                    batch_size=get_settings().retention_cleanup_batch_size
+                )
+            )
+        )[: get_settings().retention_cleanup_batch_size]
+    finally:
+        engine.dispose()
+    for operation_id in operation_ids:
+        # 只把持久化 operation 投递给 Worker，Scheduler 不接触 object storage。
+        execute_retention_cleanup.delay(operation_id)
+    scrub_retention_payloads.delay()
+    return len(operation_ids)
+
+
+@celery_app.task(name="workers.reconcile_storage_ingest_operations")  # type: ignore[untyped-decorator]
+def reconcile_storage_ingest_operations() -> int:
+    """Scheduler 只扫描未终态 ingest intent，Worker 才执行 HEAD/reconcile。"""
+    engine, factory = _session_factory()
+    try:
+        with factory() as session:
+            operation_ids = session.scalars(
+                select(StorageIngestOperation.id)
+                .where(
+                    or_(
+                        StorageIngestOperation.status.in_(
+                            ("pending", "retrying", "reconcile_required")
+                        ),
+                        and_(
+                            StorageIngestOperation.status == "processing",
+                            or_(
+                                StorageIngestOperation.lease_expires_at.is_(None),
+                                StorageIngestOperation.lease_expires_at <= utc_now(),
+                            ),
+                        ),
+                    )
+                )
+                .order_by(StorageIngestOperation.created_at, StorageIngestOperation.id)
+                .limit(get_settings().retention_cleanup_batch_size)
+            ).all()
+    finally:
+        engine.dispose()
+    for operation_id in operation_ids:
+        reconcile_storage_ingest_operation.delay(operation_id)
+    return len(operation_ids)
+
+
+@celery_app.task(name="workers.reconcile_storage_ingest_operation")  # type: ignore[untyped-decorator]
+def reconcile_storage_ingest_operation(operation_id: str) -> str:
+    """Worker 先 HEAD 固定 object key，存在则 finalize，缺失则保留人工恢复事实。"""
+    engine, factory = _session_factory()
+    try:
+        return StorageIngestRecoveryService(factory).reconcile(
+            operation_id, get_media_storage_provider(get_settings())
+        )
+    finally:
+        engine.dispose()
+
+
+@celery_app.task(name="workers.execute_retention_cleanup")  # type: ignore[untyped-decorator]
+def execute_retention_cleanup(operation_id: str) -> str:
+    """由 Worker claim、HEAD、删除并以 fenced finalize 收敛一个清理 operation。"""
+    engine, factory = _session_factory()
+    try:
+        storage = get_media_storage_provider(get_settings())
+        return RetentionCleanupService(factory).execute(
+            operation_id,
+            storage,
+            lease_seconds=get_settings().retention_cleanup_lease_seconds,
+        )
+    finally:
+        engine.dispose()
+
+
+@celery_app.task(name="workers.scrub_retention_payloads")  # type: ignore[untyped-decorator]
+def scrub_retention_payloads() -> tuple[int, int]:
+    """由 Worker 按独立 data class 策略 scrub 消息和通知正文。"""
+    engine, factory = _session_factory()
+    try:
+        policy = RetentionPolicy.from_settings(get_settings())
+        return RetentionPayloadScrubService(factory).scrub_expired_payloads(policy)
+    finally:
+        engine.dispose()

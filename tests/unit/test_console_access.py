@@ -20,6 +20,7 @@ from app.console.break_glass import (
     BreakGlassAccessService,
 )
 from app.console.models import AIExecutionRecord, BreakGlassAccessAudit
+from app.media.storage import FakeStorageProvider
 from app.messaging.models import Base, IncomingMessage, MessageAttachment, SalesAuthorization
 
 
@@ -129,6 +130,7 @@ def test_break_glass_requires_reason_audits_before_returning_raw_message(
 
 def test_break_glass_audit_failure_blocks_raw_access() -> None:
     """验证审计事务失败时不读取原始对象。"""
+
     class FailingSessionFactory:
         """模拟不可写审计数据库。"""
 
@@ -177,6 +179,7 @@ def test_database_ai_recorder_accepts_only_metadata_event(
 
 def test_break_glass_attachment_returns_signed_url_without_bytes(
     session_factory: sessionmaker[Session],
+    tmp_path,
 ) -> None:
     """验证附件 Break-glass 只返回签名地址，不把二进制装入服务响应。"""
 
@@ -198,6 +201,8 @@ def test_break_glass_attachment_returns_signed_url_without_bytes(
             self.calls.append((storage_key, expires_in_seconds, download))
             return "https://storage.test/signed/opaque"
 
+    storage = FakeStorageProvider(tmp_path)
+    stored = storage.put(b"safe", suffix=".png")
     with session_factory.begin() as session:
         session.add(
             IncomingMessage(
@@ -213,13 +218,16 @@ def test_break_glass_attachment_returns_signed_url_without_bytes(
                 id="attachment-1",
                 message_id="message-attachment",
                 media_kind="image",
-                storage_key="artifacts/opaque",
+                storage_key=stored.storage_key,
                 detected_mime_type="image/png",
+                scan_status="clean",
             )
         )
 
     provider = FakeSignedURLProvider()
-    service = BreakGlassAccessService(session_factory, signed_url_provider=provider)
+    service = BreakGlassAccessService(
+        session_factory, signed_url_provider=provider, storage_provider=storage
+    )
     result = service.access(
         BreakGlassAccessRequest(
             operator_subject="admin-1",
@@ -234,4 +242,4 @@ def test_break_glass_attachment_returns_signed_url_without_bytes(
 
     assert result.signed_url == "https://storage.test/signed/opaque"
     assert not hasattr(result, "content")
-    assert provider.calls == [("artifacts/opaque", 300, False)]
+    assert provider.calls == [(stored.storage_key, 300, False)]

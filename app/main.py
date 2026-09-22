@@ -13,6 +13,7 @@ from starlette.middleware.base import RequestResponseEndpoint
 from app.console.routes import router as console_router
 from app.core.config import get_settings
 from app.core.logging import bind_log_context, configure_logging, reset_log_context
+from app.media.readiness import ProductionMediaReadinessChecker
 from app.smart_table.adapter import SmartTableAdapter
 from app.smart_table.dependencies import get_smart_table_adapter
 from app.smart_table.readiness import SmartTableReadinessChecker
@@ -67,12 +68,14 @@ async def readiness(
     返回：配置正确时返回 200；缺失字段、权限或适配器时返回 503 与脱敏问题摘要。
     副作用：调用适配器读取结构和权限，并写入结构化就绪检查日志。
     """
-    report = SmartTableReadinessChecker().check(adapter)
-    if report.ready:
+    smart_table_report = SmartTableReadinessChecker().check(adapter)
+    media_report = ProductionMediaReadinessChecker().check(settings)
+    issues = [*smart_table_report.issues, *media_report.issues]
+    if not issues:
         return JSONResponse({"status": "ok", "service": "app", "issues": []})
 
     # 配置错误需要阻止服务接收业务流量，同时保留可操作的中文排障信息。
     return JSONResponse(
-        {"status": "error", "service": "app", "issues": list(report.issues)},
+        {"status": "error", "service": "app", "issues": issues},
         status_code=503,
     )

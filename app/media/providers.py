@@ -43,6 +43,41 @@ class NoopFileScanProvider:
         return "not_required"
 
 
+class FakeFileScanProvider:
+    """按显式结果模拟安全扫描器，禁止测试默认把未知结果当作 clean。"""
+
+    def __init__(self, result: str) -> None:
+        """保存测试扫描结果；timeout 通过调用时抛出异常表达。"""
+        self._result = result
+
+    def scan(self, content: bytes, *, mime_type: str, timeout_seconds: float) -> str:
+        """返回预设状态或模拟扫描超时。"""
+        del content, mime_type, timeout_seconds
+        if self._result == "timeout":
+            raise RuntimeError("scanner_timeout")
+        if self._result not in {
+            "pending_scan",
+            "scanning",
+            "clean",
+            "infected",
+            "failed",
+            "scan_failed",
+            "quarantined",
+            "not_required",
+        }:
+            raise RuntimeError("scanner_result_invalid")
+        return self._result
+
+
+class UnconfiguredFileScanProvider:
+    """生产未配置扫描器时的 fail-closed 实现，永不返回 clean。"""
+
+    def scan(self, content: bytes, *, mime_type: str, timeout_seconds: float) -> str:
+        """拒绝未配置扫描器的媒体，不把配置错误伪装成扫描通过。"""
+        del content, mime_type, timeout_seconds
+        raise RuntimeError("scanner_not_configured")
+
+
 class QwenOCRProvider:
     """通过 Qwen OpenAI 兼容 Chat Completions 接口执行 OCR。"""
 
