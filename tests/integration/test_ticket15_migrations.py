@@ -73,8 +73,9 @@ def test_current_migration_chain_reaches_single_head() -> None:
     compose_started = False
     try:
         # 先构建当前代码镜像，确保容器内执行的 Alembic 与被测提交一致。
-        build = _run_compose(project_name, environment, "build", "migrate")
-        _assert_compose_success(build, ("build", "migrate"))
+        # Compose 的 BuildKit raw 输出可能填满 subprocess pipe；wrapper 只需验证构建成功。
+        build = _run_compose(project_name, environment, "build", "--quiet", "migrate")
+        _assert_compose_success(build, ("build", "--quiet", "migrate"))
 
         # 只启动本测试专用 PostgreSQL 服务；不复用损坏的默认 Compose Volume。
         start = _run_compose(project_name, environment, "up", "-d", "postgres")
@@ -160,8 +161,8 @@ def test_current_migration_chain_reaches_single_head() -> None:
         _assert_compose_success(
             heads, ("run", "--rm", "--no-deps", "migrate", "alembic", "heads")
         )
-        # T18 继续以 0022 revision 作为唯一 head，并保留 0021 父 revision。
-        assert heads.stdout.count("0022_ticket18_wecom_actions") == 1
+        # T22 在 T18 之后继续保持单一 migration head。
+        assert heads.stdout.count("0023_ticket22_storage_retention") == 1
 
         # 只有 notification payload 的 T18 事实也必须阻止 downgrade，不能因没有 action 行而丢列。
         payload_seed = _run_compose(
