@@ -14,6 +14,7 @@ from starlette.middleware.base import RequestResponseEndpoint
 
 from app.console.routes import router as console_router
 from app.core.config import get_settings
+from app.core.heartbeat import check_heartbeat
 from app.core.logging import bind_log_context, configure_logging, reset_log_context
 from app.core.provider_policy import get_provider_policy
 from app.core.readiness import (
@@ -130,13 +131,29 @@ def _runtime_readiness_components() -> tuple[ReadinessComponent, ...]:
             return not_ready_component("migration", "migration_pending")
         return ready_component("migration", "migration_current")
 
+    redis_client: Redis | None = None
+
+    def get_redis_client() -> Redis:
+        """按需创建共享 Redis readiness 客户端。"""
+        nonlocal redis_client
+        if redis_client is None:
+            redis_client = Redis.from_url(settings.redis_url, socket_connect_timeout=2)
+        return redis_client
+
     def redis_check() -> ReadinessComponent:
         """执行 Redis PING，不返回 Redis URL 或错误正文。"""
         try:
-            Redis.from_url(settings.redis_url, socket_connect_timeout=2).ping()
+            get_redis_client().ping()
         except Exception:
             return not_ready_component("redis", "redis_unavailable")
         return ready_component("redis", "connection_ok")
+
+    def heartbeat_check(component: str) -> ReadinessComponent:
+        """执行单个 Worker/Scheduler heartbeat 的安全检查。"""
+        try:
+            return check_heartbeat(get_redis_client(), component)
+        except Exception:
+            return not_ready_component(component, "heartbeat_unavailable")
 
     try:
         registry = ReadinessRegistry(
@@ -144,12 +161,8 @@ def _runtime_readiness_components() -> tuple[ReadinessComponent, ...]:
                 "database": database_check,
                 "redis": redis_check,
                 "migration": migration_check,
-                "worker": lambda: ready_component("worker", "heartbeat_configured")
-                if settings.worker_readiness_configured
-                else not_ready_component("worker", "heartbeat_not_configured"),
-                "scheduler": lambda: ready_component("scheduler", "heartbeat_configured")
-                if settings.scheduler_readiness_configured
-                else not_ready_component("scheduler", "heartbeat_not_configured"),
+                "worker": lambda: heartbeat_check("worker"),
+                "scheduler": lambda: heartbeat_check("scheduler"),
             }
         )
         return registry.check().components

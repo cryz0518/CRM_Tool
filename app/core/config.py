@@ -88,8 +88,6 @@ class Settings(BaseSettings):
     console_dev_admin_token: str | None = None
     console_dev_admin_subject: str = "development-admin"
     console_dev_admin_role: str = "administrator"
-    worker_readiness_configured: bool = False
-    scheduler_readiness_configured: bool = False
 
     @field_validator(
         "wecom_smart_table_sales_can_create_records",

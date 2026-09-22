@@ -10,6 +10,7 @@ from redis import Redis
 from sqlalchemy import create_engine, text
 
 from app.core.config import Settings
+from app.core.heartbeat import check_heartbeat
 from app.core.provider_policy import ProviderPolicy
 from app.core.readiness import (
     ReadinessComponent,
@@ -53,14 +54,12 @@ def _static_components(settings: Settings) -> tuple[ReadinessComponent, ...]:
     异常：无；缺失配置以稳定原因码返回。
     副作用：仅读取本地配置和代码包。
     """
-    components = list(_policy_components(settings))
+    components: list[ReadinessComponent] = []
     components.extend(
         (
             _static_setting("database", bool(settings.database_url)),
             _static_setting("redis", bool(settings.redis_url)),
             _static_migration_component(),
-            _static_process_component("worker", settings.worker_readiness_configured),
-            _static_process_component("scheduler", settings.scheduler_readiness_configured),
         )
     )
     return tuple(components)
@@ -78,15 +77,8 @@ def _static_migration_component() -> ReadinessComponent:
     return ready_component("migration", "migration_head_declared")
 
 
-def _static_process_component(component: str, configured: bool) -> ReadinessComponent:
-    """检查 Worker/Scheduler 是否声明了可观测 readiness 信号。"""
-    if configured:
-        return ready_component(component, "heartbeat_configured")
-    return not_ready_component(component, "heartbeat_not_configured")
-
-
 def _runtime_components(settings: Settings) -> ReadinessReport:
-    """执行数据库、Redis 和 migration 的只读运行时验证。
+    """执行数据库、Redis、migration 和 heartbeat 的只读运行时验证。
 
     参数：settings 为待验证配置。
     返回值：不包含凭据和异常正文的运行时报告。
@@ -102,6 +94,8 @@ def _runtime_components(settings: Settings) -> ReadinessReport:
                 not_ready_component("database", "database_configuration_invalid"),
                 not_ready_component("redis", "runtime_probe_skipped"),
                 not_ready_component("migration", "migration_unavailable"),
+                not_ready_component("worker", "runtime_probe_skipped"),
+                not_ready_component("scheduler", "runtime_probe_skipped"),
             )
         )
 
@@ -119,16 +113,35 @@ def _runtime_components(settings: Settings) -> ReadinessReport:
             return not_ready_component("migration", "migration_pending")
         return ready_component("migration", "migration_current")
 
+    redis_client: Redis | None = None
+
+    def get_redis_client() -> Redis:
+        """按需创建共享 Redis runtime probe 客户端。"""
+        nonlocal redis_client
+        if redis_client is None:
+            redis_client = Redis.from_url(settings.redis_url, socket_connect_timeout=2)
+        return redis_client
+
     def redis_check() -> ReadinessComponent:
         """执行 Redis PING 探针。"""
-        Redis.from_url(settings.redis_url, socket_connect_timeout=2).ping()
+        get_redis_client().ping()
         return ready_component("redis", "connection_ok")
+
+    def worker_check() -> ReadinessComponent:
+        """读取 Worker heartbeat 的新鲜度。"""
+        return check_heartbeat(get_redis_client(), "worker")
+
+    def scheduler_check() -> ReadinessComponent:
+        """读取 Scheduler heartbeat 的新鲜度。"""
+        return check_heartbeat(get_redis_client(), "scheduler")
 
     registry = ReadinessRegistry(
         {
             "database": database_check,
             "redis": redis_check,
             "migration": migration_check,
+            "worker": worker_check,
+            "scheduler": scheduler_check,
         }
     )
     try:
@@ -143,12 +156,14 @@ def verify(mode: str, settings: Settings | None = None) -> ReadinessReport:
     参数：mode 为验证模式；settings 为可选配置，便于测试注入。
     返回值：聚合后的脱敏 readiness 报告。
     异常：mode 非法时抛出 ValueError；外部依赖失败转为报告状态。
-    副作用：runtime/all 模式只读取数据库、migration 版本和 Redis 状态。
+    副作用：runtime/all 模式只读取数据库、migration 版本、Redis 和 heartbeat 状态。
     """
     if mode not in {"static", "runtime", "all"}:
         raise ValueError("mode 必须是 static、runtime 或 all")
     selected = settings or Settings()
     reports: list[ReadinessComponent] = []
+    if mode in {"static", "runtime", "all"}:
+        reports.extend(_policy_components(selected))
     if mode in {"static", "all"}:
         reports.extend(_static_components(selected))
     if mode in {"runtime", "all"}:

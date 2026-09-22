@@ -670,24 +670,15 @@ def break_glass_access(
     service: Annotated[BreakGlassAccessService, Depends(get_break_glass_access_service)],
 ) -> JSONResponse:
     """执行单对象 Break-glass 访问，审计失败时拒绝返回原始数据。"""
-    decision = _require_break_glass_capability(authorizer, principal, body.access_type)
+    _require_break_glass_capability(authorizer, principal, body.access_type)
     access_request = BreakGlassAccessRequest(
-        operator_subject=principal.subject,
-        operator_role=decision.role or "unknown",
-        auth_source=principal.provider,
+        principal=principal,
         object_type=body.object_type,
         object_id=body.object_id,
         access_type=body.access_type,
         reason=body.reason,
         # Break-glass 使用 middleware 已规范化的 server id，不直接信任 header。
         request_id=normalize_request_id(getattr(request.state, "request_id", None)),
-        request_context={
-            "route": str(request.url.path),
-            "verified_subject": principal.subject,
-            "provider": principal.provider,
-            "capability": decision.capability.value,
-            "authorization_basis": decision.basis,
-        },
     )
     try:
         result = service.access(access_request)

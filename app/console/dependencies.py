@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Annotated
 
-from fastapi import Depends
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -14,6 +12,7 @@ from app.console.auth import (
     CapabilityAuthorizer,
     DenyAllAdminIdentityProvider,
     DevelopmentAdminIdentityProvider,
+    LocalCapabilityAuthorizer,
 )
 from app.console.break_glass import BreakGlassAccessService
 from app.console.health import DefaultConsoleHealthProvider
@@ -54,7 +53,7 @@ def get_admin_identity_provider() -> AdminIdentityProvider:
     try:
         # 环境判断集中在 policy；工厂只按显式 Provider 选择构造实现。
         get_provider_policy(settings).require(
-            "admin_identity_provider", settings.admin_identity_provider
+            "admin_identity_provider", settings.admin_identity_provider, settings=settings
         )
     except ProviderPolicyError:
         # 生产缺失或误用开发 Provider 时保持请求 fail closed，同时由 readiness 报告原因。
@@ -69,16 +68,14 @@ def get_admin_identity_provider() -> AdminIdentityProvider:
 
 
 def get_capability_authorizer(
-    provider: Annotated[AdminIdentityProvider, Depends(get_admin_identity_provider)],
 ) -> CapabilityAuthorizer:
     """将认证 Provider 暴露为独立 capability 授权 Seam。
 
-    参数：provider 为已由认证工厂选择的 Provider。
-    返回值：只负责授权的稳定接口，Console 路由不直接耦合实现类别。
+    返回值：只负责本地授权的稳定接口，Console 路由不直接耦合认证 Provider。
     异常：无。
     副作用：无外部调用。
     """
-    return provider
+    return LocalCapabilityAuthorizer(get_console_session_factory())
 
 
 @lru_cache
@@ -115,6 +112,7 @@ def get_break_glass_access_service() -> BreakGlassAccessService:
         ttl = 300
     return BreakGlassAccessService(
         get_console_session_factory(),
+        capability_authorizer=get_capability_authorizer(),
         signed_url_provider=signer,
         storage_provider=storage,
         signed_url_ttl_seconds=ttl,

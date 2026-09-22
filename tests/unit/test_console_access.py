@@ -14,6 +14,7 @@ from app.ai.gateway import AIGateway
 from app.ai.models import LLMResponse
 from app.ai.persistence import AIExecutionRecorderEvent, DatabaseAIExecutionRecorder
 from app.ai.provider import MockLLMProvider
+from app.console.auth import AdminPrincipal, DevelopmentAdminIdentityProvider
 from app.console.break_glass import (
     BreakGlassAccessError,
     BreakGlassAccessRequest,
@@ -80,6 +81,11 @@ def test_break_glass_requires_reason_audits_before_returning_raw_message(
     with session_factory.begin() as session:
         session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True))
         session.add(
+            SalesAuthorization(
+                wecom_user_id="admin-1", is_authorized=True, is_active=True, is_administrator=True
+            )
+        )
+        session.add(
             IncomingMessage(
                 message_id="message-1",
                 sales_user_id="sales-1",
@@ -91,8 +97,7 @@ def test_break_glass_requires_reason_audits_before_returning_raw_message(
 
     service = BreakGlassAccessService(session_factory)
     request = BreakGlassAccessRequest(
-        operator_subject="admin-1",
-        operator_role="administrator",
+        principal=AdminPrincipal("admin-1", frozenset({"administrator"}), "test"),
         object_type="message",
         object_id="message-1",
         access_type="view_raw_message",
@@ -117,8 +122,7 @@ def test_break_glass_requires_reason_audits_before_returning_raw_message(
     with pytest.raises(BreakGlassAccessError, match="必须填写原因"):
         service.access(
             request.__class__(
-                operator_subject=request.operator_subject,
-                operator_role=request.operator_role,
+                principal=request.principal,
                 object_type=request.object_type,
                 object_id=request.object_id,
                 access_type=request.access_type,
@@ -138,10 +142,14 @@ def test_break_glass_audit_failure_blocks_raw_access() -> None:
             """让审计事务在任何读取前失败。"""
             raise RuntimeError("audit database unavailable")
 
-    service = BreakGlassAccessService(FailingSessionFactory())  # type: ignore[arg-type]
+    service = BreakGlassAccessService(
+        FailingSessionFactory(),
+        capability_authorizer=DevelopmentAdminIdentityProvider(
+            token=None, subject="admin-1", roles=frozenset({"administrator"})
+        ),
+    )  # type: ignore[arg-type]
     request = BreakGlassAccessRequest(
-        operator_subject="admin-1",
-        operator_role="administrator",
+        principal=AdminPrincipal("admin-1", frozenset({"administrator"}), "test"),
         object_type="message",
         object_id="message-1",
         access_type="view_raw_message",
@@ -205,6 +213,11 @@ def test_break_glass_attachment_returns_signed_url_without_bytes(
     stored = storage.put(b"safe", suffix=".png")
     with session_factory.begin() as session:
         session.add(
+            SalesAuthorization(
+                wecom_user_id="admin-1", is_authorized=True, is_active=True, is_administrator=True
+            )
+        )
+        session.add(
             IncomingMessage(
                 message_id="message-attachment",
                 sales_user_id="sales-1",
@@ -230,8 +243,7 @@ def test_break_glass_attachment_returns_signed_url_without_bytes(
     )
     result = service.access(
         BreakGlassAccessRequest(
-            operator_subject="admin-1",
-            operator_role="administrator",
+            principal=AdminPrincipal("admin-1", frozenset({"administrator"}), "test"),
             object_type="attachment",
             object_id="attachment-1",
             access_type="preview_attachment",

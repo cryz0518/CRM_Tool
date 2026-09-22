@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -9,6 +10,12 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Protocol
+
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.messaging.models import SalesAuthorization
+
+logger = logging.getLogger(__name__)
 
 
 class ConsoleCapability(StrEnum):
@@ -284,3 +291,60 @@ class DenyAllAdminIdentityProvider:
     ) -> AuthorizationDecision:
         """返回生产未接入真实身份 Provider 时的拒绝判定。"""
         return AuthorizationDecision(False, capability, "provider_not_configured")
+
+
+class LocalCapabilityAuthorizer:
+    """只依据本地 SalesAuthorization 授予 Console capability。"""
+
+    _CAPABILITIES = frozenset(ConsoleCapability)
+
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        """保存本地授权目录会话工厂。
+
+        参数：session_factory 为读取本地 SalesAuthorization 的会话工厂。
+        返回值：无。
+        异常：无。
+        副作用：仅保存依赖，不访问数据库。
+        """
+        self._session_factory = session_factory
+
+    def authorize(self, principal: AuthenticatedPrincipal, capability: ConsoleCapability) -> bool:
+        """依据本地 active administrator 记录判断 capability。
+
+        参数：principal 为认证 Provider 返回的主体；capability 为待授权能力。
+        返回值：本地存在 active administrator 且能力受支持时返回 True。
+        异常：数据库故障按拒绝处理，不向调用方泄露数据库错误。
+        副作用：只读 SalesAuthorization。
+        """
+        return self.decide(principal, capability).allowed
+
+    def decide(
+        self, principal: AuthenticatedPrincipal, capability: ConsoleCapability
+    ) -> AuthorizationDecision:
+        """生成只包含本地授权依据的 capability 判定。
+
+        参数：principal 为认证主体；capability 为待授权能力。
+        返回值：含稳定 capability、basis 和本地角色的判定。
+        异常：数据库故障转换为拒绝判定。
+        副作用：读取本地授权目录，不信任 principal 的 claims/groups 作为授权事实。
+        """
+        if capability not in self._CAPABILITIES:
+            return AuthorizationDecision(False, capability, "capability_not_supported")
+        try:
+            with self._session_factory() as session:
+                authorization = session.get(SalesAuthorization, principal.subject)
+        except Exception as error:
+            logger.error(
+                "local_capability_authorization_failed",
+                extra={"error_type": type(error).__name__},
+            )
+            return AuthorizationDecision(False, capability, "local_authorization_unavailable")
+        if authorization is None:
+            return AuthorizationDecision(False, capability, "local_authorization_missing")
+        if not authorization.is_authorized:
+            return AuthorizationDecision(False, capability, "local_authorization_not_authorized")
+        if not authorization.is_active:
+            return AuthorizationDecision(False, capability, "local_authorization_inactive")
+        if not authorization.is_administrator:
+            return AuthorizationDecision(False, capability, "local_authorization_not_administrator")
+        return AuthorizationDecision(True, capability, "local_sales_authorization", "administrator")

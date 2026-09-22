@@ -12,7 +12,11 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.console.auth import AdminIdentityProvider, DevelopmentAdminIdentityProvider
-from app.console.dependencies import get_admin_identity_provider, get_console_maintenance_service
+from app.console.dependencies import (
+    get_admin_identity_provider,
+    get_capability_authorizer,
+    get_console_maintenance_service,
+)
 from app.console.maintenance import ConsoleMaintenanceResult, ConsoleMaintenanceService
 from app.core.failures import safe_audit_text
 from app.main import app
@@ -106,9 +110,13 @@ def overrides() -> Generator[StubMaintenanceService, None, None]:
     )
     service = StubMaintenanceService()
     app.dependency_overrides[get_admin_identity_provider] = lambda: provider
+    app.dependency_overrides[get_capability_authorizer] = lambda: app.dependency_overrides[
+        get_admin_identity_provider
+    ]()
     app.dependency_overrides[get_console_maintenance_service] = lambda: service
     yield service
     app.dependency_overrides.pop(get_admin_identity_provider, None)
+    app.dependency_overrides.pop(get_capability_authorizer, None)
     app.dependency_overrides.pop(get_console_maintenance_service, None)
 
 

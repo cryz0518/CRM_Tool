@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 PRODUCTION_ENVIRONMENTS = frozenset({"production", "prod"})
 """生产环境名称集合，避免各工厂重复实现环境判断。"""
 
-FORBIDDEN_PROVIDER_MARKERS = (
+FORBIDDEN_PROVIDER_NAMES = frozenset({
     "mock",
     "fake",
     "local",
@@ -20,8 +20,20 @@ FORBIDDEN_PROVIDER_MARKERS = (
     "unconfigured",
     "development",
     "dev",
-)
-"""生产环境不得使用的测试、开发或空 Provider 标记。"""
+})
+"""生产环境不得使用的测试、开发或空 Provider 名称。"""
+
+PROVIDER_IMPLEMENTATIONS = {
+    "admin_identity_provider": frozenset({"development"}),
+    "smart_table": frozenset({"mock", "wecom_cli"}),
+    "crm": frozenset({"mock"}),
+    "llm": frozenset({"mock", "qwen"}),
+    "ocr": frozenset({"mock", "qwen"}),
+    "asr": frozenset({"mock", "qwen"}),
+    "storage": frozenset({"local", "fake"}),
+    "scanner": frozenset({"noop", "fake"}),
+}
+"""声明当前代码实际存在的 Provider 实现，避免名称与 factory 行为漂移。"""
 
 
 @dataclass(frozen=True)
@@ -80,10 +92,16 @@ class ProviderPolicy:
         """返回当前环境是否属于生产环境。"""
         return self._app_env in PRODUCTION_ENVIRONMENTS
 
-    def evaluate(self, component: str, provider: str | None) -> ProviderPolicyResult:
+    def evaluate(
+        self,
+        component: str,
+        provider: str | None,
+        *,
+        settings: Settings | None = None,
+    ) -> ProviderPolicyResult:
         """判断一个 Provider 是否可以在当前环境使用。
 
-        参数：component 为能力组件名；provider 为配置中的 Provider 名称。
+        参数：component 为能力组件名；provider 为配置中的 Provider 名称；settings 为可选配置。
         返回值：脱敏的 ready/not_ready 判定结果。
         异常：无。
         副作用：无。
@@ -91,18 +109,29 @@ class ProviderPolicy:
         normalized = (provider or "").strip().lower()
         if not normalized or normalized == "unconfigured":
             return ProviderPolicyResult(component, normalized, "not_ready", "provider_missing")
-        if self.is_production and any(
-            marker in normalized for marker in FORBIDDEN_PROVIDER_MARKERS
-        ):
+        if self.is_production and normalized in FORBIDDEN_PROVIDER_NAMES:
             return ProviderPolicyResult(
                 component,
                 normalized,
                 "not_ready",
                 "production_test_provider_forbidden",
             )
+        if normalized not in PROVIDER_IMPLEMENTATIONS.get(component, frozenset()):
+            return ProviderPolicyResult(component, normalized, "not_ready", "provider_unavailable")
+        missing = self._missing_configuration(settings, component, normalized)
+        if missing:
+            return ProviderPolicyResult(
+                component, normalized, "not_ready", "provider_configuration_missing"
+            )
         return ProviderPolicyResult(component, normalized, "ok", "provider_allowed")
 
-    def require(self, component: str, provider: str | None) -> ProviderPolicyResult:
+    def require(
+        self,
+        component: str,
+        provider: str | None,
+        *,
+        settings: Settings | None = None,
+    ) -> ProviderPolicyResult:
         """校验 Provider，失败时抛出安全的策略错误。
 
         参数：component 为能力组件名；provider 为配置中的 Provider 名称。
@@ -110,7 +139,7 @@ class ProviderPolicy:
         异常：Provider 缺失或生产环境使用测试 Provider 时抛出 ProviderPolicyError。
         副作用：无外部调用，不会创建 Provider。
         """
-        result = self.evaluate(component, provider)
+        result = self.evaluate(component, provider, settings=settings)
         if result.status != "ok":
             raise ProviderPolicyError(result)
         return result
@@ -133,7 +162,38 @@ class ProviderPolicy:
             ("storage", settings.media_storage_provider),
             ("scanner", settings.media_scanner_provider),
         )
-        return tuple(self.evaluate(component, provider) for component, provider in selections)
+        return tuple(
+            self.evaluate(component, provider, settings=settings)
+            for component, provider in selections
+        )
+
+    @staticmethod
+    def _missing_configuration(
+        settings: Settings | None, component: str, provider: str
+    ) -> tuple[str, ...]:
+        """返回当前 Provider 缺失的必要配置字段名。
+
+        参数：settings 为可选应用配置；component 和 provider 标识 Provider。
+        返回值：缺失字段名集合；不会返回字段值或密钥内容。
+        异常：无。
+        副作用：无。
+        """
+        if settings is None:
+            return ()
+        required: tuple[str, ...] = ()
+        if component in {"llm", "ocr", "asr"} and provider == "qwen":
+            required = (
+                ("qwen_api_key",)
+                if settings.app_env.lower() in PRODUCTION_ENVIRONMENTS
+                else ()
+            )
+        elif component == "smart_table" and provider == "wecom_cli":
+            required = ("wecom_smart_table_doc_id", "wecom_smart_table_sheet_id")
+        return tuple(
+            field
+            for field in required
+            if not str(getattr(settings, field, "") or "").strip()
+        )
 
 
 def get_provider_policy(settings: Settings) -> ProviderPolicy:

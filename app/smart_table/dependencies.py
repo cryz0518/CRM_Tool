@@ -23,7 +23,9 @@ def get_smart_table_adapter() -> SmartTableAdapter:
     settings = get_settings()
     try:
         # 统一 policy 负责 production 禁止 Mock；工厂不自行读取 APP_ENV。
-        get_provider_policy(settings).require("smart_table", settings.smart_table_adapter)
+        get_provider_policy(settings).require(
+            "smart_table", settings.smart_table_adapter, settings=settings
+        )
     except ProviderPolicyError:
         return UnconfiguredSmartTableAdapter()
     if settings.smart_table_adapter == "mock":

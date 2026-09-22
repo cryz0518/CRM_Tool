@@ -19,7 +19,7 @@ def get_crm_adapter() -> CRMAdapter:
     settings = get_settings()
     # CRM 的 mock/unconfigured 选择统一由 Provider policy 判定。
     try:
-        get_provider_policy(settings).require("crm", settings.crm_adapter)
+        get_provider_policy(settings).require("crm", settings.crm_adapter, settings=settings)
     except ProviderPolicyError as error:
         # 保留 T12/T17 既有调用方可识别的 CRM 配置错误，同时不暴露策略细节或凭据。
         raise RuntimeError("CRM_ADAPTER 未配置真实实现") from error
