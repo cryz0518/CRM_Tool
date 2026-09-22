@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Annotated
 
+from fastapi import Depends
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.console.auth import (
     AdminIdentityProvider,
+    CapabilityAuthorizer,
     DenyAllAdminIdentityProvider,
     DevelopmentAdminIdentityProvider,
 )
@@ -17,6 +20,7 @@ from app.console.health import DefaultConsoleHealthProvider
 from app.console.maintenance import ConsoleMaintenanceService
 from app.console.queries import ConsoleQueryService
 from app.core.config import get_settings
+from app.core.provider_policy import ProviderPolicyError, get_provider_policy
 from app.leads.admin_create import AdminLeadCreationService
 from app.leads.discard import LeadDiscardService
 from app.leads.service import FirstTextLeadWorkspaceService, LeadReassignmentService
@@ -47,13 +51,34 @@ def get_admin_identity_provider() -> AdminIdentityProvider:
     副作用：仅读取配置，不发起认证请求。
     """
     settings = get_settings()
-    if settings.app_env in {"development", "test"}:
+    try:
+        # 环境判断集中在 policy；工厂只按显式 Provider 选择构造实现。
+        get_provider_policy(settings).require(
+            "admin_identity_provider", settings.admin_identity_provider
+        )
+    except ProviderPolicyError:
+        # 生产缺失或误用开发 Provider 时保持请求 fail closed，同时由 readiness 报告原因。
+        return DenyAllAdminIdentityProvider()
+    if settings.admin_identity_provider == "development":
         return DevelopmentAdminIdentityProvider(
             token=settings.console_dev_admin_token,
             subject=settings.console_dev_admin_subject,
             roles=frozenset({settings.console_dev_admin_role}),
         )
     return DenyAllAdminIdentityProvider()
+
+
+def get_capability_authorizer(
+    provider: Annotated[AdminIdentityProvider, Depends(get_admin_identity_provider)],
+) -> CapabilityAuthorizer:
+    """将认证 Provider 暴露为独立 capability 授权 Seam。
+
+    参数：provider 为已由认证工厂选择的 Provider。
+    返回值：只负责授权的稳定接口，Console 路由不直接耦合实现类别。
+    异常：无。
+    副作用：无外部调用。
+    """
+    return provider
 
 
 @lru_cache
@@ -84,7 +109,7 @@ def get_break_glass_access_service() -> BreakGlassAccessService:
     signer = get_media_storage_signer(settings)
     storage = get_media_storage_provider(settings)
     ttl = settings.media_signed_url_ttl_seconds
-    if ttl is None and settings.app_env in {"production", "prod"}:
+    if ttl is None and get_provider_policy(settings).is_production:
         raise RuntimeError("生产 signed URL TTL 未显式配置")
     if ttl is None:
         ttl = 300

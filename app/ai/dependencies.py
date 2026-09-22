@@ -6,6 +6,7 @@ from app.ai.gateway import AIGateway
 from app.ai.persistence import AIExecutionRecorder
 from app.ai.provider import MockLLMProvider, QwenLLMProvider
 from app.core.config import get_settings
+from app.core.provider_policy import get_provider_policy
 
 
 def get_ai_gateway(*, execution_recorder: AIExecutionRecorder | None = None) -> AIGateway:
@@ -17,6 +18,8 @@ def get_ai_gateway(*, execution_recorder: AIExecutionRecorder | None = None) -> 
     副作用：构造 Provider 与 Gateway，不记录密钥或发起模型请求。
     """
     settings = get_settings()
+    # LLM 的测试 Provider 只能在非生产环境显式使用。
+    get_provider_policy(settings).require("llm", settings.llm_provider)
     # Mock 只供测试或显式本地开发；Worker 的默认 qwen 配置始终走真实供应商边界。
     provider = (
         MockLLMProvider([])

@@ -4,15 +4,25 @@ from __future__ import annotations
 
 import logging
 from typing import Annotated
-from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+from redis import Redis
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 from starlette.middleware.base import RequestResponseEndpoint
 
 from app.console.routes import router as console_router
 from app.core.config import get_settings
 from app.core.logging import bind_log_context, configure_logging, reset_log_context
+from app.core.provider_policy import get_provider_policy
+from app.core.readiness import (
+    ReadinessComponent,
+    ReadinessRegistry,
+    not_ready_component,
+    ready_component,
+)
+from app.core.request_id import normalize_request_id
 from app.media.readiness import ProductionMediaReadinessChecker
 from app.smart_table.adapter import SmartTableAdapter
 from app.smart_table.dependencies import get_smart_table_adapter
@@ -29,7 +39,9 @@ app.include_router(console_router)
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next: RequestResponseEndpoint) -> Response:
     """为每个 HTTP 请求绑定请求标识并写入响应头和结构化日志。"""
-    request_id = request.headers.get("X-Request-ID", str(uuid4()))
+    # 客户端 header 只能作为候选值；非法、超长或含控制字符时由服务端生成新 UUID。
+    request_id = normalize_request_id(request.headers.get("X-Request-ID"))
+    request.state.request_id = request_id
     token = bind_log_context(request_id=request_id)
     try:
         logger.info(
@@ -58,6 +70,113 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "service": "app"}
 
 
+def _provider_policy_components() -> tuple[ReadinessComponent, ...]:
+    """返回所有外部 Provider 的集中策略判定，不连接任何外部厂商。
+
+    返回值：包含管理员身份、智能表格、CRM、LLM、OCR、ASR、存储和扫描器的状态。
+    异常：无。
+    副作用：仅读取已解析配置。
+    """
+    policy = get_provider_policy(settings)
+    provider_components = tuple(
+        ReadinessComponent(item.component, item.status, item.reason_code)
+        for item in policy.evaluate_settings(settings)
+    )
+    failed = next((item for item in provider_components if item.status != "ok"), None)
+    summary = (
+        ready_component("provider_policy", "all_providers_allowed")
+        if failed is None
+        else not_ready_component("provider_policy", failed.reason_code)
+    )
+    return (summary, *provider_components)
+
+
+def _runtime_readiness_components() -> tuple[ReadinessComponent, ...]:
+    """执行数据库、Redis、migration、Worker 和 Scheduler 的只读检查。
+
+    返回值：安全的组件状态，不包含异常正文、连接字符串或凭据。
+    异常：单项异常被转换为稳定 reason_code。
+    副作用：执行 SELECT、migration 版本读取和 Redis PING，不执行业务写操作。
+    """
+    try:
+        engine: Engine | None = create_engine(settings.database_url, pool_pre_ping=True)
+    except Exception:
+        # URL 解析失败也必须以安全 readiness 结果返回，不能把 DSN 放进 HTTP 异常。
+        engine = None
+
+    def database_check() -> ReadinessComponent:
+        """执行数据库最小连接探针。"""
+        if engine is None:
+            return not_ready_component("database", "database_configuration_invalid")
+        try:
+            with engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+        except Exception:
+            return not_ready_component("database", "database_unavailable")
+        return ready_component("database", "connection_ok")
+
+    def migration_check() -> ReadinessComponent:
+        """读取 migration 当前版本并拒绝未完成迁移。"""
+        if engine is None:
+            return not_ready_component("migration", "migration_unavailable")
+        try:
+            with engine.connect() as connection:
+                revision = connection.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar()
+        except Exception:
+            return not_ready_component("migration", "migration_unavailable")
+        if revision != "0023_ticket22_storage_retention":
+            return not_ready_component("migration", "migration_pending")
+        return ready_component("migration", "migration_current")
+
+    def redis_check() -> ReadinessComponent:
+        """执行 Redis PING，不返回 Redis URL 或错误正文。"""
+        try:
+            Redis.from_url(settings.redis_url, socket_connect_timeout=2).ping()
+        except Exception:
+            return not_ready_component("redis", "redis_unavailable")
+        return ready_component("redis", "connection_ok")
+
+    try:
+        registry = ReadinessRegistry(
+            {
+                "database": database_check,
+                "redis": redis_check,
+                "migration": migration_check,
+                "worker": lambda: ready_component("worker", "heartbeat_configured")
+                if settings.worker_readiness_configured
+                else not_ready_component("worker", "heartbeat_not_configured"),
+                "scheduler": lambda: ready_component("scheduler", "heartbeat_configured")
+                if settings.scheduler_readiness_configured
+                else not_ready_component("scheduler", "heartbeat_not_configured"),
+            }
+        )
+        return registry.check().components
+    finally:
+        if engine is not None:
+            engine.dispose()
+
+
+def _smart_table_component(
+    adapter: SmartTableAdapter,
+) -> tuple[ReadinessComponent, tuple[str, ...]]:
+    """检查智能表格结构并转换为统一组件状态。
+
+    参数：adapter 为 FastAPI 依赖注入的稳定 Smart Table Adapter。
+    返回值：统一组件结果及兼容旧接口的中文问题列表。
+    异常：适配器错误由既有 checker 转换或向上抛出。
+    副作用：只读取智能表格 schema 和权限。
+    """
+    report = SmartTableReadinessChecker().check(adapter)
+    if report.ready:
+        return ready_component("smart_table", "schema_and_permissions_ok"), report.issues
+    reason = "smart_table_provider_missing" if any(
+        "适配器未配置" in issue for issue in report.issues
+    ) else "smart_table_configuration_invalid"
+    return not_ready_component("smart_table", reason), report.issues
+
+
 @app.get("/health/ready")
 async def readiness(
     adapter: Annotated[SmartTableAdapter, Depends(get_smart_table_adapter)],
@@ -68,14 +187,58 @@ async def readiness(
     返回：配置正确时返回 200；缺失字段、权限或适配器时返回 503 与脱敏问题摘要。
     副作用：调用适配器读取结构和权限，并写入结构化就绪检查日志。
     """
-    smart_table_report = SmartTableReadinessChecker().check(adapter)
+    smart_table_component, smart_table_issues = _smart_table_component(adapter)
     media_report = ProductionMediaReadinessChecker().check(settings)
-    issues = [*smart_table_report.issues, *media_report.issues]
-    if not issues:
-        return JSONResponse({"status": "ok", "service": "app", "issues": []})
+    media_components = (
+        ready_component("storage", "media_policy_checked"),
+        ready_component("scanner", "media_policy_checked"),
+    )
+    if media_report.issues:
+        media_components = (
+            not_ready_component("storage", "media_configuration_invalid"),
+            not_ready_component("scanner", "media_configuration_invalid"),
+        )
+    provider_components = _provider_policy_components()
+    # 本地/测试环境不强制连接外部依赖；生产环境才执行真实只读运行探针。
+    runtime_components = (
+        _runtime_readiness_components()
+        if get_provider_policy(settings).is_production
+        else tuple(
+            ready_component(component, "non_production_not_probed")
+            for component in ("database", "redis", "migration", "worker", "scheduler")
+        )
+    )
+    components = (
+        smart_table_component,
+        *media_components,
+        *provider_components,
+        *runtime_components,
+    )
+    # 非生产环境保留 T15/T22 的 issues 文本契约；生产额外返回稳定组件原因码。
+    issues = [*smart_table_issues, *media_report.issues]
+    if get_provider_policy(settings).is_production:
+        issues.extend(
+            f"{item.component}:{item.reason_code}"
+            for item in components
+            if item.status != "ok"
+        )
+    ready = not issues
+    if not ready:
+        return JSONResponse(
+            {
+                "status": "error",
+                "service": "app",
+                "components": [item.as_dict() for item in components],
+                "issues": issues,
+            },
+            status_code=503,
+        )
 
-    # 配置错误需要阻止服务接收业务流量，同时保留可操作的中文排障信息。
     return JSONResponse(
-        {"status": "error", "service": "app", "issues": issues},
-        status_code=503,
+        {
+            "status": "ok",
+            "service": "app",
+            "components": [item.as_dict() for item in components],
+            "issues": [],
+        }
     )

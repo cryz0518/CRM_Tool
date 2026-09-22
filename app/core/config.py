@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     database_url: str = "postgresql+psycopg://crm:crm_local_only@postgres:5432/crm_lead"
     redis_url: str = "redis://redis:6379/0"
+    # 身份 Provider 必须由部署显式选择；production 下 development 会被统一 policy 拒绝。
+    admin_identity_provider: str = "development"
     smart_table_adapter: Literal["mock", "unconfigured", "wecom_cli"] = "unconfigured"
     crm_adapter: Literal["mock", "unconfigured"] = "unconfigured"
     wecom_bot_id: str | None = None
@@ -86,6 +88,8 @@ class Settings(BaseSettings):
     console_dev_admin_token: str | None = None
     console_dev_admin_subject: str = "development-admin"
     console_dev_admin_role: str = "administrator"
+    worker_readiness_configured: bool = False
+    scheduler_readiness_configured: bool = False
 
     @field_validator(
         "wecom_smart_table_sales_can_create_records",
