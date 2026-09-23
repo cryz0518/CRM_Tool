@@ -332,7 +332,9 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
                         "contactTitle": "技术负责人",
                         "communicationWay": 6,
                         "mobile": "13800000000",
-                        "remark": "【AI录入】客户已确认自动化需求，预算和现场沟通安排待进一步确认。",
+                        "remark": (
+                            "【AI录入】客户已确认自动化需求，预算和现场沟通安排待进一步确认。"
+                        ),
                         "isInternational": False,
                 },
                 snapshot_hash="c" * 64,
