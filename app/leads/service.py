@@ -28,6 +28,7 @@ from app.leads.models import (
     MessageRetryAttempt,
     SalesLeadContext,
     SmartTableSync,
+    serialize_field_value,
 )
 from app.leads.review import LeadReviewService, ReviewSyncResult
 from app.messaging.models import (
@@ -43,6 +44,7 @@ from app.smart_table.adapter import (
     SmartTableAdapter,
     SmartTableRecordNotFoundError,
 )
+from app.smart_table.registry import DEFAULT_SMART_TABLE_FIELD_VALUES, PROCESS_OPTIONS
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +157,7 @@ class DeterministicFirstTextLeadExtractor:
         "电话": "电话",
         "邮箱": "邮箱",
     }
-    _process_values = ("装配", "码垛", "视觉检测", "贴标", "开箱机", "自助加油/充电", "商业应用")
+    _process_values = PROCESS_OPTIONS
 
     def extract(self, text: str | None) -> dict[str, str] | None:
         """从显式中文标签文本提取首条可审核线索的安全字段补丁。
@@ -200,10 +202,10 @@ class DeterministicFirstTextLeadExtractor:
             ),
             "",
         )
-        for process in self._process_values:
-            if process in demand:
-                fields["工艺"] = process
-                break
+        matched_processes = [process for process in self._process_values if process in demand]
+        if matched_processes:
+            # 智能表格工艺是多选，单个工艺也按列表写入，避免后续类型漂移。
+            fields["工艺"] = matched_processes
 
         return fields
 
@@ -873,7 +875,7 @@ class FirstTextLeadWorkspaceService:
         副作用：仅正式 Lead 创建记录；既有记录的增量始终进入 T09。
         """
         if company_result.standard_company_name is None:
-            # QCC 无结果、超时或多候选仍是 temporary，完成后台归属但绝不进入表格审核。
+            # 天眼查无结果、超时或多候选仍是 temporary，完成后台归属但绝不进入表格审核。
             self._complete_deferred_company_message(
                 outbox_event_id, company_result.lead_id, command.source_segment_index
             )
@@ -1146,7 +1148,7 @@ class FirstTextLeadWorkspaceService:
                                         lead_id=context_lead.id,
                                         source_message_id=message.message_id,
                                         field_name=field_name,
-                                        value=value,
+                                        value=serialize_field_value(value),
                                     )
                                 )
                             self._mark_assigned(session, event, context_lead.id)
@@ -1240,10 +1242,10 @@ class FirstTextLeadWorkspaceService:
                                     lead_id=lead.id,
                                     source_message_id=message.message_id,
                                     field_name=field_name,
-                                    value=value,
+                                    value=serialize_field_value(value),
                                     # 确定性首录同样由系统写表，保存基线。
                                     # T09 后续读取该基线以识别销售人工编辑。
-                                    last_ai_synced_value=value,
+                                    last_ai_synced_value=serialize_field_value(value),
                                 )
                             )
                         self._record_audit(session, event, "lead_created")
@@ -1563,6 +1565,7 @@ class FirstTextLeadWorkspaceService:
                 raise ValueError(f"智能表格恢复事实不存在：{request.lead_id}")
             old_record_id = lead.smart_table_record_id
             fields: dict[str, object] = {
+                **DEFAULT_SMART_TABLE_FIELD_VALUES,
                 **lead.field_values,
                 "线索来源": lead.field_values.get("线索来源", "展会"),
                 "创建人": lead.smart_table_owner_user_id,
@@ -1632,6 +1635,7 @@ class FirstTextLeadWorkspaceService:
             # 创建人和负责人只使用接入层已授权的销售身份，模型无法影响权限关键字段。
             record = self._smart_table_adapter.create_record(
                 {
+                    **DEFAULT_SMART_TABLE_FIELD_VALUES,
                     "线索来源": "展会",
                     "创建人": request.sales_user_id,
                     "负责人": request.sales_user_id,
@@ -1777,9 +1781,9 @@ class FirstTextLeadWorkspaceService:
                             lead_id=lead.id,
                                 source_message_id=message.message_id,
                                 field_name=field_name,
-                                value=value,
+                                value=serialize_field_value(value),
                                 # 多客户的确定性首录也需要同一份人工编辑比较基线。
-                                last_ai_synced_value=value,
+                                last_ai_synced_value=serialize_field_value(value),
                         )
                     )
                 session.add(
@@ -2385,6 +2389,7 @@ class FirstTextLeadWorkspaceService:
                 existing_record_id = existing_lead.smart_table_record_id
         # 创建人和负责人共同写为当前销售，绝不使用机器人、管理员或公共账号。
         record_fields: dict[str, object] = {
+            **DEFAULT_SMART_TABLE_FIELD_VALUES,
             **fields,
             "线索来源": "展会",
             "创建人": sales_user_id,
@@ -2640,7 +2645,7 @@ class LeadReassignmentService:
                             lead_id=target.id,
                             source_message_id=request.message_id,
                             field_name=field_name,
-                            value=value,
+                            value=serialize_field_value(value),
                         )
                     )
             audit.status = "succeeded"

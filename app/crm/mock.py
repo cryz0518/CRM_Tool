@@ -28,9 +28,14 @@ class MockCRMAdapter:
     ) -> CRMCreateResult:
         """防御性校验最低创建条件后记录首次调用并返回模拟 CRM 身份。"""
         if (
-            not payload.get("线索名称")
-            or not payload.get("业务线")
-            or not any(payload.get(name) for name in ("手机", "电话", "邮箱"))
+            not payload.get("name")
+            or not payload.get("product_line_data_permission")
+            or not payload.get("source")
+            or not payload.get("contactName")
+            or not payload.get("contactTitle")
+            or not payload.get("communicationWay")
+            or not payload.get("mobile")
+            or not payload.get("remark")
         ):
             raise ValueError("CRM minimum create 条件不满足")
         self.calls += 1

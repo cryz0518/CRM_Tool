@@ -207,7 +207,11 @@ def test_concurrent_first_submission_reserves_exactly_one_global_crm_identity(
                     "线索名称": "公司 Y",
                     "业务线": "协作机器人",
                     "线索来源": "展会",
+                    "联系人": "张三",
+                    "职务": "采购经理",
+                    "沟通方式": "微信",
                     "手机": f"1380000000{index}",
+                    "备注": "客户已确认自动化需求，预算和现场沟通安排待进一步确认。",
                 },
                 actor=SmartTableActor.ROBOT,
             )
@@ -276,7 +280,17 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
     """
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     record = adapter.create_record(
-        {"负责人": "sales-1", "线索名称": "公司 Z", "业务线": "协作机器人", "手机": "13900000000"},
+        {
+            "负责人": "sales-1",
+            "线索名称": "公司 Z",
+            "业务线": "协作机器人",
+            "线索来源": "展会",
+            "联系人": "李四",
+            "职务": "技术负责人",
+            "沟通方式": "微信",
+            "手机": "13900000000",
+            "备注": "客户已确认自动化需求，预算和现场沟通安排待进一步确认。",
+        },
         actor=SmartTableActor.ROBOT,
     )
     with postgres_session_factory.begin() as session:
@@ -311,9 +325,17 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
                 smart_table_record_id=record.record_id,
                 idempotency_key="create-z",
                 canonical_payload={
-                    "线索名称": "公司 Z",
-                    "业务线": "协作机器人",
-                    "手机": "13800000000",
+                        "product_line_data_permission": 1,
+                        "name": "公司 Z",
+                        "source": 11,
+                        "contactName": "李四",
+                        "contactTitle": "技术负责人",
+                        "communicationWay": 6,
+                        "mobile": "13800000000",
+                        "remark": (
+                            "【AI录入】客户已确认自动化需求，预算和现场沟通安排待进一步确认。"
+                        ),
+                        "isInternational": False,
                 },
                 snapshot_hash="c" * 64,
                 request_message_id="update-message",

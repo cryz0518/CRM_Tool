@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.ai.dependencies import get_ai_gateway
 from app.ai.models import ExtractedLeadPatch, LeadAnalysis
 from app.ai.persistence import DatabaseAIExecutionRecorder
-from app.companies.service import CompanyLeadService, MockQCCAdapter
+from app.companies.service import CompanyLeadService, MockTYCAdapter
 from app.core.config import get_settings
 from app.crm.commands import consume_submission_command
 from app.crm.dependencies import get_crm_adapter
@@ -118,12 +118,12 @@ def consume_lead_outbox_event(
             except CardCapabilityUnavailable:
                 return "card_callback_unavailable"
             return "action_issued"
-        # T10 首期明确只接入 Mock QCC；真实企查查 API 留给 T21 的专用适配器。
+        # T10 首期明确只接入 Mock TYC；真实天眼查 API 留给后续专用适配器。
         service = FirstTextLeadWorkspaceService(
             factory,
             smart_table_adapter,
             ai_gateway=get_ai_gateway(execution_recorder=DatabaseAIExecutionRecorder(factory)),
-            company_lead_service=CompanyLeadService(factory, smart_table_adapter, MockQCCAdapter()),
+            company_lead_service=CompanyLeadService(factory, smart_table_adapter, MockTYCAdapter()),
             robot_submission_confirmation_available=get_settings().wecom_card_callback_ready(),
         )
         if recover_expired_lease:

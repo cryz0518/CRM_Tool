@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from uuid import uuid4
 
@@ -31,6 +32,47 @@ def new_lead_id() -> str:
     return str(uuid4())
 
 
+def serialize_field_value(value: object) -> str:
+    """将智能表格字段值保存为字段来源表可接受的文本。
+
+    参数：value 为字符串或工艺多选列表等业务字段值。
+    返回值：字符串原样返回；列表以无空格 JSON 保存，便于精确恢复多选顺序和值。
+    异常：无法 JSON 序列化的值向调用方抛出 TypeError。
+    副作用：无。
+    """
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def deserialize_field_value(value: str | None) -> object:
+    """恢复字段来源表中可能保存的多选 JSON 值。
+
+    参数：value 为历史或当前字段来源文本。
+    返回值：JSON 数组恢复为列表，其余值按历史文本返回。
+    异常：非本项目多选格式的 JSON 文本按普通字符串处理。
+    副作用：无。
+    """
+    if value is None or not value.startswith("["):
+        return value
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return value
+    return decoded if isinstance(decoded, list) else value
+
+
+def field_values_equal(left: object, right: object) -> bool:
+    """比较当前表格值与来源基线，兼容多选列表和旧文本基线。
+
+    参数：left、right 为当前值与字段来源值。
+    返回值：语义值相等时为 True。
+    异常：无。
+    副作用：无。
+    """
+    return left == deserialize_field_value(right) if isinstance(right, str) else left == right
+
+
 class Lead(Base):
     """保存首次采集销售和当前智能表格维护销售均明确的线索草稿。"""
 
@@ -49,15 +91,15 @@ class Lead(Base):
     )
     smart_table_record_id: Mapped[str | None] = mapped_column(String(128), unique=True)
     lifecycle_state: Mapped[str] = mapped_column(String(64), default="temporary", nullable=False)
-    field_values: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False)
+    field_values: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
     enrichment_values: Mapped[dict[str, str]] = mapped_column(JSON, default=dict, nullable=False)
     standard_company_name: Mapped[str | None] = mapped_column(String(512), index=True)
     company_region: Mapped[str] = mapped_column(String(32), default="unknown", nullable=False)
     company_verification_status: Mapped[str] = mapped_column(
         String(64), default="incomplete_company", nullable=False
     )
-    qcc_company_id: Mapped[str | None] = mapped_column(String(128))
-    qcc_candidates: Mapped[list[dict[str, str]]] = mapped_column(JSON, default=list, nullable=False)
+    tyc_customer_id: Mapped[str | None] = mapped_column(String(128))
+    tyc_candidates: Mapped[list[dict[str, str]]] = mapped_column(JSON, default=list, nullable=False)
     company_confirmed_by_user: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
@@ -70,6 +112,26 @@ class Lead(Base):
         UniqueConstraint("source_message_id", "source_segment_index"),
         UniqueConstraint("smart_table_owner_user_id", "standard_company_name"),
     )
+
+    @property
+    def qcc_company_id(self) -> str | None:
+        """兼容历史属性读取；新代码统一使用天眼查客户标识。"""
+        return self.tyc_customer_id
+
+    @qcc_company_id.setter
+    def qcc_company_id(self, value: str | None) -> None:
+        """兼容历史属性写入并转存到天眼查客户标识列。"""
+        self.tyc_customer_id = value
+
+    @property
+    def qcc_candidates(self) -> list[dict[str, str]]:
+        """兼容历史属性读取；新代码统一使用天眼查候选。"""
+        return self.tyc_candidates
+
+    @qcc_candidates.setter
+    def qcc_candidates(self, value: list[dict[str, str]]) -> None:
+        """兼容历史属性写入并转存到天眼查候选列。"""
+        self.tyc_candidates = value
 
 
 class LeadFieldProvenance(Base):

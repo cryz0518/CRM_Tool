@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+LeadFieldValue: TypeAlias = str | list[str]
 
 
 class LeadAnalysis(BaseModel):
@@ -15,11 +17,24 @@ class LeadAnalysis(BaseModel):
 
     intent: Literal["NEW_LEAD", "UPDATE_LEAD", "MULTI_LEAD", "IGNORE"]
     customer_reference: dict[str, str] = Field(default_factory=dict)
-    crm_fields: dict[str, str] = Field(default_factory=dict)
+    crm_fields: dict[str, LeadFieldValue] = Field(default_factory=dict)
     enrichment: dict[str, str] = Field(default_factory=dict)
     confidence_by_field: dict[str, float] = Field(default_factory=dict)
     conflicts: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_field_value_shapes(self) -> LeadAnalysis:
+        """限制 CRM 字段多值结构，仅允许工艺使用多选数组。
+
+        返回值：当前已校验的模型实例。
+        异常：除工艺外的 CRM 字段出现数组时抛出 ValueError，触发结构修复流程。
+        副作用：无。
+        """
+        for field_name, value in self.crm_fields.items():
+            if isinstance(value, list) and field_name != "工艺":
+                raise ValueError(f"字段不支持多值：{field_name}")
+        return self
 
 
 @dataclass(frozen=True)
@@ -46,7 +61,7 @@ class ExtractedLeadPatch:
 
     trace_id: str
     analysis: LeadAnalysis
-    fields: dict[str, str]
+    fields: dict[str, LeadFieldValue]
     pending_confirmation_fields: tuple[str, ...]
-    low_confidence_candidates: dict[str, str]
+    low_confidence_candidates: dict[str, LeadFieldValue]
     enrichment: dict[str, str] = field(default_factory=dict)

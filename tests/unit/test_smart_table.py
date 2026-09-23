@@ -273,6 +273,7 @@ def test_readiness_endpoint_returns_configuration_issues() -> None:
     assert response.json()["issues"] == [
         "缺少必需字段：业务线",
         "缺少必需字段：线索名称",
+        "缺少必需字段：是否为国际客户",
         "缺少必需字段：线索来源",
         "缺少必需字段：联系人",
         "缺少必需字段：职务",

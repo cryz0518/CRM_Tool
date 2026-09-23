@@ -16,12 +16,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import get_settings
 from app.core.failures import classify_task_failure, safe_failure_summary
 from app.crm.adapter import CRMAdapter
+from app.crm.payload import CrmPayloadBuilder, CrmPayloadError
 from app.crm.user_mapping import CRMUserMapper, DatabaseCRMUserMapper
 from app.leads.models import CrmCompanyIdentity, CrmSyncRecord, Lead, LeadDiscardRequest
 from app.leads.review import LeadReviewService
 from app.messaging.models import BusinessAuditEvent, SalesAuthorization, utc_now
 from app.smart_table.adapter import SmartTableAdapter
-from app.smart_table.registry import CRM_BUSINESS_FIELD_NAMES
 
 _TODAY_COMMAND = "提交今天的线索"
 _UPDATES_COMMAND = "提交我的更新"
@@ -35,7 +35,6 @@ _BUSINESS_COMPLETENESS_FIELDS = (
     "手机",
     "备注",
 )
-_CONTACT_FIELDS = ("手机", "电话", "邮箱")
 _CRM_PROCESSING_LEASE = timedelta(minutes=5)
 _LOGGER = logging.getLogger(__name__)
 
@@ -103,6 +102,7 @@ class CrmSubmissionService:
             else crm_create_retry_count
         )
         self._crm_user_mapper = crm_user_mapper or DatabaseCRMUserMapper()
+        self._crm_payload_builder = CrmPayloadBuilder(get_settings().crm_customer_level_scheme)
         self._robot_submission_confirmation_available = (
             get_settings().wecom_card_callback_ready()
             if robot_submission_confirmation_available is None
@@ -230,10 +230,17 @@ class CrmSubmissionService:
         ).reconcile_submission(lead_id)
         if reconciled.blocking_fields:
             return "incomplete"
-        payload = self._canonical_payload(reconciled.fields)
+        try:
+            payload = self._canonical_payload(
+                reconciled.fields, tyc_customer_id=lead.tyc_customer_id
+            )
+        except CrmPayloadError:
+            # 字典、日期或备注格式不合法时只阻止当前线索，不让批次或其他线索被异常打断。
+            self._audit(command, "crm_update_payload_invalid")
+            return "incomplete"
         previous = dict(latest.canonical_payload)
         # 公司身份是全局去重键，变动绝不能伪装成普通字段更新。
-        if payload.get("线索名称") != previous.get("线索名称"):
+        if payload.get("name") != previous.get("name"):
             with self._session_factory.begin() as session:
                 lead = session.get(Lead, lead_id)
                 if lead is not None:
@@ -244,8 +251,8 @@ class CrmSubmissionService:
                             sales_user_id=command.sales_user_id,
                             event_type="company_identity_change_pending_review",
                             details={
-                                "old_standard_company_name": previous.get("线索名称"),
-                                "new_candidate_company_name": payload.get("线索名称"),
+                                "old_standard_company_name": previous.get("name"),
+                                "new_candidate_company_name": payload.get("name"),
                                 "lead_id": lead.id,
                                 "smart_table_record_id": lead.smart_table_record_id,
                                 "smart_table_owner_user_id": lead.smart_table_owner_user_id,
@@ -366,7 +373,14 @@ class CrmSubmissionService:
             self._audit(command, "crm_create_incomplete")
             return "incomplete"
 
-        canonical_payload = self._canonical_payload(reconciled.fields)
+        try:
+            canonical_payload = self._canonical_payload(
+                reconciled.fields, tyc_customer_id=lead.tyc_customer_id
+            )
+        except CrmPayloadError:
+            # CRM DTO 校验失败属于当前线索待完善，禁止进入远端写操作。
+            self._audit(command, "crm_create_payload_invalid")
+            return "incomplete"
         snapshot_hash = self._snapshot_hash(canonical_payload)
         # 事务内锁定 Lead 后检查 create 单例；数据库 partial unique index 是并发最终兜底。
         try:
@@ -669,14 +683,17 @@ class CrmSubmissionService:
         """将数据库返回的处理租约时间统一解释为 UTC。"""
         return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
-    @staticmethod
-    def _canonical_payload(fields: dict[str, object]) -> dict[str, object]:
-        """只保留 CRM 注册业务字段并稳定清理空文本，排除 AI待确认 等元数据。"""
-        return {
-            name: value.strip() if isinstance(value, str) else value
-            for name, value in fields.items()
-            if name in CRM_BUSINESS_FIELD_NAMES and value not in (None, "")
-        }
+    def _canonical_payload(
+        self, fields: dict[str, object], *, tyc_customer_id: str | None = None
+    ) -> dict[str, object]:
+        """构造稳定的 CRM 英文键快照并排除智能表格审核元数据。
+
+        参数：fields 为提交前回读的中文智能表格字段；tyc_customer_id 为天眼查客户标识。
+        返回值：可直接冻结、哈希和发送给 CRM Adapter 的英文键 payload。
+        异常：字段枚举、日期或备注不符合 CRM 契约时抛出 CrmPayloadError。
+        副作用：无，不调用外部系统。
+        """
+        return self._crm_payload_builder.build(fields, tyc_customer_id=tyc_customer_id)
 
     @staticmethod
     def _snapshot_hash(payload: dict[str, object]) -> str:
@@ -691,11 +708,9 @@ class CrmSubmissionService:
 
     @staticmethod
     def _missing_crm_minimum(fields: dict[str, object]) -> tuple[str, ...]:
-        """独立计算首次创建最低字段，联系方式按 OR 条件处理。"""
-        missing = [name for name in ("线索名称", "业务线") if not fields.get(name)]
-        if not any(fields.get(name) for name in _CONTACT_FIELDS):
-            missing.append("联系方式")
-        return tuple(missing)
+        """独立计算首次创建的八项严格必填字段。"""
+        # CRM 提交入口采用业务确认的八项必填字段，不把任一联系方式替代为手机。
+        return tuple(name for name in _BUSINESS_COMPLETENESS_FIELDS if not fields.get(name))
 
     @staticmethod
     def _is_today_owned_candidate(lead: Lead, sales_user_id: str) -> bool:

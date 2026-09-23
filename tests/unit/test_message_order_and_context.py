@@ -143,7 +143,7 @@ def test_fragment_within_current_context_safely_updates_the_same_lead(
     record = adapter.get_record(created.smart_table_record_id)
     assert record is not None
     assert record.fields["线索名称"] == "长广溪智造"
-    assert record.fields["工艺"] == "码垛"
+    assert record.fields["工艺"] == ["码垛"]
     assert "备注" in record.fields
     with session_factory() as session:
         process_source = session.scalar(
@@ -154,7 +154,7 @@ def test_fragment_within_current_context_safely_updates_the_same_lead(
         )
 
     assert process_source is not None
-    assert process_source.last_ai_synced_value == "码垛"
+    assert process_source.last_ai_synced_value == '["码垛"]'
 
 
 def test_repeated_current_company_name_updates_instead_of_creating_a_second_lead(
@@ -431,7 +431,7 @@ def test_expired_context_uses_unique_phone_as_strong_identity(
     assert created.smart_table_record_id is not None
     record = adapter.get_record(created.smart_table_record_id)
     assert record is not None
-    assert record.fields["工艺"] == "码垛"
+    assert record.fields["工艺"] == ["码垛"]
 
 
 def test_expired_context_uses_unique_card_contact_as_strong_identity(
@@ -485,7 +485,7 @@ def test_expired_context_uses_unique_card_contact_as_strong_identity(
     assert created.smart_table_record_id is not None
     record = adapter.get_record(created.smart_table_record_id)
     assert record is not None
-    assert record.fields["工艺"] == "码垛"
+    assert record.fields["工艺"] == ["码垛"]
 
 
 def test_audio_transcript_then_text_updates_the_same_lead(
@@ -530,7 +530,7 @@ def test_audio_transcript_then_text_updates_the_same_lead(
     assert created.smart_table_record_id is not None
     record = adapter.get_record(created.smart_table_record_id)
     assert record is not None
-    assert record.fields["工艺"] == "码垛"
+    assert record.fields["工艺"] == ["码垛"]
 
 
 def test_explicit_new_customer_does_not_inherit_active_card_context(

@@ -75,7 +75,7 @@ def _lead(
             "职务": "经理",
             "沟通方式": "见面拜访",
             "手机": "13800000000",
-            "备注": "人工最终备注",
+            "备注": "人工最终备注，客户已确认项目需求并要求销售继续跟进，内容长度满足 CRM 校验。",
         },
         actor=SmartTableActor.ROBOT,
     )
@@ -121,13 +121,13 @@ def test_create_uses_stable_lead_key_and_current_smart_table_values(
     assert first.succeeded == 1
     assert second.succeeded == 0
     assert crm.calls == 1
-    assert crm.payloads[0]["线索名称"] == "人工最终公司"
+    assert crm.payloads[0]["name"] == "人工最终公司"
     with session_factory() as session:
         sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
         lead = session.get(Lead, lead_id)
     assert sync is not None
     assert sync.idempotency_key == f"crm:create:{lead_id}"
-    assert sync.canonical_payload["手机"] == "13800000000"
+    assert sync.canonical_payload["mobile"] == "13800000000"
     assert lead is not None and lead.lifecycle_state == "synced"
 
 
@@ -258,7 +258,7 @@ def test_transport_retry_reuses_frozen_payload_and_key_after_table_edit(
         sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
     assert sync is not None
     assert sync.idempotency_key == f"crm:create:{lead_id}"
-    assert sync.canonical_payload["手机"] == "13800000000"
+    assert sync.canonical_payload["mobile"] == "13800000000"
     assert crm.crm_user_ids == ["crm-1"]
 
 
@@ -374,7 +374,16 @@ def test_submission_reconcile_keeps_sales_edit_and_clears_its_pending_marker(
 
 def test_mock_crm_idempotency_is_stable_across_adapter_instances() -> None:
     """验证独立 Mock 适配器实例对同一键返回相同 CRM identity。"""
-    payload = {"线索名称": "公司", "业务线": "协作机器人", "手机": "13800000000"}
+    payload = {
+        "name": "公司",
+        "product_line_data_permission": 1,
+        "source": 11,
+        "contactName": "王工",
+        "contactTitle": "经理",
+        "communicationWay": 4,
+        "mobile": "13800000000",
+        "remark": "人工最终备注，客户已确认项目需求并要求销售继续跟进，内容长度满足 CRM 校验。",
+    }
     first = MockCRMAdapter().create_lead(
         payload, idempotency_key="crm:create:lead-1", crm_user_id="crm-1"
     )
@@ -398,7 +407,17 @@ def test_expired_create_lease_recovers_remote_success_with_original_frozen_fact(
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter)
     record_id = next(iter(adapter.get_records())).record_id
-    frozen = {"线索名称": "人工最终公司", "业务线": "协作机器人", "手机": "13800000000"}
+    frozen = {
+        "name": "人工最终公司",
+        "product_line_data_permission": 1,
+        "source": 11,
+        "contactName": "王工",
+        "contactTitle": "经理",
+        "communicationWay": 4,
+        "mobile": "13800000000",
+        "remark": "人工最终备注，客户已确认项目需求并要求销售继续跟进，内容长度满足 CRM 校验。",
+        "isInternational": False,
+    }
     with session_factory.begin() as session:
         sync = CrmSyncRecord(
             lead_id=lead_id, operation="create", smart_table_record_id=record_id,
@@ -475,7 +494,7 @@ def test_update_uses_current_table_values_once_and_skips_equal_snapshot(
     second = service.submit(SubmissionCommand("提交我的更新", "sales-1", "message-14"))
 
     assert first.updated == 1 and second.unchanged == 1
-    assert crm.update_calls == 1 and crm.update_payloads[0]["手机"] == "13900000000"
+    assert crm.update_calls == 1 and crm.update_payloads[0]["mobile"] == "13900000000"
     with session_factory() as session:
         updates = session.scalars(
             select(CrmSyncRecord).where(CrmSyncRecord.operation == "update")
@@ -570,7 +589,7 @@ def test_ambiguous_historical_company_identity_never_calls_crm(
                     operation="update",
                     smart_table_record_id=lead.smart_table_record_id or "",
                     idempotency_key=f"historical:{crm_lead_id}",
-                    canonical_payload={"线索名称": "公司 X"},
+                    canonical_payload={"name": "公司 X"},
                     snapshot_hash=f"historical-{crm_lead_id}",
                     request_message_id="message-12",
                     submitting_sales_user_id="sales-1",
@@ -616,7 +635,7 @@ def test_identical_historical_company_identity_is_backfilled_and_reused(
                     operation="update",
                     smart_table_record_id=lead.smart_table_record_id or "",
                     idempotency_key=f"historical:{suffix}",
-                    canonical_payload={"线索名称": "公司 X"},
+                    canonical_payload={"name": "公司 X"},
                     snapshot_hash=f"historical-{suffix}",
                     request_message_id="message-12",
                     submitting_sales_user_id="sales-1",
@@ -688,14 +707,18 @@ def test_retrying_update_does_not_read_changed_smart_table_before_frozen_retry(
     assert crm.update_crm_user_ids == ["crm-1"]
     assert crm.update_payloads == [
         {
-            "业务线": "协作机器人",
-            "线索名称": "人工最终公司",
-            "线索来源": "展会",
-            "联系人": "王工",
-            "职务": "经理",
-            "沟通方式": "见面拜访",
-            "手机": "13900000000",
-            "备注": "人工最终备注",
+            "product_line_data_permission": 1,
+            "name": "人工最终公司",
+            "source": 11,
+            "contactName": "王工",
+            "contactTitle": "经理",
+            "communicationWay": 4,
+            "mobile": "13900000000",
+            "remark": (
+                "【AI录入】人工最终备注，客户已确认项目需求并要求销售继续跟进，"
+                "内容长度满足 CRM 校验。"
+            ),
+            "isInternational": False,
         }
     ]
 

@@ -65,7 +65,14 @@ CUSTOMER_INDUSTRY_OPTIONS = (
     "其他",
 )
 CUSTOMER_LEVEL_OPTIONS = ("重点客户", "普通客户", "非优先客户")
+INTERNATIONAL_CUSTOMER_OPTIONS = ("国内", "国外")
 PROCESS_OPTIONS = (
+    "上下料",
+    "锁螺丝",
+    "焊接",
+    "喷涂",
+    "打磨",
+    "涂胶",
     "装配",
     "码垛",
     "视觉检测",
@@ -89,14 +96,19 @@ CRM_BUSINESS_FIELD_NAMES = (
     "客户行业",
     "客户级别",
     "工艺",
+    "是否为国际客户",
     "下次联系时间",
     "附件",
     "备注",
     "地区定位",
 )
+DEFAULT_SMART_TABLE_FIELD_VALUES = {"是否为国际客户": "国内"}
 REQUIRED_SMART_TABLE_FIELDS = (
     RequiredSmartTableField("业务线", SmartTableFieldType.SINGLE_SELECT, BUSINESS_LINE_OPTIONS),
     RequiredSmartTableField("线索名称", SmartTableFieldType.TEXT),
+    RequiredSmartTableField(
+        "是否为国际客户", SmartTableFieldType.SINGLE_SELECT, INTERNATIONAL_CUSTOMER_OPTIONS
+    ),
     RequiredSmartTableField("线索来源", SmartTableFieldType.SINGLE_SELECT, LEAD_SOURCE_OPTIONS),
     RequiredSmartTableField("联系人", SmartTableFieldType.TEXT),
     RequiredSmartTableField("职务", SmartTableFieldType.TEXT),
@@ -110,7 +122,7 @@ REQUIRED_SMART_TABLE_FIELDS = (
         "客户行业", SmartTableFieldType.SINGLE_SELECT, CUSTOMER_INDUSTRY_OPTIONS
     ),
     RequiredSmartTableField("客户级别", SmartTableFieldType.SINGLE_SELECT, CUSTOMER_LEVEL_OPTIONS),
-    RequiredSmartTableField("工艺", SmartTableFieldType.SINGLE_SELECT, PROCESS_OPTIONS),
+    RequiredSmartTableField("工艺", SmartTableFieldType.MULTI_SELECT, PROCESS_OPTIONS),
     RequiredSmartTableField("下次联系时间", SmartTableFieldType.DATE),
     RequiredSmartTableField("附件", SmartTableFieldType.ATTACHMENT),
     # 备注由 AI Prompt 生成固定文案，智能表格只保存文本，不承担格式模板职责。

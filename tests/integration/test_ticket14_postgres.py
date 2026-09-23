@@ -85,7 +85,11 @@ def prepare_pending_create_case(
             "线索名称": f"竞态公司-{suffix}",
             "业务线": "协作机器人",
             "线索来源": "展会",
+            "联系人": "王五",
+            "职务": "项目经理",
+            "沟通方式": "微信",
             "手机": "13800000000",
+            "备注": "客户已确认自动化需求，预算和现场沟通安排待进一步确认。",
         },
         actor=SmartTableActor.ROBOT,
     )
@@ -358,6 +362,9 @@ def test_retry_patch_does_not_clobber_later_message_update(
     """用确定性第二次读屏障证明失败补充不会覆盖已提交的后续消息字段。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = prepare_pending_create_case(postgres_session_factory, adapter, "lost-update")
+    # 该用例专门验证失败消息补充空联系人，因此覆盖通用提交夹具的联系人值。
+    seeded_record = adapter.get_records()[0]
+    adapter.update_record(seeded_record.record_id, {"联系人": ""})
     with postgres_session_factory.begin() as session:
         session.add(
             IncomingMessage(
