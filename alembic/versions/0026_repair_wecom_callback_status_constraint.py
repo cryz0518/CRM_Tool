@@ -17,8 +17,8 @@ def upgrade() -> None:
 
     参数：无，Alembic 通过当前数据库连接执行迁移。
     返回值：无。
-    异常：已有非法状态或数据库无法修改结构时由 Alembic 向上抛出。
-    重要副作用：只新增缺失的 CHECK 约束，不删除或改写 callback 事实。
+    异常：数据库无法修改数据或结构时由 Alembic 向上抛出。
+    重要副作用：将无法识别的历史状态归一为 rejected，再新增缺失的 CHECK 约束。
     """
 
     # 历史卷可能已记录 0022 版本但缺少该约束，按约束名检查后再补齐。
@@ -30,6 +30,19 @@ def upgrade() -> None:
         )
     }
     if "ck_wecom_callback_delivery_status" not in existing_constraints:
+        # 旧开发库可能保存过测试用的未知状态；归一为拒绝状态后才能安全收紧约束。
+        op.execute(
+            sa.text(
+                """
+                UPDATE wecom_callback_deliveries
+                SET processing_status = 'rejected'
+                WHERE processing_status IS NOT NULL
+                  AND processing_status NOT IN (
+                      'received', 'claimed', 'duplicated', 'rejected', 'completed'
+                  )
+                """
+            )
+        )
         op.create_check_constraint(
             "ck_wecom_callback_delivery_status",
             "wecom_callback_deliveries",

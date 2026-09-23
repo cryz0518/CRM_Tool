@@ -25,7 +25,8 @@ def _run_compose(
     副作用：可能创建或操作本测试专用的容器、网络和 Volume。
     """
     return subprocess.run(
-        ["docker", "compose", "-p", project_name, *arguments],
+        # 显式排除本地开发 override，避免迁移专项复用默认开发数据库卷。
+        ["docker", "compose", "-p", project_name, "-f", "docker-compose.yml", *arguments],
         check=False,
         capture_output=True,
         text=True,
@@ -161,8 +162,8 @@ def test_current_migration_chain_reaches_single_head() -> None:
         _assert_compose_success(
             heads, ("run", "--rm", "--no-deps", "migrate", "alembic", "heads")
         )
-        # T22 在 T18 之后继续保持单一 migration head。
-        assert heads.stdout.count("0023_ticket22_storage_retention") == 1
+        # 当前最新迁移继续保持单一 migration head。
+        assert heads.stdout.count("0027_repair_notification_claim_schema") == 1
 
         # 只有 notification payload 的 T18 事实也必须阻止 downgrade，不能因没有 action 行而丢列。
         payload_seed = _run_compose(
