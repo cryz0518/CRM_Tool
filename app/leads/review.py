@@ -12,7 +12,13 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.ai.models import ExtractedLeadPatch
 from app.core.config import get_settings
-from app.leads.models import Lead, LeadFieldProvenance, UserConfirmationEvent
+from app.leads.models import (
+    Lead,
+    LeadFieldProvenance,
+    UserConfirmationEvent,
+    field_values_equal,
+    serialize_field_value,
+)
 from app.leads.remarks import RemarksBuilder
 from app.messaging.models import BusinessAuditEvent, IncomingMessage
 from app.smart_table.adapter import SmartTableAdapter, SmartTableRecordNotFoundError
@@ -20,8 +26,18 @@ from app.smart_table.models import SmartTableRecord
 
 logger = logging.getLogger(__name__)
 
-CRM_REQUIRED_CORE_FIELDS = frozenset({"线索名称", "业务线"})
-CRM_CONTACT_FIELDS = frozenset({"手机", "电话", "邮箱"})
+CRM_REQUIRED_CORE_FIELDS = frozenset(
+    {
+        "业务线",
+        "线索名称",
+        "线索来源",
+        "联系人",
+        "职务",
+        "沟通方式",
+        "手机",
+        "备注",
+    }
+)
 AI_CONFIRMATION_FIELD = "AI待确认"
 
 
@@ -175,13 +191,13 @@ class LeadReviewService:
                             lead_id=lead_id,
                             source_message_id=source_message_id,
                             field_name=field_name,
-                            value=value,
-                            last_ai_synced_value=value,
+                            value=serialize_field_value(value),
+                            last_ai_synced_value=serialize_field_value(value),
                         )
                     )
                 else:
-                    source.value = value
-                    source.last_ai_synced_value = value
+                    source.value = serialize_field_value(value)
+                    source.last_ai_synced_value = serialize_field_value(value)
             if actual_written_names:
                 # 仅按字段合并本次 T09 实际写入值，绝不使用旧 Lead JSON 整体覆盖后续消息。
                 final_lead.field_values = current_values
@@ -254,7 +270,7 @@ class LeadReviewService:
                     continue
                 if current_value not in (None, "") and (
                     field_provenance is None
-                    or current_value != field_provenance.last_ai_synced_value
+                    or not field_values_equal(current_value, field_provenance.last_ai_synced_value)
                 ):
                     # 未由 AI 写入过的非空值同样不能被本轮建议静默覆盖。
                     protected.add(field_name)
@@ -264,7 +280,7 @@ class LeadReviewService:
                     protected.add(field_name)
                     pending.discard(field_name)
                     continue
-                if current_value == value:
+                if field_values_equal(current_value, value):
                     if is_pending:
                         pending.add(field_name)
                     else:
@@ -558,7 +574,9 @@ class LeadReviewService:
                 continue
             if source.last_ai_synced_value is None:
                 continue
-            if current_fields.get(field_name) != source.last_ai_synced_value:
+            if not field_values_equal(
+                current_fields.get(field_name), source.last_ai_synced_value
+            ):
                 # 当前值偏离 AI 写入值是唯一的自动确认依据，时间流逝或查看记录均不构成确认。
                 source.is_user_modified = True
                 source.is_user_confirmed = True
@@ -602,19 +620,8 @@ class LeadReviewService:
         异常：无。
         副作用：无。
         """
-        blocking = pending & CRM_REQUIRED_CORE_FIELDS
-        # 只要存在一个非待确认联系方式，其他待确认联系方式不应阻塞项目级“至少一种”规则。
-        has_confirmed_contact = any(
-            current_fields.get(field_name) not in (None, "") and field_name not in pending
-            for field_name in CRM_CONTACT_FIELDS
-        )
-        if not has_confirmed_contact:
-            blocking.update(
-                field_name
-                for field_name in CRM_CONTACT_FIELDS
-                if field_name in pending and current_fields.get(field_name) not in (None, "")
-            )
-        return blocking
+        # CRM 提交契约逐项要求八个字段；电话和邮箱不能替代必填手机。
+        return pending & CRM_REQUIRED_CORE_FIELDS
 
     def _must_not_prefill_without_confirmation(self, field_name: str) -> bool:
         """判断卡片不可用时某个中置信度字段是否必须按降级策略留空。
@@ -626,7 +633,7 @@ class LeadReviewService:
         """
         return (
             not self._robot_submission_confirmation_available
-            and field_name in CRM_REQUIRED_CORE_FIELDS | CRM_CONTACT_FIELDS
+            and field_name in CRM_REQUIRED_CORE_FIELDS
         )
 
     def _confirmation_names(self, value: object) -> set[str]:

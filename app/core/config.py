@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     ai_high_confidence_threshold: float = 0.85
     ai_medium_confidence_threshold: float = 0.60
     crm_create_retry_count: int = 3
+    # CRM 客户级别存在历史值与当前值两套字典，按部署环境显式选择。
+    crm_customer_level_scheme: Literal["legacy", "current"] = "current"
     media_storage_path: str = "/var/lib/crm-lead/media"
     media_image_mime_types: tuple[str, ...] = ("image/png", "image/jpeg", "image/webp")
     media_audio_mime_types: tuple[str, ...] = ("audio/mpeg", "audio/wav", "audio/mp4")

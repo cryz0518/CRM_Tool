@@ -51,7 +51,9 @@ class RemarksBuilder:
         """
         details: list[str] = []
         for field_name in sorted(ENUM_FIELDS_WITH_OTHER):
-            if fields.get(field_name) != "其他":
+            selected = fields.get(field_name)
+            selected_values = selected if isinstance(selected, list) else [selected]
+            if "其他" not in selected_values:
                 continue
             detail = RemarksBuilder._text(enrichment.get(field_name)) or "请补充"
             details.append(f"{field_name}：其他（{detail}）")
@@ -118,6 +120,11 @@ class RemarksBuilder:
         异常：无。
         副作用：无。
         """
+        if isinstance(value, list):
+            # 工艺已改为多选；备注模板需要把多个合法选项保留为可读文本。
+            value = "、".join(
+                item.strip() for item in value if isinstance(item, str) and item.strip()
+            )
         return value.strip() if isinstance(value, str) and value.strip() else None
 
     @staticmethod

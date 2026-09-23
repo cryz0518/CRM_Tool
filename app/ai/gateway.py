@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from app.ai.models import ExtractedLeadPatch, LeadAnalysis, LLMRequest, LLMResponse
+from app.ai.models import ExtractedLeadPatch, LeadAnalysis, LeadFieldValue, LLMRequest, LLMResponse
 from app.ai.persistence import AIExecutionRecorder, AIExecutionRecorderEvent
 from app.ai.provider import LLMProvider, LLMProviderError
 from app.core.failures import PermanentTaskFailure, RetryableTaskFailure
@@ -23,6 +23,7 @@ from app.smart_table.registry import (
     CUSTOMER_INDUSTRY_OPTIONS,
     CUSTOMER_LEVEL_OPTIONS,
     ENUM_FIELDS_WITH_OTHER,
+    INTERNATIONAL_CUSTOMER_OPTIONS,
     LEAD_SOURCE_OPTIONS,
     PROCESS_OPTIONS,
 )
@@ -36,6 +37,7 @@ _ENUM_OPTIONS = {
     "客户行业": CUSTOMER_INDUSTRY_OPTIONS,
     "客户级别": CUSTOMER_LEVEL_OPTIONS,
     "工艺": PROCESS_OPTIONS,
+    "是否为国际客户": INTERNATIONAL_CUSTOMER_OPTIONS,
 }
 _PHONE_PATTERN = re.compile(r"^\+?[0-9][0-9 -]{5,24}$")
 _EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -555,11 +557,22 @@ class AIGateway:
                 "type": "object",
                 "properties": {
                     name: {
-                        "type": value_type,
+                        "type": (
+                            ["string", "array"]
+                            if field_name == "crm_fields" and name == "工艺"
+                            else value_type
+                        ),
+                        **(
+                            {"items": {"type": "string", "enum": list(_ENUM_OPTIONS[name])}}
+                            if field_name == "crm_fields" and name == "工艺"
+                            else {}
+                        ),
                         # 仅 CRM 枚举字段附加当前注册表选项，其他字段维持字符串契约。
                         **(
                             {"enum": list(_ENUM_OPTIONS[name])}
-                            if field_name == "crm_fields" and name in _ENUM_OPTIONS
+                            if field_name == "crm_fields"
+                            and name in _ENUM_OPTIONS
+                            and name != "工艺"
                             else {}
                         ),
                     }
@@ -645,13 +658,23 @@ class AIGateway:
             # 备注只能由 T09 后的确定性生成器写入，模型不得直接提供或绕过人工保护。
             if field_name in _FORBIDDEN_AI_CRM_FIELD_NAMES:
                 raise BusinessValidationError(f"AI 禁止输出字段：{field_name}")
+            if isinstance(value, list) and field_name != "工艺":
+                raise BusinessValidationError(f"字段不支持多值：{field_name}")
             # 枚举字段必须使用管理员配置的合法选项，失败后不再调用模型修正。
-            if field_name in _ENUM_OPTIONS and value not in _ENUM_OPTIONS[field_name]:
-                raise BusinessValidationError(f"枚举值不合法：{field_name}")
+            if field_name in _ENUM_OPTIONS:
+                values = value if isinstance(value, list) else [value]
+                if not values or not all(
+                    isinstance(item, str) and item in _ENUM_OPTIONS[field_name] for item in values
+                ):
+                    raise BusinessValidationError(f"枚举值不合法：{field_name}")
             # 联系方式格式由确定性规则校验，避免模型用猜测值绕过约束。
-            if field_name in {"手机", "电话"} and not _PHONE_PATTERN.fullmatch(value):
+            if field_name in {"手机", "电话"} and (
+                not isinstance(value, str) or not _PHONE_PATTERN.fullmatch(value)
+            ):
                 raise BusinessValidationError(f"联系方式格式不合法：{field_name}")
-            if field_name == "邮箱" and not _EMAIL_PATTERN.fullmatch(value):
+            if field_name == "邮箱" and (
+                not isinstance(value, str) or not _EMAIL_PATTERN.fullmatch(value)
+            ):
                 raise BusinessValidationError("邮箱格式不合法")
             # 每个建议字段都必须提供区间内置信度，才能进入后续分级。
             confidence = analysis.confidence_by_field.get(field_name)
@@ -825,7 +848,7 @@ class AIGateway:
 
     def _apply_confidence(
         self, analysis: LeadAnalysis, source_text: str
-    ) -> tuple[dict[str, str], tuple[str, ...], dict[str, str]]:
+    ) -> tuple[dict[str, LeadFieldValue], tuple[str, ...], dict[str, LeadFieldValue]]:
         """按阈值将合法候选分为正式字段、待确认或后台低置信度候选。
 
         参数：analysis 为已完成业务校验的分析结果；source_text 为当前脱敏原文。
@@ -833,9 +856,9 @@ class AIGateway:
         异常：无。
         副作用：无；T08 只返回待确认元数据，不实现 T09 人工确认流程。
         """
-        fields: dict[str, str] = {}
+        fields: dict[str, LeadFieldValue] = {}
         pending: list[str] = []
-        low_candidates: dict[str, str] = {}
+        low_candidates: dict[str, LeadFieldValue] = {}
         for field_name, value in analysis.crm_fields.items():
             if field_name == "沟通方式" and not self._has_explicit_communication_evidence(
                 source_text, value
@@ -868,7 +891,12 @@ class AIGateway:
         for field_name, value in analysis.enrichment.items():
             if (
                 field_name in ENUM_FIELDS_WITH_OTHER
-                and analysis.crm_fields.get(field_name) != "其他"
+                and "其他"
+                not in (
+                    analysis.crm_fields.get(field_name)
+                    if isinstance(analysis.crm_fields.get(field_name), list)
+                    else [analysis.crm_fields.get(field_name)]
+                )
             ):
                 # 枚举实际说明只能附着在同名“其他”字段上，避免无关文本进入备注。
                 logger.warning(
@@ -1043,7 +1071,8 @@ class AIGateway:
             "这些引用也必须来自当前原文，不确定时留空。"
             "对所有 CRM 字段都必须先理解整条消息的语义，再独立提取字段；"
             "不得按换行、逗号、短横线、波浪线或其他符号机械切段。"
-            "每个 crm_fields value 只能填写该字段自身的单个事实值，"
+            "每个 crm_fields value 只能填写该字段自身的单个事实值；"
+            "工艺因 CRM 接口支持多选，可填写合法工艺字符串数组，"
             "不能带字段标签、解释文字、其他字段值或整句原文。"
             "业务线、客户行业、工艺、客户级别和沟通方式必须根据上下文映射到注册表合法选项；"
             "语义不足以区分候选时省略，不得用相邻字段或关键词强行推断。"
@@ -1056,7 +1085,8 @@ class AIGateway:
             "禁止输出 JSON key：备注、comment、remark、notes、description；"
             "也禁止输出 AI待确认、缺失字段、审核状态、provenance 或其他系统计算字段。"
             "备注由已审核正式字段和 enrichment 在 T09 后通过 RemarksBuilder 确定性生成。"
-            "crm_fields 的每个 value 必须是单个字符串；多值信息不得使用数组塞入 CRM 字段。"
+            "除工艺外，crm_fields 的每个 value 必须是单个字符串；"
+            "其他多值信息不得使用数组塞入 CRM 字段。"
             "没有可靠信息的字段必须直接省略，不得返回 null、空字符串或空数组。"
             "confidence_by_field 的 key 必须与 crm_fields 的 key 完全一一对应，"
             "并使用相同中文字段名。"

@@ -138,7 +138,8 @@ def test_authorized_sales_text_creates_a_personal_review_record(
     assert record.fields == {
         "线索名称": "长广溪智造",
         "联系人": "张三",
-        "工艺": "码垛",
+        "工艺": ["码垛"],
+        "是否为国际客户": "国内",
         "线索来源": "展会",
         "创建人": "sales-1",
         "负责人": "sales-1",
@@ -170,7 +171,7 @@ def test_authorized_sales_text_creates_a_personal_review_record(
     assert lead.field_values == {
         "线索名称": "长广溪智造",
         "联系人": "张三",
-        "工艺": "码垛",
+        "工艺": ["码垛"],
         "线索来源": "展会",
         "备注": (
             "基本信息：长广溪智造；城市、主要产品、年销售额、所属行业未提供。\n"

@@ -553,6 +553,25 @@ class WecomCliSmartTableAdapter:
                 # 企微电话列接受标准字符串；去除常见空格、短横线和括号，保留号码本身及国际区号加号。
                 return re.sub(r"[\s()\-]+", "", value.strip())
             return value
+        if field.field_type in {
+            SmartTableFieldType.SINGLE_SELECT,
+            SmartTableFieldType.MULTI_SELECT,
+        }:
+            # CRM 线索表的单选/多选写入都必须使用管理员已配置的 option ID。
+            values = value if isinstance(value, list) else [value]
+            if not all(isinstance(item, str) and item for item in values):
+                raise ValueError(f"选择字段必须传入非空文本列表：{canonical_name}")
+            if not field.options:
+                # 兼容旧测试替身缺少 options 的响应；真实表结构 readiness 会拒绝缺少选项。
+                return value
+            options = {option.name.removeprefix("*"): option for option in field.options}
+            try:
+                return [
+                    {"id": options[item].option_id, "text": options[item].name}
+                    for item in values
+                ]
+            except KeyError as error:
+                raise ValueError(f"选择字段缺少选项：{canonical_name}={error.args[0]}") from error
         if canonical_name == "AI待确认":
             if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
                 raise ValueError("AI待确认必须传入规范字段名列表")

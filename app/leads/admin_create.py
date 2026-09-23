@@ -19,6 +19,7 @@ from app.smart_table.adapter import (
     SmartTableDefiniteRemoteFailure,
 )
 from app.smart_table.models import SmartTableRecord
+from app.smart_table.registry import DEFAULT_SMART_TABLE_FIELD_VALUES
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,7 @@ class AdminLeadCreationService:
         *,
         original_capturing_sales_user_id: str,
         smart_table_owner_user_id: str,
-        field_values: dict[str, str],
+        field_values: dict[str, object],
         operator_subject: str,
         operator_role: str,
         auth_source: str,
@@ -90,8 +91,13 @@ class AdminLeadCreationService:
             raise ValueError("管理员创建线索必须填写 request_id 和 auth_source")
         if operator_role != "administrator":
             raise PermissionError("维护写入角色必须是 administrator")
-        normalized_fields = {key.strip(): value.strip() for key, value in field_values.items()}
-        if any(not key or not value for key, value in normalized_fields.items()):
+        normalized_fields = {
+            key.strip(): value.strip() if isinstance(value, str) else value
+            for key, value in field_values.items()
+        }
+        # 管理员补建也遵守智能表格的国内默认值；显式国外值会在后续展开中覆盖默认值。
+        normalized_fields = {**DEFAULT_SMART_TABLE_FIELD_VALUES, **normalized_fields}
+        if any(not key or value in (None, "", []) for key, value in normalized_fields.items()):
             raise ValueError("管理员创建线索的字段名和值不能为空")
         if not self._REQUIRED_FIELDS.issubset(normalized_fields):
             raise ValueError("管理员创建线索缺少线索名称或业务线")

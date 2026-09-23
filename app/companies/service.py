@@ -1,4 +1,4 @@
-"""公司地域、企查查核验和销售内保守合并服务。"""
+"""公司地域、天眼查核验和销售内保守合并服务。"""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ from app.companies.models import (
     CompanyUpsertCommand,
     CompanyUpsertResult,
     CompanyVerificationStatus,
-    QCCCandidate,
-    QCCLookupResult,
+    TYCCandidate,
+    TYCLookupResult,
 )
 from app.leads.identity import DatabaseSalesIdentityProvider, SalesIdentityProvider
 from app.leads.models import (
@@ -28,9 +28,12 @@ from app.leads.models import (
     SalesLeadContext,
     SmartTableSync,
     UserConfirmationEvent,
+    deserialize_field_value,
+    serialize_field_value,
 )
 from app.messaging.models import BusinessAuditEvent, IncomingMessage
 from app.smart_table.adapter import SmartTableActor, SmartTableAdapter
+from app.smart_table.registry import DEFAULT_SMART_TABLE_FIELD_VALUES
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +77,7 @@ class CompanyRegionResolver:
         # 销售明确确认的地域优先于文本，避免 AI 或名称风格反向推翻人工结论。
         if evidence.sales_confirmed_region is not None:
             return evidence.sales_confirmed_region
-        # 上游完成实体关联后的明确国外证据可以安全跳过企查查。
+        # 上游完成实体关联后的明确国外证据可以安全跳过天眼查。
         if evidence.explicit_foreign:
             return CompanyRegion.FOREIGN
         message_text = evidence.message_text or ""
@@ -92,11 +95,11 @@ class CompanyRegionResolver:
         return CompanyRegion.UNKNOWN
 
 
-class QCCAdapter(Protocol):
-    """隔离真实企查查接口的稳定查询契约。"""
+class TYCAdapter(Protocol):
+    """隔离真实天眼查接口的稳定查询契约。"""
 
-    def lookup(self, company_name: str) -> QCCLookupResult:
-        """按原始公司名称查询企查查候选。
+    def lookup(self, company_name: str) -> TYCLookupResult:
+        """按原始公司名称查询天眼查候选。
 
         参数：company_name 为待核验的销售或 AI 提取名称。
         返回值：唯一匹配、无结果或多候选的受控结果。
@@ -106,32 +109,32 @@ class QCCAdapter(Protocol):
         ...
 
 
-class QCCAdapterError(RuntimeError):
-    """表示真实企查查适配器已分类的可恢复调用失败。"""
+class TYCAdapterError(RuntimeError):
+    """表示真实天眼查适配器已分类的可恢复调用失败。"""
 
 
-class MockQCCAdapter:
-    """用显式预置结果模拟企查查，绝不猜测真实接口或公司事实。"""
+class MockTYCAdapter:
+    """用显式预置结果模拟天眼查，绝不猜测真实接口或公司事实。"""
 
-    def __init__(self, responses: Mapping[str, QCCLookupResult] | None = None) -> None:
+    def __init__(self, responses: Mapping[str, TYCLookupResult] | None = None) -> None:
         """初始化原始名称到受控查询结果的映射。
 
-        参数：responses 为测试或 PoC 明确提供的查询结果。
+        参数：responses 为测试或 PoC 明确提供的天眼查查询结果。
         返回值：无。
         异常：无。
         副作用：复制输入映射，避免调用方修改影响后续查询。
         """
         self._responses = dict(responses or {})
 
-    def lookup(self, company_name: str) -> QCCLookupResult:
+    def lookup(self, company_name: str) -> TYCLookupResult:
         """返回预置结果；未预置公司一律视为无结果。
 
         参数：company_name 为原始公司名称。
         返回值：预置的查询结论或 not_found。
         异常：无。
-        副作用：无；不访问真实企查查。
+        副作用：无；不访问真实天眼查。
         """
-        return self._responses.get(company_name, QCCLookupResult.not_found())
+        return self._responses.get(company_name, TYCLookupResult.not_found())
 
 
 class CompanyLeadService:
@@ -141,14 +144,14 @@ class CompanyLeadService:
         self,
         session_factory: sessionmaker[Session],
         smart_table_adapter: SmartTableAdapter,
-        qcc_adapter: QCCAdapter,
+        tyc_adapter: TYCAdapter,
         region_resolver: CompanyRegionResolver | None = None,
         sales_identity_provider: SalesIdentityProvider | None = None,
     ) -> None:
-        """注入数据库、表格和可替换的企查查适配器。
+        """注入数据库、表格和可替换的天眼查适配器。
 
         参数：session_factory 管理事务；smart_table_adapter 同步增量字段；
-        qcc_adapter 查询工商候选；region_resolver 可替换地域策略；
+        tyc_adapter 查询工商候选；region_resolver 可替换地域策略；
         sales_identity_provider 校验销售录入授权。
         返回值：无。
         异常：无。
@@ -156,7 +159,7 @@ class CompanyLeadService:
         """
         self._session_factory = session_factory
         self._smart_table_adapter = smart_table_adapter
-        self._qcc_adapter = qcc_adapter
+        self._tyc_adapter = tyc_adapter
         self._region_resolver = region_resolver or CompanyRegionResolver()
         self._sales_identity_provider = sales_identity_provider or DatabaseSalesIdentityProvider()
 
@@ -229,12 +232,12 @@ class CompanyLeadService:
     def _resolve_company(
         self, command: CompanyUpsertCommand, company_name: str, region: CompanyRegion
     ) -> CompanyResolution:
-        """在事务外查询企查查或处理人工确认，返回不含数据库副作用的公司事实。
+        """在事务外查询天眼查或处理人工确认，返回不含数据库副作用的公司事实。
 
         参数：company_name 为候选名称；region 为确定性地域；user_confirmed_company 表示销售确认。
-        返回值：标准名、企查查标识、核验状态和候选集合。
+        返回值：标准名、天眼查客户标识、核验状态和候选集合。
         异常：无；适配器超时被转换为未核验结论，避免阻塞采集。
-        副作用：国内或未知地域可能调用一次 QCC Adapter。
+        副作用：国内或未知地域可能调用一次 TYC Adapter。
         """
         if not company_name:
             return CompanyResolution(None, None, CompanyVerificationStatus.INCOMPLETE_COMPANY)
@@ -247,26 +250,26 @@ class CompanyLeadService:
             )
         failure_event_type: str | None = None
         try:
-            # domestic 和 unknown 都可查询 QCC；unknown 的失败仍绝不推导为 foreign。
-            lookup = self._qcc_adapter.lookup(company_name)
-        except (TimeoutError, QCCAdapterError) as error:
+            # domestic 和 unknown 都可查询天眼查；unknown 的失败仍绝不推导为 foreign。
+            lookup = self._tyc_adapter.lookup(company_name)
+        except (TimeoutError, TYCAdapterError) as error:
             # 只有已分类的可恢复调用故障才降级为未核验，其他编程错误必须显式失败。
             logger.warning(
-                "company_qcc_lookup_failed",
+                "company_tyc_lookup_failed",
                 extra={
                     "message_id": command.source_message_id,
                     "wecom_user_id": command.sales_user_id,
                     "error_type": type(error).__name__,
                 },
             )
-            lookup = QCCLookupResult.not_found()
-            failure_event_type = "company_qcc_lookup_timeout"
+            lookup = TYCLookupResult.not_found()
+            failure_event_type = "company_tyc_lookup_timeout"
         if lookup.status == "matched" and len(lookup.candidates) == 1:
             candidate = lookup.candidates[0]
             return CompanyResolution(
                 candidate.standard_company_name,
                 candidate.company_id,
-                CompanyVerificationStatus.QCC_VERIFIED,
+                CompanyVerificationStatus.TYC_VERIFIED,
                 lookup.candidates,
             )
         candidates = lookup.candidates
@@ -302,7 +305,7 @@ class CompanyLeadService:
         副作用：更新 Lead、字段来源和审计；随后创建或增量更新智能表格记录。
         """
         standard_name = resolution.standard_company_name
-        qcc_company_id = resolution.qcc_company_id
+        tyc_customer_id = resolution.tyc_customer_id
         verification_status = resolution.verification_status
         candidates = resolution.candidates
         with self._session_factory.begin() as session:
@@ -314,9 +317,9 @@ class CompanyLeadService:
             # 企业微信机器人可见范围不能替代后端销售授权，解析服务也必须独立守住入口。
             if not self._sales_identity_provider.is_authorized(session, command.sales_user_id):
                 raise PermissionError("销售未获授权，不能创建或更新公司线索")
-            if resolution.qcc_failure_event_type is not None:
+            if resolution.tyc_failure_event_type is not None:
                 # 将外部超时与“查无结果”区分为可审计事件，供运维和销售审核追溯。
-                self._record_audit(session, command, resolution.qcc_failure_event_type)
+                self._record_audit(session, command, resolution.tyc_failure_event_type)
             # 所有目标定位都带销售条件，避免表格阶段读取或推断其他销售的同公司信息。
             lead = self._get_requested_or_matching_lead(session, command, standard_name)
             merge_target = self._get_temporary_merge_target(
@@ -358,7 +361,7 @@ class CompanyLeadService:
                     standard_name,
                     region,
                     verification_status,
-                    qcc_company_id,
+                    tyc_customer_id,
                     candidates,
                     command.user_confirmed_company,
                     table_patch,
@@ -378,7 +381,7 @@ class CompanyLeadService:
                     standard_name,
                     region,
                     verification_status,
-                    qcc_company_id,
+                    tyc_customer_id,
                     candidates,
                 )
                 table_patch = dict(lead.field_values)
@@ -424,7 +427,7 @@ class CompanyLeadService:
                         standard_name,
                         region,
                         verification_status,
-                        qcc_company_id,
+                        tyc_customer_id,
                         candidates,
                         command.user_confirmed_company,
                         table_patch,
@@ -432,7 +435,7 @@ class CompanyLeadService:
                 self._record_audit(session, command, "company_lead_updated")
                 created = False
             if command.user_confirmed_company:
-                # 确认是受控命令事实，不得由 QCC 或后续模型输出替代或推断。
+                # 确认是受控命令事实，不得由天眼查或后续模型输出替代或推断。
                 self._record_user_confirmed_company_provenance(session, lead, command)
                 self._record_audit(session, command, "company_user_confirmation_recorded")
             session.flush()
@@ -543,8 +546,8 @@ class CompanyLeadService:
         standard_name: str | None,
         region: CompanyRegion,
         verification_status: CompanyVerificationStatus,
-        qcc_company_id: str | None,
-        candidates: tuple[QCCCandidate, ...],
+        tyc_customer_id: str | None,
+        candidates: tuple[TYCCandidate, ...],
     ) -> Lead:
         """创建一条归属当前销售的临时或已核验线索草稿。
 
@@ -554,10 +557,13 @@ class CompanyLeadService:
         副作用：增加线索、字段来源和公司处理审计。
         """
         # 临时线索也保存全部可用补丁并进入表格审核，但没有可靠标准名时不会参与去重。
-        fields = {**command.fields, "线索来源": "展会"}
+        fields = {**DEFAULT_SMART_TABLE_FIELD_VALUES, **command.fields, "线索来源": "展会"}
+        if region is CompanyRegion.FOREIGN:
+            # 国外判定来自显式证据，故可确定地覆盖默认国内值。
+            fields["是否为国际客户"] = "国外"
         if (
             standard_name is not None
-            and verification_status is CompanyVerificationStatus.QCC_VERIFIED
+            and verification_status is CompanyVerificationStatus.TYC_VERIFIED
         ):
             fields["线索名称"] = standard_name
         lead = Lead(
@@ -570,8 +576,8 @@ class CompanyLeadService:
             standard_company_name=standard_name,
             company_region=region.value,
             company_verification_status=verification_status.value,
-            qcc_company_id=qcc_company_id,
-            qcc_candidates=self._candidate_dicts(candidates),
+            tyc_customer_id=tyc_customer_id,
+            tyc_candidates=self._candidate_dicts(candidates),
             company_confirmed_by_user=command.user_confirmed_company,
         )
         session.add(lead)
@@ -583,7 +589,7 @@ class CompanyLeadService:
                     lead_id=lead.id,
                     source_message_id=command.source_message_id,
                     field_name=field_name,
-                    value=value,
+                    value=serialize_field_value(value),
                 )
             )
         self._record_audit(
@@ -662,7 +668,7 @@ class CompanyLeadService:
                         lead_id=lead.id,
                         source_message_id=source_message_id,
                         field_name=field_name,
-                        value=value,
+                        value=serialize_field_value(value),
                     )
                 )
             elif old_value != value:
@@ -682,8 +688,8 @@ class CompanyLeadService:
         standard_name: str | None,
         region: CompanyRegion,
         verification_status: CompanyVerificationStatus,
-        qcc_company_id: str | None,
-        candidates: tuple[QCCCandidate, ...],
+        tyc_customer_id: str | None,
+        candidates: tuple[TYCCandidate, ...],
         user_confirmed_company: bool,
         table_patch: dict[str, str],
     ) -> None:
@@ -697,7 +703,7 @@ class CompanyLeadService:
         if company_name and standard_name is not None:
             display_name = (
                 standard_name
-                if verification_status is CompanyVerificationStatus.QCC_VERIFIED
+                if verification_status is CompanyVerificationStatus.TYC_VERIFIED
                 else company_name
             )
             values = dict(lead.field_values)
@@ -709,8 +715,16 @@ class CompanyLeadService:
         # 查询候选和人工确认均为后台审计信息，不能混入 CRM 业务字段。
         lead.company_region = region.value
         lead.company_verification_status = verification_status.value
-        lead.qcc_company_id = qcc_company_id
-        lead.qcc_candidates = self._candidate_dicts(candidates)
+        lead.tyc_customer_id = tyc_customer_id
+        lead.tyc_candidates = self._candidate_dicts(candidates)
+        if region is CompanyRegion.FOREIGN:
+            # 明确国外证据是确定性事实，更新 CRM 业务字段；表格层仍会执行人工编辑保护。
+            lead.field_values = {**lead.field_values, "是否为国际客户": "国外"}
+            table_patch.setdefault("是否为国际客户", "国外")
+        elif "是否为国际客户" not in lead.field_values:
+            # 历史记录没有新增列时补齐国内默认值，避免提交边界出现隐式缺失。
+            lead.field_values = {**DEFAULT_SMART_TABLE_FIELD_VALUES, **lead.field_values}
+            table_patch.setdefault("是否为国际客户", "国内")
         lead.company_confirmed_by_user = lead.company_confirmed_by_user or user_confirmed_company
         lead.lifecycle_state = self._lifecycle_state(lead.field_values, lead.standard_company_name)
 
@@ -736,7 +750,13 @@ class CompanyLeadService:
             logger.info("company_smart_table_create_started", extra={"lead_id": lead_id})
             try:
                 record = self._smart_table_adapter.create_record(
-                    {**fields, "创建人": owner, "负责人": owner}, actor=SmartTableActor.ROBOT
+                    {
+                        **DEFAULT_SMART_TABLE_FIELD_VALUES,
+                        **fields,
+                        "创建人": owner,
+                        "负责人": owner,
+                    },
+                    actor=SmartTableActor.ROBOT,
                 )
             except Exception as error:
                 logger.exception(
@@ -815,8 +835,8 @@ class CompanyLeadService:
         return re.sub(r"\s+", " ", company_name).strip().casefold()
 
     @staticmethod
-    def _candidate_dicts(candidates: tuple[QCCCandidate, ...]) -> list[dict[str, str]]:
-        """将企查查候选转换为可持久化 JSON 审计结构。
+    def _candidate_dicts(candidates: tuple[TYCCandidate, ...]) -> list[dict[str, str]]:
+        """将天眼查候选转换为可持久化 JSON 审计结构。
 
         参数：candidates 为适配器返回的候选。
         返回值：不包含未声明字段的候选字典列表。
@@ -975,7 +995,10 @@ class CompanyLeadService:
         # 同一字段可能来自多条消息，按最新来源优先并兼容 T10 前未回填的同步值。
         for provenance in provenances:
             values.setdefault(
-                provenance.field_name, provenance.last_ai_synced_value or provenance.value
+                    provenance.field_name,
+                    deserialize_field_value(
+                        provenance.last_ai_synced_value or provenance.value
+                    ),
             )
         return values
 
@@ -1000,7 +1023,9 @@ class CompanyLeadService:
             # 每个字段只更新最新来源，保证下一次比较使用最近一次成功同步的基线。
             for provenance in provenances:
                 if provenance.field_name not in updated_fields:
-                    provenance.last_ai_synced_value = patch[provenance.field_name]
+                    provenance.last_ai_synced_value = serialize_field_value(
+                        patch[provenance.field_name]
+                    )
                     updated_fields.add(provenance.field_name)
 
     def _result_for_id(
@@ -1018,3 +1043,9 @@ class CompanyLeadService:
             if lead is None:
                 raise ValueError(f"线索不存在：{lead_id}")
             return self._result(lead, smart_table_patch)
+
+
+# 兼容历史测试和外部注入点；生产代码使用 TYCAdapter/MockTYCAdapter。
+QCCAdapter = TYCAdapter
+QCCAdapterError = TYCAdapterError
+MockQCCAdapter = MockTYCAdapter

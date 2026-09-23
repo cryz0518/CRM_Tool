@@ -284,7 +284,7 @@ def test_retry_failed_message_is_protected_supplement_not_history_replay(
         attempts = session.scalars(select(MessageRetryAttempt)).all()
     assert lead is not None
     assert lead.field_values["手机"] == "13800138000"
-    assert lead.field_values["工艺"] == "码垛"
+    assert lead.field_values["工艺"] == ["码垛"]
     assert lead.field_values["联系人"] == "失败联系人"
     assert failed_event is not None and failed_event.status == "failed_pending_review"
     assert all(event.status == "succeeded" for event in later_events)
