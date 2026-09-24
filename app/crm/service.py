@@ -16,8 +16,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import get_settings
 from app.core.failures import classify_task_failure, safe_failure_summary
 from app.crm.adapter import CRMAdapter
+from app.crm.employee_directory import EmployeeDirectory, EmployeeDirectoryError
 from app.crm.payload import CrmPayloadBuilder, CrmPayloadError
-from app.crm.user_mapping import CRMUserMapper, DatabaseCRMUserMapper
 from app.leads.models import CrmCompanyIdentity, CrmSyncRecord, Lead, LeadDiscardRequest
 from app.leads.review import LeadReviewService
 from app.messaging.models import BusinessAuditEvent, SalesAuthorization, utc_now
@@ -111,7 +111,7 @@ class CrmSubmissionService:
         smart_table_adapter: SmartTableAdapter,
         crm_adapter: CRMAdapter,
         crm_create_retry_count: int | None = None,
-        crm_user_mapper: CRMUserMapper | None = None,
+        employee_directory: EmployeeDirectory | None = None,
         robot_submission_confirmation_available: bool | None = None,
     ) -> None:
         """保存数据库、表格、CRM 与重试上限依赖。
@@ -130,13 +130,24 @@ class CrmSubmissionService:
             if crm_create_retry_count is None
             else crm_create_retry_count
         )
-        self._crm_user_mapper = crm_user_mapper or DatabaseCRMUserMapper()
+        self._employee_directory = employee_directory
         self._crm_payload_builder = CrmPayloadBuilder(get_settings().crm_customer_level_scheme)
         self._robot_submission_confirmation_available = (
             get_settings().wecom_card_callback_ready()
             if robot_submission_confirmation_available is None
             else robot_submission_confirmation_available
         )
+
+    def _resolve_crm_owner(self, lead: Lead) -> str | None:
+        """从冻结的 Smart Table 负责人解析唯一 employee.id，失败则拒绝调用 CRM。"""
+        directory = self._employee_directory
+        if directory is None:
+            directory = EmployeeDirectory(get_settings().employee_directory_path)
+            self._employee_directory = directory
+        try:
+            return directory.resolve(lead.smart_table_owner_user_id or "")
+        except EmployeeDirectoryError:
+            return None
 
     def submit(self, command: SubmissionCommand) -> SubmissionBatchResult:
         """解析固定命令并逐条提交当日本人待创建 Lead，保持批次部分成功。
@@ -319,7 +330,7 @@ class CrmSubmissionService:
             authorization = session.get(SalesAuthorization, command.sales_user_id)
             if lead is None or authorization is None:
                 return "incomplete"
-            crm_user_id = self._crm_user_mapper.get_crm_user_id(session, command.sales_user_id)
+            crm_user_id = self._resolve_crm_owner(lead)
             if crm_user_id is None:
                 return self._record_mapping_missing(
                     session, lead, command, payload, snapshot_hash, "update"
@@ -447,7 +458,7 @@ class CrmSubmissionService:
                 or not self._is_today_owned_candidate(current_lead, command.sales_user_id)
             ):
                 return CreateSubmissionOutcome("incomplete")
-            if self._crm_user_mapper.get_crm_user_id(session, command.sales_user_id) is None:
+            if self._resolve_crm_owner(current_lead) is None:
                 return CreateSubmissionOutcome(
                     self._record_mapping_missing(
                         session, current_lead, command, canonical_payload, snapshot_hash, "create"
@@ -478,7 +489,7 @@ class CrmSubmissionService:
                     or not self._is_today_owned_candidate(lead, command.sales_user_id)
                 ):
                     return CreateSubmissionOutcome("incomplete")
-                crm_user_id = self._crm_user_mapper.get_crm_user_id(session, command.sales_user_id)
+                crm_user_id = self._resolve_crm_owner(lead)
                 if crm_user_id is None:
                     return CreateSubmissionOutcome(
                         self._record_mapping_missing(

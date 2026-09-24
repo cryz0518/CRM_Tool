@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     tyc_provider: Literal["mock", "unconfigured", "tianyancha"] = "unconfigured"
     tianyancha_api_key: str | None = None
     tianyancha_url: str = "https://open.api.tianyancha.com/services/open/search/2.0"
+    employee_directory_path: str = "employee.csv"
     wecom_bot_id: str | None = None
     wecom_bot_secret: str | None = None
     wecom_card_callback_enabled: bool = False

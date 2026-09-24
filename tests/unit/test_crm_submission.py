@@ -5,12 +5,14 @@ from __future__ import annotations
 import logging
 from collections.abc import Generator
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.core.config import get_settings
 from app.crm.adapter import CRMSearchResult
 from app.crm.commands import (
     consume_submission_command,
@@ -18,6 +20,7 @@ from app.crm.commands import (
     notification_key_for_message,
     terminal_failure_notification_key_for_message,
 )
+from app.crm.employee_directory import EmployeeDirectory
 from app.crm.mock import MockCRMAdapter
 from app.crm.service import CrmSubmissionService, SubmissionCommand
 from app.leads.discard import LeadDiscardService, LeadDiscardStatus
@@ -41,6 +44,20 @@ from app.messaging.models import (
 from app.smart_table.adapter import SmartTableActor
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.registry import build_required_smart_table_schema
+
+
+@pytest.fixture(autouse=True)
+def employee_directory_for_crm_submission_tests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """为提交单测提供显式、隔离的 Smart Table owner 员工目录。"""
+    path = tmp_path / "employee.csv"
+    path.write_text("id,name,nickname\ncrm-1,sales-1,sales-1\n", encoding="utf-8")
+    import app.crm.service as crm_service
+
+    settings = get_settings().model_copy(update={"employee_directory_path": str(path)})
+    monkeypatch.setattr(crm_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(crm_service, "_TEST_EMPLOYEE_DIRECTORY_PATH", path, raising=False)
 
 
 @pytest.fixture
@@ -194,9 +211,13 @@ def test_missing_crm_mapping_creates_auditable_terminal_record_without_calling_c
 ) -> None:
     """验证映射缺失保留待创建线索并形成不可重试的审计事实。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
-    lead_id = _lead(session_factory, adapter, crm_user_id=None)
+    lead_id = _lead(session_factory, adapter)
+    settings_path = Path(get_settings().employee_directory_path)
+    settings_path.write_text("id,name,nickname\ncrm-2,其他销售,其他\n", encoding="utf-8")
     crm = MockCRMAdapter()
-    service = CrmSubmissionService(session_factory, adapter, crm)
+    service = CrmSubmissionService(
+        session_factory, adapter, crm, employee_directory=EmployeeDirectory(settings_path)
+    )
 
     result = service.submit(
         SubmissionCommand("提交今天的线索", "sales-1", "message-12")
@@ -217,11 +238,11 @@ def test_missing_crm_mapping_creates_auditable_terminal_record_without_calling_c
     assert lead is not None and lead.lifecycle_state == "pending_create"
 
     with session_factory.begin() as session:
-        authorization = session.get(SalesAuthorization, "sales-1")
-        assert authorization is not None
-        authorization.crm_user_id = "crm-1"
+        settings_path.write_text("id,name,nickname\ncrm-1,sales-1,sales-1\n", encoding="utf-8")
 
-    recovered = service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-13"))
+    recovered = CrmSubmissionService(
+        session_factory, adapter, crm, employee_directory=EmployeeDirectory(settings_path)
+    ).submit(SubmissionCommand("提交今天的线索", "sales-1", "message-13"))
 
     assert recovered.succeeded == 1
     assert crm.calls == 1
@@ -232,8 +253,15 @@ def test_mapping_missing_audit_key_is_bounded_for_a_maximum_length_message_id(
 ) -> None:
     """验证长消息标识仍可写入映射缺失审计事实。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
-    lead_id = _lead(session_factory, adapter, crm_user_id=None)
-    service = CrmSubmissionService(session_factory, adapter, MockCRMAdapter())
+    lead_id = _lead(session_factory, adapter)
+    settings_path = Path(get_settings().employee_directory_path)
+    settings_path.write_text("id,name,nickname\ncrm-2,其他销售,其他\n", encoding="utf-8")
+    service = CrmSubmissionService(
+        session_factory,
+        adapter,
+        MockCRMAdapter(),
+        employee_directory=EmployeeDirectory(settings_path),
+    )
 
     result = service.submit(SubmissionCommand("提交今天的线索", "sales-1", "m" * 128))
 
@@ -573,10 +601,11 @@ def test_update_mapping_missing_keeps_pending_update_until_a_later_submit(
     service = CrmSubmissionService(session_factory, adapter, crm)
     assert service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12")).succeeded
     adapter.update_record(next(iter(adapter.get_records())).record_id, {"手机": "13900000000"})
-    with session_factory.begin() as session:
-        authorization = session.get(SalesAuthorization, "sales-1")
-        assert authorization is not None
-        authorization.crm_user_id = None
+    settings_path = Path(get_settings().employee_directory_path)
+    settings_path.write_text("id,name,nickname\ncrm-2,其他销售,其他\n", encoding="utf-8")
+    service = CrmSubmissionService(
+        session_factory, adapter, crm, employee_directory=EmployeeDirectory(settings_path)
+    )
 
     blocked = service.submit(SubmissionCommand("提交我的更新", "sales-1", "message-13"))
 
@@ -593,12 +622,10 @@ def test_update_mapping_missing_keeps_pending_update_until_a_later_submit(
     assert lead is not None and lead.lifecycle_state == "pending_update"
     assert validation is not None and validation.failure_code == "mapping_missing"
 
-    with session_factory.begin() as session:
-        authorization = session.get(SalesAuthorization, "sales-1")
-        assert authorization is not None
-        authorization.crm_user_id = "crm-1"
-
-    resumed = service.submit(SubmissionCommand("提交我的更新", "sales-1", "message-14"))
+    settings_path.write_text("id,name,nickname\ncrm-1,sales-1,sales-1\n", encoding="utf-8")
+    resumed = CrmSubmissionService(
+        session_factory, adapter, crm, employee_directory=EmployeeDirectory(settings_path)
+    ).submit(SubmissionCommand("提交我的更新", "sales-1", "message-14"))
 
     assert resumed.updated == 1
     assert crm.update_calls == 1
@@ -860,11 +887,21 @@ def test_replayed_command_restores_persisted_success_to_notification_summary(
 
 
 def test_mapping_missing_reply_does_not_double_count_generic_terminal_failure(
-    session_factory: sessionmaker[Session],
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """验证 CRM 映射缺失在销售汇总中只计入专用错误分类。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
-    _lead(session_factory, adapter, crm_user_id=None)
+    _lead(session_factory, adapter)
+    settings_path = Path(get_settings().employee_directory_path)
+    settings_path.write_text("id,name,nickname\ncrm-2,其他销售,其他\n", encoding="utf-8")
+    import app.crm.dependencies as crm_dependencies
+    import app.crm.service as crm_service
+    monkeypatch.setattr(crm_service, "get_settings", lambda: get_settings().model_copy(
+        update={"employee_directory_path": str(settings_path)}
+    ))
+    monkeypatch.setattr(crm_dependencies, "get_settings", lambda: get_settings().model_copy(
+        update={"employee_directory_path": str(settings_path)}
+    ))
     with session_factory.begin() as session:
         message = session.get(IncomingMessage, "message-12")
         assert message is not None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 from urllib.parse import parse_qs
 
 import httpx
@@ -14,6 +15,7 @@ from app.companies.service import TYCAdapterError
 from app.companies.tyc import TianYanChaAdapter
 from app.core.config import Settings
 from app.core.provider_policy import ProviderPolicy
+from app.crm.employee_directory import EmployeeDirectory, EmployeeDirectoryError
 from app.crm.sop import SopCRMAdapter, SopCRMError
 
 
@@ -118,6 +120,26 @@ def test_sop_signing_matches_posted_biz_content_and_header_identity() -> None:
         crm_user_id="crm-user",
     )
     assert result.crm_lead_id == "123" and len(requests) == 1
+
+
+def test_employee_directory_resolves_unique_name_and_nickname(tmp_path: Path) -> None:
+    """验证姓名和昵称唯一精确匹配到 employee.id。"""
+    path = tmp_path / "employee.csv"
+    path.write_text("id,name,nickname\nE1,张三,三哥\nE2,李四,小李\n", encoding="utf-8")
+    directory = EmployeeDirectory(path)
+    assert directory.resolve("张三") == "E1"
+    assert directory.resolve("小李") == "E2"
+
+
+def test_employee_directory_rejects_duplicate_and_missing_owner(tmp_path: Path) -> None:
+    """验证重复员工和不存在负责人均 fail closed。"""
+    path = tmp_path / "employee.csv"
+    path.write_text("id,name,nickname\nE1,张三,三哥\nE2,张三,小李\n", encoding="utf-8")
+    directory = EmployeeDirectory(path)
+    with pytest.raises(EmployeeDirectoryError):
+        directory.resolve("张三")
+    with pytest.raises(EmployeeDirectoryError):
+        directory.resolve("不存在")
 
 
 def test_sop_duplicate_without_lead_id_fails_closed_and_no_duplicate_is_empty() -> None:
