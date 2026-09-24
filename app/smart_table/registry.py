@@ -65,6 +65,7 @@ CUSTOMER_INDUSTRY_OPTIONS = (
     "其他",
 )
 CUSTOMER_LEVEL_OPTIONS = ("重点客户", "普通客户", "非优先客户")
+SUBMISSION_STATUS_OPTIONS = ("已提交", "未提交", "放弃提交")
 INTERNATIONAL_CUSTOMER_OPTIONS = ("国内", "国外")
 PROCESS_OPTIONS = (
     "上下料",
@@ -102,7 +103,7 @@ CRM_BUSINESS_FIELD_NAMES = (
     "备注",
     "地区定位",
 )
-DEFAULT_SMART_TABLE_FIELD_VALUES = {"是否为国际客户": "国内"}
+DEFAULT_SMART_TABLE_FIELD_VALUES = {"是否为国际客户": "国内", "提交状态": "未提交"}
 REQUIRED_SMART_TABLE_FIELDS = (
     RequiredSmartTableField("业务线", SmartTableFieldType.SINGLE_SELECT, BUSINESS_LINE_OPTIONS),
     RequiredSmartTableField("线索名称", SmartTableFieldType.TEXT),
@@ -131,6 +132,9 @@ REQUIRED_SMART_TABLE_FIELDS = (
     RequiredSmartTableField("AI待确认", SmartTableFieldType.MULTI_SELECT, CRM_BUSINESS_FIELD_NAMES),
     RequiredSmartTableField("创建人", SmartTableFieldType.MEMBER),
     RequiredSmartTableField("负责人", SmartTableFieldType.MEMBER),
+    RequiredSmartTableField(
+        "提交状态", SmartTableFieldType.SINGLE_SELECT, SUBMISSION_STATUS_OPTIONS
+    ),
 )
 ENUM_FIELDS_WITH_OTHER = frozenset(
     field.name for field in REQUIRED_SMART_TABLE_FIELDS if "其他" in field.required_options

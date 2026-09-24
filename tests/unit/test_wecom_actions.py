@@ -38,6 +38,7 @@ from app.smart_table.adapter import SmartTableActor
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.registry import build_required_smart_table_schema
 from app.wecom_bot.actions import (
+    CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE,
     CARD_EVENT_KEY_CRM_FIELD_CONFIRM,
     CARD_EVENT_KEY_DISCARD_CONFIRM,
     CARD_EVENT_KEY_REASSIGN_CONFIRM,
@@ -48,6 +49,7 @@ from app.wecom_bot.actions import (
     WecomActionService,
     WecomActionStatus,
     _transition_action,
+    build_action_card,
     parse_deterministic_action_command,
 )
 from app.wecom_bot.callback import WecomTemplateCardCallbackHandler
@@ -210,6 +212,36 @@ def test_real_template_card_fixture_uses_only_verified_contract() -> None:
     assert parsed.actor_user_id == "sales-a"
     assert parsed.event_key == CARD_EVENT_KEY_CRM_FIELD_CONFIRM
     assert parsed.task_id == "task-fixture-001"
+
+
+def test_duplicate_card_supports_batch_selection_and_two_decisions() -> None:
+    """验证重复线索卡片包含多选项及继续、停止两个按钮。"""
+    card = build_action_card(
+        task_id="task-duplicate",
+        event_key=CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE,
+        title="CRM 重复线索确认",
+        description="当前系统有线索A的信息，请问是进行覆盖还是停止提交",
+        duplicate_leads=[
+            {"lead_id": "lead-a", "company_name": "线索A", "crm_lead_id": "crm-a"},
+            {"lead_id": "lead-b", "company_name": "线索B", "crm_lead_id": "crm-b"},
+        ],
+    )
+    assert card["checkbox"]["mode"] == 1  # type: ignore[index]
+    assert card["submit_button"]["text"] == "继续提交"  # type: ignore[index]
+    assert card["action_menu"]["action_list"][0]["text"] == "停止提交"  # type: ignore[index]
+
+    frame = _fixture_frame()
+    card_event = frame["body"]["event"]["template_card_event"]
+    card_event["card_type"] = "vote_interaction"
+    card_event["event_key"] = CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE
+    card_event["task_id"] = "task-duplicate"
+    card_event["selected_items"] = {
+        "selected_item": [
+            {"question_key": "crm_duplicate_leads", "option_ids": {"option_id": ["lead-a"]}}
+        ]
+    }
+    parsed = TemplateCardCallbackParser.parse(frame)
+    assert parsed.selected_option_ids == ("lead-a",)
     assert parsed.provider_msgid == "provider-msg-001"
     assert parsed.req_id == "request-001"
 

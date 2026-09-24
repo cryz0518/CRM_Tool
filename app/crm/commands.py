@@ -76,6 +76,7 @@ def consume_submission_command(
     # 重放时必须将本请求已成功的同步事实重新计入汇总，不能因 Lead 已 synced 漏报成功。
     result = _include_persisted_results(session_factory, command, result)
     _issue_field_confirmation_cards(session_factory, smart_table_adapter, command, result)
+    _issue_duplicate_confirmation_card(command, result, session_factory)
     reply = format_submission_reply(result)
     with session_factory.begin() as session:
         event = session.get(OutboxEvent, outbox_event_id)
@@ -157,6 +158,37 @@ def _issue_field_confirmation_cards(
             _LOGGER.info("wecom_field_confirmation_card_skipped", extra={"lead_id": lead_id})
 
 
+def _issue_duplicate_confirmation_card(
+    command: SubmissionCommand,
+    result: SubmissionBatchResult,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """为 CRM 查重命中的本批次线索发行一次批量继续/停止卡片。
+
+    参数：command 提供销售和提交请求身份；result 提供查重命中集合；session_factory 提供动作持久化。
+    返回值：无。
+    异常：卡片能力未就绪或动作上下文不合法时保留待确认状态并记录日志。
+    副作用：可能写入一张企业微信模板卡动作和对应通知 outbox。
+    """
+    if not result.duplicate_confirmations or not get_settings().wecom_card_callback_ready():
+        return
+    action_service = WecomActionService(session_factory, card_callback_ready=True)
+    try:
+        action_service.issue_duplicate_confirmation_action(
+            actor_user_id=command.sales_user_id,
+            request_message_id=command.request_message_id,
+            duplicates=result.duplicate_confirmations,
+        )
+    except CardCapabilityUnavailable:
+        # readiness 在事务间变化时保留未提交状态，销售可稍后重新发起提交。
+        return
+    except ValueError:
+        _LOGGER.info(
+            "wecom_duplicate_confirmation_card_skipped",
+            extra={"request_message_id": command.request_message_id},
+        )
+
+
 def notification_key_for_message(message_id: str) -> str:
     """为 CRM 提交通知生成带命名空间的固定长度 SHA-256 键。
 
@@ -216,6 +248,7 @@ def _include_persisted_results(
         unchanged=result.unchanged,
         company_identity_review=result.company_identity_review,
         mapping_missing=result.mapping_missing,
+        duplicate_confirmations=result.duplicate_confirmations,
     )
 
 
@@ -281,6 +314,7 @@ def format_submission_reply(result: SubmissionBatchResult) -> str:
         f"无变化 {result.unchanged} 条；"
         f"公司身份变化待人工审查 {result.company_identity_review} 条；"
         f"待完善或待明确确认 {result.incomplete} 条；"
+        f"重复待确认 {len(result.duplicate_confirmations)} 条；"
         f"CRM 用户映射缺失 {result.mapping_missing} 条；"
         f"提交处理中 {result.processing} 条；可重试失败 {result.retrying} 条；"
         f"需人工处理失败 {result.failed_pending_review} 条。"

@@ -291,4 +291,5 @@ def test_readiness_endpoint_returns_configuration_issues() -> None:
         "缺少必需字段：AI待确认",
         "缺少必需字段：创建人",
         "缺少必需字段：负责人",
+        "缺少必需字段：提交状态",
     ]

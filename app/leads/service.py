@@ -1079,7 +1079,18 @@ class FirstTextLeadWorkspaceService:
                     and multi_request is None
                     and multi_company_fields is None
                 ):
-                    context_lead = self._get_active_context_lead(session, message)
+                    active_context = self._get_active_context_lead(session, message)
+                    # 无公司名时沿用当前上下文；有公司名时只允许补全尚未入表的 temporary 草稿，
+                    # 已有正式记录必须创建新的智能表格线索，不能借上下文做公司名查重。
+                    if (
+                        not extracted_patch.get("线索名称")
+                        or (
+                            active_context is not None
+                            and active_context.lifecycle_state == "temporary"
+                            and active_context.standard_company_name is None
+                        )
+                    ):
+                        context_lead = active_context
                 if (
                     multi_request is None
                     and multi_company_fields is None
@@ -1568,6 +1579,8 @@ class FirstTextLeadWorkspaceService:
                 **DEFAULT_SMART_TABLE_FIELD_VALUES,
                 **lead.field_values,
                 "线索来源": lead.field_values.get("线索来源", "展会"),
+                # 机器人重建审核记录代表重新产生待提交变更，状态必须从头开始。
+                "提交状态": "未提交",
                 "创建人": lead.smart_table_owner_user_id,
                 "负责人": lead.smart_table_owner_user_id,
             }
@@ -2027,14 +2040,15 @@ class FirstTextLeadWorkspaceService:
     def _get_strong_identity_lead(
         self, session: Session, message: IncomingMessage, fields: dict[str, str]
     ) -> Lead | None:
-        """在当前销售范围内以唯一明确身份字段定位过期上下文后的既有线索。
+        """在当前销售范围内以联系人或联系方式定位过期上下文后的既有线索。
 
         参数：session 为当前事务；message 为待归属消息；fields 为确定性或 AI 提取的候选字段。
-        返回值：公司、手机、电话或邮箱恰好唯一命中时返回 Lead，否则返回 None。
+        返回值：联系人、手机、电话或邮箱恰好唯一命中时返回 Lead，否则返回 None。
         异常：数据库读取失败时由 SQLAlchemy 抛出。
         副作用：仅读取当前销售的线索草稿，不访问其他销售数据。
         """
-        strong_fields = {"线索名称", "联系人", "手机", "电话", "邮箱"}
+        # 公司名称不是智能表格阶段的查重键；手机号、电话、邮箱或联系人仍可作为会话归属辅助。
+        strong_fields = {"联系人", "手机", "电话", "邮箱"}
         candidate_values = {
             field_name: value for field_name, value in fields.items() if field_name in strong_fields
         }
@@ -2392,6 +2406,8 @@ class FirstTextLeadWorkspaceService:
             **DEFAULT_SMART_TABLE_FIELD_VALUES,
             **fields,
             "线索来源": "展会",
+            # 每次机器人首次写入审核行都从未提交开始，CRM 成功后再改为已提交。
+            "提交状态": "未提交",
             "创建人": sales_user_id,
             "负责人": sales_user_id,
         }
