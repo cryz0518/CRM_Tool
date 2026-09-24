@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     crm_app_id: str | None = None
     crm_app_auth_token: str | None = None
     crm_private_key: str | None = None
+    crm_http_trust_env: bool = True
     tyc_provider: Literal["mock", "unconfigured", "tianyancha"] = "unconfigured"
     tianyancha_api_key: str | None = None
     tianyancha_url: str = "https://open.api.tianyancha.com/services/open/search/2.0"

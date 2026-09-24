@@ -36,6 +36,7 @@ class SopCRMAdapter:
         *,
         timeout: float = 10.0,
         client: httpx.Client | None = None,
+        trust_env: bool = True,
     ) -> None:
         """初始化 SOP 配置并加载 RSA 私钥。"""
         if not all(value.strip() for value in (url, app_id, app_auth_token, private_key)):
@@ -45,7 +46,8 @@ class SopCRMAdapter:
         if not isinstance(loaded_key, rsa.RSAPrivateKey):
             raise ValueError("CRM 私钥必须是 RSA 私钥")
         self._private_key = loaded_key
-        self._client = client or httpx.Client(timeout=timeout)
+        self._client = client or httpx.Client(timeout=timeout, trust_env=trust_env)
+        self._owns_client = client is None
 
     def search_by_company_name(
         self, payload: Mapping[str, object] | str
@@ -127,18 +129,37 @@ class SopCRMAdapter:
             raise SopCRMError("CRM gateway timeout", category="transport") from error
         except httpx.HTTPError as error:
             raise SopCRMError("CRM gateway transport failure", category="transport") from error
-        except (ValueError, TypeError) as error:
-            raise SopCRMError("CRM gateway transport or protocol failure") from error
+        except ValueError as error:
+            raise SopCRMError(
+                "CRM gateway malformed response", category="malformed_response"
+            ) from error
+        except TypeError as error:
+            raise SopCRMError(
+                "CRM gateway malformed response", category="malformed_response"
+            ) from error
         if not isinstance(payload, Mapping):
             raise SopCRMError("CRM gateway malformed response")
         code = payload.get("code")
+        if not isinstance(code, (int, str)):
+            raise SopCRMError("CRM response missing code", category="malformed_response")
         if code not in (0, 200):
             error_code = str(payload.get("sub_code") or payload.get("error_code") or "")
-            category = (
-                "permission_rejection"
-                if any(token in error_code for token in ("permission", "auth", "signature"))
-                else "business_rejection"
+            auth_codes = (
+                "missing-signature", "invalid-signature", "invalid-app-id",
+                "invalid-timestamp", "invalid-auth-token", "invalid-app-auth-token",
+                "aop.invalid-auth-token", "aop.invalid-app-auth-token",
             )
+            gateway_codes = (
+                "route-no-permissions", "invalid-content-type", "insufficient-isv-permissions"
+            )
+            if any(token in error_code for token in auth_codes):
+                category = "authentication"
+            elif any(token in error_code for token in gateway_codes):
+                category = "gateway"
+            elif error_code:
+                category = "business"
+            else:
+                category = "malformed_response"
             raise SopCRMError("CRM gateway rejected request", category=category)
         data = payload.get("data")
         if isinstance(data, Mapping):

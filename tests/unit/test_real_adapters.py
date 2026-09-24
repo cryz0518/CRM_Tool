@@ -164,6 +164,60 @@ def test_sop_duplicate_create_and_update_response_shapes() -> None:
     assert adapter.update_lead("99", {}, idempotency_key="x", crm_user_id="u").crm_lead_id == "99"
 
 
+@pytest.mark.parametrize(
+    ("error_code", "category"),
+    [
+        ("isv.invalid-signature", "authentication"),
+        ("aop.invalid-app-auth-token", "authentication"),
+        ("isv.route-no-permissions", "gateway"),
+        ("crm.field-validation-failed", "business"),
+    ],
+)
+def test_sop_error_envelopes_are_classified_without_transport_confusion(
+    error_code: str, category: str
+) -> None:
+    """验证 HTTP 200 的 SOP 错误 envelope 按协议类别分类。"""
+    adapter, _ = _crm({"code": "400", "sub_code": error_code, "sub_msg": "redacted"})
+    with pytest.raises(SopCRMError) as error:
+        adapter.search_by_company_name({"name": "样例", "businessLine": 1})
+    assert error.value.category == category
+
+
+def test_sop_malformed_json_and_unexpected_shape_are_not_transport() -> None:
+    """验证 HTTP 200 的非法 JSON 或缺少 code 进入 malformed_response。"""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    ).decode()
+    for response in (
+        httpx.Response(200, text="not-json"),
+        httpx.Response(200, json={"message": "missing code"}),
+    ):
+        adapter = SopCRMAdapter(
+            "https://crm.invalid", "app", "token", pem,
+            client=httpx.Client(transport=httpx.MockTransport(lambda _request, r=response: r)),
+        )
+        with pytest.raises(SopCRMError, match="CRM") as error:
+            adapter.search_by_company_name({"name": "样例", "businessLine": 1})
+        assert error.value.category == "malformed_response"
+
+
+def test_sop_connect_error_is_transport() -> None:
+    """验证真正的连接异常仍分类为 transport。"""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    ).decode()
+    transport = httpx.MockTransport(lambda _request: (_ for _ in ()).throw(httpx.ConnectError("x")))
+    adapter = SopCRMAdapter(
+        "https://crm.invalid", "app", "token", pem,
+        client=httpx.Client(transport=transport),
+    )
+    with pytest.raises(SopCRMError) as error:
+        adapter.search_by_company_name({"name": "样例", "businessLine": 1})
+    assert error.value.category == "transport"
+
+
 def test_provider_policy_requires_real_configuration_and_forbids_mock_in_production() -> None:
     """驗證真實 provider 配置缺失和生產 mock 都 fail closed。"""
     settings = Settings(
