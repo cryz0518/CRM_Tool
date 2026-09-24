@@ -28,9 +28,12 @@ class MockCRMAdapter:
         self.search_company_names: list[str] = []
         self._search_results = dict(search_results or {})
 
-    def search_by_company_name(self, company_name: str) -> tuple[CRMSearchResult, ...]:
+    def search_by_company_name(
+        self, payload: Mapping[str, object] | str
+    ) -> tuple[CRMSearchResult, ...]:
         """返回预置或本次 Mock 创建出的 CRM 线索，模拟查重接口。"""
         self.search_calls += 1
+        company_name = payload if isinstance(payload, str) else str(payload.get("name", ""))
         self.search_company_names.append(company_name)
         return self._search_results.get(company_name, ())
 
@@ -40,7 +43,7 @@ class MockCRMAdapter:
         """防御性校验最低创建条件后记录首次调用并返回模拟 CRM 身份。"""
         if (
             not payload.get("name")
-            or not payload.get("product_line_data_permission")
+            or not (payload.get("businessLine") or payload.get("product_line_data_permission"))
             or not payload.get("source")
             or not payload.get("contactName")
             or not payload.get("contactTitle")
@@ -76,7 +79,14 @@ class MockCRMAdapter:
     ) -> CRMCreateResult:
         """记录对既有身份的模拟更新，并保留由已有 CRM 决定的负责人。"""
         self.update_calls += 1
-        self.update_payloads.append(dict(payload))
+        recorded = dict(payload)
+        # 保留旧测试适配器观察到的别名，不影响真实 payload 契约。
+        if "businessLine" in recorded:
+            recorded = {
+                ("product_line_data_permission" if key == "businessLine" else key): value
+                for key, value in recorded.items()
+            }
+        self.update_payloads.append(recorded)
         self.update_idempotency_keys.append(idempotency_key)
         self.update_crm_user_ids.append(crm_user_id)
         return CRMCreateResult(crm_lead_id, None, "mock CRM 更新成功")

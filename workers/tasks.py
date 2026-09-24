@@ -13,7 +13,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.ai.dependencies import get_ai_gateway
 from app.ai.models import ExtractedLeadPatch, LeadAnalysis
 from app.ai.persistence import DatabaseAIExecutionRecorder
-from app.companies.service import CompanyLeadService, MockTYCAdapter
+from app.companies.dependencies import get_tyc_adapter
+from app.companies.service import CompanyLeadService
 from app.core.config import get_settings
 from app.crm.commands import consume_submission_command
 from app.crm.dependencies import get_crm_adapter
@@ -123,7 +124,9 @@ def consume_lead_outbox_event(
             factory,
             smart_table_adapter,
             ai_gateway=get_ai_gateway(execution_recorder=DatabaseAIExecutionRecorder(factory)),
-            company_lead_service=CompanyLeadService(factory, smart_table_adapter, MockTYCAdapter()),
+            company_lead_service=CompanyLeadService(
+                factory, smart_table_adapter, get_tyc_adapter()
+            ),
             robot_submission_confirmation_available=get_settings().wecom_card_callback_ready(),
         )
         if recover_expired_lease:

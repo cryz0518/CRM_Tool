@@ -537,6 +537,7 @@ def test_settings_policy_covers_all_required_provider_components() -> None:
         "admin_identity_provider",
         "smart_table",
         "crm",
+            "tyc",
         "llm",
         "ocr",
         "asr",

@@ -455,7 +455,7 @@ class CrmSubmissionService:
                 )
         try:
             # CRM 查重是唯一的首次提交去重边界，智能表格阶段不读取同名线索。
-            duplicate_results = tuple(self._crm_adapter.search_by_company_name(company_name))
+            duplicate_results = tuple(self._crm_adapter.search_by_company_name(canonical_payload))
         except Exception as error:
             self._audit(command, "crm_duplicate_search_failed")
             _LOGGER.warning(
