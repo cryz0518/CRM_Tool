@@ -143,6 +143,7 @@ def test_authorized_sales_text_creates_a_personal_review_record(
         "线索来源": "展会",
         "创建人": "sales-1",
         "负责人": "sales-1",
+        "提交状态": "未提交",
         "备注": (
             "基本信息：长广溪智造；城市、主要产品、年销售额、所属行业未提供。\n"
             "线索需求：未提供。\n"
@@ -244,7 +245,7 @@ def test_consumer_upgrades_temporary_lead_when_later_message_names_the_company(
     assert record.fields["线索名称"] == "无锡长广溪智能制造有限公司"
 
 
-def test_consumer_deduplicates_same_sales_company_before_creating_smart_table_record(
+def test_consumer_keeps_same_sales_company_as_a_new_smart_table_record(
     session_factory: sessionmaker[Session],
 ) -> None:
     """验证同销售重复公司在首个 Smart Table 副作用前定位既有 Lead。
@@ -287,16 +288,19 @@ def test_consumer_deduplicates_same_sales_company_before_creating_smart_table_re
     second = service.consume(second_event_id)
 
     assert first.smart_table_record_id is not None
-    assert second.lead_id == first.lead_id
-    assert second.smart_table_record_id == first.smart_table_record_id
-    assert [record.record_id for record in adapter.get_records()] == ["mock-record-1"]
+    assert second.lead_id != first.lead_id
+    assert second.smart_table_record_id != first.smart_table_record_id
+    assert [record.record_id for record in adapter.get_records()] == [
+        "mock-record-1",
+        "mock-record-2",
+    ]
     with session_factory() as session:
         leads = session.scalars(
             select(Lead).where(Lead.smart_table_owner_user_id == "sales-1")
         ).all()
-    assert len(leads) == 1
-    assert leads[0].standard_company_name == "无锡长广溪智能制造有限公司"
-    assert leads[0].field_values["电话"] == "0510-12345678"
+    assert len(leads) == 2
+    assert {lead.standard_company_name for lead in leads} == {"无锡长广溪智能制造有限公司"}
+    assert any(lead.field_values.get("电话") == "0510-12345678" for lead in leads)
 
 
 def test_consumer_keeps_same_company_isolated_between_salespeople(
@@ -1172,7 +1176,7 @@ def test_controlled_temporary_confirmation_keeps_lifecycle_and_creates_first_rec
     assert provenance is not None
 
 
-def test_controlled_confirmation_matching_existing_record_uses_t09_protection(
+def test_controlled_confirmation_matching_existing_record_creates_independent_record(
     session_factory: sessionmaker[Session],
 ) -> None:
     """验证确认命中同销售既有公司时复用 record 并保留销售人工编辑。
@@ -1227,9 +1231,11 @@ def test_controlled_confirmation_matching_existing_record_uses_t09_protection(
     )
 
     assert confirmed.lead_id == temporary_seed.lead_id
-    assert confirmed.smart_table_record_id == existing.smart_table_record_id
-    assert len(adapter.get_records()) == 1
+    assert confirmed.smart_table_record_id != existing.smart_table_record_id
+    assert len(adapter.get_records()) == 2
     record = adapter.get_record(existing.smart_table_record_id)
     assert record is not None
     assert record.fields["联系人"] == "销售手工联系人"
-    assert record.fields["手机"] == "13800000001"
+    confirmed_record = adapter.get_record(confirmed.smart_table_record_id or "")
+    assert confirmed_record is not None
+    assert confirmed_record.fields["手机"] == "13800000001"

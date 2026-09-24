@@ -110,7 +110,6 @@ class Lead(Base):
 
     __table_args__ = (
         UniqueConstraint("source_message_id", "source_segment_index"),
-        UniqueConstraint("smart_table_owner_user_id", "standard_company_name"),
     )
 
     @property

@@ -15,8 +15,21 @@ class CRMCreateResult:
     response_summary: str
 
 
+@dataclass(frozen=True)
+class CRMSearchResult:
+    """描述 CRM 按线索名称查重返回的一条既有线索身份。"""
+
+    crm_lead_id: str
+    crm_lead_owner_user_id: str | None
+    response_summary: str
+
+
 class CRMAdapter(Protocol):
-    """隔离 T12 所需的单一 CRM 创建动作。"""
+    """隔离 CRM 查重、创建和更新动作。"""
+
+    def search_by_company_name(self, company_name: str) -> tuple[CRMSearchResult, ...]:
+        """按线索名称查询 CRM 中已有的线索身份。"""
+        ...
 
     def create_lead(
         self, payload: Mapping[str, object], *, idempotency_key: str, crm_user_id: str

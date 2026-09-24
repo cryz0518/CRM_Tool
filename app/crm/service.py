@@ -63,6 +63,35 @@ class SubmissionBatchResult:
     unchanged: int = 0
     company_identity_review: int = 0
     mapping_missing: int = 0
+    duplicate_confirmations: tuple["DuplicateSubmission", ...] = ()
+
+
+@dataclass(frozen=True)
+class DuplicateSubmission:
+    """描述一条等待销售决定是否覆盖的 CRM 重复线索。"""
+
+    lead_id: str
+    company_name: str
+    crm_lead_id: str
+    crm_lead_owner_user_id: str | None
+
+
+@dataclass(frozen=True)
+class DuplicateConfirmationResult:
+    """描述重复线索卡片一次继续或停止操作的结果。"""
+
+    submitted: int = 0
+    abandoned: int = 0
+    remaining: int = 0
+    failed: int = 0
+
+
+@dataclass(frozen=True)
+class CreateSubmissionOutcome:
+    """保存单条首次提交的状态及可选重复线索事实。"""
+
+    status: str
+    duplicate: DuplicateSubmission | None = None
 
 
 @dataclass(frozen=True)
@@ -74,7 +103,7 @@ class GlobalIdentityResolution:
 
 
 class CrmSubmissionService:
-    """执行冻结 CRM create/update，并以全局公司身份注册表阻止跨销售重复创建。"""
+    """执行冻结 CRM create/update，并在首次提交时调用 CRM 查重接口。"""
 
     def __init__(
         self,
@@ -145,19 +174,24 @@ class CrmSubmissionService:
             # 每条独立执行；任何一条失败都不得影响后续候选。
             outcome = self._submit_create(lead_id, command)
             result = SubmissionBatchResult(
-                succeeded=result.succeeded + (outcome == "succeeded"),
-                incomplete=result.incomplete + (outcome == "incomplete"),
-                retrying=result.retrying + (outcome == "retrying"),
-                processing=result.processing + (outcome == "processing"),
+                succeeded=result.succeeded + (outcome.status == "succeeded"),
+                incomplete=result.incomplete + (outcome.status == "incomplete"),
+                retrying=result.retrying + (outcome.status == "retrying"),
+                processing=result.processing + (outcome.status == "processing"),
                 failed_pending_review=(
-                    result.failed_pending_review + (outcome == "failed_pending_review")
+                    result.failed_pending_review + (outcome.status == "failed_pending_review")
                 ),
                 incomplete_lead_ids=(
                     result.incomplete_lead_ids + (lead_id,)
-                    if outcome == "incomplete"
+                    if outcome.status == "incomplete"
                     else result.incomplete_lead_ids
                 ),
-                mapping_missing=result.mapping_missing + (outcome == "mapping_missing"),
+                mapping_missing=result.mapping_missing + (outcome.status == "mapping_missing"),
+                duplicate_confirmations=(
+                    result.duplicate_confirmations + (outcome.duplicate,)
+                    if outcome.duplicate is not None
+                    else result.duplicate_confirmations
+                ),
             )
         return result
 
@@ -336,18 +370,18 @@ class CrmSubmissionService:
                 sync_id = sync.id
         return self._claim_and_call(existing_sync_id or sync_id, command.sales_user_id)
 
-    def _submit_create(self, lead_id: str, command: SubmissionCommand) -> str:
-        """为单个 Lead 建立或认领一次稳定的 create 逻辑操作。
+    def _submit_create(self, lead_id: str, command: SubmissionCommand) -> CreateSubmissionOutcome:
+        """冻结首次提交快照，先查 CRM 再决定创建或等待重复确认。
 
-        参数：lead_id 为候选线索；command 为冻结提交销售和请求消息身份。
-        返回值：succeeded、incomplete 或 failed，供批次独立汇总。
-        异常：表格读取错误向调用方传播，避免将未知最终快照提交给 CRM。
-        副作用：首次操作冻结 payload/映射；可调用一次 CRM create。
+        参数：lead_id 为当前销售当天待提交线索；command 为固定提交命令事实。
+        返回值：单条提交结果，以及 CRM 查重命中时的重复线索事实。
+        异常：智能表格、数据库或 CRM 查重错误按既有同步状态转换并记录审计。
+        副作用：读取最终表格快照，写入冻结 CRM 同步记录，必要时调用 CRM 查重或创建接口。
         """
         with self._session_factory() as session:
             lead = session.get(Lead, lead_id)
             if lead is None or not self._is_today_owned_candidate(lead, command.sales_user_id):
-                return "incomplete"
+                return CreateSubmissionOutcome("incomplete")
             existing = session.scalar(
                 select(CrmSyncRecord).where(
                     CrmSyncRecord.lead_id == lead_id, CrmSyncRecord.operation == "create"
@@ -355,9 +389,21 @@ class CrmSubmissionService:
             )
             if existing is not None:
                 if existing.status == "succeeded":
-                    return "incomplete"
+                    return CreateSubmissionOutcome("incomplete")
+                if existing.status == "awaiting_duplicate_confirmation":
+                    duplicate = self._duplicate_from_sync(lead, existing)
+                    return CreateSubmissionOutcome(
+                        (
+                            "duplicate_confirmation"
+                            if duplicate is not None
+                            else "failed_pending_review"
+                        ),
+                        duplicate,
+                    )
                 # retry 必须使用现有冻结快照，绝不重新读表替换 payload。
-                return self._claim_and_call(existing.id, command.sales_user_id)
+                return CreateSubmissionOutcome(
+                    self._claim_and_call(existing.id, command.sales_user_id)
+                )
 
         reconciled = LeadReviewService(
             self._session_factory,
@@ -371,7 +417,7 @@ class CrmSubmissionService:
             self._audit(command, "crm_business_fields_incomplete")
         if reconciled.blocking_fields or missing_minimum:
             self._audit(command, "crm_create_incomplete")
-            return "incomplete"
+            return CreateSubmissionOutcome("incomplete")
 
         try:
             canonical_payload = self._canonical_payload(
@@ -380,9 +426,44 @@ class CrmSubmissionService:
         except CrmPayloadError:
             # CRM DTO 校验失败属于当前线索待完善，禁止进入远端写操作。
             self._audit(command, "crm_create_payload_invalid")
-            return "incomplete"
+            return CreateSubmissionOutcome("incomplete")
+        company_name = canonical_payload.get("name")
+        if not isinstance(company_name, str) or not company_name:
+            return CreateSubmissionOutcome("incomplete")
         snapshot_hash = self._snapshot_hash(canonical_payload)
-        # 事务内锁定 Lead 后检查 create 单例；数据库 partial unique index 是并发最终兜底。
+        # CRM 用户映射缺失时连查重接口也不能调用，先完成本地确定性校验。
+        with self._session_factory.begin() as session:
+            current_lead = session.scalar(
+                select(Lead).where(Lead.id == lead_id).with_for_update()
+            )
+            authorization = session.scalar(
+                select(SalesAuthorization)
+                .where(SalesAuthorization.wecom_user_id == command.sales_user_id)
+                .with_for_update()
+            )
+            if (
+                current_lead is None
+                or authorization is None
+                or not self._is_today_owned_candidate(current_lead, command.sales_user_id)
+            ):
+                return CreateSubmissionOutcome("incomplete")
+            if self._crm_user_mapper.get_crm_user_id(session, command.sales_user_id) is None:
+                return CreateSubmissionOutcome(
+                    self._record_mapping_missing(
+                        session, current_lead, command, canonical_payload, snapshot_hash, "create"
+                    )
+                )
+        try:
+            # CRM 查重是唯一的首次提交去重边界，智能表格阶段不读取同名线索。
+            duplicate_results = tuple(self._crm_adapter.search_by_company_name(company_name))
+        except Exception as error:
+            self._audit(command, "crm_duplicate_search_failed")
+            _LOGGER.warning(
+                "crm_duplicate_search_failed",
+                extra={"lead_id": lead_id, "error_type": type(error).__name__},
+            )
+            return CreateSubmissionOutcome("failed_pending_review")
+
         try:
             with self._session_factory.begin() as session:
                 lead = session.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
@@ -396,11 +477,13 @@ class CrmSubmissionService:
                     or authorization is None
                     or not self._is_today_owned_candidate(lead, command.sales_user_id)
                 ):
-                    return "incomplete"
+                    return CreateSubmissionOutcome("incomplete")
                 crm_user_id = self._crm_user_mapper.get_crm_user_id(session, command.sales_user_id)
                 if crm_user_id is None:
-                    return self._record_mapping_missing(
-                        session, lead, command, canonical_payload, snapshot_hash, "create"
+                    return CreateSubmissionOutcome(
+                        self._record_mapping_missing(
+                            session, lead, command, canonical_payload, snapshot_hash, "create"
+                        )
                     )
                 existing = session.scalar(
                     select(CrmSyncRecord).where(
@@ -408,61 +491,161 @@ class CrmSubmissionService:
                     )
                 )
                 if existing is not None:
-                    return "incomplete" if existing.status == "succeeded" else existing.status
-                # 以唯一公司预留锁住首次创建；其他销售绝不能在 reserving 时另建 CRM Lead。
-                company_name = lead.standard_company_name
-                if not company_name:
-                    return "incomplete"
-                resolution = self._resolve_global_identity(session, lead, command)
-                if resolution.state == "reserving":
-                    return "processing"
-                if resolution.state in {"ambiguous", "failed_pending_review"}:
-                    return "failed_pending_review"
-                identity = resolution.identity
-                if resolution.state == "no_identity":
-                    identity = self._reserve_global_identity(session, lead, command)
-                    if identity is None:
-                        # 唯一键竞争后重新读取的 reservation 已成为其他销售的冻结事实。
-                        return "processing"
-                if identity is None:
-                    return "failed_pending_review"
-                if identity.state == "active":
-                    self._record_audit(session, command, "crm_global_identity_reused")
-                operation = "update" if identity.state == "active" else "create"
-                idempotency_key = (
-                    f"crm:update:{lead.id}:{snapshot_hash}"
-                    if operation == "update"
-                    else f"crm:create:{lead.id}"
-                )
+                    if existing.status == "succeeded":
+                        return CreateSubmissionOutcome("incomplete")
+                    if existing.status == "awaiting_duplicate_confirmation":
+                        duplicate = self._duplicate_from_sync(lead, existing)
+                        return CreateSubmissionOutcome(
+                            "duplicate_confirmation"
+                            if duplicate is not None
+                            else "failed_pending_review",
+                            duplicate,
+                        )
+                    return CreateSubmissionOutcome(existing.status)
+
+                first_duplicate = duplicate_results[0] if duplicate_results else None
                 sync = CrmSyncRecord(
                     lead_id=lead.id,
-                    operation=operation,
+                    operation="create",
                     smart_table_record_id=lead.smart_table_record_id or "",
-                    idempotency_key=idempotency_key,
+                    idempotency_key=f"crm:create:{lead.id}",
                     canonical_payload=canonical_payload,
                     snapshot_hash=snapshot_hash,
                     request_message_id=command.request_message_id,
                     submitting_sales_user_id=command.sales_user_id,
-                    # 销售 CRM 映射在逻辑 create 创建时冻结，retry 不重新读取它。
                     submitting_crm_user_id=crm_user_id,
-                    crm_lead_id=identity.crm_lead_id if operation == "update" else None,
+                    crm_lead_id=first_duplicate.crm_lead_id if first_duplicate else None,
                     crm_lead_owner_user_id=(
-                        identity.crm_lead_owner_user_id if operation == "update" else None
+                        first_duplicate.crm_lead_owner_user_id if first_duplicate else None
+                    ),
+                    status=(
+                        "awaiting_duplicate_confirmation"
+                        if first_duplicate is not None
+                        else "pending"
+                    ),
+                    response_summary=(
+                        first_duplicate.response_summary[:256] if first_duplicate else None
                     ),
                 )
                 session.add(sync)
                 session.flush()
-                if operation == "create" and identity is not None:
-                    identity.creating_sync_record_id = sync.id
-                elif operation == "update":
+                if first_duplicate is not None:
                     self._record_audit_for_sync(
-                        session, sync, command.sales_user_id, "crm_update_created"
+                        session, sync, command.sales_user_id, "crm_duplicate_awaiting_confirmation"
                     )
+                    duplicate = DuplicateSubmission(
+                        lead_id=lead.id,
+                        company_name=company_name,
+                        crm_lead_id=first_duplicate.crm_lead_id,
+                        crm_lead_owner_user_id=first_duplicate.crm_lead_owner_user_id,
+                    )
+                    return CreateSubmissionOutcome("duplicate_confirmation", duplicate)
                 sync_id = sync.id
         except IntegrityError:
-            # 只作为最后一层兜底；正常唯一键竞争会在 savepoint 中恢复并返回 processing。
-            return "processing"
-        return self._claim_and_call(sync_id, command.sales_user_id)
+            # 数据库唯一索引只保护同一 Lead 的 create 幂等，不再承担公司名称查重。
+            return CreateSubmissionOutcome("processing")
+        return CreateSubmissionOutcome(self._claim_and_call(sync_id, command.sales_user_id))
+
+    @staticmethod
+    def _duplicate_from_sync(lead: Lead, sync: CrmSyncRecord) -> DuplicateSubmission | None:
+        """从已冻结的重复同步记录重建卡片所需的脱敏重复事实。
+
+        参数：lead 为重复确认对应的本地线索；sync 为已冻结的 CRM 查重同步记录。
+        返回值：可发行卡片的重复线索事实；冻结数据不完整时返回 None。
+        异常：无。
+        副作用：无，仅读取已持久化对象。
+        """
+        company_name = sync.canonical_payload.get("name")
+        if not isinstance(company_name, str) or not sync.crm_lead_id:
+            return None
+        return DuplicateSubmission(
+            lead_id=lead.id,
+            company_name=company_name,
+            crm_lead_id=sync.crm_lead_id,
+            crm_lead_owner_user_id=sync.crm_lead_owner_user_id,
+        )
+
+    def resolve_duplicate_confirmation(
+        self,
+        request_message_id: str,
+        sales_user_id: str,
+        *,
+        continue_submission: bool,
+        selected_lead_ids: tuple[str, ...] = (),
+    ) -> DuplicateConfirmationResult:
+        """执行重复线索卡片的继续或停止决定，并只更新服务端冻结的目标。
+
+        参数：request_message_id 和 sales_user_id 定位原提交请求及操作者；
+        continue_submission 表示继续覆盖还是停止；selected_lead_ids 为销售勾选的本地线索。
+        返回值：已覆盖、已放弃、未选择和失败数量汇总。
+        异常：操作者未授权或目标不属于当前销售时抛出 ValueError。
+        副作用：更新 CRM 同步状态、审计记录和智能表格提交状态，必要时调用 CRM update。
+        """
+        selected = set(selected_lead_ids)
+        selected_sync_ids: list[int] = []
+        abandoned_lead_ids: list[str] = []
+        remaining = 0
+        with self._session_factory.begin() as session:
+            authorization = session.get(SalesAuthorization, sales_user_id)
+            if (
+                authorization is None
+                or not authorization.is_authorized
+                or not authorization.is_active
+            ):
+                raise ValueError("提交销售未授权")
+            rows = session.execute(
+                select(CrmSyncRecord, Lead)
+                .join(Lead, Lead.id == CrmSyncRecord.lead_id)
+                .where(
+                    CrmSyncRecord.request_message_id == request_message_id,
+                    CrmSyncRecord.operation == "create",
+                    CrmSyncRecord.status == "awaiting_duplicate_confirmation",
+                    Lead.smart_table_owner_user_id == sales_user_id,
+                )
+                .with_for_update()
+            ).all()
+            for sync, lead in rows:
+                if not continue_submission:
+                    sync.status = "abandoned"
+                    sync.failure_category = "user_abandoned"
+                    sync.response_summary = "用户停止提交重复线索"
+                    sync.completed_at = utc_now()
+                    abandoned_lead_ids.append(lead.id)
+                    self._record_audit_for_sync(
+                        session, sync, sales_user_id, "crm_duplicate_submission_abandoned"
+                    )
+                    continue
+                if lead.id not in selected:
+                    remaining += 1
+                    continue
+                # 复用同一冻结记录，但把后续远端动作明确切换为 CRM update。
+                sync.operation = "update"
+                sync.idempotency_key = f"crm:update:{lead.id}:{sync.snapshot_hash}"
+                sync.status = "pending"
+                sync.response_summary = None
+                selected_sync_ids.append(sync.id)
+                self._record_audit_for_sync(
+                    session, sync, sales_user_id, "crm_duplicate_update_confirmed"
+                )
+
+        if not continue_submission:
+            for lead_id in abandoned_lead_ids:
+                self._set_smart_table_submission_status(lead_id, "放弃提交")
+            return DuplicateConfirmationResult(abandoned=len(abandoned_lead_ids))
+
+        submitted = 0
+        failed = 0
+        for sync_id in selected_sync_ids:
+            state = self._claim_and_call(sync_id, sales_user_id)
+            if state == "succeeded":
+                submitted += 1
+            else:
+                failed += 1
+        return DuplicateConfirmationResult(
+            submitted=submitted,
+            remaining=remaining,
+            failed=failed,
+        )
 
     def _record_mapping_missing(
         self,
@@ -521,6 +704,7 @@ class CrmSubmissionService:
         """原子认领 pending/retrying 同步记录后调用 CRM，并持久化独立结果。"""
         claim_started_at: datetime
         claim_attempts: int
+        completed_lead_id: str | None = None
         with self._session_factory.begin() as session:
             # 先读取不可变的 operation/lead_id，再按 Lead -> Sync 锁序建立一致的短事务边界。
             sync_reference = session.get(CrmSyncRecord, sync_id)
@@ -634,6 +818,7 @@ class CrmSubmissionService:
                 sync.crm_lead_owner_user_id = crm_result.crm_lead_owner_user_id
             sync.response_summary = crm_result.response_summary[:256]
             sync.completed_at = utc_now()
+            completed_lead_id = lead.id
             if sync.operation == "create":
                 identity = session.scalar(
                     select(CrmCompanyIdentity)
@@ -676,7 +861,40 @@ class CrmSubmissionService:
             self._record_audit_for_sync(
                 session, sync, sales_user_id, f"crm_{sync.operation}_succeeded"
             )
+        if completed_lead_id is not None:
+            try:
+                # CRM 成功事实已提交后再更新审核表状态，避免远端成功被表格慢调用锁住。
+                self._set_smart_table_submission_status(completed_lead_id, "已提交")
+            except Exception as error:
+                # CRM 已成功，状态写入失败只能保留可观测告警，不能重试 CRM 写操作。
+                _LOGGER.warning(
+                    "smart_table_submission_status_update_failed",
+                    extra={
+                        "lead_id": completed_lead_id,
+                        "status": "已提交",
+                        "error_type": type(error).__name__,
+                    },
+                )
         return "succeeded"
+
+    def _set_smart_table_submission_status(self, lead_id: str, status: str) -> None:
+        """把 CRM 提交结果增量写入智能表格的提交状态列。
+
+        参数：lead_id 为本地线索；status 必须是业务规定的提交状态枚举值。
+        返回值：无。
+        异常：智能表格更新失败时向调用方抛出，由提交成功路径记录告警。
+        副作用：增量更新智能表格，并同步保存后台状态快照。
+        """
+        with self._session_factory() as session:
+            lead = session.get(Lead, lead_id)
+            if lead is None or lead.smart_table_record_id is None:
+                return
+            record_id = lead.smart_table_record_id
+        self._smart_table_adapter.update_record(record_id, {"提交状态": status})
+        with self._session_factory.begin() as session:
+            lead = session.get(Lead, lead_id)
+            if lead is not None:
+                lead.field_values = {**lead.field_values, "提交状态": status}
 
     @staticmethod
     def _as_utc(value: datetime) -> datetime:

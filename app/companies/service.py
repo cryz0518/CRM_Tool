@@ -138,7 +138,7 @@ class MockTYCAdapter:
 
 
 class CompanyLeadService:
-    """以公司事实将临时线索升级，并严格限制在当前销售内去重。"""
+    """以公司事实保存独立线索；CRM 提交阶段才负责跨线索查重。"""
 
     def __init__(
         self,
@@ -320,7 +320,7 @@ class CompanyLeadService:
             if resolution.tyc_failure_event_type is not None:
                 # 将外部超时与“查无结果”区分为可审计事件，供运维和销售审核追溯。
                 self._record_audit(session, command, resolution.tyc_failure_event_type)
-            # 所有目标定位都带销售条件，避免表格阶段读取或推断其他销售的同公司信息。
+            # 所有目标定位都带销售条件，避免表格阶段读取或推断其他销售的信息。
             lead = self._get_requested_or_matching_lead(session, command, standard_name)
             merge_target = self._get_temporary_merge_target(
                 session, lead, command.sales_user_id, standard_name
@@ -449,10 +449,10 @@ class CompanyLeadService:
     def _get_requested_or_matching_lead(
         self, session: Session, command: CompanyUpsertCommand, standard_name: str | None
     ) -> Lead | None:
-        """只在当前销售范围内定位显式目标或相同标准名线索。
+        """只按显式 Lead 标识定位目标，不在智能表格阶段按公司名称查重。
 
         参数：session 为事务；command 提供销售与可选目标；standard_name 为可靠去重键。
-        返回值：当前销售唯一可操作的线索；无可靠目标时返回 None。
+        返回值：显式目标线索；没有显式目标时返回 None。
         异常：显式目标不存在或不属于当前销售时抛出异常。
         副作用：仅读取当前销售范围内的 Lead，绝不查询其他销售数据。
         """
@@ -462,38 +462,23 @@ class CompanyLeadService:
                 raise ValueError(f"线索不存在：{command.existing_lead_id}")
             self._ensure_sales_boundary(lead, command.sales_user_id)
             return lead
-        if standard_name is None:
-            return None
-        return session.scalar(
-            select(Lead).where(
-                Lead.smart_table_owner_user_id == command.sales_user_id,
-                Lead.standard_company_name == standard_name,
-                Lead.lifecycle_state != "merged",
-            )
-        )
+        # 线索名称不再是智能表格阶段的查重键；只有显式目标才允许更新旧线索。
+        return None
 
     @staticmethod
     def _get_temporary_merge_target(
         session: Session, lead: Lead | None, sales_user_id: str, standard_name: str | None
     ) -> Lead | None:
-        """为有可靠名称的临时草稿定位同一销售已有的正式目标。
+        """保留兼容接口，但不再把临时草稿与同名线索合并。
 
         参数：session 为事务；lead 为显式升级的临时线索；sales_user_id 限制查找范围；
         standard_name 为唯一可靠的公司去重键。
-        返回值：可合并的当前销售目标；不存在或非临时升级时返回 None。
+        返回值：始终为 None，CRM 提交阶段才执行跨线索查重。
         异常：数据库读取失败时由 SQLAlchemy 抛出。
         副作用：只读取当前销售的 Lead，绝不访问其他销售记录。
         """
-        if lead is None or standard_name is None or lead.standard_company_name is not None:
-            return None
-        return session.scalar(
-            select(Lead).where(
-                Lead.smart_table_owner_user_id == sales_user_id,
-                Lead.standard_company_name == standard_name,
-                Lead.id != lead.id,
-                Lead.lifecycle_state != "merged",
-            )
-        )
+        # 解析同名公司也必须保留独立智能表格记录，CRM 查重统一在提交边界执行。
+        return None
 
     @staticmethod
     def _transfer_existing_lead_to_temporary(
@@ -753,6 +738,8 @@ class CompanyLeadService:
                     {
                         **DEFAULT_SMART_TABLE_FIELD_VALUES,
                         **fields,
+                        # 机器人重新物化记录代表又产生了待提交变更，状态必须回到未提交。
+                        "提交状态": "未提交",
                         "创建人": owner,
                         "负责人": owner,
                     },
@@ -770,11 +757,12 @@ class CompanyLeadService:
                     raise ValueError(f"线索不存在：{lead_id}")
                 lead.smart_table_record_id = record.record_id
             record_id = record.record_id
-        elif patch and record_id is not None:
+        elif record_id is not None:
             # 再次写入前读取销售当前表格值；不同的非空值一律按人工编辑保护处理。
             current_record = self._smart_table_adapter.get_record(record_id)
             if current_record is None:
                 raise ValueError(f"智能表格记录不存在：{record_id}")
+            # 解析产生新表格写入时，提交状态由机器人统一重置为未提交。
             last_synced_values = self._last_synced_values(lead_id, set(patch))
             safe_patch = {
                 field_name: value
@@ -783,6 +771,8 @@ class CompanyLeadService:
                 or current_record.fields.get(field_name) == value
                 or current_record.fields.get(field_name) == last_synced_values.get(field_name)
             }
+            # 提交状态是系统控制字段，不参与销售人工字段保护；任何机器人新写入都将其置为未提交。
+            safe_patch["提交状态"] = "未提交"
             protected_fields = set(patch) - set(safe_patch)
             if protected_fields:
                 self._mark_user_protected_fields(lead_id, protected_fields)
@@ -817,6 +807,10 @@ class CompanyLeadService:
                 )
                 raise
             self._record_last_ai_synced_values(lead_id, safe_patch)
+            with self._session_factory.begin() as session:
+                lead = session.get(Lead, lead_id)
+                if lead is not None:
+                    lead.field_values = {**lead.field_values, "提交状态": "未提交"}
         with self._session_factory() as session:
             lead = session.get(Lead, lead_id)
             if lead is None:
