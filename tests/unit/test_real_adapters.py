@@ -218,6 +218,49 @@ def test_sop_connect_error_is_transport() -> None:
     assert error.value.category == "transport"
 
 
+@pytest.mark.parametrize(
+    ("status", "response", "category"),
+    [
+        (401, {"code": "401", "sub_code": "isv.invalid-signature"}, "authentication"),
+        (403, {"code": "403", "sub_code": "isv.route-no-permissions"}, "gateway"),
+        (500, {"code": "500", "sub_code": "isv.gateway-error"}, "gateway"),
+    ],
+)
+def test_sop_http_error_statuses_are_not_transport(
+    status: int, response: object, category: str
+) -> None:
+    """验证收到 HTTP 响应后按 status/envelope 分类，不误报 transport。"""
+    adapter, _ = _crm(response)
+    # _crm 固定 200，因此用独立 fake transport 覆盖状态码。
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    ).decode()
+    adapter = SopCRMAdapter(
+        "https://crm.invalid", "app", "token", pem,
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda req: httpx.Response(status, json=response, request=req)
+            )
+        ),
+    )
+    with pytest.raises(SopCRMError) as error:
+        adapter.search_by_company_name({"name": "样例", "businessLine": 1})
+    assert error.value.category == category
+    assert error.value.http_status == status
+
+
+def test_tianyancha_uppercase_environment_names_are_loaded() -> None:
+    """验证正式 TYC 环境变量名为 TIANYANCHA_API_KEY/TIANYANCHA_URL。"""
+    settings = Settings(
+        _env_file=None,
+        TIANYANCHA_API_KEY="key",  # type: ignore[call-arg]
+        TIANYANCHA_URL="https://tyc.invalid",  # type: ignore[call-arg]
+    )
+    assert settings.tianyancha_api_key == "key"
+    assert settings.tianyancha_url == "https://tyc.invalid"
+
+
 def test_provider_policy_requires_real_configuration_and_forbids_mock_in_production() -> None:
     """驗證真實 provider 配置缺失和生產 mock 都 fail closed。"""
     settings = Settings(

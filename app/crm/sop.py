@@ -18,9 +18,12 @@ from app.crm.adapter import CRMCreateResult, CRMSearchResult
 class SopCRMError(RuntimeError):
     """表示 SOP Gateway 或 CRM 业务拒绝。"""
 
-    def __init__(self, message: str, *, category: str = "business_rejection") -> None:
+    def __init__(
+        self, message: str, *, category: str = "business_rejection", http_status: int | None = None
+    ) -> None:
         """保存脱敏错误分类，供任务层区分永久拒绝与传输失败。"""
         self.category = category
+        self.http_status = http_status
         super().__init__(message)
 
 
@@ -123,25 +126,36 @@ class SopCRMAdapter:
                 data=params,
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
-            response.raise_for_status()
-            payload = response.json()
+            status = response.status_code
+            try:
+                payload = response.json()
+            except ValueError as error:
+                category = "authentication" if status == 401 else (
+                    "gateway" if status >= 400 else "malformed_response"
+                )
+                raise SopCRMError(
+                    "CRM gateway response is not JSON", category=category, http_status=status
+                ) from error
         except httpx.TimeoutException as error:
             raise SopCRMError("CRM gateway timeout", category="transport") from error
         except httpx.HTTPError as error:
             raise SopCRMError("CRM gateway transport failure", category="transport") from error
-        except ValueError as error:
-            raise SopCRMError(
-                "CRM gateway malformed response", category="malformed_response"
-            ) from error
         except TypeError as error:
             raise SopCRMError(
                 "CRM gateway malformed response", category="malformed_response"
             ) from error
         if not isinstance(payload, Mapping):
-            raise SopCRMError("CRM gateway malformed response")
+            raise SopCRMError(
+                "CRM gateway malformed response", category="malformed_response", http_status=status
+            )
         code = payload.get("code")
         if not isinstance(code, (int, str)):
-            raise SopCRMError("CRM response missing code", category="malformed_response")
+            category = (
+                "authentication"
+                if status == 401
+                else ("gateway" if status >= 400 else "malformed_response")
+            )
+            raise SopCRMError("CRM response missing code", category=category, http_status=status)
         if code not in (0, 200):
             error_code = str(payload.get("sub_code") or payload.get("error_code") or "")
             auth_codes = (
@@ -160,7 +174,11 @@ class SopCRMAdapter:
                 category = "business"
             else:
                 category = "malformed_response"
-            raise SopCRMError("CRM gateway rejected request", category=category)
+            if status == 401:
+                category = "authentication"
+            elif status >= 400 and category == "business":
+                category = "gateway"
+            raise SopCRMError("CRM gateway rejected request", category=category, http_status=status)
         data = payload.get("data")
         if isinstance(data, Mapping):
             return data
