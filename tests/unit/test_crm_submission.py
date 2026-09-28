@@ -54,7 +54,7 @@ from app.smart_table.registry import build_required_smart_table_schema
 @pytest.fixture(autouse=True)
 def employee_directory_for_crm_submission_tests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+) -> Path:
     """为提交单测提供显式、隔离的 Smart Table owner 员工目录。"""
     path = tmp_path / "employee.csv"
     path.write_text("id,name,nickname\ncrm-1,sales-1,sales-1\n", encoding="utf-8")
@@ -63,6 +63,7 @@ def employee_directory_for_crm_submission_tests(
     settings = get_settings().model_copy(update={"employee_directory_path": str(path)})
     monkeypatch.setattr(crm_service, "get_settings", lambda: settings)
     monkeypatch.setattr(crm_service, "_TEST_EMPLOYEE_DIRECTORY_PATH", path, raising=False)
+    return path
 
 
 @pytest.fixture
@@ -724,11 +725,12 @@ def test_duplicate_crm_match_selected_continue_uses_update_and_marks_submitted(
 
 def test_missing_crm_mapping_creates_auditable_terminal_record_without_calling_crm(
     session_factory: sessionmaker[Session],
+    employee_directory_for_crm_submission_tests: Path,
 ) -> None:
     """验证映射缺失保留待创建线索并形成不可重试的审计事实。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter)
-    settings_path = Path(get_settings().employee_directory_path)
+    settings_path = employee_directory_for_crm_submission_tests
     settings_path.write_text("id,name,nickname\ncrm-2,其他销售,其他\n", encoding="utf-8")
     crm = MockCRMAdapter()
     service = CrmSubmissionService(
@@ -766,11 +768,12 @@ def test_missing_crm_mapping_creates_auditable_terminal_record_without_calling_c
 
 def test_mapping_missing_audit_key_is_bounded_for_a_maximum_length_message_id(
     session_factory: sessionmaker[Session],
+    employee_directory_for_crm_submission_tests: Path,
 ) -> None:
     """验证长消息标识仍可写入映射缺失审计事实。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter)
-    settings_path = Path(get_settings().employee_directory_path)
+    settings_path = employee_directory_for_crm_submission_tests
     settings_path.write_text("id,name,nickname\ncrm-2,其他销售,其他\n", encoding="utf-8")
     service = CrmSubmissionService(
         session_factory,
@@ -1109,6 +1112,7 @@ def test_update_uses_current_table_values_once_and_skips_equal_snapshot(
 
 def test_update_mapping_missing_keeps_pending_update_until_a_later_submit(
     session_factory: sessionmaker[Session],
+    employee_directory_for_crm_submission_tests: Path,
 ) -> None:
     """验证缺映射的真实更新不调用 CRM，补齐映射后才允许提交。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
@@ -1117,7 +1121,7 @@ def test_update_mapping_missing_keeps_pending_update_until_a_later_submit(
     service = CrmSubmissionService(session_factory, adapter, crm)
     assert service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12")).succeeded
     adapter.update_record(next(iter(adapter.get_records())).record_id, {"手机": "13900000000"})
-    settings_path = Path(get_settings().employee_directory_path)
+    settings_path = employee_directory_for_crm_submission_tests
     settings_path.write_text("id,name,nickname\ncrm-2,其他销售,其他\n", encoding="utf-8")
     service = CrmSubmissionService(
         session_factory, adapter, crm, employee_directory=EmployeeDirectory(settings_path)
@@ -1403,12 +1407,14 @@ def test_replayed_command_restores_persisted_success_to_notification_summary(
 
 
 def test_mapping_missing_reply_does_not_double_count_generic_terminal_failure(
-    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    employee_directory_for_crm_submission_tests: Path,
 ) -> None:
     """验证 CRM 映射缺失在销售汇总中只计入专用错误分类。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     _lead(session_factory, adapter)
-    settings_path = Path(get_settings().employee_directory_path)
+    settings_path = employee_directory_for_crm_submission_tests
     settings_path.write_text("id,name,nickname\ncrm-2,其他销售,其他\n", encoding="utf-8")
     import app.crm.dependencies as crm_dependencies
     import app.crm.service as crm_service
