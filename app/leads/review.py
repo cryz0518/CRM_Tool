@@ -80,9 +80,9 @@ class _SafePatchPlan:
 
     fields_to_write: dict[str, object]
     written_names: tuple[str, ...]
-    synced_values: dict[str, str]
+    synced_values: dict[str, object]
     protected_fields: tuple[str, ...]
-    base_lead_values: dict[str, str | None]
+    base_lead_values: dict[str, object]
 
 
 class LeadReviewService:
@@ -251,7 +251,7 @@ class LeadReviewService:
             pending.difference_update(protected)
             fields_to_write: dict[str, object] = {}
             written_names: list[str] = []
-            synced_values: dict[str, str] = {}
+            synced_values: dict[str, object] = {}
             # T08 已完成结构和业务校验；本层仅决定是否可安全写入，不重新解释 AI 内容。
             for field_name, value in patch.fields.items():
                 if field_name == "备注":

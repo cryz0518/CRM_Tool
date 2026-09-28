@@ -279,7 +279,11 @@ class AIGateway:
         # 若模型把联系人放在正式字段而不是 customer_reference，仅借用该已输出值判断相邻职位，
         # 不提升其原有置信度，也不改变人工/低置信度分级结果。
         contact_candidate = analysis.crm_fields.get("联系人")
-        if not contact and contact_candidate and contact_candidate.strip() in source_text:
+        if (
+            not contact
+            and isinstance(contact_candidate, str)
+            and contact_candidate.strip() in source_text
+        ):
             contact = contact_candidate.strip()
         if contact:
             recovered_title = AIGateway._extract_verified_title(source_text, contact)
@@ -296,8 +300,9 @@ class AIGateway:
             # 普通模型候选可能包含上下文信息，确定性兜底只补空位或修正明确的身份拼接错误。
             if field_name in fields:
                 current_confidence = confidence_by_field.get(field_name)
+                field_value = fields[field_name]
                 if (
-                    fields[field_name] == value
+                    field_value == value
                     and (current_confidence is None or current_confidence < 1.0)
                 ):
                     # 原文直接证实模型候选时，确定性证据可以补齐缺失或过低置信度造成的误过滤。
@@ -307,8 +312,9 @@ class AIGateway:
                     identity_pair[0]
                     and identity_pair[1]
                     and field_name in {"线索名称", "联系人"}
+                    and isinstance(field_value, str)
                     and AIGateway._is_combined_identity_value(
-                        fields[field_name], identity_pair[0], identity_pair[1]
+                        field_value, identity_pair[0], identity_pair[1]
                     )
                 ):
                     # 仅纠正模型已语义拆分、但把公司和联系人拼回单字段的格式错误；不依赖任何分隔符。
@@ -930,6 +936,10 @@ class AIGateway:
             if field_name in _ENRICHMENT_ONLY_FIELD_NAMES:
                 value = fields.pop(field_name)
                 confidences.pop(field_name, None)
+                if not isinstance(value, str):
+                    # 补充信息是文本素材，多值候选不能绕过字段类型校验进入备注。
+                    dropped_unknown_fields.append(field_name)
+                    continue
                 existing_value = enrichment.get(field_name)
                 if existing_value is None or existing_value == value:
                     enrichment[field_name] = value
@@ -956,7 +966,7 @@ class AIGateway:
 
             value = fields.pop(field_name)
             confidences.pop(field_name, None)
-            if not value or value not in source_text:
+            if not isinstance(value, str) or not value or value not in source_text:
                 # 未知字段没有原文证据时只丢弃候选，避免模型幻觉阻塞整条线索。
                 dropped_unknown_fields.append(field_name)
                 continue
@@ -1037,8 +1047,9 @@ class AIGateway:
         pending: list[str] = []
         low_candidates: dict[str, LeadFieldValue] = {}
         for field_name, value in analysis.crm_fields.items():
-            if field_name == "沟通方式" and not self._has_explicit_communication_evidence(
-                source_text, value
+            if field_name == "沟通方式" and (
+                not isinstance(value, str)
+                or not self._has_explicit_communication_evidence(source_text, value)
             ):
                 # “后续沟通”等弱描述不足以选择枚举，必须保留正式字段为空。
                 continue
@@ -1066,14 +1077,15 @@ class AIGateway:
         """
         valid_enrichment: dict[str, str] = {}
         for field_name, value in analysis.enrichment.items():
+            candidate_value = analysis.crm_fields.get(field_name)
+            candidate_values: list[str | None]
+            if isinstance(candidate_value, list):
+                candidate_values = list(candidate_value)
+            else:
+                candidate_values = [candidate_value]
             if (
                 field_name in ENUM_FIELDS_WITH_OTHER
-                and "其他"
-                not in (
-                    analysis.crm_fields.get(field_name)
-                    if isinstance(analysis.crm_fields.get(field_name), list)
-                    else [analysis.crm_fields.get(field_name)]
-                )
+                and "其他" not in candidate_values
             ):
                 # 枚举实际说明只能附着在同名“其他”字段上，避免无关文本进入备注。
                 logger.warning(
