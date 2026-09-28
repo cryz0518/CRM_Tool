@@ -5,9 +5,41 @@ from __future__ import annotations
 from celery import Celery, signals
 from redis import Redis
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.heartbeat import HeartbeatPublisher
 from app.core.logging import configure_logging
+from app.media.retention import retention_policy_is_configured
+
+
+def build_beat_schedule(settings: Settings) -> dict[str, dict[str, object]]:
+    """根据配置构建 Celery Beat 任务表，未配置保留策略时不注册清理任务。
+
+    参数：settings 为当前进程配置。
+    返回值：不含凭据的 Celery beat 任务定义；基础 outbox、操作恢复任务始终保留。
+    异常：无。
+    副作用：无，仅创建内存字典。
+    """
+    schedule: dict[str, dict[str, object]] = {
+        "consume-pending-lead-outbox-events": {
+            "task": "workers.consume_pending_lead_outbox_events",
+            "schedule": settings.lead_outbox_poll_seconds,
+        },
+        "consume-pending-wecom-actions": {
+            "task": "workers.consume_pending_wecom_actions",
+            "schedule": settings.lead_outbox_poll_seconds,
+        },
+        "reconcile-storage-ingest-operations": {
+            "task": "workers.reconcile_storage_ingest_operations",
+            "schedule": settings.lead_outbox_poll_seconds,
+        },
+    }
+    if retention_policy_is_configured(settings):
+        # 保留策略未显式配置时，开发环境不应周期性触发必然失败的清理任务。
+        schedule["issue-retention-cleanup-operations"] = {
+            "task": "workers.issue_retention_cleanup_operations",
+            "schedule": settings.lead_outbox_poll_seconds,
+        }
+    return schedule
 
 settings = get_settings()
 configure_logging(settings.log_level, environment=settings.app_env, service="worker")
@@ -23,24 +55,7 @@ celery_app.conf.update(
     broker_connection_retry_on_startup=True,
     timezone="Asia/Shanghai",
     enable_utc=False,
-    beat_schedule={
-        "consume-pending-lead-outbox-events": {
-            "task": "workers.consume_pending_lead_outbox_events",
-            "schedule": settings.lead_outbox_poll_seconds,
-        },
-        "consume-pending-wecom-actions": {
-            "task": "workers.consume_pending_wecom_actions",
-            "schedule": settings.lead_outbox_poll_seconds,
-        },
-        "issue-retention-cleanup-operations": {
-            "task": "workers.issue_retention_cleanup_operations",
-            "schedule": settings.lead_outbox_poll_seconds,
-        },
-        "reconcile-storage-ingest-operations": {
-            "task": "workers.reconcile_storage_ingest_operations",
-            "schedule": settings.lead_outbox_poll_seconds,
-        },
-    },
+    beat_schedule=build_beat_schedule(settings),
 )
 
 

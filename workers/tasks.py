@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -15,7 +16,8 @@ from app.ai.models import ExtractedLeadPatch, LeadAnalysis
 from app.ai.persistence import DatabaseAIExecutionRecorder
 from app.companies.dependencies import get_tyc_adapter
 from app.companies.service import CompanyLeadService
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
+from app.core.provider_policy import get_provider_policy
 from app.crm.commands import consume_submission_command, parse_company_submission_request
 from app.crm.dependencies import get_crm_adapter
 from app.leads.review import LeadReviewService
@@ -27,6 +29,7 @@ from app.media.retention import (
     RetentionPayloadScrubService,
     RetentionPolicy,
     StorageIngestRecoveryService,
+    retention_policy_is_configured,
 )
 from app.messaging.models import (
     IncomingMessage,
@@ -45,6 +48,27 @@ from app.wecom_bot.actions import (
     parse_deterministic_action_command,
 )
 from workers.celery_app import celery_app
+
+logger = logging.getLogger(__name__)
+
+
+def _get_retention_policy_or_skip(settings: Settings) -> RetentionPolicy | None:
+    """读取清理策略；非生产未配置时安全跳过，生产仍保持 fail-closed。
+
+    参数：settings 为当前 Worker 配置。
+    返回值：完整配置时返回冻结策略；开发环境缺失配置时返回 None。
+    异常：生产环境或配置格式非法时传播原始配置错误。
+    副作用：未配置的非生产环境记录一次结构化告警，不访问数据库或对象存储。
+    """
+    if retention_policy_is_configured(settings):
+        return RetentionPolicy.from_settings(settings)
+    if not get_provider_policy(settings).is_production:
+        logger.warning(
+            "retention_policy_not_configured_skipped",
+            extra={"app_env": settings.app_env},
+        )
+        return None
+    return RetentionPolicy.from_settings(settings)
 
 
 def _session_factory() -> tuple[Engine, sessionmaker[Session]]:
@@ -486,23 +510,26 @@ def _is_wecom_action_command(session_factory: sessionmaker[Session], outbox_even
 @celery_app.task(name="workers.issue_retention_cleanup_operations")  # type: ignore[untyped-decorator]
 def issue_retention_cleanup_operations() -> int:
     """由 Scheduler 扫描到期附件并签发 operation，不执行远端删除。"""
+    settings = get_settings()
+    policy = _get_retention_policy_or_skip(settings)
+    if policy is None:
+        return 0
     engine, factory = _session_factory()
     try:
-        policy = RetentionPolicy.from_settings(get_settings())
         scheduler = RetentionCleanupScheduler(factory)
         operation_ids = scheduler.scan_and_issue(
             policy,
-            batch_size=get_settings().retention_cleanup_batch_size,
+            batch_size=settings.retention_cleanup_batch_size,
         )
         # 同一周期同时重新派发 retry/reconcile 和已过期租约，覆盖 Worker 崩溃恢复。
         operation_ids = list(
             dict.fromkeys(
                 operation_ids
                 + scheduler.runnable_operation_ids(
-                    batch_size=get_settings().retention_cleanup_batch_size
+                    batch_size=settings.retention_cleanup_batch_size
                 )
             )
-        )[: get_settings().retention_cleanup_batch_size]
+        )[: settings.retention_cleanup_batch_size]
     finally:
         engine.dispose()
     for operation_id in operation_ids:
@@ -574,9 +601,12 @@ def execute_retention_cleanup(operation_id: str) -> str:
 @celery_app.task(name="workers.scrub_retention_payloads")  # type: ignore[untyped-decorator]
 def scrub_retention_payloads() -> tuple[int, int]:
     """由 Worker 按独立 data class 策略 scrub 消息和通知正文。"""
+    settings = get_settings()
+    policy = _get_retention_policy_or_skip(settings)
+    if policy is None:
+        return (0, 0)
     engine, factory = _session_factory()
     try:
-        policy = RetentionPolicy.from_settings(get_settings())
         return RetentionPayloadScrubService(factory).scrub_expired_payloads(policy)
     finally:
         engine.dispose()

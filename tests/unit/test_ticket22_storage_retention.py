@@ -37,6 +37,8 @@ from app.messaging.models import (
     SalesAuthorization,
     StorageIngestOperation,
 )
+from workers.celery_app import build_beat_schedule
+from workers.tasks import _get_retention_policy_or_skip
 
 
 @pytest.fixture
@@ -79,6 +81,46 @@ def test_production_readiness_fails_closed_without_real_capabilities() -> None:
     assert "生产对象存储未配置" in report.issues
     assert "生产文件扫描器未配置" in report.issues
     assert "媒体保留期策略未显式配置" in report.issues
+
+
+def test_development_without_retention_policy_does_not_schedule_cleanup() -> None:
+    """开发环境未配置保留策略时不应注册会持续报错的清理定时任务。"""
+    settings = Settings(_env_file=None, app_env="development")
+
+    schedule = build_beat_schedule(settings)
+
+    assert "issue-retention-cleanup-operations" not in schedule
+
+
+def test_explicit_retention_policy_schedules_cleanup() -> None:
+    """显式配置完整保留策略后仍应注册清理定时任务。"""
+    settings = Settings(
+        _env_file=None,
+        app_env="development",
+        media_retention_policy_version="test-v1",
+        media_retention_days=30,
+        message_payload_retention_days=30,
+        notification_payload_retention_days=30,
+    )
+
+    schedule = build_beat_schedule(settings)
+
+    assert "issue-retention-cleanup-operations" in schedule
+
+
+def test_development_manual_retention_task_skips_without_policy() -> None:
+    """开发环境手动触发清理任务时应安全跳过，而不是抛出配置异常。"""
+    settings = Settings(_env_file=None, app_env="development")
+
+    assert _get_retention_policy_or_skip(settings) is None
+
+
+def test_production_manual_retention_task_stays_fail_closed() -> None:
+    """生产环境缺少保留策略时仍拒绝执行清理任务。"""
+    settings = Settings(_env_file=None, app_env="production")
+
+    with pytest.raises(RuntimeError, match="retention_policy_not_configured"):
+        _get_retention_policy_or_skip(settings)
 
 
 def test_retention_policy_rejects_zero_and_negative_values() -> None:
