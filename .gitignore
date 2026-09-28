@@ -1,4 +1,5 @@
 .env
+employee.csv
 .env.*
 !.env.example
 .codegraph/

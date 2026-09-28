@@ -14,6 +14,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.companies.models import CompanyVerificationStatus
 from app.core.config import get_settings
 from app.core.failures import classify_task_failure, safe_failure_summary
 from app.crm.adapter import CRMAdapter
@@ -156,19 +157,17 @@ class CrmSubmissionService:
             # 重新读取当前审核快照，避免使用 Lead 创建时保存的过期成员显示值。
             record = self._smart_table_adapter.get_record(lead.smart_table_record_id)
             if record is not None:
-                owner_field = record.fields.get("负责人")
                 member_names = getattr(record, "member_names", {})
                 if isinstance(member_names, Mapping):
                     candidate = member_names.get("负责人")
                     if isinstance(candidate, str) and candidate.strip():
                         owner_name = candidate.strip()
-                # Mock/历史适配器可能直接返回姓名；只有它明确不是冻结 userId 时才采用。
-                if owner_name is None and isinstance(owner_field, str):
-                    normalized_field = owner_field.strip()
-                    if normalized_field and normalized_field != lead.smart_table_owner_user_id:
-                        owner_name = normalized_field
+                # owner 字段只保留企微 userId；没有同一响应提供的 display name 时不能反向猜姓名。
+        if owner_name is None:
+            # 缺少可信成员显示名时，禁止把 opaque userId 交给员工目录解析。
+            return None
         try:
-            return directory.resolve(owner_name or lead.smart_table_owner_user_id or "")
+            return directory.resolve(owner_name)
         except EmployeeDirectoryError:
             return None
 
@@ -321,7 +320,8 @@ class CrmSubmissionService:
             return "incomplete"
         try:
             payload = self._canonical_payload(
-                reconciled.fields, tyc_customer_id=lead.tyc_customer_id
+                reconciled.fields,
+                tyc_customer_id=self._reliable_tyc_customer_id(lead, reconciled.fields),
             )
         except CrmPayloadError:
             # 字典、日期或备注格式不合法时只阻止当前线索，不让批次或其他线索被异常打断。
@@ -479,7 +479,8 @@ class CrmSubmissionService:
 
         try:
             canonical_payload = self._canonical_payload(
-                reconciled.fields, tyc_customer_id=lead.tyc_customer_id
+                reconciled.fields,
+                tyc_customer_id=self._reliable_tyc_customer_id(lead, reconciled.fields),
             )
         except CrmPayloadError:
             # CRM DTO 校验失败属于当前线索待完善，禁止进入远端写操作。
@@ -517,12 +518,22 @@ class CrmSubmissionService:
             # CRM 查重是唯一的首次提交去重边界，智能表格阶段不读取同名线索。
             duplicate_results = tuple(self._crm_adapter.search_by_company_name(canonical_payload))
         except Exception as error:
+            failure_category = classify_task_failure(error)
             self._audit(command, "crm_duplicate_search_failed")
             _LOGGER.warning(
                 "crm_duplicate_search_failed",
-                extra={"lead_id": lead_id, "error_type": type(error).__name__},
+                extra={
+                    "lead_id": lead_id,
+                    "error_type": type(error).__name__,
+                    "failure_category": failure_category.value,
+                },
             )
-            return CreateSubmissionOutcome("failed_pending_review")
+            # 查重尚未创建 Sync 记录；暂态故障返回 retrying，下一次命令会重新执行查重。
+            return CreateSubmissionOutcome(
+                "retrying"
+                if failure_category.value == "transient"
+                else "failed_pending_review"
+            )
 
         try:
             with self._session_factory.begin() as session:
@@ -847,6 +858,10 @@ class CrmSubmissionService:
                 sync_id, sales_user_id, error, claim_started_at, claim_attempts
             )
         except Exception as error:
+            if classify_task_failure(error).value == "transient":
+                return self._record_crm_transport_failure(
+                    sync_id, sales_user_id, error, claim_started_at, claim_attempts
+                )
             return self._record_crm_failure(
                 sync_id, sales_user_id, error, claim_started_at, claim_attempts
             )
@@ -974,6 +989,24 @@ class CrmSubmissionService:
         副作用：无，不调用外部系统。
         """
         return self._crm_payload_builder.build(fields, tyc_customer_id=tyc_customer_id)
+
+    @staticmethod
+    def _reliable_tyc_customer_id(
+        lead: Lead, fields: Mapping[str, object]
+    ) -> str | None:
+        """只为唯一核验且名称未被销售改写的线索返回天眼查 ID。"""
+        if lead.company_verification_status != CompanyVerificationStatus.TYC_VERIFIED.value:
+            return None
+        customer_id = lead.tyc_customer_id
+        company_name = fields.get("线索名称")
+        if (
+            not isinstance(customer_id, str)
+            or not customer_id
+            or not isinstance(company_name, str)
+            or company_name != lead.standard_company_name
+        ):
+            return None
+        return customer_id
 
     @staticmethod
     def _snapshot_hash(payload: dict[str, object]) -> str:

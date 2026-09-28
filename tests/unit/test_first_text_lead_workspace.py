@@ -313,7 +313,7 @@ def test_consumer_prefills_first_ambiguous_tyc_candidate_and_marks_name_pending(
         ).all()
     assert lead is not None
     assert lead.standard_company_name == "上海智造有限公司"
-    assert lead.tyc_customer_id == "qcc-1"
+    assert lead.tyc_customer_id is None
     assert lead.company_verification_status == "company_unverified"
     assert "company_tyc_ambiguous_first_candidate_selected" in audits
 

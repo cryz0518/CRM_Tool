@@ -449,7 +449,7 @@ def test_ambiguous_qcc_prefills_first_candidate_and_marks_name_pending(
     with session_factory() as session:
         lead = session.get(Lead, unverified.lead_id)
     assert lead is not None
-    assert lead.tyc_customer_id == "qcc-1"
+    assert lead.tyc_customer_id is None
     assert lead.field_values["线索名称"] == "上海智造有限公司"
     assert lead.qcc_candidates == [
         {"standard_company_name": "上海智造有限公司", "company_id": "qcc-1"},

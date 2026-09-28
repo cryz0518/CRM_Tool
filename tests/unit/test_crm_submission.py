@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from datetime import timedelta
 from pathlib import Path
 
@@ -12,8 +12,9 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.companies.models import CompanyVerificationStatus
 from app.core.config import get_settings
-from app.crm.adapter import CRMSearchResult
+from app.crm.adapter import CRMCreateResult, CRMSearchResult
 from app.crm.commands import (
     consume_submission_command,
     format_submission_reply,
@@ -24,6 +25,7 @@ from app.crm.commands import (
 from app.crm.employee_directory import EmployeeDirectory
 from app.crm.mock import MockCRMAdapter
 from app.crm.service import CrmSubmissionService, SubmissionCommand
+from app.crm.sop import SopCRMError
 from app.leads.discard import LeadDiscardService, LeadDiscardStatus
 from app.leads.models import (
     CrmCompanyIdentity,
@@ -125,6 +127,39 @@ def _lead(
         return lead.id
 
 
+class RecordingCRMAdapter(MockCRMAdapter):
+    """记录查重与创建 payload，验证 TYC 身份是否越过提交服务边界。"""
+
+    def __init__(self) -> None:
+        """初始化空的查重和创建 payload 记录。"""
+        super().__init__()
+        self.search_payloads: list[dict[str, object]] = []
+        self.create_payloads: list[dict[str, object]] = []
+
+    def search_by_company_name(
+        self, payload: Mapping[str, object] | str
+    ) -> tuple[CRMSearchResult, ...]:
+        """记录查重请求后返回空的 CRM 结果。"""
+        if isinstance(payload, str):
+            self.search_payloads.append({"name": payload})
+        else:
+            self.search_payloads.append(dict(payload))
+        return super().search_by_company_name(payload)
+
+    def create_lead(
+        self,
+        payload: Mapping[str, object],
+        *,
+        idempotency_key: str,
+        crm_user_id: str,
+    ) -> CRMCreateResult:
+        """记录创建请求并复用 Mock 的成功响应。"""
+        self.create_payloads.append(dict(payload))
+        return super().create_lead(
+            payload, idempotency_key=idempotency_key, crm_user_id=crm_user_id
+        )
+
+
 def test_create_uses_stable_lead_key_and_current_smart_table_values(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -218,6 +253,179 @@ def test_owner_user_id_is_converted_to_employee_name_before_crm_submit(
 
     assert result.succeeded == 1
     assert crm.crm_user_ids == ["crm-1"]
+
+
+def test_missing_member_display_name_rejects_opaque_owner_id(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证智能表格没有可信成员显示名时不会把负责人 userId 当员工姓名。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    _lead(session_factory, adapter)
+    original_get_record = adapter.get_record
+
+    def get_record_without_member_name(record_id: str) -> SmartTableRecord | None:
+        """返回不含成员显示名的智能表格快照。"""
+        record = original_get_record(record_id)
+        if record is None:
+            return None
+        return SmartTableRecord(record.record_id, record.fields, member_names={})
+
+    monkeypatch.setattr(adapter, "get_record", get_record_without_member_name)
+    crm = MockCRMAdapter()
+
+    result = CrmSubmissionService(session_factory, adapter, crm).submit(
+        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+    )
+
+    assert result.mapping_missing == 1
+    assert crm.search_calls == 0
+    assert crm.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("category", "http_status", "expected_status", "expected_failure_category"),
+    [
+        ("transport", None, "retrying", "transient"),
+        ("authentication", 401, "failed_pending_review", "permanent"),
+        ("business", 200, "failed_pending_review", "permanent"),
+        ("gateway", 403, "failed_pending_review", "permanent"),
+        ("gateway", 503, "retrying", "transient"),
+        ("malformed_response", 200, "failed_pending_review", "permanent"),
+    ],
+)
+def test_sop_error_category_controls_submission_failure_semantics(
+    session_factory: sessionmaker[Session],
+    category: str,
+    http_status: int | None,
+    expected_status: str,
+    expected_failure_category: str,
+) -> None:
+    """验证提交服务按 SopCRMError.category 保存重试或人工失败语义。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+
+    class CategorizedCRM(MockCRMAdapter):
+        """抛出带稳定 category 的 SOP 错误，模拟真实 Adapter。"""
+
+        def create_lead(
+            self,
+            payload: Mapping[str, object],
+            *,
+            idempotency_key: str,
+            crm_user_id: str,
+        ) -> CRMCreateResult:
+            """不发送外部请求，返回指定分类的错误。"""
+            del payload, idempotency_key, crm_user_id
+            raise SopCRMError(
+                "sanitized CRM failure", category=category, http_status=http_status
+            )
+
+    result = CrmSubmissionService(session_factory, adapter, CategorizedCRM()).submit(
+        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+    )
+
+    if expected_status == "retrying":
+        assert result.retrying == 1
+    else:
+        assert result.failed_pending_review == 1
+    with session_factory() as session:
+        sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
+    assert sync is not None
+    assert sync.status == expected_status
+    assert sync.failure_category == expected_failure_category
+
+
+def test_sop_transport_during_duplicate_search_reports_retrying(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证查重尚未建立 Sync 时的 SOP 传输故障也返回可重试结果。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    _lead(session_factory, adapter)
+
+    class SearchTransportCRM(MockCRMAdapter):
+        """模拟查重请求在收到响应前发生的暂态故障。"""
+
+        def search_by_company_name(
+            self, payload: Mapping[str, object] | str
+        ) -> tuple[CRMSearchResult, ...]:
+            """抛出明确的 transport 分类。"""
+            del payload
+            raise SopCRMError("sanitized transport", category="transport")
+
+    result = CrmSubmissionService(session_factory, adapter, SearchTransportCRM()).submit(
+        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+    )
+
+    assert result.retrying == 1
+
+
+def test_tyc_unique_identity_is_sent_to_crm(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证唯一核验的天眼查 ID 才会进入 CRM payload。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.company_verification_status = CompanyVerificationStatus.TYC_VERIFIED.value
+        lead.tyc_customer_id = "tyc-verified"
+    crm = RecordingCRMAdapter()
+
+    result = CrmSubmissionService(session_factory, adapter, crm).submit(
+        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+    )
+
+    assert result.succeeded == 1
+    assert crm.search_payloads[0]["tycCustomerId"] == "tyc-verified"
+    assert crm.create_payloads[0]["tycCustomerId"] == "tyc-verified"
+
+
+def test_tyc_ambiguous_candidate_id_never_enters_crm(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 ambiguous 的首候选 ID 即使残留在 Lead 也不会发送 CRM。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.company_verification_status = CompanyVerificationStatus.COMPANY_UNVERIFIED.value
+        lead.tyc_customer_id = "stale-ambiguous-id"
+    crm = RecordingCRMAdapter()
+
+    result = CrmSubmissionService(session_factory, adapter, crm).submit(
+        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+    )
+
+    assert result.succeeded == 1
+    assert "tycCustomerId" not in crm.search_payloads[0]
+    assert "tycCustomerId" not in crm.create_payloads[0]
+
+
+def test_salesperson_company_name_edit_drops_old_tyc_candidate_id(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证销售改写预填公司名后不会携带旧天眼查 ID。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.company_verification_status = CompanyVerificationStatus.TYC_VERIFIED.value
+        lead.tyc_customer_id = "stale-after-edit"
+        lead.standard_company_name = "人工最终公司"
+    record = adapter.get_records()[0]
+    adapter.update_record(record.record_id, {"线索名称": "销售修改后的公司"})
+    crm = RecordingCRMAdapter()
+
+    result = CrmSubmissionService(session_factory, adapter, crm).submit(
+        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+    )
+
+    assert result.succeeded == 1
+    assert "tycCustomerId" not in crm.search_payloads[0]
+    assert "tycCustomerId" not in crm.create_payloads[0]
 
 
 def test_targeted_company_submission_reuses_service_for_one_lead(

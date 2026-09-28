@@ -274,11 +274,11 @@ class CompanyLeadService:
             )
         candidates = lookup.candidates
         if lookup.status == "ambiguous" and candidates:
-            # 多候选无法可靠唯一判断时，预填接口返回的第一候选；全部候选仍保留供审计。
+            # 多候选只能预填第一候选名称；未经唯一确认不得把任何候选 ID 当作 CRM 身份。
             candidate = candidates[0]
             return CompanyResolution(
                 candidate.standard_company_name,
-                candidate.company_id,
+                None,
                 CompanyVerificationStatus.COMPANY_UNVERIFIED,
                 candidates,
                 failure_event_type,

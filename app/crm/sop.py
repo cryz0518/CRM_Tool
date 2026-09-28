@@ -203,4 +203,6 @@ class SopCRMAdapter:
             return {"id": data}
         if method == "crm_update_lead" and data in (None, ""):
             return {"success": True}
-        raise SopCRMError("CRM response missing data")
+        raise SopCRMError(
+            "CRM response missing data", category="malformed_response", http_status=status
+        )
