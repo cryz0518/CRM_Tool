@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from uuid import uuid4
@@ -14,10 +15,16 @@ from app.messaging.models import NotificationRecord, utc_now
 
 logger = logging.getLogger(__name__)
 _NOTIFICATION_LEASE = timedelta(minutes=5)
+_SDK_ERROR_CODE = re.compile(r"errcode=(\d+)")
+_NON_RETRYABLE_PROVIDER_CODES = frozenset(
+    {f"420{code}" for code in range(27, 52)}
+)
 
 _SUPPORTED_NOTIFICATION_TYPES = frozenset(
     {
         "crm_submission_summary",
+        "crm_submission_preview",
+        "wecom_action_preview",
         "sales_authorization_denied",
         "media_text_input_required",
         "wecom_action_card",
@@ -84,23 +91,25 @@ class WecomOutboundNotificationSender:
                 )
                 current.processing_claim_token = claim_token
             try:
-                # payload 仅保存已构造的白名单消息 body；旧通知没有 payload 时继续发送普通文本。
-                body = notice.payload or {
-                    "msgtype": "text",
-                    "text": {"content": notice.content or "系统通知"},
-                }
+                # AI Bot 主动发送只支持 markdown 或模板卡片；旧通知可能仍保存 text，统一在边界转换。
+                body = _build_supported_body(notice.payload, notice.content)
                 await self._client.send_message(notice.sales_user_id, body)
-            except Exception:
+            except Exception as exc:
+                provider_error_code = _provider_error_code(exc)
+                retryable = provider_error_code not in _NON_RETRYABLE_PROVIDER_CODES
                 with self._session_factory.begin() as session:
                     current = session.get(NotificationRecord, notice.notification_key)
                     if current is not None and current.processing_claim_token == claim_token:
-                        current.status = "retrying"
+                        current.status = "retrying" if retryable else "failed"
                         current.processing_started_at = None
                         current.processing_lease_expires_at = None
                         current.processing_claim_token = None
                         current.attempts += 1
+                        # 日志正文只保留异常类型和纯数字错误码，禁止透传回执原文。
                         logger.warning(
-                            "notification_send_failed",
+                            "notification_send_failed class=%s code=%s",
+                            type(exc).__name__,
+                            provider_error_code or "unknown",
                             extra={
                                 "notification_key": notice.notification_key,
                                 "event": "notification_send_failed",
@@ -137,3 +146,40 @@ class WecomOutboundNotificationSender:
 def _as_utc(value: datetime) -> datetime:
     """将数据库返回的时间统一解释为 UTC，以兼容 SQLite 测试存储。"""
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _build_supported_body(
+    payload: dict[str, object] | None, content: str | None
+) -> dict[str, object]:
+    """构造企业微信 AI Bot 主动发送支持的消息体。
+
+    参数：payload 为通知持久化的白名单消息体；content 为旧通知的纯文本内容。
+    返回值：保留模板卡片等已支持消息，或返回 Markdown 文本消息体。
+    异常：非法 payload 不会透传，降级为安全的固定文本消息。
+    副作用：无，不修改数据库中的原始通知载荷。
+    """
+    if isinstance(payload, dict):
+        msgtype = payload.get("msgtype")
+        if msgtype == "template_card":
+            return payload
+        if msgtype == "markdown":
+            markdown = payload.get("markdown")
+            if isinstance(markdown, dict) and isinstance(markdown.get("content"), str):
+                return payload
+        if msgtype == "text":
+            text = payload.get("text")
+            if isinstance(text, dict) and isinstance(text.get("content"), str):
+                return {"msgtype": "markdown", "markdown": {"content": text["content"]}}
+    return {"msgtype": "markdown", "markdown": {"content": content or "系统通知"}}
+
+
+def _provider_error_code(error: BaseException) -> str | None:
+    """从 SDK 异常中提取纯数字错误码，避免把回执原文写入日志。
+
+    参数：error 为企业微信 SDK 抛出的异常。
+    返回值：匹配到的数字错误码；无法安全提取时返回 None。
+    异常：无；正则处理失败时按无错误码处理。
+    副作用：无，不读取或记录异常消息之外的敏感内容。
+    """
+    match = _SDK_ERROR_CODE.search(str(error))
+    return match.group(1) if match else None

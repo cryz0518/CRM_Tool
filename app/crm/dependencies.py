@@ -33,5 +33,7 @@ def get_crm_adapter() -> CRMAdapter:
             settings.crm_app_auth_token or "",
             settings.crm_private_key or "",
             trust_env=settings.crm_http_trust_env,
+            proxy=settings.crm_http_proxy,
+            authorization=settings.crm_authorization,
         )
     raise RuntimeError("CRM_ADAPTER 未配置真实实现")

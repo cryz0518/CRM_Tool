@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -46,6 +47,7 @@ class SubmissionCommand:
     text: str
     sales_user_id: str
     request_message_id: str
+    target_lead_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -139,13 +141,34 @@ class CrmSubmissionService:
         )
 
     def _resolve_crm_owner(self, lead: Lead) -> str | None:
-        """从冻结的 Smart Table 负责人解析唯一 employee.id，失败则拒绝调用 CRM。"""
+        """在 CRM 调用前把企微负责人 ID 转为姓名并解析唯一 employee.id。
+
+        智能表格成员字段继续以 userId 作为权限和归属事实；只有企业微信响应附带的
+        userName 才用于 EmployeeDirectory 姓名/花名解析。缺少可读姓名、姓名不唯一或
+        记录归属不一致时返回 None，调用方必须 fail closed，不调用 CRM。
+        """
         directory = self._employee_directory
         if directory is None:
             directory = EmployeeDirectory(get_settings().employee_directory_path)
             self._employee_directory = directory
+        owner_name: str | None = None
+        if lead.smart_table_record_id:
+            # 重新读取当前审核快照，避免使用 Lead 创建时保存的过期成员显示值。
+            record = self._smart_table_adapter.get_record(lead.smart_table_record_id)
+            if record is not None:
+                owner_field = record.fields.get("负责人")
+                member_names = getattr(record, "member_names", {})
+                if isinstance(member_names, Mapping):
+                    candidate = member_names.get("负责人")
+                    if isinstance(candidate, str) and candidate.strip():
+                        owner_name = candidate.strip()
+                # Mock/历史适配器可能直接返回姓名；只有它明确不是冻结 userId 时才采用。
+                if owner_name is None and isinstance(owner_field, str):
+                    normalized_field = owner_field.strip()
+                    if normalized_field and normalized_field != lead.smart_table_owner_user_id:
+                        owner_name = normalized_field
         try:
-            return directory.resolve(lead.smart_table_owner_user_id or "")
+            return directory.resolve(owner_name or lead.smart_table_owner_user_id or "")
         except EmployeeDirectoryError:
             return None
 
@@ -159,9 +182,12 @@ class CrmSubmissionService:
         """
         if command.text == _UPDATES_COMMAND:
             return self._submit_updates(command)
-        if command.text != _TODAY_COMMAND:
+        if command.text not in {_TODAY_COMMAND, "提交指定线索"}:
             raise ValueError("不支持的 CRM 提交命令")
+        if command.target_lead_id is not None and command.text != "提交指定线索":
+            raise ValueError("目标线索只能用于指定线索提交命令")
 
+        target_missing = False
         with self._session_factory() as session:
             authorization = session.get(SalesAuthorization, command.sales_user_id)
             if (
@@ -170,16 +196,34 @@ class CrmSubmissionService:
                 or not authorization.is_active
             ):
                 raise ValueError("提交销售未授权")
-            candidate_ids = [
-                lead_id
-                for lead_id in session.scalars(
-                    select(Lead.id).where(
+            if command.text == "提交指定线索":
+                if command.target_lead_id is None:
+                    raise ValueError("指定线索提交缺少目标线索")
+                target = session.scalar(
+                    select(Lead).where(
+                        Lead.id == command.target_lead_id,
                         Lead.smart_table_owner_user_id == command.sales_user_id,
                         Lead.lifecycle_state == "pending_create",
                     )
                 )
-            ]
+                target_missing = target is None
+                candidate_ids = [target.id] if target is not None else []
+            else:
+                candidate_ids = [
+                    lead_id
+                    for lead_id in session.scalars(
+                        select(Lead.id).where(
+                            Lead.smart_table_owner_user_id == command.sales_user_id,
+                            Lead.lifecycle_state == "pending_create",
+                        )
+                    )
+                ]
 
+        if target_missing:
+            return SubmissionBatchResult(
+                incomplete=1,
+                incomplete_lead_ids=(command.target_lead_id or "",),
+            )
         result = SubmissionBatchResult()
         for lead_id in candidate_ids:
             # 每条独立执行；任何一条失败都不得影响后续候选。
@@ -389,9 +433,12 @@ class CrmSubmissionService:
         异常：智能表格、数据库或 CRM 查重错误按既有同步状态转换并记录审计。
         副作用：读取最终表格快照，写入冻结 CRM 同步记录，必要时调用 CRM 查重或创建接口。
         """
+        allow_non_today_target = command.target_lead_id is not None
         with self._session_factory() as session:
             lead = session.get(Lead, lead_id)
-            if lead is None or not self._is_today_owned_candidate(lead, command.sales_user_id):
+            if lead is None or not self._is_create_candidate(
+                lead, command.sales_user_id, allow_non_today_target
+            ):
                 return CreateSubmissionOutcome("incomplete")
             existing = session.scalar(
                 select(CrmSyncRecord).where(
@@ -455,7 +502,9 @@ class CrmSubmissionService:
             if (
                 current_lead is None
                 or authorization is None
-                or not self._is_today_owned_candidate(current_lead, command.sales_user_id)
+                or not self._is_create_candidate(
+                    current_lead, command.sales_user_id, allow_non_today_target
+                )
             ):
                 return CreateSubmissionOutcome("incomplete")
             if self._resolve_crm_owner(current_lead) is None:
@@ -486,7 +535,9 @@ class CrmSubmissionService:
                 if (
                     lead is None
                     or authorization is None
-                    or not self._is_today_owned_candidate(lead, command.sales_user_id)
+                    or not self._is_create_candidate(
+                        lead, command.sales_user_id, allow_non_today_target
+                    )
                 ):
                     return CreateSubmissionOutcome("incomplete")
                 crm_user_id = self._resolve_crm_owner(lead)
@@ -950,6 +1001,21 @@ class CrmSubmissionService:
             lead.smart_table_owner_user_id == sales_user_id
             and lead.lifecycle_state == "pending_create"
             and created.astimezone(shanghai).date() == datetime.now(shanghai).date()
+        )
+
+    @staticmethod
+    def _is_create_candidate(
+        lead: Lead, sales_user_id: str, allow_non_today_target: bool
+    ) -> bool:
+        """判定批量或精确目标线索是否允许进入首次 CRM 提交。"""
+
+        if (
+            lead.smart_table_owner_user_id != sales_user_id
+            or lead.lifecycle_state != "pending_create"
+        ):
+            return False
+        return allow_non_today_target or CrmSubmissionService._is_today_owned_candidate(
+            lead, sales_user_id
         )
 
     @staticmethod

@@ -35,6 +35,15 @@ class FailingClient(FakeClient):
         raise ConnectionError("temporary")
 
 
+class InvalidCardClient(FakeClient):
+    """模拟企业微信拒绝不合法模板卡片的非重试错误。"""
+
+    async def send_message(self, userid_or_chatid: str, body: dict[str, object]) -> dict[str, str]:
+        """抛出仅含非敏感错误码的 SDK 异常。"""
+        self.calls.append((userid_or_chatid, body))
+        raise RuntimeError("Reply ack error: errcode=42035")
+
+
 def test_bot_sender_uses_submitting_sales_userid_and_marks_notice_sent() -> None:
     """验证现有 Bot 客户端消费通知时以销售 userid 主动推送。"""
     engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
@@ -55,7 +64,10 @@ def test_bot_sender_uses_submitting_sales_userid_and_marks_notice_sent() -> None
     asyncio.run(WecomOutboundNotificationSender(factory, client).send_pending_once())
 
     assert client.calls == [
-        ("sales-1", {"msgtype": "text", "text": {"content": "CRM 提交结果：创建成功 1 条。"}})
+        (
+            "sales-1",
+            {"msgtype": "markdown", "markdown": {"content": "CRM 提交结果：创建成功 1 条。"}},
+        )
     ]
     with factory() as session:
         notice = session.get(NotificationRecord, "n-1")
@@ -84,6 +96,35 @@ def test_notification_failure_is_retryable_without_duplicate_business_work() -> 
         notice = session.get(NotificationRecord, "n-2")
         assert notice is not None
         assert notice.status == "retrying"
+        assert notice.attempts == 1
+
+
+def test_invalid_template_card_error_is_terminal_without_infinite_retry() -> None:
+    """验证企业微信卡片协议错误不会被当作可重试网络故障。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    factory = sessionmaker(engine)
+    Base.metadata.create_all(engine)
+    with factory.begin() as session:
+        session.add(
+            NotificationRecord(
+                notification_key="invalid-card",
+                sales_user_id="sales-card",
+                source_message_id="message-card",
+                notification_type="wecom_action_card",
+                content="确认",
+                payload={
+                    "msgtype": "template_card",
+                    "template_card": {"card_type": "button_interaction"},
+                },
+            )
+        )
+
+    asyncio.run(WecomOutboundNotificationSender(factory, InvalidCardClient()).send_pending_once())
+
+    with factory() as session:
+        notice = session.get(NotificationRecord, "invalid-card")
+        assert notice is not None
+        assert notice.status == "failed"
         assert notice.attempts == 1
 
 
@@ -180,5 +221,58 @@ def test_action_card_payload_is_sent_without_creating_business_retry() -> None:
                 "msgtype": "template_card",
                 "template_card": {"task_id": "t18_1", "card_type": "text_notice"},
             },
+        )
+    ]
+
+
+def test_company_submission_preview_notification_is_sent() -> None:
+    """验证按公司定位生成的预览回复会进入 Bot 主动发送白名单。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    factory = sessionmaker(engine)
+    Base.metadata.create_all(engine)
+    with factory.begin() as session:
+        session.add(
+            NotificationRecord(
+                notification_key="company-preview",
+                sales_user_id="sales-preview",
+                source_message_id="message-preview",
+                notification_type="crm_submission_preview",
+                content="已定位，请确认。",
+            )
+        )
+    client = FakeClient()
+
+    assert asyncio.run(WecomOutboundNotificationSender(factory, client).send_pending_once()) == 1
+    assert client.calls == [
+        (
+            "sales-preview",
+            {"msgtype": "markdown", "markdown": {"content": "已定位，请确认。"}},
+        )
+    ]
+
+
+def test_legacy_text_payload_is_converted_to_supported_markdown() -> None:
+    """验证历史 text 通知在主动发送边界转换为 AI Bot 支持的 Markdown。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    factory = sessionmaker(engine)
+    Base.metadata.create_all(engine)
+    with factory.begin() as session:
+        session.add(
+            NotificationRecord(
+                notification_key="legacy-text",
+                sales_user_id="sales-legacy",
+                source_message_id="message-legacy",
+                notification_type="crm_submission_summary",
+                content="旧内容",
+                payload={"msgtype": "text", "text": {"content": "历史通知"}},
+            )
+        )
+    client = FakeClient()
+
+    assert asyncio.run(WecomOutboundNotificationSender(factory, client).send_pending_once()) == 1
+    assert client.calls == [
+        (
+            "sales-legacy",
+            {"msgtype": "markdown", "markdown": {"content": "历史通知"}},
         )
     ]

@@ -243,6 +243,8 @@ class LeadReviewService:
             self._require_source_message(session, source_message_id)
             provenance = self._latest_provenance_by_field(session, lead_id)
             pending = self._confirmation_names(current_fields.get(AI_CONFIRMATION_FIELD))
+            # 系统决策也可能只新增审核元数据而不改业务字段，必须先合并本轮待确认声明。
+            pending.update(patch.pending_confirmation_fields)
             protected = self._detect_user_edits(
                 session, lead, provenance, current_fields, pending, source_message_id
             )

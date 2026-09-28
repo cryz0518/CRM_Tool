@@ -17,6 +17,7 @@ from app.ai.persistence import AIExecutionRecorder, AIExecutionRecorderEvent
 from app.ai.provider import LLMProvider, LLMProviderError
 from app.core.failures import PermanentTaskFailure, RetryableTaskFailure
 from app.smart_table.registry import (
+    AI_FIELD_ALIASES,
     BUSINESS_LINE_OPTIONS,
     COMMUNICATION_METHOD_OPTIONS,
     CRM_BUSINESS_FIELD_NAMES,
@@ -74,6 +75,7 @@ _ENRICHMENT_ONLY_FIELD_NAMES = frozenset(
     {"城市/地区", "主营产品", "年销售额", "客户需求/痛点", "预算", "特殊要求"}
 )
 _ENRICHMENT_FIELD_NAMES = _ENRICHMENT_ONLY_FIELD_NAMES | ENUM_FIELDS_WITH_OTHER
+_MODEL_FIELD_ALIASES = AI_FIELD_ALIASES
 _FORBIDDEN_AI_CRM_FIELD_NAMES = frozenset({"备注"})
 _NON_QUARANTINABLE_AI_FIELD_NAMES = frozenset(
     {"备注", "AI待确认", "创建人", "负责人", "智能表格负责人", "CRM线索负责人"}
@@ -751,23 +753,179 @@ class AIGateway:
         return analysis.model_copy(update={"crm_fields": fields})
 
     @staticmethod
+    def _model_field_alias(raw_name: str) -> str:
+        """将模型字段别名解析为注册表字段名，不执行模糊匹配。
+
+        参数：raw_name 为模型返回的字段名。
+        返回值：注册表规范字段名，或原字段名（表示无法归一化）。
+        异常：无。
+        副作用：无；仅查询有限别名表。
+        """
+        normalized = raw_name.strip().lower()
+        return _MODEL_FIELD_ALIASES.get(normalized, raw_name)
+
+    @staticmethod
+    def _model_value_has_source_evidence(value: LeadFieldValue, source_text: str) -> bool:
+        """判断模型字段值是否能在当前原文中逐字核验。
+
+        参数：value 为 CRM 字段候选；source_text 为脱敏后的当前消息文本。
+        返回值：候选为非空字符串或字符串数组且全部有原文证据时返回 True。
+        异常：无。
+        副作用：无；不调用外部服务。
+        """
+        values = value if isinstance(value, list) else [value]
+        return bool(values) and all(
+            isinstance(item, str) and item.strip() and item in source_text for item in values
+        )
+
+    @staticmethod
+    def _normalize_enum_candidate(
+        field_name: str, value: LeadFieldValue, source_text: str
+    ) -> tuple[LeadFieldValue | None, str | None]:
+        """将枚举候选归一化为合法选项，必要时落到“其他”并保留原文。
+
+        参数：field_name 为规范枚举字段；value 为模型候选；source_text 为当前原文。
+        返回值：规范枚举值及可选的“其他”补充原文；无法确认时返回 None。
+        异常：无；不合法候选不会抛出业务异常。
+        副作用：无；不修改传入对象。
+        """
+        options = _ENUM_OPTIONS.get(field_name)
+        if options is None:
+            return value, None
+        raw_values = value if isinstance(value, list) else [value]
+        if not raw_values or not all(isinstance(item, str) for item in raw_values):
+            return None, None
+        known_values = [item for item in raw_values if item in options]
+        unknown_values = [
+            item for item in raw_values if item not in options and item in source_text
+        ]
+        if len(known_values) != len(raw_values) and field_name not in ENUM_FIELDS_WITH_OTHER:
+            return None, None
+        if unknown_values:
+            if "其他" not in options:
+                return None, None
+            if "其他" not in known_values:
+                known_values.append("其他")
+            normalized: LeadFieldValue = (
+                known_values if isinstance(value, list) else "其他"
+            )
+            return normalized, "、".join(unknown_values)
+        if not known_values:
+            return None, None
+        return (
+            known_values if isinstance(value, list) else known_values[0],
+            None,
+        )
+
+    @staticmethod
     def _normalize_enrichment_field_placement(
         analysis: LeadAnalysis, source_text: str
     ) -> LeadAnalysis:
-        """把模型误放入 crm_fields 的备注素材归回 enrichment。
+        """把模型误放入错误位置的备注素材安全归入 enrichment。
 
         参数：analysis 为模型结构化分析结果；source_text 为当前脱敏原文。
         返回值：仅调整补充信息字段位置、同步移除其无关置信度后的分析结果。
-        异常：无；真正未知的 CRM 字段仍交由业务白名单校验抛出异常。
-        副作用：记录字段归位或冲突告警，不记录客户原文和候选值。
+        异常：无；可识别别名按注册表归一化，无法归一化字段不会进入业务结构。
+        副作用：记录字段归位、别名归一化或丢弃告警，不记录客户原文和候选值。
         """
         fields = dict(analysis.crm_fields)
         enrichment = dict(analysis.enrichment)
         confidences = dict(analysis.confidence_by_field)
         moved_fields: list[str] = []
+        aliased_fields: list[str] = []
         quarantined_fields: list[str] = []
         dropped_unknown_fields: list[str] = []
         conflicted_fields: list[str] = []
+
+        # 先把模型返回的有限别名归一化为注册表字段；未知键绝不动态创建字段。
+        for alias in tuple(fields):
+            if alias == "备注":
+                # 备注是智能表格中的文本列，但最终内容仍由 T09 备注生成器统一编排。
+                # 模型偶尔把原文备注放在 crm_fields 时，只把有原文证据的文本转为素材，
+                # 不能让这个位置错误阻塞整条消息，也不能绕过人工编辑保护直接写表格。
+                value = fields.pop(alias)
+                confidences.pop(alias, None)
+                if not AIGateway._model_value_has_source_evidence(value, source_text):
+                    dropped_unknown_fields.append(alias)
+                    continue
+                text_value = value if isinstance(value, str) else ""
+                if not text_value:
+                    dropped_unknown_fields.append(alias)
+                    continue
+                existing_value = enrichment.get("特殊要求")
+                if existing_value is None:
+                    enrichment["特殊要求"] = text_value
+                    moved_fields.append(alias)
+                elif existing_value != text_value:
+                    conflicted_fields.append(alias)
+                continue
+            target_field = AIGateway._model_field_alias(alias)
+            if target_field == alias:
+                continue
+            value = fields.pop(alias)
+            confidence = confidences.pop(alias, None)
+            if not AIGateway._model_value_has_source_evidence(value, source_text):
+                dropped_unknown_fields.append(alias)
+                continue
+            if target_field in _ENRICHMENT_ONLY_FIELD_NAMES:
+                text_value = value if isinstance(value, str) else ""
+                if not text_value:
+                    dropped_unknown_fields.append(alias)
+                    continue
+                existing_value = enrichment.get(target_field)
+                if existing_value is None:
+                    enrichment[target_field] = text_value
+                    aliased_fields.append(alias)
+                elif existing_value != text_value:
+                    conflicted_fields.append(alias)
+                continue
+            normalized_value, detail = AIGateway._normalize_enum_candidate(
+                target_field, value, source_text
+            )
+            if normalized_value is None:
+                dropped_unknown_fields.append(alias)
+                continue
+            current_value = fields.get(target_field)
+            if current_value is not None and current_value != normalized_value:
+                conflicted_fields.append(alias)
+                continue
+            fields[target_field] = normalized_value
+            confidences[target_field] = confidence if confidence is not None else 1.0
+            if detail:
+                enrichment[target_field] = detail
+            aliased_fields.append(alias)
+
+        for alias in tuple(enrichment):
+            target_field = AIGateway._model_field_alias(alias)
+            if target_field == alias:
+                continue
+            value = enrichment.pop(alias)
+            if not value or value not in source_text:
+                dropped_unknown_fields.append(alias)
+                continue
+            if target_field in _ENRICHMENT_ONLY_FIELD_NAMES:
+                existing_value = enrichment.get(target_field)
+                if existing_value is None:
+                    enrichment[target_field] = value
+                    aliased_fields.append(alias)
+                elif existing_value != value:
+                    conflicted_fields.append(alias)
+                continue
+            normalized_value, detail = AIGateway._normalize_enum_candidate(
+                target_field, value, source_text
+            )
+            if normalized_value is None:
+                dropped_unknown_fields.append(alias)
+                continue
+            current_value = fields.get(target_field)
+            if current_value is not None and current_value != normalized_value:
+                conflicted_fields.append(alias)
+                continue
+            fields[target_field] = normalized_value
+            confidences[target_field] = 1.0
+            if detail:
+                enrichment[target_field] = detail
+            aliased_fields.append(alias)
         for field_name in tuple(fields):
             if field_name in _ENRICHMENT_ONLY_FIELD_NAMES:
                 value = fields.pop(field_name)
@@ -814,6 +972,21 @@ class AIGateway:
                 enrichment["特殊要求"] = f"{existing_requirement}；{detail}"
             quarantined_fields.append(field_name)
 
+        # Provider 可能绕过输出 schema，将未知键直接放入 enrichment；未知键不能
+        # 进入任何业务字段，也不能被当作新的字段契约，只能安全丢弃。
+        for field_name in tuple(enrichment):
+            if field_name in _ENRICHMENT_FIELD_NAMES:
+                continue
+
+            value = enrichment.pop(field_name)
+            del value
+            dropped_unknown_fields.append(field_name)
+
+        if aliased_fields:
+            logger.warning(
+                "ai_model_field_alias_normalized",
+                extra={"field_names": aliased_fields},
+            )
         if moved_fields:
             logger.warning(
                 "ai_enrichment_fields_relocated",
@@ -835,7 +1008,11 @@ class AIGateway:
                 extra={"field_names": dropped_unknown_fields},
             )
         if not (
-            moved_fields or quarantined_fields or dropped_unknown_fields or conflicted_fields
+            moved_fields
+            or aliased_fields
+            or quarantined_fields
+            or dropped_unknown_fields
+            or conflicted_fields
         ):
             return analysis
         return analysis.model_copy(
@@ -1076,6 +1253,9 @@ class AIGateway:
             "不能带字段标签、解释文字、其他字段值或整句原文。"
             "业务线、客户行业、工艺、客户级别和沟通方式必须根据上下文映射到注册表合法选项；"
             "语义不足以区分候选时省略，不得用相邻字段或关键词强行推断。"
+            "例如‘做电气自动化’属于客户行业；若不在行业枚举中，客户行业填写‘其他’，"
+            "并将连续原文‘电气自动化’放入 enrichment 的‘客户行业’，禁止输出‘业务领域’字段。"
+            "例如‘主要想做喷涂方面’属于工艺，工艺填写合法选项‘喷涂’，不得创建新的工艺字段。"
             "手机号、电话、邮箱、日期和地点分别按各自格式识别，不能把姓名、职位、公司名或说明文字混入。"
             "主营产品、客户需求/痛点、预算、年销售额和特殊要求属于 enrichment，"
             "按语义归类但 value 必须保留当前原文中的连续事实片段；模型摘要或扩写不得写入。"

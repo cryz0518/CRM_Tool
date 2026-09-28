@@ -16,7 +16,7 @@ from app.ai.persistence import DatabaseAIExecutionRecorder
 from app.companies.dependencies import get_tyc_adapter
 from app.companies.service import CompanyLeadService
 from app.core.config import get_settings
-from app.crm.commands import consume_submission_command
+from app.crm.commands import consume_submission_command, parse_company_submission_request
 from app.crm.dependencies import get_crm_adapter
 from app.leads.review import LeadReviewService
 from app.leads.service import COMPLETED_CHECKPOINT_STATUSES, FirstTextLeadWorkspaceService
@@ -82,8 +82,18 @@ def consume_lead_outbox_event(
         smart_table_adapter = get_smart_table_adapter()
         if _is_submission_command(factory, outbox_event_id):
             # 命令已在 T02 确定性分类；只编排现有 T12 服务，绝不进入 AI 线索路径。
+            with factory() as session:
+                event = session.get(OutboxEvent, outbox_event_id)
+                message = session.get(IncomingMessage, event.message_id) if event else None
+            company_request = (
+                message is not None
+                and parse_company_submission_request(message.normalized_text or "") is not None
+            )
             return consume_submission_command(
-                factory, smart_table_adapter, get_crm_adapter(), outbox_event_id
+                factory,
+                smart_table_adapter,
+                None if company_request else get_crm_adapter(),
+                outbox_event_id,
             )
         if _is_wecom_action_command(factory, outbox_event_id):
             with factory() as session:
@@ -199,7 +209,7 @@ def _message_id(session_factory: sessionmaker[Session], outbox_event_id: int) ->
 
 
 def _is_submission_command(session_factory: sessionmaker[Session], outbox_event_id: int) -> bool:
-    """判断已认领 Outbox 是否为 T12 确定性 CRM 提交命令。
+    """判断已认领 Outbox 是否为 T12 确定性 CRM 提交或公司预览命令。
 
     参数：session_factory 为数据库会话工厂；outbox_event_id 为待消费事件。
     返回值：仅 event_type 为 crm_submission_command 时返回 True。

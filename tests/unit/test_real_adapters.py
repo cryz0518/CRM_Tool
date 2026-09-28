@@ -41,6 +41,28 @@ def test_tyc_accepts_only_one_exact_company_match() -> None:
     assert result.status == "matched" and result.candidates[0].company_id == "1"
 
 
+def test_tyc_accepts_numeric_company_type_from_real_search_envelope() -> None:
+    """验证天眼查真实搜索响应的数字 type=1 能解析为企业候选。"""
+    adapter = _tyc({"error_code": 0, "reason": "ok", "result": {"total": 2, "items": [
+        {
+            "name": "希捷国际科技（无锡）有限公司",
+            "id": 2343827108,
+            "type": 1,
+        },
+        {
+            "name": "希捷国际科技（无锡）有限公司工会委员会",
+            "id": 4470657997,
+            "type": 1,
+        },
+    ]}})
+
+    result = adapter.lookup("希捷国际科技（无锡）有限公司")
+
+    assert result.status == "matched"
+    assert len(result.candidates) == 1
+    assert result.candidates[0].standard_company_name == "希捷国际科技（无锡）有限公司"
+
+
 def test_tyc_not_found_is_only_documented_code_or_no_company_items() -> None:
     """验证文档无结果码和空企业结果可返回 not_found。"""
     assert _tyc({"error_code": 300000}).lookup("公司").status == "not_found"
@@ -76,7 +98,7 @@ def test_tyc_malformed_response_and_timeout_raise_classified_error() -> None:
 
 
 def _crm(
-    response: object, callback: object | None = None
+    response: object, callback: object | None = None, authorization: str | None = None
 ) -> tuple[SopCRMAdapter, list[httpx.Request]]:
     """以临时 RSA key 和 fake transport 构造 SOP 客户端。"""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -99,6 +121,7 @@ def _crm(
         "fake-token",
         pem,
         client=httpx.Client(transport=httpx.MockTransport(send)),
+        authorization=authorization,
     )
     return adapter, requests
 
@@ -122,6 +145,13 @@ def test_sop_signing_matches_posted_biz_content_and_header_identity() -> None:
     assert result.crm_lead_id == "123" and len(requests) == 1
 
 
+def test_sop_authorization_header_is_sent_when_configured() -> None:
+    """验证配置的 SOP Authorization 仅作为请求头发送。"""
+    adapter, requests = _crm({"code": 0, "data": {"result": 0}}, authorization="Bearer fake")
+    assert adapter.search_by_company_name({"name": "样例", "businessLine": 1}) == ()
+    assert requests[0].headers["Authorization"] == "Bearer fake"
+
+
 def test_employee_directory_resolves_unique_name_and_nickname(tmp_path: Path) -> None:
     """验证姓名和昵称唯一精确匹配到 employee.id。"""
     path = tmp_path / "employee.csv"
@@ -129,6 +159,29 @@ def test_employee_directory_resolves_unique_name_and_nickname(tmp_path: Path) ->
     directory = EmployeeDirectory(path)
     assert directory.resolve("张三") == "E1"
     assert directory.resolve("小李") == "E2"
+
+
+def test_employee_directory_resolves_wecom_combined_name_and_nickname(
+    tmp_path: Path,
+) -> None:
+    """验证企微姓名（花名）组合仍要求两部分精确匹配。"""
+    path = tmp_path / "employee.csv"
+    path.write_text("id,name,nickname\nE1,张华杰,JJ\n", encoding="utf-8")
+    directory = EmployeeDirectory(path)
+
+    assert directory.resolve("张华杰(JJ)") == "E1"
+    assert directory.resolve("张华杰（其他花名）") == "E1"
+
+
+def test_employee_directory_uses_nickname_only_to_disambiguate_duplicate_names(
+    tmp_path: Path,
+) -> None:
+    """验证姓名唯一时不校验花名，姓名重复时才用花名消歧。"""
+    path = tmp_path / "employee.csv"
+    path.write_text("id,name,nickname\nE1,张三,三哥\nE2,张三,小张\n", encoding="utf-8")
+    directory = EmployeeDirectory(path)
+
+    assert directory.resolve("张三(小张)") == "E2"
 
 
 def test_employee_directory_rejects_duplicate_and_missing_owner(tmp_path: Path) -> None:
@@ -181,6 +234,14 @@ def test_sop_error_envelopes_are_classified_without_transport_confusion(
     with pytest.raises(SopCRMError) as error:
         adapter.search_by_company_name({"name": "样例", "businessLine": 1})
     assert error.value.category == category
+
+
+def test_sop_alternate_gateway_envelope_is_gateway() -> None:
+    """验证 SOP 的 code/data/status/message 错误 envelope 不会误报 malformed。"""
+    adapter, _ = _crm({"code": -1, "data": None, "message": "redacted", "status": "error"})
+    with pytest.raises(SopCRMError) as error:
+        adapter.search_by_company_name({"name": "样例", "businessLine": 1})
+    assert error.value.category == "gateway"
 
 
 def test_sop_malformed_json_and_unexpected_shape_are_not_transport() -> None:

@@ -273,6 +273,17 @@ class CompanyLeadService:
                 lookup.candidates,
             )
         candidates = lookup.candidates
+        if lookup.status == "ambiguous" and candidates:
+            # 多候选无法可靠唯一判断时，预填接口返回的第一候选；全部候选仍保留供审计。
+            candidate = candidates[0]
+            return CompanyResolution(
+                candidate.standard_company_name,
+                candidate.company_id,
+                CompanyVerificationStatus.COMPANY_UNVERIFIED,
+                candidates,
+                failure_event_type,
+                ("线索名称",),
+            )
         if command.user_confirmed_company:
             # 销售确认可作为当前销售去重与后续提交的标准名，但不伪装成工商核验成功。
             return CompanyResolution(
@@ -308,6 +319,7 @@ class CompanyLeadService:
         tyc_customer_id = resolution.tyc_customer_id
         verification_status = resolution.verification_status
         candidates = resolution.candidates
+        pending_confirmation_fields = resolution.pending_confirmation_fields
         with self._session_factory.begin() as session:
             message = session.get(IncomingMessage, command.source_message_id)
             if message is None:
@@ -320,6 +332,11 @@ class CompanyLeadService:
             if resolution.tyc_failure_event_type is not None:
                 # 将外部超时与“查无结果”区分为可审计事件，供运维和销售审核追溯。
                 self._record_audit(session, command, resolution.tyc_failure_event_type)
+            if resolution.pending_confirmation_fields:
+                # 多候选采用首项预填，但将销售确认责任固定记录为审计事实。
+                self._record_audit(
+                    session, command, "company_tyc_ambiguous_first_candidate_selected"
+                )
             # 所有目标定位都带销售条件，避免表格阶段读取或推断其他销售的信息。
             lead = self._get_requested_or_matching_lead(session, command, standard_name)
             merge_target = self._get_temporary_merge_target(
@@ -443,8 +460,12 @@ class CompanyLeadService:
 
         if command.defer_smart_table_sync:
             # 首次文本消费者会在公司唯一性决策后统一走 T09 创建或更新审核表。
-            return self._result_for_id(lead_id, table_patch)
-        return self._sync_smart_table(lead_id, table_patch, created)
+            return self._result_for_id(
+                lead_id, table_patch, pending_confirmation_fields
+            )
+        return self._sync_smart_table(
+            lead_id, table_patch, created, pending_confirmation_fields
+        )
 
     def _get_requested_or_matching_lead(
         self, session: Session, command: CompanyUpsertCommand, standard_name: str | None
@@ -546,9 +567,12 @@ class CompanyLeadService:
         if region is CompanyRegion.FOREIGN:
             # 国外判定来自显式证据，故可确定地覆盖默认国内值。
             fields["是否为国际客户"] = "国外"
-        if (
-            standard_name is not None
-            and verification_status is CompanyVerificationStatus.TYC_VERIFIED
+        if standard_name is not None and (
+            verification_status is CompanyVerificationStatus.TYC_VERIFIED
+            or (
+                verification_status is CompanyVerificationStatus.COMPANY_UNVERIFIED
+                and candidates
+            )
         ):
             fields["线索名称"] = standard_name
         lead = Lead(
@@ -689,11 +713,25 @@ class CompanyLeadService:
             display_name = (
                 standard_name
                 if verification_status is CompanyVerificationStatus.TYC_VERIFIED
+                or (
+                    verification_status is CompanyVerificationStatus.COMPANY_UNVERIFIED
+                    and candidates
+                )
                 else company_name
             )
             values = dict(lead.field_values)
-            if values.get("线索名称") != display_name:
+            name_changed = values.get("线索名称") != display_name
+            if name_changed:
                 values["线索名称"] = display_name
+            # 天眼查解析可能发生在智能表格首次写入之后；即使后台 Lead 已经是首选候选，
+            # 仍需把名称作为增量补丁交给 T09，由其重读表格并判断是否可以安全回写。
+            # 这样既能修复远端表格落后于后台的情况，也不会绕过销售人工编辑保护。
+            if candidates and verification_status in (
+                CompanyVerificationStatus.TYC_VERIFIED,
+                CompanyVerificationStatus.COMPANY_UNVERIFIED,
+            ):
+                table_patch["线索名称"] = display_name
+            elif name_changed:
                 table_patch["线索名称"] = display_name
             lead.field_values = values
             lead.standard_company_name = standard_name
@@ -714,7 +752,11 @@ class CompanyLeadService:
         lead.lifecycle_state = self._lifecycle_state(lead.field_values, lead.standard_company_name)
 
     def _sync_smart_table(
-        self, lead_id: str, patch: Mapping[str, str], created: bool
+        self,
+        lead_id: str,
+        patch: Mapping[str, object],
+        created: bool,
+        pending_confirmation_fields: tuple[str, ...] = (),
     ) -> CompanyUpsertResult:
         """在事务提交后创建或增量更新智能表格，并回写记录定位。
 
@@ -734,15 +776,19 @@ class CompanyLeadService:
         if record_id is None and has_standard_company_name:
             logger.info("company_smart_table_create_started", extra={"lead_id": lead_id})
             try:
+                record_fields: dict[str, object] = {
+                    **DEFAULT_SMART_TABLE_FIELD_VALUES,
+                    **fields,
+                    # 机器人重新物化记录代表又产生了待提交变更，状态必须回到未提交。
+                    "提交状态": "未提交",
+                    "创建人": owner,
+                    "负责人": owner,
+                }
+                if pending_confirmation_fields:
+                    # 多候选预填的公司名写入审核元数据，但不改变 CRM 业务字段。
+                    record_fields["AI待确认"] = list(pending_confirmation_fields)
                 record = self._smart_table_adapter.create_record(
-                    {
-                        **DEFAULT_SMART_TABLE_FIELD_VALUES,
-                        **fields,
-                        # 机器人重新物化记录代表又产生了待提交变更，状态必须回到未提交。
-                        "提交状态": "未提交",
-                        "创建人": owner,
-                        "负责人": owner,
-                    },
+                    record_fields,
                     actor=SmartTableActor.ROBOT,
                 )
             except Exception as error:
@@ -764,13 +810,25 @@ class CompanyLeadService:
                 raise ValueError(f"智能表格记录不存在：{record_id}")
             # 解析产生新表格写入时，提交状态由机器人统一重置为未提交。
             last_synced_values = self._last_synced_values(lead_id, set(patch))
-            safe_patch = {
+            safe_patch: dict[str, object] = {
                 field_name: value
                 for field_name, value in patch.items()
                 if not current_record.fields.get(field_name)
                 or current_record.fields.get(field_name) == value
                 or current_record.fields.get(field_name) == last_synced_values.get(field_name)
             }
+            if pending_confirmation_fields:
+                # 只追加系统产生的待确认字段，不清除表格中已有的审核标记。
+                existing_pending = current_record.fields.get("AI待确认")
+                if isinstance(existing_pending, (list, tuple, set)):
+                    pending_values = {
+                        value for value in existing_pending if isinstance(value, str)
+                    }
+                else:
+                    pending_values = set()
+                safe_patch["AI待确认"] = sorted(
+                    pending_values.union(pending_confirmation_fields)
+                )
             # 提交状态是系统控制字段，不参与销售人工字段保护；任何机器人新写入都将其置为未提交。
             safe_patch["提交状态"] = "未提交"
             protected_fields = set(patch) - set(safe_patch)
@@ -785,7 +843,9 @@ class CompanyLeadService:
                     },
                 )
             if not safe_patch:
-                return self._result_for_id(lead_id)
+                return self._result_for_id(
+                    lead_id, pending_confirmation_fields=pending_confirmation_fields
+                )
             logger.info(
                 "company_smart_table_update_started",
                 extra={
@@ -815,7 +875,7 @@ class CompanyLeadService:
             lead = session.get(Lead, lead_id)
             if lead is None:
                 raise ValueError(f"线索不存在：{lead_id}")
-            return self._result(lead)
+            return self._result(lead, pending_confirmation_fields=pending_confirmation_fields)
 
     @staticmethod
     def _normalize_company_name_for_comparison(company_name: str) -> str:
@@ -930,7 +990,9 @@ class CompanyLeadService:
 
     @staticmethod
     def _result(
-        lead: Lead, smart_table_patch: Mapping[str, str] | None = None
+        lead: Lead,
+        smart_table_patch: Mapping[str, object] | None = None,
+        pending_confirmation_fields: tuple[str, ...] = (),
     ) -> CompanyUpsertResult:
         """将 ORM 线索转换为可在会话外使用的应用服务结果。
 
@@ -946,6 +1008,7 @@ class CompanyLeadService:
             lead.standard_company_name,
             CompanyVerificationStatus(lead.company_verification_status),
             dict(smart_table_patch or {}),
+            pending_confirmation_fields,
         )
 
     def _mark_user_protected_fields(self, lead_id: str, field_names: set[str]) -> None:
@@ -996,7 +1059,7 @@ class CompanyLeadService:
             )
         return values
 
-    def _record_last_ai_synced_values(self, lead_id: str, patch: Mapping[str, str]) -> None:
+    def _record_last_ai_synced_values(self, lead_id: str, patch: Mapping[str, object]) -> None:
         """回写本轮成功写入表格的机器人字段值。
 
         参数：lead_id 为当前线索；patch 为已成功写入的最小字段补丁。
@@ -1023,7 +1086,10 @@ class CompanyLeadService:
                     updated_fields.add(provenance.field_name)
 
     def _result_for_id(
-        self, lead_id: str, smart_table_patch: Mapping[str, str] | None = None
+        self,
+        lead_id: str,
+        smart_table_patch: Mapping[str, object] | None = None,
+        pending_confirmation_fields: tuple[str, ...] = (),
     ) -> CompanyUpsertResult:
         """读取并返回指定线索的会话外稳定结果。
 
@@ -1036,7 +1102,7 @@ class CompanyLeadService:
             lead = session.get(Lead, lead_id)
             if lead is None:
                 raise ValueError(f"线索不存在：{lead_id}")
-            return self._result(lead, smart_table_patch)
+            return self._result(lead, smart_table_patch, pending_confirmation_fields)
 
 
 # 兼容历史测试和外部注入点；生产代码使用 TYCAdapter/MockTYCAdapter。

@@ -96,6 +96,7 @@ class CompanyResolution:
     verification_status: CompanyVerificationStatus
     candidates: tuple[TYCCandidate, ...] = ()
     tyc_failure_event_type: str | None = None
+    pending_confirmation_fields: tuple[str, ...] = ()
 
     @property
     def qcc_company_id(self) -> str | None:
@@ -132,6 +133,7 @@ class CompanyUpsertResult:
     standard_company_name: str | None
     verification_status: CompanyVerificationStatus
     smart_table_patch: dict[str, object] = field(default_factory=dict)
+    pending_confirmation_fields: tuple[str, ...] = ()
 
 
 # 兼容现有测试和外部适配器导入；生产入口与文案统一使用 TYC。

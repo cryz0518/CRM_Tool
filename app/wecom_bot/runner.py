@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import signal
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from app.wecom_bot.adapter import WecomMediaMessageAdapter, WecomTextMessageAdap
 from app.wecom_bot.callback import WecomTemplateCardCallbackHandler
 
 logger = logging.getLogger(__name__)
+_SDK_ERROR_CODE = re.compile(r"errcode=(\d+)")
 
 
 class WecomSdkLogger:
@@ -60,8 +62,13 @@ class WecomSdkLogger:
         异常：无。
         副作用：向结构化应用日志写入固定事件名。
         """
-        del message, args
-        logger.warning("wecom_sdk_warning")
+        del args
+        # SDK 回执只提取数字错误码；不记录 errmsg，避免透传服务端原文或敏感上下文。
+        match = _SDK_ERROR_CODE.search(message)
+        if match:
+            logger.warning("wecom_sdk_warning code=%s", match.group(1))
+        else:
+            logger.warning("wecom_sdk_warning")
 
     def error(self, message: str, *args: Any) -> None:
         """记录不携带 SDK 原始文本的通用错误事件。

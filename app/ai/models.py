@@ -7,6 +7,8 @@ from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.smart_table.registry import AI_FIELD_ALIASES
+
 LeadFieldValue: TypeAlias = str | list[str]
 
 
@@ -32,7 +34,8 @@ class LeadAnalysis(BaseModel):
         副作用：无。
         """
         for field_name, value in self.crm_fields.items():
-            if isinstance(value, list) and field_name != "工艺":
+            canonical_name = AI_FIELD_ALIASES.get(field_name.strip().lower(), field_name)
+            if isinstance(value, list) and canonical_name != "工艺":
                 raise ValueError(f"字段不支持多值：{field_name}")
         return self
 

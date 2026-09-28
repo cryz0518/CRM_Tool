@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,12 +41,42 @@ class EmployeeDirectory:
         )
 
     def resolve(self, owner: str) -> str:
-        """按姓名或昵称精确解析唯一 employee.id，歧义或缺失均拒绝。"""
+        """按姓名、花名或姓名（花名）组合精确解析唯一 employee.id。
+
+        参数：owner 为智能表格成员显示名，可为姓名、花名或企微返回的组合显示文本。
+        返回值：唯一员工的 employee.id。
+        异常：姓名/花名缺失、组合不一致或匹配多个员工时抛出 EmployeeDirectoryError。
+        副作用：无，仅读取已加载的员工目录。
+        """
         normalized = owner.strip()
+        display_name = normalized
+        display_nickname: str | None = None
+        # 企微成员单元格可能展示为“姓名(花名)”或“姓名（花名）”；先拆出姓名，花名只用于重名消歧。
+        combined = re.fullmatch(r"(.+?)[(（]([^()（）]+)[)）]", normalized)
+        if combined is not None:
+            display_name, display_nickname = (part.strip() for part in combined.groups())
+
+        name_matches = {
+            employee.employee_id
+            for employee in self._employees
+            if display_name and display_name == employee.name
+        }
+        if len(name_matches) == 1:
+            return next(iter(name_matches))
+        if len(name_matches) > 1 and display_nickname:
+            nickname_matches = {
+                employee.employee_id
+                for employee in self._employees
+                if employee.employee_id in name_matches and employee.nickname == display_nickname
+            }
+            if len(nickname_matches) == 1:
+                return next(iter(nickname_matches))
+
+        # 没有姓名命中时，允许单独输入花名进行唯一精确匹配；不进行模糊或跨字段猜测。
         matches = {
             employee.employee_id
             for employee in self._employees
-            if normalized and (normalized == employee.name or normalized == employee.nickname)
+            if normalized and normalized == employee.nickname
         }
         if len(matches) != 1:
             raise EmployeeDirectoryError("负责人无法唯一匹配")

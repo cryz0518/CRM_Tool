@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 CARD_EVENT_KEY_CRM_FIELD_CONFIRM = "crm.field_confirmation.confirm"
 CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE = "crm.duplicate_confirmation.continue"
 CARD_EVENT_KEY_CRM_DUPLICATE_STOP = "crm.duplicate_confirmation.stop"
+CARD_EVENT_KEY_CRM_COMPANY_CONFIRM = "crm.company_submission.confirm"
 CARD_EVENT_KEY_DISCARD_CONFIRM = "lead.discard.confirm"
 CARD_EVENT_KEY_REASSIGN_CONFIRM = "lead.reassignment.confirm"
 CARD_TYPE_BUTTON_INTERACTION = "button_interaction"
@@ -43,6 +44,7 @@ ALLOWED_CARD_EVENT_KEYS = frozenset(
         CARD_EVENT_KEY_CRM_FIELD_CONFIRM,
         CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE,
         CARD_EVENT_KEY_CRM_DUPLICATE_STOP,
+        CARD_EVENT_KEY_CRM_COMPANY_CONFIRM,
         CARD_EVENT_KEY_DISCARD_CONFIRM,
         CARD_EVENT_KEY_REASSIGN_CONFIRM,
     }
@@ -50,12 +52,14 @@ ALLOWED_CARD_EVENT_KEYS = frozenset(
 
 ACTION_TYPE_CRM_FIELD_CONFIRMATION = "crm_field_confirmation"
 ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION = "crm_duplicate_confirmation"
+ACTION_TYPE_CRM_COMPANY_CONFIRMATION = "crm_company_submission_confirmation"
 ACTION_TYPE_DISCARD_CONFIRMATION = "lead_discard_confirmation"
 ACTION_TYPE_REASSIGN_CONFIRMATION = "lead_reassignment_confirmation"
 ALLOWED_ACTION_TYPES = frozenset(
     {
         ACTION_TYPE_CRM_FIELD_CONFIRMATION,
         ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION,
+        ACTION_TYPE_CRM_COMPANY_CONFIRMATION,
         ACTION_TYPE_DISCARD_CONFIRMATION,
         ACTION_TYPE_REASSIGN_CONFIRMATION,
     }
@@ -63,6 +67,7 @@ ALLOWED_ACTION_TYPES = frozenset(
 ACTION_EXPECTED_EVENT_KEYS = {
     ACTION_TYPE_CRM_FIELD_CONFIRMATION: CARD_EVENT_KEY_CRM_FIELD_CONFIRM,
     ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION: CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE,
+    ACTION_TYPE_CRM_COMPANY_CONFIRMATION: CARD_EVENT_KEY_CRM_COMPANY_CONFIRM,
     ACTION_TYPE_DISCARD_CONFIRMATION: CARD_EVENT_KEY_DISCARD_CONFIRM,
     ACTION_TYPE_REASSIGN_CONFIRMATION: CARD_EVENT_KEY_REASSIGN_CONFIRM,
 }
@@ -352,6 +357,7 @@ class WecomActionService:
         description: str,
         source_message_id: str | None = None,
         expires_at: datetime | None = None,
+        preview_fields: Mapping[str, object] | None = None,
     ) -> WecomAction:
         """持久化业务动作并在同一事务中登记待发送卡片通知。
 
@@ -430,6 +436,25 @@ class WecomActionService:
                 session.expunge(existing)
                 return existing
             # 事务提交前先把完整卡片 body 固化；通知重试只重发卡片，不重建 action。
+            if preview_fields is not None:
+                preview_notification_key = hashlib.sha256(
+                    f"wecom_action_preview:{action_id}".encode()
+                ).hexdigest()
+                session.add(
+                    NotificationRecord(
+                        notification_key=preview_notification_key,
+                        sales_user_id=actor_user_id,
+                        source_message_id=source_message_id or action_id,
+                        notification_type="wecom_action_preview",
+                        content="提交前字段明细",
+                        payload={
+                            "msgtype": "markdown",
+                            "markdown": {
+                                "content": build_preview_markdown(preview_fields)
+                            },
+                        },
+                    )
+                )
             notification_key = hashlib.sha256(f"wecom_action_card:{action_id}".encode()).hexdigest()
             session.add(
                 NotificationRecord(
@@ -446,6 +471,9 @@ class WecomActionService:
                             title=title,
                             description=description,
                             duplicate_leads=safe_context.get("duplicate_leads"),
+                            selection_options=safe_context.get("candidate_leads"),
+                            selection_key=expected_action_key,
+                            preview_fields=preview_fields,
                         ),
                     },
                 )
@@ -573,20 +601,57 @@ class WecomActionService:
                     True,
                 )
 
-            if action.action_type == ACTION_TYPE_CRM_FIELD_CONFIRMATION:
+            if action.action_type in {
+                ACTION_TYPE_CRM_FIELD_CONFIRMATION,
+                ACTION_TYPE_CRM_COMPANY_CONFIRMATION,
+            }:
                 # 字段确认在 callback claim 前就锁定并核对当前表格负责人，避免先创建 outbox 再拒绝。
                 from app.leads.models import Lead
 
-                lead = session.scalar(
-                    select(Lead).where(Lead.id == action.target_id).with_for_update()
+                candidate_leads = (
+                    action.context.get("candidate_leads")
+                    if action.action_type == ACTION_TYPE_CRM_COMPANY_CONFIRMATION
+                    else None
                 )
-                if lead is None or lead.smart_table_owner_user_id != callback.actor_user_id:
-                    return self._deny_action(
-                        action,
-                        delivery,
-                        "owner_mismatch",
-                        "当前账号已不是智能表格负责人",
+                if candidate_leads is not None:
+                    candidate_ids = _context_lead_ids(candidate_leads)
+                    if len(callback.selected_option_ids) != 1 or set(
+                        callback.selected_option_ids
+                    ) - set(candidate_ids):
+                        return self._deny_action(
+                            action,
+                            delivery,
+                            "selection_mismatch",
+                            "候选线索选择无效，请重新发起提交",
+                        )
+                    selected_id = callback.selected_option_ids[0]
+                    lead = session.scalar(
+                        select(Lead)
+                        .where(
+                            Lead.id == selected_id,
+                            Lead.smart_table_owner_user_id == callback.actor_user_id,
+                        )
+                        .with_for_update()
                     )
+                    if lead is None:
+                        return self._deny_action(
+                            action,
+                            delivery,
+                            "owner_mismatch",
+                            "候选线索不属于当前销售",
+                        )
+                    action.context = {**action.context, "selected_lead_id": selected_id}
+                else:
+                    lead = session.scalar(
+                        select(Lead).where(Lead.id == action.target_id).with_for_update()
+                    )
+                    if lead is None or lead.smart_table_owner_user_id != callback.actor_user_id:
+                        return self._deny_action(
+                            action,
+                            delivery,
+                            "owner_mismatch",
+                            "当前账号已不是智能表格负责人",
+                        )
 
             if action.action_type == ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION:
                 # 重复确认卡携带的 option id 只能映射到发行时冻结的 Lead 集合。
@@ -1057,6 +1122,76 @@ class WecomActionService:
             source_message_id=request_message_id,
         )
 
+    def issue_company_submission_confirmation_action(
+        self,
+        *,
+        actor_user_id: str,
+        lead_id: str,
+        request_message_id: str,
+        company_name: str,
+        field_values: Mapping[str, object],
+    ) -> WecomAction:
+        """发行单条公司线索的全字段提交确认卡。
+
+        参数：lead_id 为服务端线索标识；field_values 为本次查表得到的展示快照。
+        返回值：已持久化的服务端动作。
+        异常：卡片能力、权限或展示值不合法时抛出异常。
+        副作用：只写入确认动作和待发送卡片，不调用 CRM。
+        """
+
+        return self.issue_action(
+            actor_user_id=actor_user_id,
+            action_type=ACTION_TYPE_CRM_COMPANY_CONFIRMATION,
+            target_type="lead",
+            target_id=lead_id,
+            expected_action_key=CARD_EVENT_KEY_CRM_COMPANY_CONFIRM,
+            context={"request_message_id": request_message_id},
+            title="确认提交线索",
+            description=f"请核对“{_redact_text(company_name, 96)}”的全部字段后确认提交",
+            source_message_id=request_message_id,
+            preview_fields=field_values,
+        )
+
+    def issue_company_candidate_confirmation_action(
+        self,
+        *,
+        actor_user_id: str,
+        request_message_id: str,
+        company_name: str,
+        candidates: tuple[dict[str, str], ...],
+        contains_match: bool = False,
+    ) -> WecomAction:
+        """发行精确或包含匹配候选选择卡，禁止客户端自行指定目标线索。
+
+        参数：candidates 仅含服务端 Lead 标识和展示名称；contains_match 表示候选来自包含匹配。
+        返回值：已持久化的服务端动作。
+        异常：候选为空或动作参数不合法时抛出异常。
+        副作用：只写入候选确认卡，不调用 CRM。
+        """
+
+        if not candidates:
+            raise ValueError("候选确认卡不能为空")
+        target_id = hashlib.sha256(
+            f"crm-company-candidates:{request_message_id}:{company_name}".encode()
+        ).hexdigest()
+        return self.issue_action(
+            actor_user_id=actor_user_id,
+            action_type=ACTION_TYPE_CRM_COMPANY_CONFIRMATION,
+            target_type="crm_company_candidates",
+            target_id=target_id,
+            expected_action_key=CARD_EVENT_KEY_CRM_COMPANY_CONFIRM,
+            context={
+                "request_message_id": request_message_id,
+                "candidate_leads": [dict(item) for item in candidates],
+            },
+            title="选择要提交的线索",
+            description=(
+                f"公司名称“{_redact_text(company_name, 96)}”存在多个"
+                f"{'包含匹配' if contains_match else '精确'}候选，请选择一条"
+            ),
+            source_message_id=request_message_id,
+        )
+
     def issue_discard_action(
         self,
         *,
@@ -1300,10 +1435,14 @@ def build_action_card(
     title: str,
     description: str,
     duplicate_leads: object = None,
+    selection_options: object = None,
+    selection_key: str | None = None,
+    preview_fields: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """构造服务端生成的 template card body，不携带业务目标或客户原文。
+    """构造服务端生成的 template card body，并可附带只读预览快照。
 
-    参数：task_id 和 event_key 为服务端生成的关联值，title 和 description 为安全文案。
+    参数：task_id 和 event_key 为服务端生成的关联值，title 和 description 为安全文案；
+    preview_fields 只用于卡片展示，业务目标仍只保存在服务端 action 中。
     返回值：可交给企业微信发送接口的卡片 body。
     异常：无；调用方应先完成动作定义校验。
     副作用：无，不保存任何客户端业务字段。
@@ -1316,19 +1455,29 @@ def build_action_card(
         "main_title": {"title": title, "desc": description},
         "button_list": [{"text": "确认", "style": 1, "key": event_key}],
     }
-    if isinstance(duplicate_leads, list) and duplicate_leads:
-        # 企业微信的批量勾选卡片使用 vote_interaction，回调仍携带统一的 selected_items。
+    if isinstance(preview_fields, Mapping):
+        # 展示快照只进入待发送卡片，不进入 action context；确认时服务端会重新读取表格。
+        payload["horizontal_content_list"] = _preview_card_rows(preview_fields)
+    options = selection_options if selection_options is not None else duplicate_leads
+    if isinstance(options, list) and options:
+        submit_key = selection_key or CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE
+        question_key = (
+            "crm_submission_candidates"
+            if selection_options is not None
+            else "crm_duplicate_leads"
+        )
+        # 企业微信的候选确认使用单选语义；服务端 callback 还会再次限制只能选一条。
         payload["card_type"] = CARD_TYPE_VOTE_INTERACTION
         payload["checkbox"] = {
-            "question_key": "crm_duplicate_leads",
-            "mode": 1,
+            "question_key": question_key,
+            "mode": 0 if selection_options is not None else 1,
             "option_list": [
                 {
                     "id": item["lead_id"],
-                    "text": str(item["company_name"])[:32],
+                    "text": str(item["company_name"])[:64],
                     "is_checked": False,
                 }
-                for item in duplicate_leads
+                for item in options
                 if isinstance(item, dict)
                 and isinstance(item.get("lead_id"), str)
                 and isinstance(item.get("company_name"), str)
@@ -1336,13 +1485,14 @@ def build_action_card(
         }
         payload.pop("button_list")
         payload["submit_button"] = {
-            "text": "继续提交",
-            "key": CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE,
+            "text": "确认选择" if selection_options is not None else "继续提交",
+            "key": submit_key,
         }
-        payload["action_menu"] = {
-            "desc": "重复线索处理",
-            "action_list": [{"text": "停止提交", "key": CARD_EVENT_KEY_CRM_DUPLICATE_STOP}],
-        }
+        if selection_options is None:
+            payload["action_menu"] = {
+                "desc": "重复线索处理",
+                "action_list": [{"text": "停止提交", "key": CARD_EVENT_KEY_CRM_DUPLICATE_STOP}],
+            }
     if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > _MAX_CARD_PAYLOAD_BYTES:
         raise ValueError("动作卡片 payload 超出大小限制")
     return payload
@@ -1366,6 +1516,7 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
         "segment_index",
         "reason",
         "duplicate_leads",
+        "candidate_leads",
     }
     if any(key not in allowed_keys for key in context):
         raise ValueError("动作 context 含未允许字段")
@@ -1424,6 +1575,26 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
                     }
                 )
             safe[key] = safe_duplicates
+        elif key == "candidate_leads" and isinstance(value, list) and 1 < len(value) <= 20:
+            safe_candidates: list[dict[str, str]] = []
+            for item in value:
+                if (
+                    not isinstance(item, dict)
+                    or set(item) != {"lead_id", "company_name"}
+                    or not all(isinstance(item[name], str) for name in item)
+                    or _ID_PATTERN.fullmatch(item["lead_id"]) is None
+                    or not 0 < len(item["company_name"]) <= 512
+                    or "\n" in item["company_name"]
+                    or "\r" in item["company_name"]
+                ):
+                    raise ValueError("候选线索 context 非法")
+                safe_candidates.append(
+                    {
+                        "lead_id": item["lead_id"],
+                        "company_name": _redact_text(item["company_name"], 128),
+                    }
+                )
+            safe[key] = safe_candidates
         else:
             raise ValueError("动作 context 值类型非法")
     return safe
@@ -1456,6 +1627,60 @@ def _redact_text(value: str, limit: int) -> str:
     redacted = _PII_EMAIL.sub("[email]", value)
     redacted = _PII_PHONE.sub("[phone]", redacted)
     return redacted[:limit]
+
+
+def _preview_card_value(value: object) -> str:
+    """把表格快照转换为不含换行的卡片展示文本。"""
+
+    if value is None or value == "":
+        return "未填写"
+    if isinstance(value, (list, tuple, dict)):
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    else:
+        text = str(value)
+    return " ".join(text.replace("\r", " ").replace("\n", " ").split())[:512]
+
+
+def _preview_card_rows(preview_fields: Mapping[str, object]) -> list[dict[str, str]]:
+    """把完整字段快照压缩到企业微信模板卡片允许的最多六行。
+
+    参数：preview_fields 为已按表格顺序整理的字段快照。
+    返回值：不超过六项的卡片横向字段列表；完整字段由同一动作的 Markdown 明细通知展示。
+    异常：无；空字段名会被忽略。
+    副作用：无，不修改输入快照。
+    """
+    items = [
+        (name, _preview_card_value(value))
+        for name, value in preview_fields.items()
+        if isinstance(name, str) and name
+    ]
+    if len(items) <= 6:
+        return [{"keyname": name[:64], "value": value} for name, value in items]
+    # 平台拒绝超过六项；卡片保留前六项，全部字段在同动作 Markdown 明细中逐行展示。
+    return [{"keyname": name[:64], "value": value} for name, value in items[:6]]
+
+
+def build_preview_markdown(preview_fields: Mapping[str, object]) -> str:
+    """构造可换行阅读的完整提交前字段明细。
+
+    参数：preview_fields 为已按智能表格顺序整理的字段快照。
+    返回值：适用于企业微信 AI Bot 的 Markdown 消息正文。
+    异常：无；空字段名会被忽略。
+    副作用：无，不修改输入快照。
+    """
+    lines = ["**提交前字段明细**"]
+    for name, value in preview_fields.items():
+        if isinstance(name, str) and name:
+            rendered_name = _escape_markdown(name)
+            rendered_value = _escape_markdown(_preview_card_value(value))
+            lines.append(f"- {rendered_name}：{rendered_value}")
+    lines.append("\n请核对以上全部字段后，点击下方确认卡片提交。")
+    return "\n".join(lines)
+
+
+def _escape_markdown(value: str) -> str:
+    """转义字段展示中的 Markdown 控制字符，避免表格文本改变消息结构。"""
+    return value.replace("\\", "\\\\").replace("`", "\\`").replace("*", "\\*").replace("_", "\\_")
 
 
 def _safe_operation_payload(payload: Mapping[str, object]) -> dict[str, object]:
@@ -1557,6 +1782,8 @@ class DeterministicWecomActionExecutor:
             return self._confirm_submission_fields(action)
         if action.action_type == ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION:
             return self._confirm_duplicate_submission(action)
+        if action.action_type == ACTION_TYPE_CRM_COMPANY_CONFIRMATION:
+            return self._confirm_company_submission(action)
         if action.action_type == ACTION_TYPE_DISCARD_CONFIRMATION:
             return self._discard_lead(action)
         if action.action_type == ACTION_TYPE_REASSIGN_CONFIRMATION:
@@ -1672,6 +1899,39 @@ class DeterministicWecomActionExecutor:
             f"重复线索处理完成：覆盖成功 {result.submitted} 条；"
             f"未选择 {result.remaining} 条；失败 {result.failed} 条。",
         )
+
+    def _confirm_company_submission(self, action: ActionSnapshot) -> tuple[str, str]:
+        """重读智能表格后复用 CRM 提交服务执行单条公司线索提交。"""
+
+        from app.crm.commands import format_submission_reply
+        from app.crm.service import CrmSubmissionService, SubmissionCommand
+
+        request_message_id = action.context.get("request_message_id")
+        target_lead_id = action.context.get("selected_lead_id", action.target_id)
+        if not isinstance(request_message_id, str) or not isinstance(target_lead_id, str):
+            raise ValueError("公司提交确认动作 context 不完整")
+        if self._action_service is not None:
+            self._action_service.begin_domain_operation(action.id, action.claim_token)
+        result = CrmSubmissionService(
+            self._session_factory,
+            self._smart_table_adapter,
+            self._crm_adapter,
+            robot_submission_confirmation_available=True,
+        ).submit(
+            SubmissionCommand(
+                "提交指定线索",
+                action.bound_actor_wecom_user_id,
+                request_message_id,
+                target_lead_id=target_lead_id,
+            )
+        )
+        if result.duplicate_confirmations and self._action_service is not None:
+            self._action_service.issue_duplicate_confirmation_action(
+                actor_user_id=action.bound_actor_wecom_user_id,
+                request_message_id=request_message_id,
+                duplicates=result.duplicate_confirmations,
+            )
+        return "crm_company_submission_completed", format_submission_reply(result)
 
     def _discard_lead(self, action: ActionSnapshot) -> tuple[str, str]:
         """重新读取当前线索状态后复用既有 LeadDiscardService。

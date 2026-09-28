@@ -71,6 +71,7 @@ class WecomCliSmartTableAdapter:
         *,
         doc_id: str,
         sheet_id: str,
+        sheet_title: str | None = None,
         sales_can_create_records: bool | None = None,
         sales_can_delete_records: bool | None = None,
         command: str = "wecom-cli",
@@ -80,7 +81,8 @@ class WecomCliSmartTableAdapter:
     ) -> None:
         """初始化固定文档、子表和可替换的 CLI 执行入口。
 
-        参数：doc_id、sheet_id 为管理员配置的目标表标识；两个 sales 参数仅接受管理员
+        参数：doc_id、sheet_id 为管理员配置的目标表标识；sheet_title 为完整查询接口使用的子表名称；
+        两个 sales 参数仅接受管理员
         已核验的权限快照；command、timeout_seconds、retry_count 控制 CLI 调用；runner 供测试替换。
         异常：标识为空或重试次数为负数时抛出 SmartTableAdapterConfigurationError。
         副作用：不访问网络，仅保存不可变配置。
@@ -94,6 +96,7 @@ class WecomCliSmartTableAdapter:
 
         self._doc_id = doc_id
         self._sheet_id = sheet_id
+        self._sheet_title = sheet_title.strip() if isinstance(sheet_title, str) else None
         self._sales_can_create_records = sales_can_create_records
         self._sales_can_delete_records = sales_can_delete_records
         self._command = command
@@ -144,6 +147,12 @@ class WecomCliSmartTableAdapter:
         副作用：调用 wecom-cli 的 records list 接口。
         """
         schema = self.get_schema()
+        if self._sheet_title:
+            # 完整查询可读取机器人在列表接口中不可见的受限记录，避免按负责人提交时漏行。
+            return next(
+                (record for record in self._query_records(schema) if record.record_id == record_id),
+                None,
+            )
         for item in self._list_pages("records"):
             # records list 没有按记录标识读取的独立接口，先按原始标识定位。
             # 这样历史异常行不会阻断目标行回读。
@@ -181,6 +190,9 @@ class WecomCliSmartTableAdapter:
         副作用：调用 wecom-cli 的 records list 接口。
         """
         schema = self.get_schema()
+        if self._sheet_title:
+            # 记录列表接口会按当前可见范围返回子集；配置子表名称后优先使用完整 SQL 读取。
+            return self._query_records(schema)
         return [self._parse_record(item, schema) for item in self._list_pages("records")]
 
     def create_record(
@@ -251,6 +263,118 @@ class WecomCliSmartTableAdapter:
             time.monotonic(),
             SmartTableRecord(record_id=record_id, fields=dict(fields)),
         )
+
+    def _query_records(self, schema: SmartTableSchema) -> list[SmartTableRecord]:
+        """使用完整查询接口读取目标子表的全部记录。
+
+        参数：schema 为启动时校验过的字段结构。
+        返回值：按查询结果顺序转换后的记录快照。
+        异常：查询协议、权限或字段结构异常时抛出适配器异常。
+        副作用：启动一次只读的 wecom-cli records query，不修改智能表格。
+        """
+        if not self._sheet_title:
+            raise SmartTableAdapterConfigurationError("完整查询缺少 WECOM_SMART_TABLE_SHEET_TITLE")
+        columns = ["RECORD_ID"] + [
+            self._quote_sql_identifier(field.name) for field in schema.fields
+        ]
+        sql = (
+            f"SELECT {', '.join(columns)} FROM "
+            f"{self._quote_sql_identifier(self._sheet_title)} LIMIT 1000"
+        )
+        response = self._call_query(sql)
+        values = response.get("values")
+        if not isinstance(values, list) or len(values) != 1:
+            raise WecomCliProtocolError("wecom-cli records query 缺少唯一 values 结果")
+        result = values[0]
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except json.JSONDecodeError as error:
+                raise WecomCliProtocolError("wecom-cli records query 结果不是 JSON") from error
+        if not isinstance(result, Mapping):
+            raise WecomCliProtocolError("wecom-cli records query 结果结构异常")
+        inner_error = result.get("errcode")
+        if inner_error not in (None, 0):
+            raise WecomCliProtocolError("wecom-cli records query 返回业务错误")
+        rows = result.get("rows", [])
+        if not isinstance(rows, list):
+            raise WecomCliProtocolError("wecom-cli records query 的 rows 不是列表")
+        return [self._parse_query_record(self._as_mapping(row, "查询记录"), schema) for row in rows]
+
+    @staticmethod
+    def _quote_sql_identifier(value: str) -> str:
+        """为智能表格查询安全引用字段或子表名称。"""
+        return f"`{value.replace('`', '``')}`"
+
+    def _call_query(self, sql: str) -> Mapping[str, object]:
+        """调用 records query 并复用 CLI 的有限重试与错误转换。"""
+        arguments = (
+            self._command,
+            "smartsheet",
+            "records",
+            "query",
+            "--docid",
+            self._doc_id,
+            "--sql",
+            sql,
+        )
+        for attempt in range(self._retry_count + 1):
+            try:
+                response = self._runner(arguments)
+            except WecomCliProcessError as error:
+                if attempt == self._retry_count:
+                    raise WecomCliTransportError("wecom-cli 查询进程调用失败") from error
+                self._log_retry("records", "query", attempt, "ProcessExit")
+                time.sleep(0.2 * (attempt + 1))
+                continue
+            except (OSError, subprocess.TimeoutExpired) as error:
+                if attempt == self._retry_count:
+                    raise WecomCliTransportError("wecom-cli 查询调用失败") from error
+                self._log_retry("records", "query", attempt, type(error).__name__)
+                time.sleep(0.2 * (attempt + 1))
+                continue
+            if self._is_transient_network_error(response):
+                if attempt == self._retry_count:
+                    raise WecomCliTransportError("wecom-cli 查询网络调用失败")
+                self._log_retry("records", "query", attempt, "NetworkError")
+                time.sleep(0.2 * (attempt + 1))
+                continue
+            self._raise_for_error(response)
+            return response
+        raise AssertionError("已覆盖全部 CLI 查询重试分支")
+
+    def _parse_query_record(
+        self, row: Mapping[str, object], schema: SmartTableSchema
+    ) -> SmartTableRecord:
+        """把 records query 的字段名称和值转换为统一领域快照。"""
+        record_id = row.get("RECORD_ID")
+        if not isinstance(record_id, str) or not record_id:
+            raise WecomCliProtocolError("wecom-cli 查询记录缺少 RECORD_ID")
+        normalized: dict[str, object] = {}
+        member_names: dict[str, str] = {}
+        for field in schema.fields:
+            raw = row.get(field.name)
+            if raw is None and field.name.startswith("*"):
+                raw = row.get(field.name.removeprefix("*"))
+            canonical_name = field.name.removeprefix("*")
+            if field.field_type is SmartTableFieldType.MULTI_SELECT and raw is None:
+                # records query 对未填多选返回 null；领域层统一使用空列表表示未选择。
+                raw = []
+            if field.field_type is SmartTableFieldType.MEMBER and isinstance(raw, list):
+                # query 返回成员对象使用 id；同时保留服务端提供的可读姓名，供提交边界解析员工目录。
+                raw = [
+                    {
+                        "userId": item.get("id") or item.get("userId"),
+                        "userName": item.get("name") or item.get("userName"),
+                    }
+                    for item in raw
+                    if isinstance(item, Mapping)
+                ]
+            normalized[canonical_name] = self._from_cli_value(canonical_name, field, raw)
+            member_name = self._member_display_name(field, raw)
+            if member_name is not None:
+                member_names[canonical_name] = member_name
+        return SmartTableRecord(record_id=record_id, fields=normalized, member_names=member_names)
 
     def _list_pages(self, resource: ReadResource) -> list[Mapping[str, object]]:
         """按 CLI next_cursor 读取 fields 或 records 的所有分页响应。
@@ -558,9 +682,12 @@ class WecomCliSmartTableAdapter:
             SmartTableFieldType.MULTI_SELECT,
         }:
             # CRM 线索表的单选/多选写入都必须使用管理员已配置的 option ID。
-            values = value if isinstance(value, list) else [value]
-            if not all(isinstance(item, str) and item for item in values):
-                raise ValueError(f"选择字段必须传入非空文本列表：{canonical_name}")
+            raw_values = value if isinstance(value, list) else [value]
+            values: list[str] = []
+            for item in raw_values:
+                if not isinstance(item, str) or not item:
+                    raise ValueError(f"选择字段必须传入非空文本列表：{canonical_name}")
+                values.append(item)
             if not field.options:
                 # 兼容旧测试替身缺少 options 的响应；真实表结构 readiness 会拒绝缺少选项。
                 return value
@@ -573,13 +700,18 @@ class WecomCliSmartTableAdapter:
             except KeyError as error:
                 raise ValueError(f"选择字段缺少选项：{canonical_name}={error.args[0]}") from error
         if canonical_name == "AI待确认":
-            if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
+            if not isinstance(value, list):
                 raise ValueError("AI待确认必须传入规范字段名列表")
+            names: list[str] = []
+            for name in value:
+                if not isinstance(name, str):
+                    raise ValueError("AI待确认必须传入规范字段名列表")
+                names.append(name)
             # 管理员可为业务字段选项增加必填前缀；写入必须使用 schema 中真实 option ID。
             options = {option.name.removeprefix("*"): option for option in field.options}
             try:
                 return [
-                    {"id": options[name].option_id, "text": options[name].name} for name in value
+                    {"id": options[name].option_id, "text": options[name].name} for name in names
                 ]
             except KeyError as error:
                 raise ValueError(f"AI待确认缺少字段选项：{error.args[0]}") from error
@@ -600,12 +732,41 @@ class WecomCliSmartTableAdapter:
         if not isinstance(record_id, str) or not isinstance(fields, Mapping):
             raise WecomCliProtocolError("wecom-cli 记录缺少 record_id 或 values")
         normalized: dict[str, object] = {}
+        member_names: dict[str, str] = {}
         for display_name, value in self._as_mapping(fields, "记录 values").items():
             # 真实记录可能包含管理员后续新增字段；未知字段保留原名以避免读数据丢失。
             field = schema.get_field(display_name)
             canonical_name = field.name.removeprefix("*") if field is not None else display_name
             normalized[canonical_name] = self._from_cli_value(canonical_name, field, value)
-        return SmartTableRecord(record_id=record_id, fields=normalized)
+            member_name = self._member_display_name(field, value)
+            if member_name is not None:
+                member_names[canonical_name] = member_name
+        return SmartTableRecord(record_id=record_id, fields=normalized, member_names=member_names)
+
+    @staticmethod
+    def _member_display_name(
+        field: SmartTableField | None, value: object
+    ) -> str | None:
+        """提取企业微信成员单元格中的可读姓名，不把姓名替代 userId。
+
+        参数：field 为真实字段定义；value 为成员字段原始值。
+        返回值：唯一非空 userName，缺失或结构不适配时返回 None。
+        异常：无；成员 userId 的严格校验仍由 ``_from_cli_value`` 执行。
+        副作用：无。
+        """
+        if field is None or field.field_type is not SmartTableFieldType.MEMBER:
+            return None
+        if (
+            not isinstance(value, list)
+            or len(value) != 1
+            or not isinstance(value[0], Mapping)
+        ):
+            return None
+        name = value[0].get("userName")
+        if not isinstance(name, str):
+            return None
+        normalized = name.strip()
+        return normalized or None
 
     @staticmethod
     def _from_cli_value(
@@ -640,6 +801,7 @@ class WecomCliSmartTableAdapter:
             )
         if field is not None and field.field_type in {
             SmartTableFieldType.TEXT,
+            SmartTableFieldType.LONG_TEXT,
             SmartTableFieldType.PHONE_NUMBER,
             SmartTableFieldType.EMAIL,
             SmartTableFieldType.SINGLE_SELECT,
@@ -650,6 +812,12 @@ class WecomCliSmartTableAdapter:
             if isinstance(value, list):
                 if not value:
                     return None
+                if field.field_type in {
+                    SmartTableFieldType.TEXT,
+                    SmartTableFieldType.LONG_TEXT,
+                }:
+                    # 文本字段可能按富文本片段返回多个单元格，按服务端顺序拼接还原原文。
+                    return "".join(WecomCliSmartTableAdapter._cell_text(item) for item in value)
                 if len(value) != 1:
                     # 多个候选无法无损收敛为单一领域值，禁止拼接、任选或猜测。
                     raise WecomCliProtocolError("文本或单选字段返回值不是唯一单元格")

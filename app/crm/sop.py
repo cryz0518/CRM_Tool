@@ -40,16 +40,26 @@ class SopCRMAdapter:
         timeout: float = 10.0,
         client: httpx.Client | None = None,
         trust_env: bool = True,
+        proxy: str | None = None,
+        authorization: str | None = None,
     ) -> None:
         """初始化 SOP 配置并加载 RSA 私钥。"""
         if not all(value.strip() for value in (url, app_id, app_auth_token, private_key)):
             raise ValueError("CRM SOP 配置不完整")
         self._url, self._app_id, self._token, self._timeout = url, app_id, app_auth_token, timeout
+        self._authorization = (
+            authorization.strip() if authorization and authorization.strip() else None
+        )
         loaded_key = serialization.load_pem_private_key(private_key.encode(), password=None)
         if not isinstance(loaded_key, rsa.RSAPrivateKey):
             raise ValueError("CRM 私钥必须是 RSA 私钥")
         self._private_key = loaded_key
-        self._client = client or httpx.Client(timeout=timeout, trust_env=trust_env)
+        # 代理只绑定 CRM 客户端，避免宿主机代理环境意外影响其他外部 Provider。
+        self._client = client or httpx.Client(
+            timeout=timeout,
+            trust_env=trust_env,
+            proxy=proxy.strip() if proxy and proxy.strip() else None,
+        )
         self._owns_client = client is None
 
     def search_by_company_name(
@@ -121,10 +131,13 @@ class SopCRMAdapter:
         signature = self._private_key.sign(sign_text.encode(), padding.PKCS1v15(), hashes.SHA256())
         params["sign"] = base64.b64encode(signature).decode("ascii")
         try:
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            if self._authorization is not None:
+                headers["Authorization"] = self._authorization
             response = self._client.post(
                 self._url,
                 data=params,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                headers=headers,
             )
             status = response.status_code
             try:
@@ -172,6 +185,10 @@ class SopCRMAdapter:
                 category = "gateway"
             elif error_code:
                 category = "business"
+            elif "status" in payload or "message" in payload or "msg" in payload:
+                # SOP 的另一种合法错误 envelope 可能只有 code/data/status/message；
+                # 已收到可解释 JSON 时，未知错误必须归入 Gateway，而不是伪装成传输失败。
+                category = "gateway"
             else:
                 category = "malformed_response"
             if status == 401:

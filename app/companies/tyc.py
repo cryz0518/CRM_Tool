@@ -86,7 +86,13 @@ class TianYanChaAdapter:
         """过滤非企业搜索结果。"""
         if not isinstance(item, Mapping) or not item.get("name") or not item.get("id"):
             return False
-        kind = str(item.get("type") or item.get("entityType") or item.get("category") or "")
+        # 天眼查搜索接口将企业类型返回为数字 1；不能只按字符串枚举判断，否则会把真实企业全部过滤掉。
+        raw_type = item.get("type")
+        if isinstance(raw_type, int):
+            return raw_type == 1
+        if isinstance(raw_type, str) and raw_type.strip().isdigit():
+            return raw_type.strip() == "1"
+        kind = str(raw_type or item.get("entityType") or item.get("category") or "")
         return not kind or any(token in kind.casefold() for token in ("company", "企业", "公司"))
 
     @staticmethod

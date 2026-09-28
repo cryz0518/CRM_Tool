@@ -36,6 +36,7 @@ def get_smart_table_adapter() -> SmartTableAdapter:
         return WecomCliSmartTableAdapter(
             doc_id=settings.wecom_smart_table_doc_id or "",
             sheet_id=settings.wecom_smart_table_sheet_id or "",
+            sheet_title=settings.wecom_smart_table_sheet_title,
             sales_can_create_records=settings.wecom_smart_table_sales_can_create_records,
             sales_can_delete_records=settings.wecom_smart_table_sales_can_delete_records,
             command=settings.wecom_cli_command,

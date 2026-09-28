@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from enum import StrEnum
 from typing import Mapping
 
@@ -63,10 +64,15 @@ class SmartTableSchema:
 
 @dataclass(frozen=True)
 class SmartTableRecord:
-    """表示业务层可读写的一条智能表格记录快照。"""
+    """表示业务层可读写的一条智能表格记录快照。
+
+    ``fields`` 保持成员字段的原始企业微信 userId，供权限和归属判断使用；
+    ``member_names`` 只保存同一响应中由企业微信提供的可读姓名，不改变字段语义。
+    """
 
     record_id: str
     fields: Mapping[str, object]
+    member_names: Mapping[str, str] = dataclass_field(default_factory=dict)
 
 
 @dataclass(frozen=True)

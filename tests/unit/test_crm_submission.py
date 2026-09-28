@@ -18,6 +18,7 @@ from app.crm.commands import (
     consume_submission_command,
     format_submission_reply,
     notification_key_for_message,
+    prepare_company_submission_preview,
     terminal_failure_notification_key_for_message,
 )
 from app.crm.employee_directory import EmployeeDirectory
@@ -39,10 +40,12 @@ from app.messaging.models import (
     NotificationRecord,
     OutboxEvent,
     SalesAuthorization,
+    WecomAction,
     utc_now,
 )
 from app.smart_table.adapter import SmartTableActor
 from app.smart_table.mock import MockSmartTableAdapter
+from app.smart_table.models import SmartTableRecord
 from app.smart_table.registry import build_required_smart_table_schema
 
 
@@ -148,6 +151,311 @@ def test_create_uses_stable_lead_key_and_current_smart_table_values(
     assert sync.idempotency_key == f"crm:create:{lead_id}"
     assert sync.canonical_payload["mobile"] == "13800000000"
     assert lead is not None and lead.lifecycle_state == "synced"
+
+
+def test_owner_user_id_is_converted_to_employee_name_before_crm_submit(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证真实成员字段的 userId 先转换为 userName，再解析 employee.id。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    fields = {
+        "负责人": "wecom-owner",
+        "线索名称": "企微成员姓名转换测试",
+        "业务线": "协作机器人",
+        "线索来源": "展会",
+        "联系人": "王工",
+        "职务": "经理",
+        "沟通方式": "见面拜访",
+        "手机": "13800000000",
+        "备注": "验证提交前的成员身份转换，不包含真实客户信息，内容仅用于离线测试。",
+    }
+    record = adapter.create_record(fields, actor=SmartTableActor.ROBOT)
+    with session_factory.begin() as session:
+        session.add(
+            SalesAuthorization(
+                wecom_user_id="wecom-owner", is_authorized=True, is_active=True
+            )
+        )
+        session.add(
+            IncomingMessage(
+                message_id="message-member-name",
+                sales_user_id="wecom-owner",
+                sequence=1,
+                raw_payload={},
+            )
+        )
+        lead = Lead(
+            source_message_id="message-member-name",
+            original_capturing_sales_user_id="wecom-owner",
+            smart_table_owner_user_id="wecom-owner",
+            smart_table_record_id=record.record_id,
+            lifecycle_state="pending_create",
+            standard_company_name="企微成员姓名转换测试",
+            field_values={},
+        )
+        session.add(lead)
+        session.flush()
+
+    original_get_record = adapter.get_record
+
+    def get_record_with_member_name(record_id: str) -> SmartTableRecord | None:
+        """给 Mock 记录补充真实 CLI 会返回的 userName 元数据。"""
+        current = original_get_record(record_id)
+        if current is None:
+            return None
+        return SmartTableRecord(
+            record_id=current.record_id,
+            fields=current.fields,
+            member_names={"负责人": "sales-1"},
+        )
+
+    monkeypatch.setattr(adapter, "get_record", get_record_with_member_name)
+    crm = MockCRMAdapter()
+
+    result = CrmSubmissionService(session_factory, adapter, crm).submit(
+        SubmissionCommand("提交今天的线索", "wecom-owner", "message-member-name")
+    )
+
+    assert result.succeeded == 1
+    assert crm.crm_user_ids == ["crm-1"]
+
+
+def test_targeted_company_submission_reuses_service_for_one_lead(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证确认卡只把一个目标 Lead 交给既有提交服务，不扩大为批量提交。"""
+
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    target_id = _lead(session_factory, adapter)
+    crm = MockCRMAdapter()
+    result = CrmSubmissionService(session_factory, adapter, crm).submit(
+        SubmissionCommand(
+            "提交指定线索",
+            "sales-1",
+            "message-target",
+            target_lead_id=target_id,
+        )
+    )
+
+    assert result.succeeded == 1
+    assert crm.calls == 1
+    with session_factory() as session:
+        assert session.get(Lead, target_id).lifecycle_state == "synced"  # type: ignore[union-attr]
+
+
+def test_company_preview_exactly_matches_table_and_does_not_call_crm(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证公司请求先生成全字段确认卡，确认前不调用 CRM。"""
+
+    import app.crm.commands as crm_commands
+
+    settings = get_settings().model_copy(
+        update={
+            "wecom_card_callback_enabled": True,
+            "wecom_card_transport_configured": True,
+            "wecom_card_callback_handler_configured": True,
+        }
+    )
+    monkeypatch.setattr(crm_commands, "get_settings", lambda: settings)
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    record = adapter.create_record(
+        {
+            "负责人": "sales-1",
+            "线索名称": "上海世界纵横智能科技有限公司",
+            "业务线": "协作机器人",
+            "线索来源": "展会",
+            "联系人": "王工",
+            "职务": "经理",
+            "沟通方式": "见面拜访",
+            "手机": "13800000000",
+            "备注": "已确认需求",
+        },
+        actor=SmartTableActor.ROBOT,
+    )
+    original_find_records = adapter.find_records
+
+    def find_records_with_member_names(filters: dict[str, object]) -> list[SmartTableRecord]:
+        """为预览测试补充企业微信成员显示名元数据。"""
+        records = original_find_records(filters)
+        return [
+            SmartTableRecord(
+                record_id=item.record_id,
+                fields=item.fields,
+                member_names={"负责人": "张华杰(JJ)", "创建人": "杨康鑫"},
+            )
+            for item in records
+        ]
+
+    monkeypatch.setattr(adapter, "find_records", find_records_with_member_names)
+    with session_factory.begin() as session:
+        session.add(
+            SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True)
+        )
+        session.add(
+            IncomingMessage(
+                message_id="preview-message",
+                sales_user_id="sales-1",
+                sequence=1,
+                raw_payload={},
+            )
+        )
+        session.add(
+            Lead(
+                id="preview-lead",
+                source_message_id="preview-message",
+                original_capturing_sales_user_id="sales-1",
+                smart_table_owner_user_id="sales-1",
+                smart_table_record_id=record.record_id,
+                lifecycle_state="pending_create",
+                field_values={"线索名称": record.fields["线索名称"]},
+            )
+        )
+    crm = MockCRMAdapter()
+    reply = prepare_company_submission_preview(
+        session_factory,
+        adapter,
+        SubmissionCommand(
+            "请帮我提交上海世界纵横智能科技有限公司这条线索",
+            "sales-1",
+            "preview-message",
+        ),
+        "上海世界纵横智能科技有限公司",
+    )
+
+    assert "确认卡" in reply
+    assert crm.calls == 0
+    with session_factory() as session:
+        action = session.scalar(select(WecomAction))
+        assert action is not None and action.target_id == "preview-lead"
+        preview = session.scalar(
+            select(NotificationRecord).where(
+                NotificationRecord.notification_type == "wecom_action_preview"
+            )
+        )
+        assert preview is not None
+        preview_content = str(preview.payload["markdown"]["content"])
+        assert "张华杰(JJ)" in preview_content
+        assert "杨康鑫" in preview_content
+        assert "sales-1" not in preview_content
+
+
+def test_company_preview_contains_match_still_requires_confirmation_card(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证精确无结果时的名称包含匹配仍只发行确认卡，不调用 CRM。"""
+    import app.crm.commands as crm_commands
+
+    settings = get_settings().model_copy(
+        update={
+            "wecom_card_callback_enabled": True,
+            "wecom_card_transport_configured": True,
+            "wecom_card_callback_handler_configured": True,
+        }
+    )
+    monkeypatch.setattr(crm_commands, "get_settings", lambda: settings)
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    record = adapter.create_record(
+        {"负责人": "sales-1", "线索名称": "上海世界纵横智能科技有限公司"},
+        actor=SmartTableActor.ROBOT,
+    )
+    with session_factory.begin() as session:
+        session.add(
+            SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True)
+        )
+        session.add(
+            IncomingMessage(
+                message_id="contains-preview-message",
+                sales_user_id="sales-1",
+                sequence=1,
+                raw_payload={},
+            )
+        )
+        session.add(
+            Lead(
+                id="contains-preview-lead",
+                source_message_id="contains-preview-message",
+                original_capturing_sales_user_id="sales-1",
+                smart_table_owner_user_id="sales-1",
+                smart_table_record_id=record.record_id,
+                lifecycle_state="pending_create",
+                field_values={"线索名称": record.fields["线索名称"]},
+            )
+        )
+
+    reply = prepare_company_submission_preview(
+        session_factory,
+        adapter,
+        SubmissionCommand(
+            "请帮我提交世界纵横这条线索", "sales-1", "contains-preview-message"
+        ),
+        "世界纵横",
+    )
+
+    assert "名称包含关系" in reply
+    with session_factory() as session:
+        action = session.scalar(select(WecomAction))
+        assert action is not None and action.target_id == "contains-preview-lead"
+
+
+def test_company_preview_links_existing_owner_record_into_local_lead(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证新数据库可为当前销售负责的既有表格行建立可审计本地 Lead 映射。"""
+    import app.crm.commands as crm_commands
+
+    settings = get_settings().model_copy(
+        update={
+            "wecom_card_callback_enabled": True,
+            "wecom_card_transport_configured": True,
+            "wecom_card_callback_handler_configured": True,
+        }
+    )
+    monkeypatch.setattr(crm_commands, "get_settings", lambda: settings)
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    record = adapter.create_record(
+        {
+            "负责人": "sales-1",
+            "线索名称": "已有表格线索",
+            "业务线": "协作机器人",
+            "手机": "13800000000",
+        },
+        actor=SmartTableActor.ROBOT,
+    )
+    with session_factory.begin() as session:
+        session.add(
+            SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True)
+        )
+        session.add(
+            IncomingMessage(
+                message_id="link-existing-message",
+                sales_user_id="sales-1",
+                sequence=1,
+                raw_payload={},
+            )
+        )
+
+    reply = prepare_company_submission_preview(
+        session_factory,
+        adapter,
+        SubmissionCommand(
+            "请帮我提交已有表格线索这条线索", "sales-1", "link-existing-message"
+        ),
+        "已有表格线索",
+    )
+
+    assert "确认卡" in reply
+    with session_factory() as session:
+        lead = session.scalar(select(Lead).where(Lead.smart_table_record_id == record.record_id))
+        audit = session.scalar(
+            select(BusinessAuditEvent).where(
+                BusinessAuditEvent.event_type == "smart_table_existing_lead_linked"
+            )
+        )
+    assert lead is not None
+    assert lead.smart_table_owner_user_id == "sales-1"
+    assert lead.lifecycle_state == "pending_create"
+    assert audit is not None
 
 
 def test_duplicate_crm_match_waits_for_confirmation_and_stop_marks_table_status(
