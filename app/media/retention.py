@@ -86,8 +86,10 @@ class RetentionPolicy:
         assert media_days is not None
         assert message_days is not None
         assert notification_days is not None
+        version = settings.media_retention_policy_version
+        assert version is not None
         return cls(
-            version=settings.media_retention_policy_version,
+            version=version,
             media_retention_days=media_days,
             message_payload_retention_days=message_days,
             notification_payload_retention_days=notification_days,

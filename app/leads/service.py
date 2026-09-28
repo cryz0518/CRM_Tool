@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.ai.gateway import AIGateway, AIGatewayError
-from app.ai.models import ExtractedLeadPatch, LeadAnalysis
+from app.ai.models import ExtractedLeadPatch, LeadAnalysis, LeadFieldValue
 from app.companies.models import CompanyRegionEvidence, CompanyUpsertCommand, CompanyUpsertResult
 from app.companies.service import CompanyLeadService
 from app.core.config import get_settings
@@ -106,10 +106,29 @@ class ContextUpdateRequest:
     source_message_id: str
     lead_id: str
     record_id: str
-    fields: dict[str, str]
+    fields: Mapping[str, LeadFieldValue]
     outbox_event_id: int
     segment_index: int = 0
     pending_confirmation_fields: tuple[str, ...] = ()
+
+
+def _normalize_company_patch(fields: Mapping[str, object]) -> dict[str, LeadFieldValue]:
+    """校验公司服务交给 T09 的字段值形状，拒绝未知类型继续同步。
+
+    参数：fields 为公司解析服务生成的智能表格增量补丁。
+    返回值：仅包含字符串或字符串列表的字段映射，供 ExtractedLeadPatch 使用。
+    异常：字段值不是允许的 LeadFieldValue 时抛出 ValueError。
+    副作用：不修改输入映射，仅创建一个新的规范化字典。
+    """
+    normalized: dict[str, LeadFieldValue] = {}
+    for field_name, value in fields.items():
+        if isinstance(value, str):
+            normalized[field_name] = value
+        elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+            normalized[field_name] = value
+        else:
+            raise ValueError(f"智能表格字段值类型不支持：{field_name}")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -857,7 +876,7 @@ class FirstTextLeadWorkspaceService:
                         source_message_id=command.source_message_id,
                         lead_id=company_result.lead_id,
                         record_id=record_id,
-                        fields=company_result.smart_table_patch,
+                        fields=_normalize_company_patch(company_result.smart_table_patch),
                         outbox_event_id=outbox_event_id,
                         segment_index=command.source_segment_index,
                         pending_confirmation_fields=company_result.pending_confirmation_fields,
@@ -1013,7 +1032,7 @@ class FirstTextLeadWorkspaceService:
                     source_message_id=command.source_message_id,
                     lead_id=company_result.lead_id,
                     record_id=record_id,
-                    fields=company_result.smart_table_patch,
+                    fields=_normalize_company_patch(company_result.smart_table_patch),
                     outbox_event_id=outbox_event_id,
                     segment_index=command.source_segment_index,
                     pending_confirmation_fields=company_result.pending_confirmation_fields,
@@ -2474,7 +2493,7 @@ class FirstTextLeadWorkspaceService:
                 ExtractedLeadPatch(
                     trace_id=f"deterministic-{request.outbox_event_id}",
                     analysis=LeadAnalysis(intent="UPDATE_LEAD"),
-                    fields=request.fields,
+                    fields=dict(request.fields),
                     pending_confirmation_fields=request.pending_confirmation_fields,
                     low_confidence_candidates={},
                 ),
