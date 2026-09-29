@@ -35,6 +35,7 @@ CARD_EVENT_KEY_CRM_FIELD_CONFIRM = "crm.field_confirmation.confirm"
 CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE = "crm.duplicate_confirmation.continue"
 CARD_EVENT_KEY_CRM_DUPLICATE_STOP = "crm.duplicate_confirmation.stop"
 CARD_EVENT_KEY_CRM_COMPANY_CONFIRM = "crm.company_submission.confirm"
+CARD_EVENT_KEY_CRM_BATCH_SUBMISSION = "crm.batch_submission.confirm"
 CARD_EVENT_KEY_DISCARD_CONFIRM = "lead.discard.confirm"
 CARD_EVENT_KEY_REASSIGN_CONFIRM = "lead.reassignment.confirm"
 CARD_TYPE_BUTTON_INTERACTION = "button_interaction"
@@ -45,6 +46,7 @@ ALLOWED_CARD_EVENT_KEYS = frozenset(
         CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE,
         CARD_EVENT_KEY_CRM_DUPLICATE_STOP,
         CARD_EVENT_KEY_CRM_COMPANY_CONFIRM,
+        CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
         CARD_EVENT_KEY_DISCARD_CONFIRM,
         CARD_EVENT_KEY_REASSIGN_CONFIRM,
     }
@@ -53,6 +55,7 @@ ALLOWED_CARD_EVENT_KEYS = frozenset(
 ACTION_TYPE_CRM_FIELD_CONFIRMATION = "crm_field_confirmation"
 ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION = "crm_duplicate_confirmation"
 ACTION_TYPE_CRM_COMPANY_CONFIRMATION = "crm_company_submission_confirmation"
+ACTION_TYPE_CRM_BATCH_SUBMISSION = "crm_batch_submission"
 ACTION_TYPE_DISCARD_CONFIRMATION = "lead_discard_confirmation"
 ACTION_TYPE_REASSIGN_CONFIRMATION = "lead_reassignment_confirmation"
 ALLOWED_ACTION_TYPES = frozenset(
@@ -60,6 +63,7 @@ ALLOWED_ACTION_TYPES = frozenset(
         ACTION_TYPE_CRM_FIELD_CONFIRMATION,
         ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION,
         ACTION_TYPE_CRM_COMPANY_CONFIRMATION,
+        ACTION_TYPE_CRM_BATCH_SUBMISSION,
         ACTION_TYPE_DISCARD_CONFIRMATION,
         ACTION_TYPE_REASSIGN_CONFIRMATION,
     }
@@ -68,6 +72,7 @@ ACTION_EXPECTED_EVENT_KEYS = {
     ACTION_TYPE_CRM_FIELD_CONFIRMATION: CARD_EVENT_KEY_CRM_FIELD_CONFIRM,
     ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION: CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE,
     ACTION_TYPE_CRM_COMPANY_CONFIRMATION: CARD_EVENT_KEY_CRM_COMPANY_CONFIRM,
+    ACTION_TYPE_CRM_BATCH_SUBMISSION: CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
     ACTION_TYPE_DISCARD_CONFIRMATION: CARD_EVENT_KEY_DISCARD_CONFIRM,
     ACTION_TYPE_REASSIGN_CONFIRMATION: CARD_EVENT_KEY_REASSIGN_CONFIRM,
 }
@@ -653,6 +658,39 @@ class WecomActionService:
                             "当前账号已不是智能表格负责人",
                         )
 
+            if action.action_type == ACTION_TYPE_CRM_BATCH_SUBMISSION:
+                # 批量卡只允许选择发行时冻结、且仍属于当前销售的 Lead。
+                from app.leads.models import Lead
+
+                candidate_ids = _context_lead_ids(action.context.get("candidate_leads"))
+                owned_ids = set(
+                    session.scalars(
+                        select(Lead.id).where(
+                            Lead.id.in_(candidate_ids),
+                            Lead.smart_table_owner_user_id == callback.actor_user_id,
+                        )
+                    ).all()
+                )
+                if not candidate_ids or owned_ids != set(candidate_ids):
+                    return self._deny_action(
+                        action,
+                        delivery,
+                        "owner_mismatch",
+                        "候选线索中存在当前账号无权操作的记录",
+                    )
+                selected = set(callback.selected_option_ids)
+                if not selected or selected - set(candidate_ids):
+                    return self._deny_action(
+                        action,
+                        delivery,
+                        "selection_mismatch",
+                        "请至少选择一条有效线索",
+                    )
+                action.context = {
+                    **action.context,
+                    "selected_lead_ids": list(callback.selected_option_ids),
+                }
+
             if action.action_type == ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION:
                 # 重复确认卡携带的 option id 只能映射到发行时冻结的 Lead 集合。
                 from app.leads.models import Lead
@@ -1122,6 +1160,45 @@ class WecomActionService:
             source_message_id=request_message_id,
         )
 
+    def issue_batch_submission_action(
+        self,
+        *,
+        actor_user_id: str,
+        request_message_id: str,
+        command_text: str,
+        candidates: tuple[dict[str, str], ...],
+    ) -> WecomAction:
+        """发行批量提交候选卡，销售只能勾选服务端冻结的本人线索。
+
+        参数：actor_user_id 为销售身份；request_message_id 为命令消息；command_text 为固定命令；
+        candidates 仅含服务端线索标识和展示名称。
+        返回值：已持久化的候选选择动作。
+        异常：候选数据、卡片能力或权限不满足时抛出异常。
+        副作用：写入动作、卡片通知和发送 outbox，不调用 CRM。
+        """
+
+        if not candidates or len(candidates) > 20:
+            raise ValueError("批量提交候选数量非法")
+        target_id = hashlib.sha256(
+            f"crm-batch-submission:{request_message_id}:{command_text}".encode()
+        ).hexdigest()
+        title = "重新提交放弃线索" if "放弃提交" in command_text else "选择要提交的线索"
+        return self.issue_action(
+            actor_user_id=actor_user_id,
+            action_type=ACTION_TYPE_CRM_BATCH_SUBMISSION,
+            target_type="crm_batch_submission",
+            target_id=target_id,
+            expected_action_key=CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
+            context={
+                "command_text": command_text,
+                "request_message_id": request_message_id,
+                "candidate_leads": [dict(item) for item in candidates],
+            },
+            title=title,
+            description="请勾选需要提交的线索；未勾选的线索不会调用 CRM",
+            source_message_id=request_message_id,
+        )
+
     def issue_company_submission_confirmation_action(
         self,
         *,
@@ -1466,11 +1543,14 @@ def build_action_card(
             if selection_options is not None
             else "crm_duplicate_leads"
         )
-        # 企业微信的候选确认使用单选语义；服务端 callback 还会再次限制只能选一条。
+        # 公司候选使用单选，批量提交和重复处理使用多选；服务端 callback 会再次校验范围。
         payload["card_type"] = CARD_TYPE_VOTE_INTERACTION
         payload["checkbox"] = {
             "question_key": question_key,
-            "mode": 0 if selection_options is not None else 1,
+            # 批量提交允许多选；公司候选仍保持单选，重复处理沿用既有多选契约。
+            "mode": 1 if selection_key == CARD_EVENT_KEY_CRM_BATCH_SUBMISSION else (
+                0 if selection_options is not None else 1
+            ),
             "option_list": [
                 {
                     "id": item["lead_id"],
@@ -1575,7 +1655,7 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
                     }
                 )
             safe[key] = safe_duplicates
-        elif key == "candidate_leads" and isinstance(value, list) and 1 < len(value) <= 20:
+        elif key == "candidate_leads" and isinstance(value, list) and 0 < len(value) <= 20:
             safe_candidates: list[dict[str, str]] = []
             for item in value:
                 if (
@@ -1782,6 +1862,8 @@ class DeterministicWecomActionExecutor:
             return self._confirm_submission_fields(action)
         if action.action_type == ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION:
             return self._confirm_duplicate_submission(action)
+        if action.action_type == ACTION_TYPE_CRM_BATCH_SUBMISSION:
+            return self._confirm_batch_submission(action)
         if action.action_type == ACTION_TYPE_CRM_COMPANY_CONFIRMATION:
             return self._confirm_company_submission(action)
         if action.action_type == ACTION_TYPE_DISCARD_CONFIRMATION:
@@ -1899,6 +1981,48 @@ class DeterministicWecomActionExecutor:
             f"重复线索处理完成：覆盖成功 {result.submitted} 条；"
             f"未选择 {result.remaining} 条；失败 {result.failed} 条。",
         )
+
+    def _confirm_batch_submission(self, action: ActionSnapshot) -> tuple[str, str]:
+        """执行批量候选卡的勾选结果，并复用 CRM 提交服务。
+
+        参数：action 为 callback 已冻结并完成负责人校验的动作快照。
+        返回值：结果码和不含敏感数据的提交摘要。
+        异常：动作上下文非法或领域校验失败时向动作执行器抛出。
+        副作用：对勾选的线索执行查重/创建，并在命中重复时发行后续确认卡。
+        """
+        from app.crm.commands import format_submission_reply
+        from app.crm.service import CrmSubmissionService, SubmissionCommand
+
+        command_text = action.context.get("command_text")
+        request_message_id = action.context.get("request_message_id")
+        selected = action.context.get("selected_lead_ids", [])
+        if (
+            not isinstance(command_text, str)
+            or not isinstance(request_message_id, str)
+            or not isinstance(selected, list)
+            or not selected
+            or not all(isinstance(item, str) for item in selected)
+        ):
+            raise ValueError("批量提交动作 context 不完整")
+        if self._action_service is not None:
+            self._action_service.begin_domain_operation(action.id, action.claim_token)
+        service = CrmSubmissionService(
+            self._session_factory,
+            self._smart_table_adapter,
+            self._crm_adapter,
+            robot_submission_confirmation_available=True,
+        )
+        result = service.submit_selected(
+            SubmissionCommand(command_text, action.bound_actor_wecom_user_id, request_message_id),
+            tuple(selected),
+        )
+        if result.duplicate_confirmations and self._action_service is not None:
+            self._action_service.issue_duplicate_confirmation_action(
+                actor_user_id=action.bound_actor_wecom_user_id,
+                request_message_id=request_message_id,
+                duplicates=result.duplicate_confirmations,
+            )
+        return "crm_batch_submission_completed", format_submission_reply(result)
 
     def _confirm_company_submission(self, action: ActionSnapshot) -> tuple[str, str]:
         """重读智能表格后复用 CRM 提交服务执行单条公司线索提交。"""

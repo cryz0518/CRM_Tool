@@ -39,6 +39,7 @@ from app.smart_table.adapter import SmartTableActor
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.registry import build_required_smart_table_schema
 from app.wecom_bot.actions import (
+    CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
     CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE,
     CARD_EVENT_KEY_CRM_FIELD_CONFIRM,
     CARD_EVENT_KEY_DISCARD_CONFIRM,
@@ -498,10 +499,13 @@ def test_expired_action_does_not_create_execution(session_factory: sessionmaker[
 
 
 def test_exact_submission_commands_never_use_llm_intent_inference() -> None:
-    """验证只有两个完整命令进入 CRM 命令边界，相似自然语言全部拒绝。"""
+    """验证只有完整固定命令进入 CRM 命令边界，相似自然语言全部拒绝。"""
 
     assert parse_crm_submission_command("提交今天的线索") == "提交今天的线索"
+    assert parse_crm_submission_command("提交我所有线索") == "提交我所有线索"
+    assert parse_crm_submission_command("帮我提交放弃提交的线索") == "帮我提交放弃提交的线索"
     assert parse_crm_submission_command("提交我的更新") == "提交我的更新"
+    assert parse_crm_submission_command("请提交我所有线索") is None
     assert parse_crm_submission_command("帮我提交今天的线索") is None
     assert parse_crm_submission_command("提交今天的线索。") is None
     assert parse_crm_submission_command("请提交我的更新") is None
@@ -589,6 +593,51 @@ def test_company_submission_candidate_card_uses_single_selection() -> None:
     assert card["card_type"] == "vote_interaction"
     assert card["checkbox"]["mode"] == 0  # type: ignore[index]
     assert card["submit_button"]["key"] == "crm.company_submission.confirm"  # type: ignore[index]
+
+
+def test_batch_submission_card_allows_multi_selection() -> None:
+    """验证“提交我所有线索”候选卡支持勾选多条线索。"""
+
+    card = build_action_card(
+        task_id="task-batch-candidates",
+        event_key=CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
+        title="选择要提交的线索",
+        description="请勾选需要提交的线索",
+        selection_options=[
+            {"lead_id": "lead-a", "company_name": "候选一"},
+            {"lead_id": "lead-b", "company_name": "候选二"},
+        ],
+        selection_key=CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
+    )
+
+    assert card["checkbox"]["mode"] == 1  # type: ignore[index]
+    assert card["submit_button"]["key"] == CARD_EVENT_KEY_CRM_BATCH_SUBMISSION  # type: ignore[index]
+
+
+def test_batch_submission_action_accepts_single_candidate_and_freezes_context(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证只有一条未提交线索时仍发行可选择的批量卡。"""
+
+    _authorize(session_factory)
+    action = _service(session_factory).issue_batch_submission_action(
+        actor_user_id="sales-a",
+        request_message_id="message-batch-card",
+        command_text="提交我所有线索",
+        candidates=({"lead_id": "lead-a", "company_name": "候选一"},),
+    )
+
+    assert action.context["candidate_leads"] == [
+        {"lead_id": "lead-a", "company_name": "候选一"}
+    ]
+    with session_factory() as session:
+        notice = session.scalar(
+            select(NotificationRecord).where(
+                NotificationRecord.notification_type == "wecom_action_card"
+            )
+        )
+    assert notice is not None
+    assert notice.payload["template_card"]["checkbox"]["mode"] == 1  # type: ignore[index]
 
 
 def test_duplicate_provider_msgid_and_different_msgid_claim_once(

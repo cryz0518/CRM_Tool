@@ -30,7 +30,9 @@ from app.wecom_bot.actions import (
 
 _LOGGER = logging.getLogger(__name__)
 
-CRM_SUBMISSION_COMMANDS = frozenset({"提交今天的线索", "提交我的更新"})
+CRM_SUBMISSION_COMMANDS = frozenset(
+    {"提交今天的线索", "提交我所有线索", "帮我提交放弃提交的线索", "提交我的更新"}
+)
 _COMPANY_SUBMISSION_PATTERN = re.compile(r"^请帮我提交(?P<company>[^\r\n。]{1,128})这条线索$")
 _PREVIEW_FIELD_NAMES = (
     "业务线",
@@ -134,6 +136,30 @@ def consume_submission_command(
         return reply
     if crm_adapter is None:
         raise ValueError("批量 CRM 命令缺少 CRM Adapter")
+    if command.text in {"提交我所有线索", "帮我提交放弃提交的线索"}:
+        try:
+            reply = prepare_batch_submission_selection(
+                session_factory, smart_table_adapter, crm_adapter, command
+            )
+        except Exception:
+            # 候选读取或卡片发行失败同样必须释放消息顺序检查点，并遵循统一重试策略。
+            return _record_command_failure(session_factory, outbox_event_id, command)
+        with session_factory.begin() as session:
+            event = session.get(OutboxEvent, outbox_event_id)
+            if event is not None:
+                event.status = "succeeded"
+            key = notification_key_for_message(command.request_message_id)
+            if session.get(NotificationRecord, key) is None:
+                session.add(
+                    NotificationRecord(
+                        notification_key=key,
+                        sales_user_id=command.sales_user_id,
+                        source_message_id=command.request_message_id,
+                        notification_type="crm_submission_selection",
+                        content=reply,
+                    )
+                )
+        return reply
     try:
         service = CrmSubmissionService(
             session_factory,
@@ -175,6 +201,52 @@ def consume_submission_command(
                 )
             )
     return reply
+
+
+def prepare_batch_submission_selection(
+    session_factory: sessionmaker[Session],
+    smart_table_adapter: SmartTableAdapter,
+    crm_adapter: CRMAdapter,
+    command: SubmissionCommand,
+) -> str:
+    """为批量提交命令发行服务端候选卡，不在发卡阶段调用 CRM。
+
+    参数：前三项为既有 CRM 提交依赖；command 为已鉴权的固定命令。
+    返回值：可直接回复销售的候选卡状态文本。
+    异常：卡片能力或服务端状态异常向调用方传播；不吞掉安全拒绝。
+    副作用：可能写入一张仅允许当前销售勾选的模板卡动作。
+    """
+    service = CrmSubmissionService(
+        session_factory,
+        smart_table_adapter,
+        crm_adapter,
+        robot_submission_confirmation_available=get_settings().wecom_card_callback_ready(),
+    )
+    candidates = service.list_submission_candidates(command.text, command.sales_user_id)
+    if not candidates:
+        if command.text == "帮我提交放弃提交的线索":
+            return "当前没有可重新提交的放弃提交线索。"
+        return "当前没有可提交的未提交线索。"
+    if len(candidates) > 20:
+        return "当前可提交线索超过卡片单次选择上限（20条），请先分批处理。"
+    action_service = WecomActionService(
+        session_factory,
+        card_callback_ready=get_settings().wecom_card_callback_ready(),
+    )
+    try:
+        action_service.issue_batch_submission_action(
+            actor_user_id=command.sales_user_id,
+            request_message_id=command.request_message_id,
+            command_text=command.text,
+            candidates=tuple(
+                {"lead_id": item.lead_id, "company_name": item.company_name}
+                for item in candidates
+            ),
+        )
+    except CardCapabilityUnavailable:
+        return "候选线索已找到，但当前机器人卡片能力未就绪，请先完成卡片配置。"
+    title = "重新提交放弃线索" if command.text == "帮我提交放弃提交的线索" else "选择要提交的线索"
+    return f"{title}：已发送候选卡，请勾选后确认提交（共 {len(candidates)} 条）。"
 
 
 def prepare_company_submission_preview(

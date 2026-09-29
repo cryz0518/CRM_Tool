@@ -100,6 +100,7 @@ def _lead(
             "沟通方式": "见面拜访",
             "手机": "13800000000",
             "备注": "人工最终备注，客户已确认项目需求并要求销售继续跟进，内容长度满足 CRM 校验。",
+            "提交状态": "未提交",
         },
         actor=SmartTableActor.ROBOT,
     )
@@ -187,6 +188,87 @@ def test_create_uses_stable_lead_key_and_current_smart_table_values(
     assert sync.idempotency_key == f"crm:create:{lead_id}"
     assert sync.canonical_payload["mobile"] == "13800000000"
     assert lead is not None and lead.lifecycle_state == "synced"
+
+
+def test_all_submission_includes_historical_pending_lead(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证“提交我所有线索”包含非当天且仍待创建的本人线索。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.created_at = utc_now() - timedelta(days=1)
+
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+
+    today_result = service.submit(
+        SubmissionCommand("提交今天的线索", "sales-1", "message-today")
+    )
+    all_result = service.submit(
+        SubmissionCommand("提交我所有线索", "sales-1", "message-all")
+    )
+
+    assert today_result.succeeded == 0
+    assert today_result.incomplete == 0
+    assert all_result.succeeded == 1
+    assert crm.calls == 1
+
+
+def test_all_submission_does_not_reopen_abandoned_sync_after_table_tampering(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证销售手动改写提交状态不能重新打开服务端已放弃事实。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    _lead(session_factory, adapter)
+    record = adapter.get_records()[0]
+    crm = MockCRMAdapter(
+        search_results={
+            "人工最终公司": (CRMSearchResult("crm-existing", "crm-owner", "CRM 已有线索"),)
+        }
+    )
+    service = CrmSubmissionService(session_factory, adapter, crm)
+
+    first = service.submit(
+        SubmissionCommand("提交今天的线索", "sales-1", "message-abandoned")
+    )
+    service.resolve_duplicate_confirmation(
+        "message-abandoned", "sales-1", continue_submission=False
+    )
+    assert first.duplicate_confirmations
+    adapter.update_record(record.record_id, {"提交状态": "未提交"})
+    blocked = service.submit(
+        SubmissionCommand("提交我所有线索", "sales-1", "message-reopened")
+    )
+    assert blocked.succeeded == 0
+    assert blocked.duplicate_confirmations == ()
+
+
+def test_all_submission_does_not_turn_submitted_record_into_update(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证“提交我所有线索”只处理待创建线索，不把已提交记录转成 update。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    _lead(session_factory, adapter)
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+
+    created = service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-create"))
+    assert created.succeeded == 1
+    record = adapter.get_records()[0]
+    adapter.update_record(
+        record.record_id,
+        {"手机": "13900000000", "提交状态": "未提交"},
+    )
+
+    result = service.submit(SubmissionCommand("提交我所有线索", "sales-1", "message-all"))
+
+    assert result.updated == 0
+    assert result.succeeded == 0
+    assert crm.calls == 1
+    assert crm.update_calls == 0
 
 
 def test_owner_user_id_is_converted_to_employee_name_before_crm_submit(
@@ -693,6 +775,17 @@ def test_duplicate_crm_match_waits_for_confirmation_and_stop_marks_table_status(
     record = adapter.get_records()[0]
     assert sync is not None and sync.status == "abandoned"
     assert record.fields["提交状态"] == "放弃提交"
+
+    adapter.update_record(record.record_id, {"提交状态": "未提交"})
+    candidates = service.list_submission_candidates("帮我提交放弃提交的线索", "sales-1")
+    assert [candidate.lead_id for candidate in candidates] == [lead_id]
+    reopened = service.submit_selected(
+        SubmissionCommand("帮我提交放弃提交的线索", "sales-1", "message-reopen"),
+        (lead_id,),
+    )
+    assert len(reopened.duplicate_confirmations) == 1
+    assert crm.search_calls == 2
+    assert crm.calls == 0
 
 
 def test_duplicate_crm_match_selected_continue_uses_update_and_marks_submitted(

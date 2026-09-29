@@ -26,6 +26,8 @@ from app.messaging.models import BusinessAuditEvent, SalesAuthorization, utc_now
 from app.smart_table.adapter import SmartTableAdapter
 
 _TODAY_COMMAND = "提交今天的线索"
+_ALL_COMMAND = "提交我所有线索"
+_ABANDONED_COMMAND = "帮我提交放弃提交的线索"
 _UPDATES_COMMAND = "提交我的更新"
 _BUSINESS_COMPLETENESS_FIELDS = (
     "业务线",
@@ -77,6 +79,14 @@ class DuplicateSubmission:
     company_name: str
     crm_lead_id: str
     crm_lead_owner_user_id: str | None
+
+
+@dataclass(frozen=True)
+class SubmissionCandidate:
+    """描述卡片中可由当前销售选择的待提交线索。"""
+
+    lead_id: str
+    company_name: str
 
 
 @dataclass(frozen=True)
@@ -172,7 +182,7 @@ class CrmSubmissionService:
             return None
 
     def submit(self, command: SubmissionCommand) -> SubmissionBatchResult:
-        """解析固定命令并逐条提交当日本人待创建 Lead，保持批次部分成功。
+        """解析固定命令并逐条提交本人待创建 Lead，保持批次部分成功。
 
         参数：command 为机器人已可靠接收的文本命令和提交销售身份。
         返回值：成功、待完善和外部失败的汇总；更新命令明确标记未实现。
@@ -181,7 +191,12 @@ class CrmSubmissionService:
         """
         if command.text == _UPDATES_COMMAND:
             return self._submit_updates(command)
-        if command.text not in {_TODAY_COMMAND, "提交指定线索"}:
+        if command.text not in {
+            _TODAY_COMMAND,
+            _ALL_COMMAND,
+            _ABANDONED_COMMAND,
+            "提交指定线索",
+        }:
             raise ValueError("不支持的 CRM 提交命令")
         if command.target_lead_id is not None and command.text != "提交指定线索":
             raise ValueError("目标线索只能用于指定线索提交命令")
@@ -207,15 +222,25 @@ class CrmSubmissionService:
                 )
                 target_missing = target is None
                 candidate_ids = [target.id] if target is not None else []
-            else:
+            elif command.text in {_ALL_COMMAND, _ABANDONED_COMMAND}:
+                # 批量命令只使用候选枚举规则；卡片入口会在调用 CRM 前再次复核这些 ID。
                 candidate_ids = [
-                    lead_id
-                    for lead_id in session.scalars(
-                        select(Lead.id).where(
-                            Lead.smart_table_owner_user_id == command.sales_user_id,
-                            Lead.lifecycle_state == "pending_create",
-                        )
+                    item.lead_id
+                    for item in self.list_submission_candidates(
+                        command.text, command.sales_user_id
                     )
+                ]
+            else:
+                candidates = session.scalars(
+                    select(Lead).where(
+                        Lead.smart_table_owner_user_id == command.sales_user_id,
+                        Lead.lifecycle_state == "pending_create",
+                    )
+                )
+                candidate_ids = [
+                    lead.id
+                    for lead in candidates
+                    if self._is_today_owned_candidate(lead, command.sales_user_id)
                 ]
 
         if target_missing:
@@ -235,6 +260,134 @@ class CrmSubmissionService:
                 failed_pending_review=(
                     result.failed_pending_review + (outcome.status == "failed_pending_review")
                 ),
+                incomplete_lead_ids=(
+                    result.incomplete_lead_ids + (lead_id,)
+                    if outcome.status == "incomplete"
+                    else result.incomplete_lead_ids
+                ),
+                mapping_missing=result.mapping_missing + (outcome.status == "mapping_missing"),
+                duplicate_confirmations=(
+                    result.duplicate_confirmations + (outcome.duplicate,)
+                    if outcome.duplicate is not None
+                    else result.duplicate_confirmations
+                ),
+            )
+        return result
+
+    def list_submission_candidates(
+        self, command_text: str, sales_user_id: str
+    ) -> tuple[SubmissionCandidate, ...]:
+        """列出当前销售可在机器人卡片中选择的线索，不调用 CRM。
+
+        参数：command_text 为精确命令；sales_user_id 为当前销售身份。
+        返回值：只包含本人、待创建且符合系统状态的线索候选。
+        异常：销售未授权或命令不支持时抛出 ValueError。
+        副作用：读取数据库及智能表格，不修改任何状态。
+        """
+        if command_text not in {_ALL_COMMAND, _ABANDONED_COMMAND}:
+            raise ValueError("不支持候选卡片的 CRM 命令")
+        with self._session_factory() as session:
+            authorization = session.get(SalesAuthorization, sales_user_id)
+            if (
+                authorization is None
+                or not authorization.is_authorized
+                or not authorization.is_active
+            ):
+                raise ValueError("提交销售未授权")
+            leads = list(
+                session.scalars(
+                    select(Lead).where(
+                        Lead.smart_table_owner_user_id == sales_user_id,
+                        Lead.lifecycle_state == "pending_create",
+                    )
+                )
+            )
+            candidates: list[SubmissionCandidate] = []
+            for lead in leads:
+                sync = session.scalar(
+                    select(CrmSyncRecord).where(
+                        CrmSyncRecord.lead_id == lead.id,
+                        CrmSyncRecord.operation == "create",
+                    )
+                )
+                if command_text == _ABANDONED_COMMAND:
+                    if sync is None or sync.status != "abandoned":
+                        continue
+                else:
+                    if sync is not None and sync.status in {"succeeded", "abandoned"}:
+                        continue
+                    if not self._is_unsubmitted_smart_table_record(lead):
+                        continue
+                company_name = lead.standard_company_name or lead.field_values.get("线索名称")
+                if isinstance(company_name, str) and company_name.strip():
+                    candidates.append(SubmissionCandidate(lead.id, company_name.strip()))
+            return tuple(candidates)
+
+    def submit_selected(
+        self,
+        command: SubmissionCommand,
+        selected_lead_ids: tuple[str, ...],
+    ) -> SubmissionBatchResult:
+        """提交卡片勾选的线索，并在服务端重新校验候选归属和状态。
+
+        参数：command 为原始精确命令；selected_lead_ids 为 callback 中的服务端候选标识。
+        返回值：与普通批量提交相同的部分成功汇总。
+        异常：销售未授权或命令不支持时抛出 ValueError；无效目标被安全忽略。
+        副作用：对通过复核的目标调用既有首次提交流程。
+        """
+        if command.text not in {_ALL_COMMAND, _ABANDONED_COMMAND}:
+            raise ValueError("不支持卡片选择提交")
+        selected = tuple(dict.fromkeys(selected_lead_ids))
+        with self._session_factory() as session:
+            authorization = session.get(SalesAuthorization, command.sales_user_id)
+            if (
+                authorization is None
+                or not authorization.is_authorized
+                or not authorization.is_active
+            ):
+                raise ValueError("提交销售未授权")
+            valid_ids: list[str] = []
+            for lead_id in selected:
+                lead = session.scalar(
+                    select(Lead).where(
+                        Lead.id == lead_id,
+                        Lead.smart_table_owner_user_id == command.sales_user_id,
+                        Lead.lifecycle_state == "pending_create",
+                    )
+                )
+                sync = session.scalar(
+                    select(CrmSyncRecord).where(
+                        CrmSyncRecord.lead_id == lead_id,
+                        CrmSyncRecord.operation == "create",
+                    )
+                )
+                if lead is None:
+                    continue
+                if command.text == _ABANDONED_COMMAND:
+                    if sync is not None and sync.status == "abandoned":
+                        valid_ids.append(lead_id)
+                elif (
+                    (sync is None or sync.status not in {"succeeded", "abandoned"})
+                    and self._is_unsubmitted_smart_table_record(lead)
+                ):
+                    valid_ids.append(lead_id)
+        result = SubmissionBatchResult()
+        for lead_id in valid_ids:
+            outcome = self._submit_create(
+                lead_id,
+                SubmissionCommand(
+                    command.text,
+                    command.sales_user_id,
+                    command.request_message_id,
+                ),
+            )
+            result = SubmissionBatchResult(
+                succeeded=result.succeeded + (outcome.status == "succeeded"),
+                incomplete=result.incomplete + (outcome.status == "incomplete"),
+                retrying=result.retrying + (outcome.status == "retrying"),
+                processing=result.processing + (outcome.status == "processing"),
+                failed_pending_review=result.failed_pending_review
+                + (outcome.status == "failed_pending_review"),
                 incomplete_lead_ids=(
                     result.incomplete_lead_ids + (lead_id,)
                     if outcome.status == "incomplete"
@@ -428,12 +581,15 @@ class CrmSubmissionService:
     def _submit_create(self, lead_id: str, command: SubmissionCommand) -> CreateSubmissionOutcome:
         """冻结首次提交快照，先查 CRM 再决定创建或等待重复确认。
 
-        参数：lead_id 为当前销售当天待提交线索；command 为固定提交命令事实。
+        参数：lead_id 为当前销售待提交线索；command 为固定提交命令事实。
         返回值：单条提交结果，以及 CRM 查重命中时的重复线索事实。
         异常：智能表格、数据库或 CRM 查重错误按既有同步状态转换并记录审计。
         副作用：读取最终表格快照，写入冻结 CRM 同步记录，必要时调用 CRM 查重或创建接口。
         """
-        allow_non_today_target = command.target_lead_id is not None
+        allow_non_today_target = command.text in {
+            _ALL_COMMAND,
+            _ABANDONED_COMMAND,
+        } or command.target_lead_id is not None
         with self._session_factory() as session:
             lead = session.get(Lead, lead_id)
             if lead is None or not self._is_create_candidate(
@@ -458,10 +614,14 @@ class CrmSubmissionService:
                         ),
                         duplicate,
                     )
-                # retry 必须使用现有冻结快照，绝不重新读表替换 payload。
-                return CreateSubmissionOutcome(
-                    self._claim_and_call(existing.id, command.sales_user_id)
-                )
+                if existing.status == "abandoned" and command.text == _ABANDONED_COMMAND:
+                    # 只有专用“重新提交放弃线索”命令允许重开服务端放弃事实。
+                    pass
+                else:
+                    # retry 必须使用现有冻结快照，绝不重新读表替换 payload。
+                    return CreateSubmissionOutcome(
+                        self._claim_and_call(existing.id, command.sales_user_id)
+                    )
 
         reconciled = LeadReviewService(
             self._session_factory,
@@ -574,34 +734,82 @@ class CrmSubmissionService:
                             else "failed_pending_review",
                             duplicate,
                         )
-                    return CreateSubmissionOutcome(existing.status)
+                    if existing.status == "abandoned" and command.text == _ABANDONED_COMMAND:
+                        # 专用重提命令复用原同步记录，但不信任销售手动改写的表格状态。
+                        pass
+                    else:
+                        return CreateSubmissionOutcome(existing.status)
 
                 first_duplicate = duplicate_results[0] if duplicate_results else None
-                sync = CrmSyncRecord(
-                    lead_id=lead.id,
-                    operation="create",
-                    smart_table_record_id=lead.smart_table_record_id or "",
-                    idempotency_key=f"crm:create:{lead.id}",
-                    canonical_payload=canonical_payload,
-                    snapshot_hash=snapshot_hash,
-                    request_message_id=command.request_message_id,
-                    submitting_sales_user_id=command.sales_user_id,
-                    submitting_crm_user_id=crm_user_id,
-                    crm_lead_id=first_duplicate.crm_lead_id if first_duplicate else None,
-                    crm_lead_owner_user_id=(
+                if existing is not None:
+                    existing.canonical_payload = canonical_payload
+                    existing.snapshot_hash = snapshot_hash
+                    existing.request_message_id = command.request_message_id
+                    existing.submitting_sales_user_id = command.sales_user_id
+                    existing.submitting_crm_user_id = crm_user_id
+                    existing.crm_lead_id = first_duplicate.crm_lead_id if first_duplicate else None
+                    existing.crm_lead_owner_user_id = (
                         first_duplicate.crm_lead_owner_user_id if first_duplicate else None
-                    ),
-                    status=(
+                    )
+                    existing.status = (
                         "awaiting_duplicate_confirmation"
                         if first_duplicate is not None
                         else "pending"
-                    ),
-                    response_summary=(
+                    )
+                    existing.attempts = 0
+                    existing.failure_category = None
+                    existing.failure_kind = None
+                    existing.failure_code = None
+                    existing.failure_summary = None
+                    existing.response_summary = (
                         first_duplicate.response_summary[:256] if first_duplicate else None
-                    ),
-                )
-                session.add(sync)
-                session.flush()
+                    )
+                    existing.failed_at = None
+                    existing.processing_started_at = None
+                    existing.processing_lease_expires_at = None
+                    existing.completed_at = None
+                    sync_id = existing.id
+                    if first_duplicate is not None:
+                        self._record_audit_for_sync(
+                            session,
+                            existing,
+                            command.sales_user_id,
+                            "crm_duplicate_awaiting_confirmation",
+                        )
+                        duplicate = DuplicateSubmission(
+                            lead_id=lead.id,
+                            company_name=company_name,
+                            crm_lead_id=first_duplicate.crm_lead_id,
+                            crm_lead_owner_user_id=first_duplicate.crm_lead_owner_user_id,
+                        )
+                        return CreateSubmissionOutcome("duplicate_confirmation", duplicate)
+                else:
+                    sync = CrmSyncRecord(
+                        lead_id=lead.id,
+                        operation="create",
+                        smart_table_record_id=lead.smart_table_record_id or "",
+                        idempotency_key=f"crm:create:{lead.id}",
+                        canonical_payload=canonical_payload,
+                        snapshot_hash=snapshot_hash,
+                        request_message_id=command.request_message_id,
+                        submitting_sales_user_id=command.sales_user_id,
+                        submitting_crm_user_id=crm_user_id,
+                        crm_lead_id=first_duplicate.crm_lead_id if first_duplicate else None,
+                        crm_lead_owner_user_id=(
+                            first_duplicate.crm_lead_owner_user_id if first_duplicate else None
+                        ),
+                        status=(
+                            "awaiting_duplicate_confirmation"
+                            if first_duplicate is not None
+                            else "pending"
+                        ),
+                        response_summary=(
+                            first_duplicate.response_summary[:256] if first_duplicate else None
+                        ),
+                    )
+                    session.add(sync)
+                    session.flush()
+                    sync_id = sync.id
                 if first_duplicate is not None:
                     self._record_audit_for_sync(
                         session, sync, command.sales_user_id, "crm_duplicate_awaiting_confirmation"
@@ -1035,6 +1243,13 @@ class CrmSubmissionService:
             and lead.lifecycle_state == "pending_create"
             and created.astimezone(shanghai).date() == datetime.now(shanghai).date()
         )
+
+    def _is_unsubmitted_smart_table_record(self, lead: Lead) -> bool:
+        """读取智能表格当前提交状态，确认批量提交只处理“未提交”记录。"""
+        if lead.smart_table_record_id is None:
+            return False
+        record = self._smart_table_adapter.get_record(lead.smart_table_record_id)
+        return record is not None and record.fields.get("提交状态") == "未提交"
 
     @staticmethod
     def _is_create_candidate(

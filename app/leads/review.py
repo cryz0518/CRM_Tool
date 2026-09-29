@@ -636,6 +636,9 @@ class LeadReviewService:
         return (
             not self._robot_submission_confirmation_available
             and field_name in CRM_REQUIRED_CORE_FIELDS
+            # 天眼查多候选时，业务规则允许把首候选公司名预填到审核工作区，
+            # 同时保留 AI待确认 标记；只有销售确认后才允许作为可靠身份提交 CRM。
+            and field_name != "线索名称"
         )
 
     def _confirmation_names(self, value: object) -> set[str]:
