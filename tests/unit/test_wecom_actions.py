@@ -549,16 +549,17 @@ def test_expired_action_does_not_create_execution(session_factory: sessionmaker[
         assert session.scalars(select(WecomActionOutbox)).all() == []
 
 
-def test_exact_submission_commands_never_use_llm_intent_inference() -> None:
-    """验证只有完整固定命令进入 CRM 命令边界，相似自然语言全部拒绝。"""
+def test_submission_command_aliases_normalize_to_confirmed_intents() -> None:
+    """验证常见自然说法归一化到既有确认卡命令，不绕过服务端选择。"""
 
     assert parse_crm_submission_command("提交今天的线索") == "提交今天的线索"
     assert parse_crm_submission_command("提交我所有线索") == "提交我所有线索"
     assert parse_crm_submission_command("帮我提交放弃提交的线索") == "帮我提交放弃提交的线索"
     assert parse_crm_submission_command("提交我的更新") == "提交我的更新"
+    assert parse_crm_submission_command("提交我所有的线索") == "提交我所有线索"
     assert parse_crm_submission_command("请提交我所有线索") is None
-    assert parse_crm_submission_command("帮我提交今天的线索") is None
-    assert parse_crm_submission_command("提交今天的线索。") is None
+    assert parse_crm_submission_command("帮我提交今天的线索") == "提交今天的线索"
+    assert parse_crm_submission_command("提交今天的线索。") == "提交今天的线索"
     assert parse_crm_submission_command("请提交我的更新") is None
 
 
@@ -758,6 +759,30 @@ def test_batch_callback_accepts_only_selected_frozen_subset(
         assert stored is not None
         assert stored.context["selected_lead_ids"] == list(lead_ids[:2])
         assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
+
+
+def test_batch_callback_accepts_temporary_unsubmitted_candidate(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证“全部未提交”卡片可确认资料不完整的 temporary 线索。"""
+
+    lead_ids = _seed_batch_leads(session_factory, count=1)
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_ids[0])
+        assert lead is not None
+        lead.lifecycle_state = "temporary"
+    action = _service(session_factory).issue_batch_submission_action(
+        actor_user_id="sales-a",
+        request_message_id="message-temporary-candidate",
+        command_text="提交我所有线索",
+        candidates=({"lead_id": lead_ids[0], "company_name": "同名公司"},),
+    )
+
+    result = _service(session_factory).claim_callback(
+        _batch_frame_for_action(action, lead_ids, msgid="provider-temporary-candidate")
+    )
+
+    assert result.code == "claimed"
 
 
 def test_batch_callback_rejects_injected_option_id(

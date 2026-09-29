@@ -8,7 +8,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -16,6 +16,7 @@ from app.companies.models import CompanyVerificationStatus
 from app.core.config import get_settings
 from app.crm.adapter import CRMCreateResult, CRMSearchResult
 from app.crm.commands import (
+    _link_unsubmitted_smart_table_records,
     consume_submission_command,
     format_submission_reply,
     notification_key_for_message,
@@ -100,6 +101,7 @@ def _lead(
             "职务": "经理",
             "沟通方式": "见面拜访",
             "手机": "13800000000",
+            "客户行业": "其他",
             "备注": "人工最终备注，客户已确认项目需求并要求销售继续跟进，内容长度满足 CRM 校验。",
             "提交状态": "未提交",
         },
@@ -285,6 +287,7 @@ def test_owner_user_id_is_converted_to_employee_name_before_crm_submit(
         "职务": "经理",
         "沟通方式": "见面拜访",
         "手机": "13800000000",
+        "客户行业": "其他",
         "备注": "验证提交前的成员身份转换，不包含真实客户信息，内容仅用于离线测试。",
     }
     record = adapter.create_record(fields, actor=SmartTableActor.ROBOT)
@@ -818,6 +821,146 @@ def test_company_preview_links_existing_owner_record_into_local_lead(
     assert audit is not None
 
 
+def test_batch_selection_links_unsubmitted_table_record_missing_local_lead(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证批量卡片会按稳定表格 record_id 补齐新库遗漏的当前销售线索。"""
+    import app.crm.commands as crm_commands
+
+    settings = get_settings().model_copy(
+        update={
+            "wecom_card_callback_enabled": True,
+            "wecom_card_transport_configured": True,
+            "wecom_card_callback_handler_configured": True,
+        }
+    )
+    monkeypatch.setattr(crm_commands, "get_settings", lambda: settings)
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    record = adapter.create_record(
+        {
+            "负责人": "sales-1",
+            "线索名称": "批量补齐表格线索",
+            "业务线": "协作机器人",
+            "手机": "13800000000",
+            "提交状态": "未提交",
+        },
+        actor=SmartTableActor.ROBOT,
+    )
+    with session_factory.begin() as session:
+        session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
+        session.add(
+            IncomingMessage(
+                message_id="batch-link-message", sales_user_id="sales-1", sequence=1, raw_payload={}
+            )
+        )
+
+    reply = prepare_batch_submission_selection(
+        session_factory,
+        adapter,
+        MockCRMAdapter(),
+        SubmissionCommand("提交我所有线索", "sales-1", "batch-link-message"),
+    )
+
+    assert "共 1 条" in reply
+    with session_factory() as session:
+        lead = session.scalar(select(Lead).where(Lead.smart_table_record_id == record.record_id))
+    assert lead is not None
+    assert lead.lifecycle_state == "pending_create"
+
+
+def test_batch_linking_multiple_records_writes_one_audit_event(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证批量补齐多条表格记录不会因消息审计唯一键冲突而失败。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    for company_name in ("批量审计线索甲", "批量审计线索乙"):
+        adapter.create_record(
+            {
+                "负责人": "sales-1",
+                "线索名称": company_name,
+                "业务线": "协作机器人",
+                "手机": "13800000000",
+                "提交状态": "未提交",
+            },
+            actor=SmartTableActor.ROBOT,
+        )
+    with session_factory.begin() as session:
+        session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
+        session.add(
+            IncomingMessage(
+                message_id="batch-audit-message",
+                sales_user_id="sales-1",
+                sequence=1,
+                raw_payload={},
+            )
+        )
+
+    _link_unsubmitted_smart_table_records(
+        session_factory,
+        adapter,
+        SubmissionCommand("提交我所有线索", "sales-1", "batch-audit-message"),
+    )
+
+    with session_factory() as session:
+        assert session.scalar(select(func.count(Lead.id))) == 2
+        assert session.scalar(
+            select(func.count(BusinessAuditEvent.id)).where(
+                BusinessAuditEvent.message_id == "batch-audit-message",
+                BusinessAuditEvent.event_type == "smart_table_existing_leads_linked",
+            )
+        ) == 1
+
+
+def test_batch_card_can_show_temporary_unsubmitted_lead_but_never_calls_crm(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证未完善草稿可被销售看到，但提交时只返回待完善且不调用 CRM。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    record = adapter.create_record(
+        {
+            "负责人": "sales-1",
+            "线索名称": "待完善批量线索",
+            "提交状态": "未提交",
+        },
+        actor=SmartTableActor.ROBOT,
+    )
+    with session_factory.begin() as session:
+        session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
+        session.add(
+            Lead(
+                source_message_id=None,
+                original_capturing_sales_user_id="sales-1",
+                smart_table_owner_user_id="sales-1",
+                smart_table_record_id=record.record_id,
+                lifecycle_state="temporary",
+                field_values={"线索名称": "待完善批量线索"},
+            )
+        )
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+
+    candidates = service.list_submission_candidates("提交我所有线索", "sales-1")
+    result = service.submit_selected(
+        SubmissionCommand("提交我所有线索", "sales-1", "temporary-batch-message"),
+        (candidates[0].lead_id,),
+    )
+
+    assert len(candidates) == 1
+    assert result.incomplete == 1
+    assert set(result.incomplete_missing_fields) == {
+        "业务线",
+        "线索来源",
+        "联系人",
+        "职务",
+        "沟通方式",
+        "手机",
+        "客户行业",
+        "备注",
+    }
+    assert crm.search_calls == 0
+    assert crm.calls == 0
+
+
 def test_duplicate_crm_match_waits_for_confirmation_and_stop_marks_table_status(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -1090,10 +1233,10 @@ def test_mapping_missing_audit_key_is_bounded_for_a_maximum_length_message_id(
     assert len(sync.idempotency_key) <= 128
 
 
-def test_non_minimum_confirmation_does_not_block_but_only_pending_contact_does(
+def test_ai_pending_confirmation_does_not_block_when_core_values_present(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证非最低字段待确认可创建，而唯一联系方式待确认必须阻塞。"""
+    """验证 AI待确认 只是建议，八项必填值完整时不阻塞 CRM 提交。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter)
     record_id = next(iter(adapter.get_records())).record_id
@@ -1122,7 +1265,8 @@ def test_non_minimum_confirmation_does_not_block_but_only_pending_contact_does(
     adapter.update_record(record_id, {"AI待确认": ["手机"]})
 
     second = service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12"))
-    assert second.incomplete == 1
+    assert second.incomplete == 0
+    assert len(second.duplicate_confirmations) == 1
     assert crm.calls == 1
 
 
@@ -1240,10 +1384,17 @@ def test_submission_reply_is_count_only_and_includes_update_categories() -> None
         )
     )
     update_reply = format_submission_reply(SubmissionBatchResult(updated=1, unchanged=2))
+    incomplete_reply = format_submission_reply(
+        SubmissionBatchResult(
+            incomplete=1,
+            incomplete_missing_fields=("业务线", "手机"),
+        )
+    )
 
     assert "创建成功 1 条" in create_reply and "更新成功 0 条" in create_reply
     assert "手机号" not in create_reply and "payload" not in create_reply.lower()
     assert "更新成功 1 条" in update_reply and "无变化 2 条" in update_reply
+    assert "缺少必填字段：业务线、手机" in incomplete_reply
 
 
 def test_submission_reconcile_keeps_sales_edit_and_clears_its_pending_marker(
@@ -1671,6 +1822,7 @@ def test_retrying_update_does_not_read_changed_smart_table_before_frozen_retry(
             "contactTitle": "经理",
             "communicationWay": 4,
             "mobile": "13900000000",
+            "industry": 11,
             "remark": (
                 "【AI录入】人工最终备注，客户已确认项目需求并要求销售继续跟进，"
                 "内容长度满足 CRM 校验。"

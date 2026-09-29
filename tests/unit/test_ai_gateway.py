@@ -112,6 +112,209 @@ def test_gateway_normalizes_explicit_communication_alias_before_enum_validation(
     assert result.fields == {"沟通方式": "打电话"}
 
 
+def test_gateway_classifies_submission_intent_without_crm_side_effect() -> None:
+    """验证模型只把“所有线索”映射为规范命令，不直接执行 CRM。"""
+    provider = MockLLMProvider(responses=['{"intent":"SUBMIT_ALL","company_name":null}'])
+
+    command = AIGateway(provider).classify_submission_intent("请把我所有能提交的线索都提交一下")
+
+    assert command == "提交我所有线索"
+    assert provider.requests
+    assert "意图分类" in provider.requests[0].messages[0]["content"]
+
+
+def test_gateway_recovers_unique_process_from_explicit_source_context() -> None:
+    """验证模型漏返回时，原文“想做装配相关”仍能确定性写入工艺。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "埃迈诺冠气动器材（上海）有限公司"},
+                confidence_by_field={"线索名称": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(
+        "今天跟埃迈诺冠气动器材（上海）有限公司的王经理沟通了一下，他们想做装配相关的"
+    )
+
+    assert result.fields["工艺"] == "装配"
+
+
+def test_gateway_recovers_process_from_wants_to_process_wording() -> None:
+    """验证“主要想焊接”这类自然表达仍能确定性映射到工艺。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "安徽富乐德科技发展股份有限公司"},
+                confidence_by_field={"线索名称": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(
+        "安徽富乐德科技发展股份有限公司的金总，他们主要想焊接"
+    )
+
+    assert result.fields["工艺"] == "焊接"
+
+
+def test_gateway_recovers_process_when_model_returns_empty_placeholder() -> None:
+    """验证模型返回空工艺占位值时，原文唯一证据仍能恢复合法工艺。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "遨博", "工艺": ""},
+                confidence_by_field={"线索名称": 0.95, "工艺": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(
+        "遨博的张总，手机号19882313122，是做机器人的，想了解涂胶的工艺场景实现"
+    )
+
+    assert result.fields["工艺"] == "涂胶"
+
+
+def test_gateway_keeps_explicit_process_when_model_confidence_is_too_low() -> None:
+    """验证原文唯一工艺证据可修复模型过低或缺失的工艺置信度。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "埃维塔", "工艺": "焊接"},
+                confidence_by_field={"线索名称": 0.95, "工艺": 0.4},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(
+        "埃维塔的苏总，手机号19732570198，做数控机床的，想了解焊接"
+    )
+
+    assert result.fields["工艺"] == "焊接"
+
+
+def test_gateway_drops_industry_inferred_from_product_and_recovers_process() -> None:
+    """验证“做数控机床”不会臆造客户行业，同时恢复原文中的焊接工艺。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "埃维塔", "客户行业": "机械加工"},
+                confidence_by_field={"线索名称": 0.95, "客户行业": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(
+        "埃维塔的苏总，手机号19732570198，做数控机床的，想了解焊接"
+    )
+
+    assert "客户行业" not in result.fields
+    assert result.fields["工艺"] == "焊接"
+
+
+def test_gateway_replaces_conflicting_process_with_unique_source_evidence() -> None:
+    """验证模型把工艺暂存为“其他”时，唯一原文工艺仍覆盖冲突候选。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "埃维塔", "工艺": ["其他"]},
+                enrichment={"工艺": "焊接"},
+                confidence_by_field={"线索名称": 0.95, "工艺": 0.4},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("埃维塔，想了解焊接")
+
+    assert result.fields["工艺"] == ["焊接"]
+
+
+def test_gateway_drops_unverified_customer_level_and_recovers_process_demand() -> None:
+    """验证客户级别没有原文依据时不填充，并恢复明确工艺与需求素材。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "遨博", "客户级别": "重点客户", "工艺": ""},
+                confidence_by_field={
+                    "线索名称": 0.95,
+                    "客户级别": 0.95,
+                    "工艺": 0.95,
+                },
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(
+        "遨博的张总，手机号19882313122，是做机器人的，想了解码垛的工艺场景实现"
+    )
+
+    assert "客户级别" not in result.fields
+    assert result.fields["工艺"] == "码垛"
+    assert result.enrichment == {
+        "主营产品": "机器人",
+        "客户需求/痛点": "想了解码垛的工艺场景实现",
+    }
+
+
+def test_gateway_completes_demand_when_model_only_returns_product() -> None:
+    """验证模型只返回主营产品时，原文工艺需求仍会进入备注素材。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "遨博"},
+                enrichment={"主营产品": "智能机器人"},
+                confidence_by_field={"线索名称": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(
+        "遨博的张总，手机号19882313587，是做智能机器人的，想了解视觉检测"
+    )
+
+    assert result.fields["工艺"] == "视觉检测"
+    assert result.enrichment == {
+        "主营产品": "智能机器人",
+        "客户需求/痛点": "想了解视觉检测",
+    }
+
+
+def test_gateway_maps_explicit_process_alias_to_registered_option() -> None:
+    """验证自然表达“自助充电”只映射到既有“自助加油/充电”选项。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "安威联软件科技（上海）有限公司"},
+                confidence_by_field={"线索名称": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(
+        "安威联软件科技（上海）有限公司，他们想做自助充电这一块"
+    )
+
+    assert result.fields["工艺"] == "自助加油/充电"
+
+
+def test_gateway_does_not_guess_when_source_contains_multiple_processes() -> None:
+    """验证原文同时出现多个工艺时保持待人工确认，不自动选择。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "长广溪智造"},
+                confidence_by_field={"线索名称": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("客户想做装配，也想做视觉检测")
+
+    assert "工艺" not in result.fields
+
+
 def test_gateway_drops_unverified_communication_candidate_without_blocking_other_fields() -> None:
     """验证无法由原文证实的沟通方式候选不会阻塞其他可靠字段。"""
     provider = MockLLMProvider(
@@ -220,10 +423,8 @@ def test_gateway_prompt_includes_current_context_only_for_relation_judgment() ->
     assert "明确介绍另一个客户时返回 NEW_LEAD" in prompt
 
 
-def test_gateway_drops_field_when_model_omits_its_confidence(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """验证单个字段缺少置信度时不会阻塞同一响应中的可靠字段。
+def test_gateway_recovers_natural_company_when_model_omits_company_confidence() -> None:
+    """验证“公司名的联系人”原文证据可恢复公司，不受模型置信度遗漏影响。
 
     参数：无。
     返回值：无。
@@ -240,13 +441,46 @@ def test_gateway_drops_field_when_model_omits_its_confidence(
             )
         ]
     )
-    caplog.set_level(logging.WARNING)
+    result = AIGateway(provider).extract_fields(source_text)
+
+    assert result.fields == {
+        "线索名称": "中国动力",
+        "联系人": "张总",
+        "手机": "13913991399",
+    }
+    assert result.analysis.crm_fields["线索名称"] == "中国动力"
+
+
+def test_gateway_corrects_model_combined_company_contact_value() -> None:
+    """验证模型把“公司名的联系人”整体写入线索名称时由原文确定性纠正。"""
+    source_text = "遨博的张总，手机号19882313122，是做机器人的，想了解涂胶的工艺场景实现"
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                customer_reference={
+                    "company": "遨博的张总",
+                    "contact": "张总",
+                    "phone": "19882313122",
+                },
+                crm_fields={
+                    "线索名称": "遨博的张总",
+                    "联系人": "张总",
+                    "手机": "19882313122",
+                },
+                confidence_by_field={
+                    "线索名称": 0.95,
+                    "联系人": 0.95,
+                    "手机": 0.99,
+                },
+            )
+        ]
+    )
 
     result = AIGateway(provider).extract_fields(source_text)
 
-    assert result.fields == {"联系人": "张总", "手机": "13913991399"}
-    assert "线索名称" not in result.analysis.crm_fields
-    assert "ai_fields_dropped_missing_confidence" in caplog.text
+    assert result.fields["线索名称"] == "遨博"
+    assert result.fields["联系人"] == "张总"
+    assert result.fields["手机"] == "19882313122"
 
 
 def test_gateway_moves_enrichment_only_field_out_of_crm_fields() -> None:
@@ -271,6 +505,26 @@ def test_gateway_moves_enrichment_only_field_out_of_crm_fields() -> None:
 
     assert result.fields == {"线索名称": "长广溪智造"}
     assert result.enrichment == {"预算": "预算100万元"}
+
+
+def test_gateway_keeps_purchase_model_as_customer_demand_not_main_product() -> None:
+    """验证“想采购20台C12L”不会被误写成客户主营产品。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "安威联软件科技（上海）有限公司"},
+                enrichment={"主营产品": "C12L"},
+                confidence_by_field={"线索名称": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(
+        "安威联软件科技（上海）有限公司，他们想采购20台C12L，预算30万"
+    )
+
+    assert "主营产品" not in result.enrichment
+    assert result.enrichment["客户需求/痛点"] == "采购20台C12L"
 
 
 def test_gateway_quarantines_other_unknown_evidence_to_special_requirements() -> None:
@@ -328,7 +582,10 @@ def test_gateway_normalizes_registered_field_aliases_without_creating_fields() -
         "客户行业": "其他",
         "工艺": ["喷涂"],
     }
-    assert result.enrichment == {"客户行业": "电气自动化"}
+    assert result.enrichment == {
+        "客户行业": "电气自动化",
+        "客户需求/痛点": "主要想做喷涂方面",
+    }
 
 
 def test_gateway_normalizes_aliases_across_identity_enum_and_enrichment_fields() -> None:
@@ -663,6 +920,63 @@ def test_gateway_keeps_low_confidence_value_out_of_formal_fields() -> None:
     assert result.fields == {"线索名称": "长广溪智造"}
     assert result.pending_confirmation_fields == ()
     assert result.low_confidence_candidates == {"联系人": "张三"}
+
+
+def test_gateway_prefills_low_confidence_single_select_and_marks_pending() -> None:
+    """验证低置信度单选合法候选可预填并保留待确认标记。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"客户行业": "机械加工"},
+                confidence_by_field={"客户行业": 0.4},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("客户行业：机械加工")
+
+    assert result.fields == {"客户行业": "机械加工"}
+    assert result.pending_confirmation_fields == ("客户行业",)
+    assert result.pending_prefill_allowed_fields == ("客户行业",)
+    assert result.low_confidence_candidates == {}
+
+
+def test_gateway_maps_low_confidence_unknown_single_select_to_other() -> None:
+    """验证低置信度单选未知候选落到“其他”并保留原文备注素材。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"客户行业": "电气自动化"},
+                confidence_by_field={"客户行业": 0.4},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("客户行业：电气自动化")
+
+    assert result.fields == {"客户行业": "其他"}
+    assert result.enrichment == {"客户行业": "电气自动化"}
+    assert result.pending_confirmation_fields == ("客户行业",)
+    assert result.pending_prefill_allowed_fields == ("客户行业",)
+
+
+def test_gateway_prefills_one_or_two_low_confidence_multi_select_values() -> None:
+    """验证低置信度多选一到两项合法候选可预填并保留待确认标记。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"工艺": ["焊接", "装配"]},
+                confidence_by_field={"工艺": 0.4},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("客户工艺：焊接和装配")
+
+    assert result.fields == {"工艺": ["焊接", "装配"]}
+    assert result.pending_confirmation_fields == ("工艺",)
+    assert result.pending_prefill_allowed_fields == ("工艺",)
+    assert result.low_confidence_candidates == {}
 
 
 def test_gateway_keeps_ambiguous_follow_up_communication_out_of_formal_fields() -> None:

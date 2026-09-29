@@ -77,6 +77,30 @@ def test_authorized_message_persists_message_and_pending_outbox_together(
     assert audit is not None
 
 
+def test_submission_like_natural_language_enters_async_intent_classification(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证非固定命令先进入模型意图分类，不会被普通线索处理静默忽略。"""
+    authorize_salesperson(session_factory, "sales-1")
+
+    MessageIntakeService(session_factory).receive(
+        IncomingMessageCommand(
+            message_id="message-submit-intent",
+            sales_user_id="sales-1",
+            raw_payload={"text": "请把我所有能提交的线索都提交一下"},
+            normalized_text="请把我所有能提交的线索都提交一下",
+        )
+    )
+
+    with session_factory() as session:
+        event = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.message_id == "message-submit-intent")
+        )
+
+    assert event is not None
+    assert event.event_type == "crm_submission_intent"
+
+
 def test_duplicate_authorized_message_has_no_second_business_side_effect(
     session_factory: sessionmaker[Session],
 ) -> None:

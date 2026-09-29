@@ -272,14 +272,15 @@ class LeadReviewService:
                     protected.add(field_name)
                     pending.discard(field_name)
                     continue
-                if current_value not in (None, "") and (
+                # 多选字段的空值由智能表格返回 []；空数组与 None/空字符串一样不能阻止首次写入。
+                if current_value and (
                     field_provenance is None
                     or not field_values_equal(current_value, field_provenance.last_ai_synced_value)
                 ):
                     # 未由 AI 写入过的非空值同样不能被本轮建议静默覆盖。
                     protected.add(field_name)
                     continue
-                if protected_supplement and current_value not in (None, ""):
+                if protected_supplement and current_value:
                     # 历史失败消息只能补充当前空字段，不能覆盖后续消息已经形成的非空事实。
                     protected.add(field_name)
                     pending.discard(field_name)

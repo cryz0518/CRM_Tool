@@ -43,7 +43,7 @@ def session_factory() -> Generator[sessionmaker[Session], None, None]:
 
 def _patch(
     *,
-    fields: dict[str, str],
+    fields: dict[str, str | list[str]],
     pending: tuple[str, ...] = (),
     enrichment: dict[str, str] | None = None,
 ) -> ExtractedLeadPatch:
@@ -62,6 +62,26 @@ def _patch(
         low_confidence_candidates={},
         enrichment=enrichment or {},
     )
+
+
+def test_t09_writes_process_when_smart_table_returns_empty_multiselect(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证智能表格的空多选数组不会被误判为销售已有值而阻止工艺写入。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead_with_record(session_factory, adapter)
+    record_id = next(iter(adapter.get_records())).record_id
+
+    result = LeadReviewService(session_factory, adapter).sync_ai_patch(
+        lead_id,
+        "message-9",
+        _patch(fields={"工艺": ["上下料"]}),
+    )
+
+    record = adapter.get_record(record_id)
+    assert record is not None
+    assert record.fields["工艺"] == ["上下料"]
+    assert "工艺" in result.updated_fields
 
 
 def _lead_with_record(

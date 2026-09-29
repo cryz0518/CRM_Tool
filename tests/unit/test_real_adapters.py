@@ -234,6 +234,7 @@ def test_sop_error_envelopes_are_classified_without_transport_confusion(
     with pytest.raises(SopCRMError) as error:
         adapter.search_by_company_name({"name": "样例", "businessLine": 1})
     assert error.value.category == category
+    assert error.value.sub_code == error_code
 
 
 def test_sop_alternate_gateway_envelope_is_gateway() -> None:

@@ -687,9 +687,18 @@ class WecomActionService:
                     current_status = latest.status if latest is not None else None
                     if command_text == "帮我提交放弃提交的线索":
                         valid_state = current_status == "abandoned"
+                        valid_lifecycle = (
+                            lead is not None and lead.lifecycle_state == "pending_create"
+                        )
                     else:
                         valid_state = current_status not in {"succeeded", "abandoned"}
-                    if lead is None or lead.lifecycle_state != "pending_create" or not valid_state:
+                        # “提交全部未提交线索”允许卡片展示资料不完整的 temporary 记录；
+                        # submit_selected() 会将其归为待完善，不会调用 CRM。
+                        valid_lifecycle = lead is not None and lead.lifecycle_state in {
+                            "pending_create",
+                            "temporary",
+                        }
+                    if not valid_lifecycle or not valid_state:
                         return self._deny_action(
                             action,
                             delivery,

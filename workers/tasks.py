@@ -18,7 +18,11 @@ from app.companies.dependencies import get_tyc_adapter
 from app.companies.service import CompanyLeadService
 from app.core.config import Settings, get_settings
 from app.core.provider_policy import get_provider_policy
-from app.crm.commands import consume_submission_command, parse_company_submission_request
+from app.crm.commands import (
+    consume_submission_command,
+    notification_key_for_message,
+    parse_company_submission_request,
+)
 from app.crm.dependencies import get_crm_adapter
 from app.leads.review import LeadReviewService
 from app.leads.service import COMPLETED_CHECKPOINT_STATUSES, FirstTextLeadWorkspaceService
@@ -33,6 +37,7 @@ from app.media.retention import (
 )
 from app.messaging.models import (
     IncomingMessage,
+    NotificationRecord,
     OutboxEvent,
     SalesAuthorization,
     StorageIngestOperation,
@@ -118,6 +123,26 @@ def consume_lead_outbox_event(
                 smart_table_adapter,
                 None if company_request else get_crm_adapter(),
                 outbox_event_id,
+            )
+        if _is_submission_intent(factory, outbox_event_id):
+            # 只对“像提交命令”的消息调用模型；模型仅返回受限意图，CRM 仍必须走候选卡确认。
+            with factory() as session:
+                event = session.get(OutboxEvent, outbox_event_id)
+                message = session.get(IncomingMessage, event.message_id) if event else None
+            if message is None:
+                raise ValueError("CRM 提交意图缺少来源消息")
+            command_text = get_ai_gateway().classify_submission_intent(
+                message.normalized_text or ""
+            )
+            if command_text is None:
+                return _finish_unrecognized_submission_intent(factory, outbox_event_id, message)
+            company_request = parse_company_submission_request(command_text) is not None
+            return consume_submission_command(
+                factory,
+                smart_table_adapter,
+                None if company_request else get_crm_adapter(),
+                outbox_event_id,
+                command_text=command_text,
             )
         if _is_wecom_action_command(factory, outbox_event_id):
             with factory() as session:
@@ -245,6 +270,42 @@ def _is_submission_command(session_factory: sessionmaker[Session], outbox_event_
         if event is None:
             raise ValueError(f"Outbox 事件不存在：{outbox_event_id}")
         return event.event_type == "crm_submission_command"
+
+
+def _is_submission_intent(session_factory: sessionmaker[Session], outbox_event_id: int) -> bool:
+    """判断 Outbox 是否需要异步模型提交意图识别。"""
+    with session_factory() as session:
+        event = session.get(OutboxEvent, outbox_event_id)
+        if event is None:
+            raise ValueError(f"Outbox 事件不存在：{outbox_event_id}")
+        return event.event_type == "crm_submission_intent"
+
+
+def _finish_unrecognized_submission_intent(
+    session_factory: sessionmaker[Session], outbox_event_id: int, message: IncomingMessage
+) -> str:
+    """安全结束无法确定提交意图的消息，并写入可重试无关的提示通知。"""
+    content = (
+        "未能确定提交意图。请说明是提交今天、提交全部、提交放弃提交的线索、"
+        "提交更新，或提交某一家公司。"
+    )
+    with session_factory.begin() as session:
+        event = session.get(OutboxEvent, outbox_event_id)
+        if event is not None:
+            event.status = "succeeded"
+            event.processing_started_at = None
+        key = notification_key_for_message(f"intent:{message.message_id}")
+        if session.get(NotificationRecord, key) is None:
+            session.add(
+                NotificationRecord(
+                    notification_key=key,
+                    sales_user_id=message.sales_user_id,
+                    source_message_id=message.message_id,
+                    notification_type="crm_submission_intent_unrecognized",
+                    content=content,
+                )
+            )
+    return "submission_intent_unrecognized"
 
 
 @dataclass(frozen=True)
