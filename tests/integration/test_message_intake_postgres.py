@@ -185,7 +185,6 @@ def test_concurrent_first_submission_reserves_exactly_one_global_crm_identity(
             session.add(
                 SalesAuthorization(
                     wecom_user_id=sales_user_id,
-                    crm_user_id=f"crm-{sales_user_id}",
                     is_authorized=True,
                     is_active=True,
                 )
@@ -214,6 +213,7 @@ def test_concurrent_first_submission_reserves_exactly_one_global_crm_identity(
                     "备注": "客户已确认自动化需求，预算和现场沟通安排待进一步确认。",
                 },
                 actor=SmartTableActor.ROBOT,
+                member_names={"负责人": sales_user_id},
             )
             lead = Lead(
                 source_message_id=message_id,
@@ -292,12 +292,11 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
             "备注": "客户已确认自动化需求，预算和现场沟通安排待进一步确认。",
         },
         actor=SmartTableActor.ROBOT,
+        member_names={"负责人": "sales-1"},
     )
     with postgres_session_factory.begin() as session:
         session.add(
-            SalesAuthorization(
-                wecom_user_id="sales-1", crm_user_id="crm-1", is_authorized=True, is_active=True
-            )
+            SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True)
         )
         session.flush()
         session.add(

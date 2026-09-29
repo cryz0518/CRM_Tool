@@ -92,12 +92,12 @@ def prepare_pending_create_case(
             "备注": "客户已确认自动化需求，预算和现场沟通安排待进一步确认。",
         },
         actor=SmartTableActor.ROBOT,
+        member_names={"负责人": sales_user_id},
     )
     with session_factory.begin() as session:
         session.add(
             SalesAuthorization(
                 wecom_user_id=sales_user_id,
-                crm_user_id=f"crm-{suffix}",
                 is_authorized=True,
                 is_active=True,
             )
@@ -505,7 +505,7 @@ def test_remote_success_then_timeout_reuses_frozen_create_operation(
     assert crm.idempotency_keys[0] == crm.idempotency_keys[1]
     assert crm.payloads[0] == crm.payloads[1]
     assert crm.payloads[0] == frozen_payload
-    assert crm.crm_user_ids == ["crm-timeout-recovery", "crm-timeout-recovery"]
+    assert crm.crm_user_ids == ["crm-sales-timeout-recovery", "crm-sales-timeout-recovery"]
     assert crm.delete_calls == 0
 
     with postgres_session_factory() as session:
@@ -591,7 +591,7 @@ def test_expired_crm_claim_fences_late_worker_result(
     assert len(crm.received_payloads) == 2
     assert crm.received_keys == [crm.received_keys[0], crm.received_keys[0]]
     assert crm.received_payloads == [crm.received_payloads[0], crm.received_payloads[0]]
-    assert crm.received_users == ["crm-claim-fence", "crm-claim-fence"]
+    assert crm.received_users == ["crm-sales-claim-fence", "crm-sales-claim-fence"]
     assert crm.calls == 1
     assert crm.delete_calls == 0
     with postgres_session_factory() as session:

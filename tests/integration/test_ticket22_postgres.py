@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -9,8 +10,10 @@ from threading import Barrier, Event, Lock
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, func, select, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.schema import CreateSchema, DropSchema
 
 from app.core.config import get_settings
 from app.media.providers import FakeFileScanProvider, MockASRProvider, MockOCRProvider
@@ -28,6 +31,7 @@ from app.media.storage import (
     StorageDeleteResult,
 )
 from app.messaging.models import (
+    Base,
     IncomingMessage,
     MessageAttachment,
     SalesAuthorization,
@@ -36,16 +40,27 @@ from app.messaging.models import (
 )
 
 
-@pytest.fixture(scope="module")
-def postgres_session_factory() -> sessionmaker[Session]:
-    """连接 Compose 提供的真实 PostgreSQL，不以 SQLite 替代并发语义。"""
+@pytest.fixture
+def postgres_session_factory() -> Generator[sessionmaker[Session], None, None]:
+    """为单个 T22 测试创建独立 PostgreSQL schema，隔离固定消息标识。"""
     engine = create_engine(get_settings().database_url, pool_pre_ping=True)
-    with engine.connect() as connection:
-        connection.execute(select(1))
-    factory = sessionmaker(engine)
+    schema_name = f"t22_{uuid4().hex}"
     try:
-        yield factory
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except OperationalError:
+        engine.dispose()
+        pytest.skip("需要 Docker Compose PostgreSQL 执行 T22 集成测试")
+    with engine.begin() as connection:
+        connection.execute(CreateSchema(schema_name))
+    schema_engine = engine.execution_options(schema_translate_map={None: schema_name})
+    Base.metadata.create_all(schema_engine)
+    try:
+        yield sessionmaker(schema_engine)
     finally:
+        schema_engine.dispose()
+        with engine.begin() as connection:
+            connection.execute(DropSchema(schema_name, cascade=True))
         engine.dispose()
 
 
