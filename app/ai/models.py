@@ -68,3 +68,5 @@ class ExtractedLeadPatch:
     pending_confirmation_fields: tuple[str, ...]
     low_confidence_candidates: dict[str, LeadFieldValue]
     enrichment: dict[str, str] = field(default_factory=dict)
+    # 仅允许明确来源（例如 TYC 多候选首项）的待确认字段在无卡片时预填。
+    pending_prefill_allowed_fields: tuple[str, ...] = ()

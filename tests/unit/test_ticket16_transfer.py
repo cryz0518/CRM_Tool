@@ -170,6 +170,7 @@ def seeded_lead(session_factory: sessionmaker[Session]) -> str:
             CrmSyncRecord(
                 lead_id="lead-1",
                 operation="create",
+                generation=1,
                 smart_table_record_id="record-1",
                 idempotency_key="crm:create:lead-1",
                 canonical_payload={"线索名称": "星海科技"},

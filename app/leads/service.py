@@ -110,6 +110,7 @@ class ContextUpdateRequest:
     outbox_event_id: int
     segment_index: int = 0
     pending_confirmation_fields: tuple[str, ...] = ()
+    pending_prefill_allowed_fields: tuple[str, ...] = ()
 
 
 def _normalize_company_patch(fields: Mapping[str, object]) -> dict[str, LeadFieldValue]:
@@ -880,6 +881,9 @@ class FirstTextLeadWorkspaceService:
                         outbox_event_id=outbox_event_id,
                         segment_index=command.source_segment_index,
                         pending_confirmation_fields=company_result.pending_confirmation_fields,
+                        pending_prefill_allowed_fields=(
+                            company_result.pending_prefill_allowed_fields
+                        ),
                     )
                 )
                 if updated.status is LeadProcessingStatus.SYNC_FAILED:
@@ -1036,6 +1040,9 @@ class FirstTextLeadWorkspaceService:
                     outbox_event_id=outbox_event_id,
                     segment_index=command.source_segment_index,
                     pending_confirmation_fields=company_result.pending_confirmation_fields,
+                    pending_prefill_allowed_fields=(
+                        company_result.pending_prefill_allowed_fields
+                    ),
                 )
             )
             return LeadProcessingResult(
@@ -2495,6 +2502,7 @@ class FirstTextLeadWorkspaceService:
                     analysis=LeadAnalysis(intent="UPDATE_LEAD"),
                     fields=dict(request.fields),
                     pending_confirmation_fields=request.pending_confirmation_fields,
+                    pending_prefill_allowed_fields=request.pending_prefill_allowed_fields,
                     low_confidence_candidates={},
                 ),
             )

@@ -216,6 +216,7 @@ def test_discard_rechecks_sync_after_lead_lock(
         sync = CrmSyncRecord(
             lead_id=lead_id,
             operation="create",
+            generation=1,
             smart_table_record_id=held_lead.smart_table_record_id or "",
             idempotency_key=f"crm:create:{lead_id}",
             canonical_payload={
