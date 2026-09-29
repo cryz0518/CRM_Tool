@@ -9,6 +9,7 @@ from uuid import uuid4
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -16,8 +17,9 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    select,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.messaging.models import Base, utc_now
 
@@ -256,13 +258,18 @@ class SmartTableSync(Base):
 
 
 class CrmSyncRecord(Base):
-    """保存一个逻辑 CRM create 及其全部重试的冻结事实。"""
+    """保存一个 CRM 提交 generation 及其全部重试的冻结事实。"""
 
     __tablename__ = "crm_sync_records"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     lead_id: Mapped[str] = mapped_column(ForeignKey("leads.id"), nullable=False, index=True)
     operation: Mapped[str] = mapped_column(String(32), nullable=False)
+    # generation 只用于 create；update、validation 等历史操作保持 NULL。
+    generation: Mapped[int | None] = mapped_column(Integer)
+    supersedes_sync_record_id: Mapped[int | None] = mapped_column(
+        ForeignKey("crm_sync_records.id")
+    )
     smart_table_record_id: Mapped[str] = mapped_column(String(128), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
     canonical_payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
@@ -288,13 +295,24 @@ class CrmSyncRecord(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
-        # T13 可为同一 Lead 保存多次 update；仅首次 create 是 Lead 级单例。
+        CheckConstraint(
+            "operation != 'create' OR (generation IS NOT NULL AND generation >= 1)",
+            name="ck_crm_sync_records_create_generation",
+        ),
+        # 每个 create generation 独立冻结；generation 1 保留历史兼容语义。
         Index(
-            "uq_crm_sync_records_one_create_per_lead",
+            "uq_crm_sync_records_create_generation",
             "lead_id",
+            "generation",
             unique=True,
             postgresql_where=(operation == "create"),
             sqlite_where=(operation == "create"),
+        ),
+        # 一个 generation 最多只能有一个直接 successor；NULL 可由多条历史记录共享。
+        Index(
+            "uq_crm_sync_records_successor",
+            "supersedes_sync_record_id",
+            unique=True,
         ),
         Index(
             "uq_crm_sync_records_update_snapshot",
@@ -305,6 +323,27 @@ class CrmSyncRecord(Base):
             sqlite_where=(operation == "update"),
         ),
     )
+
+
+def latest_crm_create_sync(
+    session: Session, lead_id: str, *, for_update: bool = False
+) -> CrmSyncRecord | None:
+    """读取某条 Lead 最新的 CRM create generation。
+
+    参数：session 为当前数据库会话；lead_id 为目标线索；for_update 表示是否锁定最新行。
+    返回值：按 generation、主键倒序的最新 create 记录；不存在时返回 None。
+    异常：数据库读取失败时向调用方传播。
+    副作用：for_update=True 时在当前事务中锁定返回行。
+    """
+    statement = (
+        select(CrmSyncRecord)
+        .where(CrmSyncRecord.lead_id == lead_id, CrmSyncRecord.operation == "create")
+        .order_by(CrmSyncRecord.generation.desc().nullslast(), CrmSyncRecord.id.desc())
+        .limit(1)
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    return session.scalar(statement)
 
 
 class MessageRetryAttempt(Base):

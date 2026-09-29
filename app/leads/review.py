@@ -260,7 +260,9 @@ class LeadReviewService:
                 field_provenance = provenance.get(field_name)
                 current_value = current_fields.get(field_name)
                 is_pending = field_name in patch.pending_confirmation_fields
-                if is_pending and self._must_not_prefill_without_confirmation(field_name):
+                if is_pending and self._must_not_prefill_without_confirmation(
+                    field_name, patch.pending_prefill_allowed_fields
+                ):
                     # 没有可靠卡片时，冻结规则要求必填中置信度候选仅留在后台，不写正式字段。
                     continue
                 if field_provenance is not None and (
@@ -625,10 +627,13 @@ class LeadReviewService:
         # CRM 提交契约逐项要求八个字段；电话和邮箱不能替代必填手机。
         return pending & CRM_REQUIRED_CORE_FIELDS
 
-    def _must_not_prefill_without_confirmation(self, field_name: str) -> bool:
+    def _must_not_prefill_without_confirmation(
+        self, field_name: str, pending_prefill_allowed_fields: tuple[str, ...] = ()
+    ) -> bool:
         """判断卡片不可用时某个中置信度字段是否必须按降级策略留空。
 
-        参数：field_name 为已通过 T08 校验的业务字段名称。
+        参数：field_name 为已通过 T08 校验的业务字段名称；
+        pending_prefill_allowed_fields 为明确业务来源允许无卡片预填的字段。
         返回值：机器人无法可靠确认且字段属于项目 CRM 最小必填集时返回 True。
         异常：无。
         副作用：无。
@@ -636,9 +641,7 @@ class LeadReviewService:
         return (
             not self._robot_submission_confirmation_available
             and field_name in CRM_REQUIRED_CORE_FIELDS
-            # 天眼查多候选时，业务规则允许把首候选公司名预填到审核工作区，
-            # 同时保留 AI待确认 标记；只有销售确认后才允许作为可靠身份提交 CRM。
-            and field_name != "线索名称"
+            and field_name not in pending_prefill_allowed_fields
         )
 
     def _confirmation_names(self, value: object) -> set[str]:

@@ -134,6 +134,7 @@ class CompanyUpsertResult:
     verification_status: CompanyVerificationStatus
     smart_table_patch: dict[str, object] = field(default_factory=dict)
     pending_confirmation_fields: tuple[str, ...] = ()
+    pending_prefill_allowed_fields: tuple[str, ...] = ()
 
 
 # 兼容现有测试和外部适配器导入；生产入口与文案统一使用 TYC。

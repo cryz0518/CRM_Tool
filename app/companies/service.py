@@ -320,6 +320,11 @@ class CompanyLeadService:
         verification_status = resolution.verification_status
         candidates = resolution.candidates
         pending_confirmation_fields = resolution.pending_confirmation_fields
+        pending_prefill_allowed_fields = (
+            ("线索名称",)
+            if candidates and "线索名称" in pending_confirmation_fields
+            else ()
+        )
         with self._session_factory.begin() as session:
             message = session.get(IncomingMessage, command.source_message_id)
             if message is None:
@@ -461,10 +466,17 @@ class CompanyLeadService:
         if command.defer_smart_table_sync:
             # 首次文本消费者会在公司唯一性决策后统一走 T09 创建或更新审核表。
             return self._result_for_id(
-                lead_id, table_patch, pending_confirmation_fields
+                lead_id,
+                table_patch,
+                pending_confirmation_fields,
+                pending_prefill_allowed_fields,
             )
         return self._sync_smart_table(
-            lead_id, table_patch, created, pending_confirmation_fields
+            lead_id,
+            table_patch,
+            created,
+            pending_confirmation_fields,
+            pending_prefill_allowed_fields,
         )
 
     def _get_requested_or_matching_lead(
@@ -757,6 +769,7 @@ class CompanyLeadService:
         patch: Mapping[str, object],
         created: bool,
         pending_confirmation_fields: tuple[str, ...] = (),
+        pending_prefill_allowed_fields: tuple[str, ...] = (),
     ) -> CompanyUpsertResult:
         """在事务提交后创建或增量更新智能表格，并回写记录定位。
 
@@ -844,7 +857,9 @@ class CompanyLeadService:
                 )
             if not safe_patch:
                 return self._result_for_id(
-                    lead_id, pending_confirmation_fields=pending_confirmation_fields
+                    lead_id,
+                    pending_confirmation_fields=pending_confirmation_fields,
+                    pending_prefill_allowed_fields=pending_prefill_allowed_fields,
                 )
             logger.info(
                 "company_smart_table_update_started",
@@ -875,7 +890,11 @@ class CompanyLeadService:
             lead = session.get(Lead, lead_id)
             if lead is None:
                 raise ValueError(f"线索不存在：{lead_id}")
-            return self._result(lead, pending_confirmation_fields=pending_confirmation_fields)
+            return self._result(
+                lead,
+                pending_confirmation_fields=pending_confirmation_fields,
+                pending_prefill_allowed_fields=pending_prefill_allowed_fields,
+            )
 
     @staticmethod
     def _normalize_company_name_for_comparison(company_name: str) -> str:
@@ -993,6 +1012,7 @@ class CompanyLeadService:
         lead: Lead,
         smart_table_patch: Mapping[str, object] | None = None,
         pending_confirmation_fields: tuple[str, ...] = (),
+        pending_prefill_allowed_fields: tuple[str, ...] = (),
     ) -> CompanyUpsertResult:
         """将 ORM 线索转换为可在会话外使用的应用服务结果。
 
@@ -1009,6 +1029,7 @@ class CompanyLeadService:
             CompanyVerificationStatus(lead.company_verification_status),
             dict(smart_table_patch or {}),
             pending_confirmation_fields,
+            pending_prefill_allowed_fields,
         )
 
     def _mark_user_protected_fields(self, lead_id: str, field_names: set[str]) -> None:
@@ -1090,6 +1111,7 @@ class CompanyLeadService:
         lead_id: str,
         smart_table_patch: Mapping[str, object] | None = None,
         pending_confirmation_fields: tuple[str, ...] = (),
+        pending_prefill_allowed_fields: tuple[str, ...] = (),
     ) -> CompanyUpsertResult:
         """读取并返回指定线索的会话外稳定结果。
 
@@ -1102,7 +1124,12 @@ class CompanyLeadService:
             lead = session.get(Lead, lead_id)
             if lead is None:
                 raise ValueError(f"线索不存在：{lead_id}")
-            return self._result(lead, smart_table_patch, pending_confirmation_fields)
+            return self._result(
+                lead,
+                smart_table_patch,
+                pending_confirmation_fields,
+                pending_prefill_allowed_fields,
+            )
 
 
 # 兼容历史测试和外部注入点；生产代码使用 TYCAdapter/MockTYCAdapter。

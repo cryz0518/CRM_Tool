@@ -227,26 +227,38 @@ def prepare_batch_submission_selection(
         if command.text == "帮我提交放弃提交的线索":
             return "当前没有可重新提交的放弃提交线索。"
         return "当前没有可提交的未提交线索。"
-    if len(candidates) > 20:
-        return "当前可提交线索超过卡片单次选择上限（20条），请先分批处理。"
     action_service = WecomActionService(
         session_factory,
         card_callback_ready=get_settings().wecom_card_callback_ready(),
     )
     try:
-        action_service.issue_batch_submission_action(
-            actor_user_id=command.sales_user_id,
-            request_message_id=command.request_message_id,
-            command_text=command.text,
-            candidates=tuple(
-                {"lead_id": item.lead_id, "company_name": item.company_name}
-                for item in candidates
-            ),
-        )
+        page_size = 20
+        pages = [
+            candidates[start : start + page_size]
+            for start in range(0, len(candidates), page_size)
+        ]
+        for page_number, page in enumerate(pages, start=1):
+            # 每一页都由服务端冻结候选 ID；销售只能在对应卡片内选择，不能传任意 offset。
+            action_service.issue_batch_submission_action(
+                actor_user_id=command.sales_user_id,
+                request_message_id=command.request_message_id,
+                command_text=command.text,
+                candidates=tuple(
+                    {
+                        "lead_id": item.lead_id,
+                        "company_name": item.company_name,
+                        "display_text": item.display_text or item.company_name,
+                    }
+                    for item in page
+                ),
+                page=page_number,
+                page_count=len(pages),
+            )
     except CardCapabilityUnavailable:
         return "候选线索已找到，但当前机器人卡片能力未就绪，请先完成卡片配置。"
     title = "重新提交放弃线索" if command.text == "帮我提交放弃提交的线索" else "选择要提交的线索"
-    return f"{title}：已发送候选卡，请勾选后确认提交（共 {len(candidates)} 条）。"
+    page_suffix = f"，共 {len(pages)} 张候选卡" if len(pages) > 1 else ""
+    return f"{title}：已发送候选卡，请勾选后确认提交（共 {len(candidates)} 条{page_suffix}）。"
 
 
 def prepare_company_submission_preview(

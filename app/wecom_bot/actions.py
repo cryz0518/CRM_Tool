@@ -660,7 +660,7 @@ class WecomActionService:
 
             if action.action_type == ACTION_TYPE_CRM_BATCH_SUBMISSION:
                 # 批量卡只允许选择发行时冻结、且仍属于当前销售的 Lead。
-                from app.leads.models import Lead
+                from app.leads.models import Lead, latest_crm_create_sync
 
                 candidate_ids = _context_lead_ids(action.context.get("candidate_leads"))
                 owned_ids = set(
@@ -678,6 +678,24 @@ class WecomActionService:
                         "owner_mismatch",
                         "候选线索中存在当前账号无权操作的记录",
                     )
+                command_text = action.context.get("command_text")
+                for candidate_id in candidate_ids:
+                    lead = session.scalar(
+                        select(Lead).where(Lead.id == candidate_id).with_for_update()
+                    )
+                    latest = latest_crm_create_sync(session, candidate_id, for_update=True)
+                    current_status = latest.status if latest is not None else None
+                    if command_text == "帮我提交放弃提交的线索":
+                        valid_state = current_status == "abandoned"
+                    else:
+                        valid_state = current_status not in {"succeeded", "abandoned"}
+                    if lead is None or lead.lifecycle_state != "pending_create" or not valid_state:
+                        return self._deny_action(
+                            action,
+                            delivery,
+                            "candidate_state_changed",
+                            "候选线索状态已变化，请重新发起提交",
+                        )
                 selected = set(callback.selected_option_ids)
                 if not selected or selected - set(candidate_ids):
                     return self._deny_action(
@@ -1167,6 +1185,8 @@ class WecomActionService:
         request_message_id: str,
         command_text: str,
         candidates: tuple[dict[str, str], ...],
+        page: int = 1,
+        page_count: int = 1,
     ) -> WecomAction:
         """发行批量提交候选卡，销售只能勾选服务端冻结的本人线索。
 
@@ -1177,12 +1197,14 @@ class WecomActionService:
         副作用：写入动作、卡片通知和发送 outbox，不调用 CRM。
         """
 
-        if not candidates or len(candidates) > 20:
+        if not candidates or len(candidates) > 20 or page < 1 or page_count < page:
             raise ValueError("批量提交候选数量非法")
         target_id = hashlib.sha256(
-            f"crm-batch-submission:{request_message_id}:{command_text}".encode()
+            f"crm-batch-submission:{request_message_id}:{command_text}:page:{page}".encode()
         ).hexdigest()
         title = "重新提交放弃线索" if "放弃提交" in command_text else "选择要提交的线索"
+        if page_count > 1:
+            title = f"{title}（第 {page}/{page_count} 批）"
         return self.issue_action(
             actor_user_id=actor_user_id,
             action_type=ACTION_TYPE_CRM_BATCH_SUBMISSION,
@@ -1193,9 +1215,14 @@ class WecomActionService:
                 "command_text": command_text,
                 "request_message_id": request_message_id,
                 "candidate_leads": [dict(item) for item in candidates],
+                "page": page,
+                "page_count": page_count,
             },
             title=title,
-            description="请勾选需要提交的线索；未勾选的线索不会调用 CRM",
+            description=(
+                "请勾选需要提交的线索；未勾选的线索不会调用 CRM"
+                + (f"（第 {page}/{page_count} 批）" if page_count > 1 else "")
+            ),
             source_message_id=request_message_id,
         )
 
@@ -1554,7 +1581,7 @@ def build_action_card(
             "option_list": [
                 {
                     "id": item["lead_id"],
-                    "text": str(item["company_name"])[:64],
+                    "text": str(item.get("display_text") or item["company_name"])[:64],
                     "is_checked": False,
                 }
                 for item in options
@@ -1597,6 +1624,8 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
         "reason",
         "duplicate_leads",
         "candidate_leads",
+        "page",
+        "page_count",
     }
     if any(key not in allowed_keys for key in context):
         raise ValueError("动作 context 含未允许字段")
@@ -1606,7 +1635,11 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
             if len(value) > 512 or "\n" in value or "\r" in value:
                 raise ValueError("动作 context 文本非法")
             safe[key] = _redact_text(value, 256 if key == "reason" else 512)
-        elif isinstance(value, int) and key in {"segment_index"} and value >= 0:
+        elif (
+            isinstance(value, int)
+            and key in {"segment_index", "page", "page_count"}
+            and value >= 0
+        ):
             safe[key] = value
         elif (
             key == "field_names"
@@ -1660,20 +1693,33 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
             for item in value:
                 if (
                     not isinstance(item, dict)
-                    or set(item) != {"lead_id", "company_name"}
+                    or set(item)
+                    not in (
+                        {"lead_id", "company_name"},
+                        {"lead_id", "company_name", "display_text"},
+                    )
                     or not all(isinstance(item[name], str) for name in item)
                     or _ID_PATTERN.fullmatch(item["lead_id"]) is None
                     or not 0 < len(item["company_name"]) <= 512
                     or "\n" in item["company_name"]
                     or "\r" in item["company_name"]
+                    or (
+                        "display_text" in item
+                        and (
+                            not 0 < len(item["display_text"]) <= 512
+                            or "\n" in item["display_text"]
+                            or "\r" in item["display_text"]
+                        )
+                    )
                 ):
                     raise ValueError("候选线索 context 非法")
-                safe_candidates.append(
-                    {
-                        "lead_id": item["lead_id"],
-                        "company_name": _redact_text(item["company_name"], 128),
-                    }
-                )
+                candidate = {
+                    "lead_id": item["lead_id"],
+                    "company_name": _redact_text(item["company_name"], 128),
+                }
+                if "display_text" in item:
+                    candidate["display_text"] = _redact_text(item["display_text"], 128)
+                safe_candidates.append(candidate)
             safe[key] = safe_candidates
         else:
             raise ValueError("动作 context 值类型非法")

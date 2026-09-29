@@ -158,6 +158,57 @@ def _seed_confirmable_lead(
         return lead.id
 
 
+def _seed_batch_leads(
+    session_factory: sessionmaker[Session], count: int = 3
+) -> tuple[str, ...]:
+    """创建供批量候选回调测试使用的同销售待提交线索。"""
+
+    with session_factory.begin() as session:
+        session.add(SalesAuthorization(wecom_user_id="sales-a", is_authorized=True, is_active=True))
+        leads: list[Lead] = []
+        for index in range(count):
+            message_id = f"batch-message-{index}"
+            session.add(
+                IncomingMessage(
+                    message_id=message_id,
+                    sales_user_id="sales-a",
+                    sequence=index + 1,
+                    raw_payload={},
+                )
+            )
+            leads.append(
+                Lead(
+                    id=f"batch-lead-{index}",
+                    source_message_id=message_id,
+                    original_capturing_sales_user_id="sales-a",
+                    smart_table_owner_user_id="sales-a",
+                    lifecycle_state="pending_create",
+                    field_values={"线索名称": "同名公司", "提交状态": "未提交"},
+                )
+            )
+        session.add_all(leads)
+        return tuple(lead.id for lead in leads)
+
+
+def _batch_frame_for_action(
+    action: WecomAction, selected: tuple[str, ...], *, msgid: str
+) -> dict[str, object]:
+    """构造带服务端冻结候选选择项的批量 callback 帧。"""
+
+    frame = _frame_for_action(action, msgid=msgid)
+    card_event = frame["body"]["event"]["template_card_event"]  # type: ignore[index]
+    card_event["card_type"] = "vote_interaction"  # type: ignore[index]
+    card_event["selected_items"] = {  # type: ignore[index]
+        "selected_item": [
+            {
+                "question_key": "crm_submission_candidates",
+                "option_ids": {"option_id": list(selected)},
+            }
+        ]
+    }
+    return frame
+
+
 def _seed_reassignment_case(session_factory: sessionmaker[Session]) -> str:
     """创建当前销售可将消息分段归属到目标线索的最小事实集。"""
 
@@ -604,14 +655,24 @@ def test_batch_submission_card_allows_multi_selection() -> None:
         title="选择要提交的线索",
         description="请勾选需要提交的线索",
         selection_options=[
-            {"lead_id": "lead-a", "company_name": "候选一"},
-            {"lead_id": "lead-b", "company_name": "候选二"},
+            {
+                "lead_id": "lead-a",
+                "company_name": "候选一",
+                "display_text": "候选一｜王工｜2026-09-29",
+            },
+            {
+                "lead_id": "lead-b",
+                "company_name": "候选二",
+                "display_text": "候选二｜李工｜2026-09-28",
+            },
         ],
         selection_key=CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
     )
 
     assert card["checkbox"]["mode"] == 1  # type: ignore[index]
     assert card["submit_button"]["key"] == CARD_EVENT_KEY_CRM_BATCH_SUBMISSION  # type: ignore[index]
+    options = card["checkbox"]["option_list"]  # type: ignore[index]
+    assert options[0]["text"] != options[1]["text"]  # type: ignore[index]
 
 
 def test_batch_submission_action_accepts_single_candidate_and_freezes_context(
@@ -630,6 +691,8 @@ def test_batch_submission_action_accepts_single_candidate_and_freezes_context(
     assert action.context["candidate_leads"] == [
         {"lead_id": "lead-a", "company_name": "候选一"}
     ]
+    assert action.context["page"] == 1
+    assert action.context["page_count"] == 1
     with session_factory() as session:
         notice = session.scalar(
             select(NotificationRecord).where(
@@ -638,6 +701,167 @@ def test_batch_submission_action_accepts_single_candidate_and_freezes_context(
         )
     assert notice is not None
     assert notice.payload["template_card"]["checkbox"]["mode"] == 1  # type: ignore[index]
+
+
+def test_batch_submission_action_freezes_page_for_more_than_one_page(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证超过 20 条候选时服务端动作可冻结独立分页。"""
+
+    _authorize(session_factory)
+    candidates = tuple(
+        {"lead_id": f"lead-{index}", "company_name": f"公司{index}"}
+        for index in range(20)
+    )
+    action = _service(session_factory).issue_batch_submission_action(
+        actor_user_id="sales-a",
+        request_message_id="message-page",
+        command_text="提交我所有线索",
+        candidates=candidates,
+        page=2,
+        page_count=3,
+    )
+
+    assert action.context["page"] == 2
+    assert action.context["page_count"] == 3
+    with session_factory() as session:
+        notice = session.scalar(
+            select(NotificationRecord).where(
+                NotificationRecord.notification_type == "wecom_action_card"
+            )
+        )
+    assert notice is not None
+    assert "第 2/3 批" in notice.content
+
+
+def test_batch_callback_accepts_only_selected_frozen_subset(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证批量回调只认服务端冻结候选中的已勾选子集。"""
+
+    lead_ids = _seed_batch_leads(session_factory)
+    action = _service(session_factory).issue_batch_submission_action(
+        actor_user_id="sales-a",
+        request_message_id="message-subset",
+        command_text="提交我所有线索",
+        candidates=tuple(
+            {"lead_id": lead_id, "company_name": "同名公司"} for lead_id in lead_ids
+        ),
+    )
+    result = _service(session_factory).claim_callback(
+        _batch_frame_for_action(action, lead_ids[:2], msgid="provider-subset")
+    )
+
+    assert result.code == "claimed"
+    with session_factory() as session:
+        stored = session.get(WecomAction, action.id)
+        assert stored is not None
+        assert stored.context["selected_lead_ids"] == list(lead_ids[:2])
+        assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
+
+
+def test_batch_callback_rejects_injected_option_id(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证客户端注入未发行 option id 时不创建执行 outbox。"""
+
+    lead_ids = _seed_batch_leads(session_factory)
+    action = _service(session_factory).issue_batch_submission_action(
+        actor_user_id="sales-a",
+        request_message_id="message-injected-option",
+        command_text="提交我所有线索",
+        candidates=tuple(
+            {"lead_id": lead_id, "company_name": "同名公司"} for lead_id in lead_ids
+        ),
+    )
+    result = _service(session_factory).claim_callback(
+        _batch_frame_for_action(action, ("not-frozen-lead",), msgid="provider-injected")
+    )
+
+    assert result.code == "selection_mismatch"
+    with session_factory() as session:
+        assert session.scalars(select(WecomActionOutbox)).all() == []
+
+
+def test_batch_callback_rechecks_owner_transfer_and_status_change(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证卡片发行后负责人转移或生命周期变化都会在回调前拒绝。"""
+
+    lead_ids = _seed_batch_leads(session_factory, count=2)
+    _authorize(session_factory, "sales-b")
+    action = _service(session_factory).issue_batch_submission_action(
+        actor_user_id="sales-a",
+        request_message_id="message-owner-change",
+        command_text="提交我所有线索",
+        candidates=tuple(
+            {"lead_id": lead_id, "company_name": "同名公司"} for lead_id in lead_ids
+        ),
+    )
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_ids[0])
+        assert lead is not None
+        lead.smart_table_owner_user_id = "sales-b"
+        lead.lifecycle_state = "synced"
+
+    result = _service(session_factory).claim_callback(
+        _batch_frame_for_action(action, (lead_ids[0],), msgid="provider-owner-change")
+    )
+
+    assert result.code == "owner_mismatch"
+    with session_factory() as session:
+        assert session.scalars(select(WecomActionOutbox)).all() == []
+
+
+def test_batch_callback_replay_is_idempotent(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证同一批量卡重复投递不会产生第二次执行。"""
+
+    lead_ids = _seed_batch_leads(session_factory, count=1)
+    action = _service(session_factory).issue_batch_submission_action(
+        actor_user_id="sales-a",
+        request_message_id="message-replay",
+        command_text="提交我所有线索",
+        candidates=({"lead_id": lead_ids[0], "company_name": "同名公司"},),
+    )
+    service = _service(session_factory)
+    first = service.claim_callback(
+        _batch_frame_for_action(action, lead_ids, msgid="provider-replay-1")
+    )
+    duplicate = service.claim_callback(
+        _batch_frame_for_action(action, lead_ids, msgid="provider-replay-1")
+    )
+    replay = service.claim_callback(
+        _batch_frame_for_action(action, lead_ids, msgid="provider-replay-2")
+    )
+
+    assert first.code == "claimed"
+    assert duplicate.code == "duplicate_delivery"
+    assert replay.code == "action_processing"
+    with session_factory() as session:
+        assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
+
+
+def test_abandoned_only_card_cannot_submit_normal_unsubmitted_lead(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证放弃提交卡只允许最新 abandoned generation，不能提交普通未提交线索。"""
+
+    lead_ids = _seed_batch_leads(session_factory, count=1)
+    action = _service(session_factory).issue_batch_submission_action(
+        actor_user_id="sales-a",
+        request_message_id="message-abandoned-only",
+        command_text="帮我提交放弃提交的线索",
+        candidates=({"lead_id": lead_ids[0], "company_name": "同名公司"},),
+    )
+    result = _service(session_factory).claim_callback(
+        _batch_frame_for_action(action, lead_ids, msgid="provider-abandoned-only")
+    )
+
+    assert result.code == "candidate_state_changed"
+    with session_factory() as session:
+        assert session.scalars(select(WecomActionOutbox)).all() == []
 
 
 def test_duplicate_provider_msgid_and_different_msgid_claim_once(

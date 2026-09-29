@@ -9,7 +9,12 @@ from enum import StrEnum
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.leads.models import CrmCompanyIdentity, CrmSyncRecord, Lead, LeadDiscardRequest
+from app.leads.models import (
+    CrmCompanyIdentity,
+    Lead,
+    LeadDiscardRequest,
+    latest_crm_create_sync,
+)
 from app.messaging.models import BusinessAuditEvent, SalesAuthorization, utc_now
 
 
@@ -70,11 +75,7 @@ class LeadDiscardService:
             # 先锁 Lead，确保本事务之后读取的 CRM create 是锁释放后的最新提交事实。
             lead = session.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
             # CRM create 也采用 Lead -> Sync 锁序，避免 discard 与 create 互相等待。
-            sync = session.scalar(
-                select(CrmSyncRecord)
-                .where(CrmSyncRecord.lead_id == lead_id, CrmSyncRecord.operation == "create")
-                .with_for_update()
-            )
+            sync = latest_crm_create_sync(session, lead_id, for_update=True)
             operator = session.get(SalesAuthorization, operator_user_id)
             if lead is None or operator is None:
                 raise ValueError("线索或废弃操作人不存在")

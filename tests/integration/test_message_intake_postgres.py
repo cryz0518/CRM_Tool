@@ -321,6 +321,7 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
             CrmSyncRecord(
                 lead_id=lead.id,
                 operation="create",
+                generation=1,
                 smart_table_record_id=record.record_id,
                 idempotency_key="create-z",
                 canonical_payload={

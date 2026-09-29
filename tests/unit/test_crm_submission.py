@@ -19,6 +19,7 @@ from app.crm.commands import (
     consume_submission_command,
     format_submission_reply,
     notification_key_for_message,
+    prepare_batch_submission_selection,
     prepare_company_submission_preview,
     terminal_failure_notification_key_for_message,
 )
@@ -178,7 +179,7 @@ def test_create_uses_stable_lead_key_and_current_smart_table_values(
 
     assert first.succeeded == 1
     assert second.succeeded == 0
-    assert crm.calls == 1
+    assert crm.search_calls == 1 and crm.calls == 1
     assert crm.payloads[0]["name"] == "人工最终公司"
     assert adapter.get_records()[0].fields["提交状态"] == "已提交"
     with session_factory() as session:
@@ -207,8 +208,11 @@ def test_all_submission_includes_historical_pending_lead(
     today_result = service.submit(
         SubmissionCommand("提交今天的线索", "sales-1", "message-today")
     )
-    all_result = service.submit(
-        SubmissionCommand("提交我所有线索", "sales-1", "message-all")
+    with pytest.raises(ValueError, match="批量提交必须通过"):
+        service.submit(SubmissionCommand("提交我所有线索", "sales-1", "message-all"))
+    all_result = service.submit_selected(
+        SubmissionCommand("提交我所有线索", "sales-1", "message-all"),
+        (lead_id,),
     )
 
     assert today_result.succeeded == 0
@@ -239,11 +243,9 @@ def test_all_submission_does_not_reopen_abandoned_sync_after_table_tampering(
     )
     assert first.duplicate_confirmations
     adapter.update_record(record.record_id, {"提交状态": "未提交"})
-    blocked = service.submit(
-        SubmissionCommand("提交我所有线索", "sales-1", "message-reopened")
-    )
-    assert blocked.succeeded == 0
-    assert blocked.duplicate_confirmations == ()
+    with pytest.raises(ValueError, match="批量提交必须通过"):
+        service.submit(SubmissionCommand("提交我所有线索", "sales-1", "message-reopened"))
+    assert crm.search_calls == 1 and crm.calls == 0
 
 
 def test_all_submission_does_not_turn_submitted_record_into_update(
@@ -263,10 +265,8 @@ def test_all_submission_does_not_turn_submitted_record_into_update(
         {"手机": "13900000000", "提交状态": "未提交"},
     )
 
-    result = service.submit(SubmissionCommand("提交我所有线索", "sales-1", "message-all"))
-
-    assert result.updated == 0
-    assert result.succeeded == 0
+    with pytest.raises(ValueError, match="批量提交必须通过"):
+        service.submit(SubmissionCommand("提交我所有线索", "sales-1", "message-all"))
     assert crm.calls == 1
     assert crm.update_calls == 0
 
@@ -689,6 +689,75 @@ def test_company_preview_contains_match_still_requires_confirmation_card(
         assert action is not None and action.target_id == "contains-preview-lead"
 
 
+@pytest.mark.parametrize(
+    "candidate_count, expected_pages", [(0, 0), (1, 1), (20, 1), (21, 2), (41, 3)]
+)
+def test_batch_submission_issues_server_frozen_pages(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    candidate_count: int,
+    expected_pages: int,
+) -> None:
+    """验证 20 条以上候选会发行可执行的服务端分页卡，而不是提示无法处理。"""
+    import app.crm.commands as crm_commands
+
+    settings = get_settings().model_copy(
+        update={
+            "wecom_card_callback_enabled": True,
+            "wecom_card_transport_configured": True,
+            "wecom_card_callback_handler_configured": True,
+        }
+    )
+    monkeypatch.setattr(crm_commands, "get_settings", lambda: settings)
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    with session_factory.begin() as session:
+        session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
+        for index in range(candidate_count):
+            message_id = f"batch-page-message-{index}"
+            record = adapter.create_record(
+                {
+                    "负责人": "sales-1",
+                    "线索名称": f"同名公司-{index}",
+                    "联系人": f"联系人-{index}",
+                    "提交状态": "未提交",
+                },
+                actor=SmartTableActor.ROBOT,
+            )
+            session.add(
+                IncomingMessage(
+                    message_id=message_id,
+                    sales_user_id="sales-1",
+                    sequence=index + 1,
+                    raw_payload={},
+                )
+            )
+            session.add(
+                Lead(
+                    id=f"batch-page-lead-{index}",
+                    source_message_id=message_id,
+                    original_capturing_sales_user_id="sales-1",
+                    smart_table_owner_user_id="sales-1",
+                    smart_table_record_id=record.record_id,
+                    lifecycle_state="pending_create",
+                    field_values={"线索名称": f"旧名称-{index}"},
+                    standard_company_name=f"同名公司-{index}",
+                )
+            )
+
+    reply = prepare_batch_submission_selection(
+        session_factory,
+        adapter,
+        MockCRMAdapter(),
+        SubmissionCommand("提交我所有线索", "sales-1", f"batch-page-command-{candidate_count}"),
+    )
+
+    with session_factory() as session:
+        actions = session.scalars(select(WecomAction)).all()
+    assert len(actions) == expected_pages
+    if candidate_count > 20:
+        assert "张候选卡" in reply
+
+
 def test_company_preview_links_existing_owner_record_into_local_lead(
     session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -762,6 +831,11 @@ def test_duplicate_crm_match_waits_for_confirmation_and_stop_marks_table_status(
     )
     service = CrmSubmissionService(session_factory, adapter, crm)
 
+    with pytest.raises(ValueError, match="批量提交必须通过"):
+        service.submit(
+            SubmissionCommand("帮我提交放弃提交的线索", "sales-1", "message-abandoned-direct")
+        )
+    assert crm.search_calls == 0 and crm.calls == 0
     first = service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12"))
     stopped = service.resolve_duplicate_confirmation(
         "message-12", "sales-1", continue_submission=False
@@ -774,6 +848,11 @@ def test_duplicate_crm_match_waits_for_confirmation_and_stop_marks_table_status(
         sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
     record = adapter.get_records()[0]
     assert sync is not None and sync.status == "abandoned"
+    first_generation_snapshot = {
+        "canonical_payload": dict(sync.canonical_payload),
+        "request_message_id": sync.request_message_id,
+        "completed_at": sync.completed_at,
+    }
     assert record.fields["提交状态"] == "放弃提交"
 
     adapter.update_record(record.record_id, {"提交状态": "未提交"})
@@ -786,6 +865,52 @@ def test_duplicate_crm_match_waits_for_confirmation_and_stop_marks_table_status(
     assert len(reopened.duplicate_confirmations) == 1
     assert crm.search_calls == 2
     assert crm.calls == 0
+    with session_factory() as session:
+        generations = session.scalars(
+            select(CrmSyncRecord)
+            .where(CrmSyncRecord.lead_id == lead_id, CrmSyncRecord.operation == "create")
+            .order_by(CrmSyncRecord.generation)
+        ).all()
+    assert len(generations) == 2
+    first_generation, second_generation = generations
+    assert first_generation.generation == 1
+    assert first_generation.status == "abandoned"
+    assert first_generation.idempotency_key == f"crm:create:{lead_id}"
+    assert second_generation.generation == 2
+    assert second_generation.supersedes_sync_record_id == first_generation.id
+    assert second_generation.idempotency_key == f"crm:create:{lead_id}:g2"
+    assert second_generation.canonical_payload == first_generation.canonical_payload
+    assert second_generation.request_message_id == "message-reopen"
+    assert {
+        "canonical_payload": dict(first_generation.canonical_payload),
+        "request_message_id": first_generation.request_message_id,
+        "completed_at": first_generation.completed_at,
+    } == first_generation_snapshot
+    with session_factory() as session:
+        identity = session.get(CrmCompanyIdentity, "人工最终公司")
+    assert identity is not None and identity.creating_sync_record_id == second_generation.id
+
+    stopped_again = service.resolve_duplicate_confirmation(
+        "message-reopen", "sales-1", continue_submission=False
+    )
+    assert stopped_again.abandoned == 1
+    adapter.update_record(record.record_id, {"提交状态": "未提交"})
+    third = service.submit_selected(
+        SubmissionCommand("帮我提交放弃提交的线索", "sales-1", "message-reopen-3"),
+        (lead_id,),
+    )
+    assert len(third.duplicate_confirmations) == 1
+    with session_factory() as session:
+        generations = session.scalars(
+            select(CrmSyncRecord)
+            .where(CrmSyncRecord.lead_id == lead_id, CrmSyncRecord.operation == "create")
+            .order_by(CrmSyncRecord.generation)
+        ).all()
+    assert len(generations) == 3
+    assert generations[1].status == "abandoned"
+    assert generations[2].generation == 3
+    assert generations[2].supersedes_sync_record_id == generations[1].id
+    assert generations[2].idempotency_key == f"crm:create:{lead_id}:g3"
 
 
 def test_duplicate_crm_match_selected_continue_uses_update_and_marks_submitted(
@@ -814,6 +939,87 @@ def test_duplicate_crm_match_selected_continue_uses_update_and_marks_submitted(
     assert sync is not None and sync.status == "succeeded" and sync.operation == "update"
     assert lead is not None and lead.lifecycle_state == "synced"
     assert adapter.get_records()[0].fields["提交状态"] == "已提交"
+
+
+@pytest.mark.parametrize(
+    "latest_status, expected_processing, expected_incomplete",
+    [("processing", 1, 0), ("succeeded", 0, 1)],
+)
+def test_latest_generation_state_never_forks_new_create_generation(
+    session_factory: sessionmaker[Session],
+    latest_status: str,
+    expected_processing: int,
+    expected_incomplete: int,
+) -> None:
+    """验证 processing/succeeded 最新 generation 都不会被重提命令复制成新行。"""
+
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    frozen = {
+        "name": "人工最终公司",
+        "product_line_data_permission": 1,
+        "source": 11,
+        "contactName": "王工",
+        "contactTitle": "经理",
+        "communicationWay": 4,
+        "mobile": "13800000000",
+        "remark": "人工最终备注，客户已确认项目需求并要求销售继续跟进，内容长度满足 CRM 校验。",
+    }
+    with session_factory.begin() as session:
+        first = CrmSyncRecord(
+            lead_id=lead_id,
+            operation="create",
+            generation=1,
+            smart_table_record_id=next(iter(adapter.get_records())).record_id,
+            idempotency_key=f"crm:create:{lead_id}",
+            canonical_payload=frozen,
+            snapshot_hash="1" * 64,
+            request_message_id="generation-message-1",
+            submitting_sales_user_id="sales-1",
+            submitting_crm_user_id="crm-1",
+            status="abandoned",
+        )
+        session.add(first)
+        session.flush()
+        session.add(
+            CrmSyncRecord(
+                lead_id=lead_id,
+                operation="create",
+                generation=2,
+                supersedes_sync_record_id=first.id,
+                smart_table_record_id=first.smart_table_record_id,
+                idempotency_key=f"crm:create:{lead_id}:g2",
+                canonical_payload=frozen,
+                snapshot_hash="2" * 64,
+                request_message_id="generation-message-2",
+                submitting_sales_user_id="sales-1",
+                submitting_crm_user_id="crm-1",
+                status=latest_status,
+                crm_lead_id="crm-existing" if latest_status == "succeeded" else None,
+                completed_at=utc_now() if latest_status == "succeeded" else None,
+                processing_lease_expires_at=(
+                    utc_now() + timedelta(minutes=5)
+                    if latest_status == "processing"
+                    else None
+                ),
+            )
+        )
+
+    crm = MockCRMAdapter()
+    result = CrmSubmissionService(session_factory, adapter, crm).submit(
+        SubmissionCommand("提交今天的线索", "sales-1", "generation-retry")
+    )
+
+    assert result.processing == expected_processing
+    assert result.incomplete == expected_incomplete
+    assert crm.calls == 0
+    with session_factory() as session:
+        generations = session.scalars(
+            select(CrmSyncRecord)
+            .where(CrmSyncRecord.lead_id == lead_id, CrmSyncRecord.operation == "create")
+            .order_by(CrmSyncRecord.generation)
+        ).all()
+    assert [item.generation for item in generations] == [1, 2]
 
 
 def test_missing_crm_mapping_creates_auditable_terminal_record_without_calling_crm(
@@ -1002,8 +1208,8 @@ def test_unknown_crm_failure_does_not_finalize_discard_request(
     assert lead is not None and lead.lifecycle_state == "pending_create"
     assert sync is not None and sync.failure_category == "unknown"
     assert request is not None and request.status == "pending"
-    # 新流程只以 CRM 查重结果为准，不再在首次提交前创建本地公司预留。
-    assert identity is None
+    # 未知结果保留公司 reservation，等待外部事实恢复而不释放预留。
+    assert identity is not None and identity.state == "reserving"
     assert audit is not None and audit.details["attempts"] == 1
 
 
@@ -1119,7 +1325,7 @@ def test_expired_create_lease_recovers_remote_success_with_original_frozen_fact(
     }
     with session_factory.begin() as session:
         sync = CrmSyncRecord(
-            lead_id=lead_id, operation="create", smart_table_record_id=record_id,
+            lead_id=lead_id, operation="create", generation=1, smart_table_record_id=record_id,
             idempotency_key=f"crm:create:{lead_id}", canonical_payload=frozen,
             snapshot_hash="a" * 64, request_message_id="message-12",
             submitting_sales_user_id="sales-1", submitting_crm_user_id="crm-1",
@@ -1166,8 +1372,8 @@ def test_t13_audit_and_logs_keep_identity_metadata_without_sensitive_payload(
             )
         )
     assert "crm_create_succeeded" in event_types
-    assert "crm_global_identity_activated" not in event_types
-    assert activated is None
+    assert "crm_global_identity_activated" in event_types
+    assert activated is not None
     assert crm.search_calls == 1
     logged = caplog.text
     for sensitive in ("13800000000", "人工最终备注", "crm-1", "payload", "secret"):
@@ -1316,7 +1522,7 @@ def test_historical_company_identity_does_not_bypass_crm_duplicate_search(
     assert crm.calls == 0 and crm.update_calls == 0
     with session_factory() as session:
         identity = session.get(CrmCompanyIdentity, "公司 X")
-    assert identity is None
+    assert identity is not None and identity.state == "reserving"
     assert crm.search_calls == 1
 
 
@@ -1356,8 +1562,10 @@ def test_identical_historical_company_identity_does_not_bypass_crm_create_search
     assert result.succeeded == 1
     assert crm.calls == 1 and crm.update_calls == 0 and crm.search_calls == 1
     with session_factory() as session:
-        identity = session.get(CrmCompanyIdentity, "公司 X")
-    assert identity is None
+        identities = session.scalars(select(CrmCompanyIdentity)).all()
+    assert len(identities) == 1
+    assert identities[0].creating_sync_record_id is not None
+    assert identities[0].state == "active"
 
 
 def test_retrying_update_does_not_read_changed_smart_table_before_frozen_retry(
