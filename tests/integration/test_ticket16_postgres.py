@@ -58,7 +58,11 @@ class BlockingTransferAdapter:
                     "负责人": "sales-old",
                 },
             )
-            return SmartTableRecord(record_id=record_id, fields=dict(fields))
+            return SmartTableRecord(
+                record_id=record_id,
+                fields=dict(fields),
+                member_names={"负责人": "sales-old"},
+            )
 
     def update_record(self, record_id: str, fields: dict[str, object]) -> SmartTableRecord:
         """阻塞首个远端写入，随后返回记录快照。"""
@@ -134,7 +138,6 @@ def _seed(session_factory: sessionmaker[Session], suffix: str) -> str:
                     wecom_user_id="sales-old",
                     is_authorized=True,
                     is_active=True,
-                    crm_user_id="crm-old",
                 ),
                 SalesAuthorization(
                     wecom_user_id="sales-a",

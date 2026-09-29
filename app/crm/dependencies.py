@@ -6,6 +6,7 @@ from app.core.config import get_settings
 from app.core.provider_policy import ProviderPolicyError, get_provider_policy
 from app.crm.adapter import CRMAdapter
 from app.crm.mock import MockCRMAdapter
+from app.crm.sop import SopCRMAdapter
 
 
 def get_crm_adapter() -> CRMAdapter:
@@ -25,4 +26,14 @@ def get_crm_adapter() -> CRMAdapter:
         raise RuntimeError("CRM_ADAPTER 未配置真实实现") from error
     if settings.crm_adapter == "mock":
         return MockCRMAdapter()
+    if settings.crm_adapter == "sop":
+        return SopCRMAdapter(
+            settings.crm_url or "",
+            settings.crm_app_id or "",
+            settings.crm_app_auth_token or "",
+            settings.crm_private_key or "",
+            trust_env=settings.crm_http_trust_env,
+            proxy=settings.crm_http_proxy,
+            authorization=settings.crm_authorization,
+        )
     raise RuntimeError("CRM_ADAPTER 未配置真实实现")

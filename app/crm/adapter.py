@@ -27,8 +27,10 @@ class CRMSearchResult:
 class CRMAdapter(Protocol):
     """隔离 CRM 查重、创建和更新动作。"""
 
-    def search_by_company_name(self, company_name: str) -> tuple[CRMSearchResult, ...]:
-        """按线索名称查询 CRM 中已有的线索身份。"""
+    def search_by_company_name(
+        self, payload: Mapping[str, object] | str
+    ) -> tuple[CRMSearchResult, ...]:
+        """按 canonical payload 的 name、businessLine 和可选天眼查标识查重。"""
         ...
 
     def create_lead(

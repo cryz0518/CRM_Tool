@@ -35,6 +35,24 @@ def classify_task_failure(error: BaseException) -> TaskFailureCategory:
         return TaskFailureCategory.PERMANENT
     if isinstance(error, RetryableTaskFailure):
         return TaskFailureCategory.TRANSIENT
+    # 外部适配器可能使用自定义 RuntimeError 携带稳定 category；不能因继承关系丢失语义。
+    adapter_category = getattr(error, "category", None)
+    if isinstance(adapter_category, str):
+        if adapter_category == "transport":
+            return TaskFailureCategory.TRANSIENT
+        if adapter_category in {
+            "authentication",
+            "business",
+            "business_rejection",
+            "malformed_response",
+        }:
+            return TaskFailureCategory.PERMANENT
+        if adapter_category == "gateway":
+            # Gateway 已收到请求；仅明确的限流/服务端失败允许稍后重试，其余为永久拒绝。
+            status = getattr(error, "http_status", None)
+            if isinstance(status, int) and (status in {408, 425, 429} or status >= 500):
+                return TaskFailureCategory.TRANSIENT
+            return TaskFailureCategory.PERMANENT
     # 参数、权限和业务校验失败即使重复执行也不会自行恢复。
     if isinstance(error, (ValueError, PermissionError, LookupError)):
         return TaskFailureCategory.PERMANENT

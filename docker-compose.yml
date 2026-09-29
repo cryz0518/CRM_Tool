@@ -38,12 +38,25 @@ services:
       ADMIN_IDENTITY_PROVIDER: ${ADMIN_IDENTITY_PROVIDER:-development}
       SMART_TABLE_ADAPTER: ${SMART_TABLE_ADAPTER:-mock}
       CRM_ADAPTER: ${CRM_ADAPTER:-unconfigured}
+      CRM_URL: ${CRM_URL:-}
+      CRM_APP_ID: ${CRM_APP_ID:-}
+      CRM_APP_AUTH_TOKEN: ${CRM_APP_AUTH_TOKEN:-}
+      CRM_PRIVATE_KEY: ${CRM_PRIVATE_KEY:-}
+      # 外部 SOP Gateway 的认证头和代理继承策略必须显式注入容器。
+      Authorization: ${Authorization:-}
+      CRM_AUTHORIZATION: ${CRM_AUTHORIZATION:-}
+      CRM_HTTP_TRUST_ENV: ${CRM_HTTP_TRUST_ENV:-true}
+      EMPLOYEE_DIRECTORY_PATH: ${EMPLOYEE_DIRECTORY_PATH:-/app/employee.csv}
+      TYC_PROVIDER: ${TYC_PROVIDER:-unconfigured}
+      TIANYANCHA_API_KEY: ${TIANYANCHA_API_KEY:-}
+      TIANYANCHA_URL: ${TIANYANCHA_URL:-https://open.api.tianyancha.com/services/open/search/2.0}
       WECOM_CARD_CALLBACK_ENABLED: ${WECOM_CARD_CALLBACK_ENABLED:-false}
       WECOM_CARD_TRANSPORT_CONFIGURED: ${WECOM_CARD_TRANSPORT_CONFIGURED:-false}
       WECOM_CARD_CALLBACK_HANDLER_CONFIGURED: ${WECOM_CARD_CALLBACK_HANDLER_CONFIGURED:-false}
       WECOM_CARD_CALLBACK_TIMEOUT_SECONDS: ${WECOM_CARD_CALLBACK_TIMEOUT_SECONDS:-4}
       WECOM_SMART_TABLE_DOC_ID: ${WECOM_SMART_TABLE_DOC_ID:-}
       WECOM_SMART_TABLE_SHEET_ID: ${WECOM_SMART_TABLE_SHEET_ID:-}
+      WECOM_SMART_TABLE_SHEET_TITLE: ${WECOM_SMART_TABLE_SHEET_TITLE:-}
       WECOM_SMART_TABLE_SALES_CAN_CREATE_RECORDS: ${WECOM_SMART_TABLE_SALES_CAN_CREATE_RECORDS:-}
       WECOM_SMART_TABLE_SALES_CAN_DELETE_RECORDS: ${WECOM_SMART_TABLE_SALES_CAN_DELETE_RECORDS:-}
       WECOM_CLI_COMMAND: ${WECOM_CLI_COMMAND:-wecom-cli}
@@ -107,6 +120,11 @@ services:
       - type: bind
         source: ${WECOM_CLI_CREDENTIALS_PATH:-./.wecom-cli-credentials}
         target: /home/appuser/.config/wecom
+        read_only: true
+      # 员工目录只读注入容器，供提交边界解析 CRM headerId；不写入镜像或数据库。
+      - type: bind
+        source: ${EMPLOYEE_DIRECTORY_HOST_PATH:-./employee.csv}
+        target: /app/employee.csv
         read_only: true
       - media_data:/var/lib/crm-lead/media
     ports:
@@ -179,5 +197,7 @@ services:
     restart: unless-stopped
 
 volumes:
+  # 使用已完成 T21 迁移且通过启动验证的本地卷；旧损坏卷已单独清理。
   postgres_data:
+    name: crm_t21_final_postgres_data
   media_data:

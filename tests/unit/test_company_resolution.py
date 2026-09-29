@@ -408,24 +408,25 @@ def test_verified_company_keeps_same_name_records_for_each_submission(
     assert second.field_values["联系人"] == "王五"
 
 
-def test_qcc_failure_or_ambiguity_keeps_company_unverified_until_sales_confirmation(
+def test_ambiguous_qcc_prefills_first_candidate_and_marks_name_pending(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证 QCC 不确定结论不阻塞采集，也不被自动伪装成国外公司。
+    """验证多候选时预填首项并把线索名称标记为待销售确认。
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
-    异常：未核验状态、候选审计或人工确认标准名不正确时由 pytest 报告。
-    副作用：创建一个多候选线索，再由销售确认相同名称。
+    异常：首候选、候选审计或 AI 待确认元数据错误时由 pytest 报告。
+    副作用：创建一条带多候选审计的审核表记录。
     """
     persist_source_message(session_factory, "ambiguous-company", "sales-1")
     candidates = (
         QCCCandidate("上海智造有限公司", "qcc-1"),
         QCCCandidate("上海智造科技有限公司", "qcc-2"),
     )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     service = CompanyLeadService(
         session_factory,
-        MockSmartTableAdapter(schema=build_required_smart_table_schema()),
+        adapter,
         MockQCCAdapter({"上海智造": QCCLookupResult.ambiguous(candidates)}),
     )
 
@@ -436,29 +437,25 @@ def test_qcc_failure_or_ambiguity_keeps_company_unverified_until_sales_confirmat
             fields={"线索名称": "上海智造", "联系人": "张三"},
         )
     )
-    confirmed = service.upsert(
-        CompanyUpsertCommand(
-            source_message_id="ambiguous-company",
-            sales_user_id="sales-1",
-            existing_lead_id=unverified.lead_id,
-            fields={"线索名称": "上海智造"},
-            user_confirmed_company=True,
-        )
-    )
-
     assert unverified.lifecycle_state == "temporary"
-    assert unverified.standard_company_name is None
+    assert unverified.standard_company_name == "上海智造有限公司"
     assert unverified.verification_status.value == "company_unverified"
-    assert confirmed.standard_company_name == "上海智造"
-    assert confirmed.verification_status.value == "user_confirmed_unverified"
+    assert unverified.pending_confirmation_fields == ("线索名称",)
+    assert unverified.smart_table_record_id is not None
+    record = adapter.get_record(unverified.smart_table_record_id)
+    assert record is not None
+    assert record.fields["线索名称"] == "上海智造有限公司"
+    assert record.fields["AI待确认"] == ["线索名称"]
     with session_factory() as session:
-        lead = session.get(Lead, confirmed.lead_id)
+        lead = session.get(Lead, unverified.lead_id)
     assert lead is not None
+    assert lead.tyc_customer_id is None
+    assert lead.field_values["线索名称"] == "上海智造有限公司"
     assert lead.qcc_candidates == [
         {"standard_company_name": "上海智造有限公司", "company_id": "qcc-1"},
         {"standard_company_name": "上海智造科技有限公司", "company_id": "qcc-2"},
     ]
-    assert lead.company_confirmed_by_user is True
+    assert lead.company_confirmed_by_user is False
 
 
 def test_explicit_foreign_evidence_skips_qcc_and_preserves_display_name(
@@ -753,6 +750,100 @@ def test_table_company_name_changed_by_salesperson_is_not_overwritten_during_qcc
         )
     assert provenance is not None
     assert provenance.is_user_modified is True
+
+
+def test_tyc_name_is_synced_when_backend_is_ahead_of_stale_smart_table(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证后台已有首选天眼查名称时仍会补同步落后的智能表格名称。"""
+    persist_source_message(session_factory, "stale-tyc-name", "sales-1")
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    initial = CompanyLeadService(session_factory, adapter, MockQCCAdapter()).upsert(
+        CompanyUpsertCommand(
+            source_message_id="stale-tyc-name",
+            sales_user_id="sales-1",
+            fields={"线索名称": "汇川技术"},
+            region_evidence=CompanyRegionEvidence(explicit_foreign=True),
+        )
+    )
+    assert initial.smart_table_record_id is not None
+    assert adapter.get_record(initial.smart_table_record_id).fields["线索名称"] == "汇川技术"
+
+    # 模拟此前公司解析已提交后台，但智能表格仍停留在原始名称的可恢复不一致状态。
+    with session_factory.begin() as session:
+        lead = session.get(Lead, initial.lead_id)
+        assert lead is not None
+        lead.field_values = {**lead.field_values, "线索名称": "深圳市汇川技术股份有限公司"}
+        lead.standard_company_name = "深圳市汇川技术股份有限公司"
+
+    upgraded = CompanyLeadService(
+        session_factory,
+        adapter,
+        MockQCCAdapter(
+            {
+                "汇川技术": QCCLookupResult.matched(
+                    QCCCandidate("深圳市汇川技术股份有限公司", "tyc-1")
+                )
+            }
+        ),
+    ).upsert(
+        CompanyUpsertCommand(
+            source_message_id="stale-tyc-name",
+            sales_user_id="sales-1",
+            existing_lead_id=initial.lead_id,
+            fields={"线索名称": "汇川技术"},
+        )
+    )
+
+    assert upgraded.standard_company_name == "深圳市汇川技术股份有限公司"
+    record = adapter.get_record(initial.smart_table_record_id)
+    assert record is not None
+    assert record.fields["线索名称"] == "深圳市汇川技术股份有限公司"
+
+
+def test_tyc_name_is_synced_for_existing_lead_with_new_company_text(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证同一联系方式的后续公司解析仍会同步首选天眼查名称。"""
+    persist_source_message(session_factory, "existing-company-first", "sales-1")
+    persist_source_message(session_factory, "existing-company-second", "sales-1")
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    initial = CompanyLeadService(session_factory, adapter, MockQCCAdapter()).upsert(
+        CompanyUpsertCommand(
+            source_message_id="existing-company-first",
+            sales_user_id="sales-1",
+            fields={"线索名称": "汇川技术", "手机": "17318902311"},
+            region_evidence=CompanyRegionEvidence(explicit_foreign=True),
+        )
+    )
+
+    upgraded = CompanyLeadService(
+        session_factory,
+        adapter,
+        MockQCCAdapter(
+            {
+                "艾利特": QCCLookupResult.ambiguous(
+                    (
+                        QCCCandidate("艾利特智能机器人股份有限公司", "tyc-1"),
+                        QCCCandidate("艾利特机器人科技有限公司", "tyc-2"),
+                    )
+                )
+            }
+        ),
+    ).upsert(
+        CompanyUpsertCommand(
+            source_message_id="existing-company-second",
+            sales_user_id="sales-1",
+            existing_lead_id=initial.lead_id,
+            fields={"线索名称": "艾利特", "手机": "17318902311"},
+        )
+    )
+
+    assert upgraded.lead_id == initial.lead_id
+    record = adapter.get_record(initial.smart_table_record_id)
+    assert record is not None
+    assert record.fields["线索名称"] == "艾利特智能机器人股份有限公司"
+    assert record.fields["AI待确认"] == ["线索名称"]
 
 
 def test_later_qcc_result_conflicting_with_sales_confirmation_requires_review(

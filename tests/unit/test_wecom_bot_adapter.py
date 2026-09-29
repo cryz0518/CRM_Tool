@@ -102,6 +102,32 @@ def test_submission_command_is_persisted_as_a_command_outbox_event(
         assert event.event_type == "crm_submission_command"
 
 
+def test_company_submission_request_is_persisted_as_a_command_outbox_event(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证按公司名称提交请求进入同一可靠命令边界，不在接入层调用 CRM。"""
+
+    with session_factory.begin() as session:
+        session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
+    frame = {
+        "body": {
+            "msgid": "company-command-1",
+            "from": {"userid": "sales-1"},
+            "msgtype": "text",
+            "text": {"content": "请帮我提交上海世界纵横智能科技有限公司这条线索"},
+        }
+    }
+
+    result = WecomTextMessageAdapter(MessageIntakeService(session_factory)).receive_text_frame(
+        frame
+    )
+
+    assert result is not None and result.accepted is True
+    with session_factory() as session:
+        [event] = session.scalars(select(OutboxEvent)).all()
+        assert event.event_type == "crm_submission_command"
+
+
 def test_text_frame_without_official_identity_fields_is_not_forwarded(
     session_factory: sessionmaker[Session],
 ) -> None:

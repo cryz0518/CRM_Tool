@@ -14,15 +14,20 @@ from sqlalchemy.pool import StaticPool
 from app.ai.gateway import AIGateway
 from app.ai.provider import LLMProviderError, MockLLMProvider
 from app.companies.models import CompanyUpsertCommand, QCCCandidate, QCCLookupResult
-from app.companies.service import CompanyLeadService, MockQCCAdapter
+from app.companies.service import CompanyLeadService, MockQCCAdapter, MockTYCAdapter
 from app.core.failures import RetryableTaskFailure
 from app.leads.models import (
     Lead,
     LeadFieldProvenance,
     LeadMessageResolution,
+    SalesLeadContext,
     SmartTableSync,
 )
-from app.leads.service import FirstTextLeadWorkspaceService, LeadProcessingStatus
+from app.leads.service import (
+    DeterministicFirstTextLeadExtractor,
+    FirstTextLeadWorkspaceService,
+    LeadProcessingStatus,
+)
 from app.messaging.models import (
     Base,
     BusinessAuditEvent,
@@ -108,6 +113,29 @@ def persist_outbox_text(
         session.add(event)
         session.flush()
         return event.id
+
+
+def test_multiline_labeled_message_keeps_all_fields_in_one_lead() -> None:
+    """多行标签应合并为一条线索，不能把联系人等字段吞进公司名。"""
+    text = (
+        "公司：希捷国际科技（无锡）有限公司\n"
+        "联系人：杨总\n"
+        "手机：13800000000\n"
+        "业务线：协作机器人\n"
+        "备注：T21 全流程验收"
+    )
+
+    fields = DeterministicFirstTextLeadExtractor().extract_many(text)
+
+    assert fields == [
+        {
+            "线索名称": "希捷国际科技（无锡）有限公司",
+            "联系人": "杨总",
+            "手机": "13800000000",
+            "业务线": "协作机器人",
+            "备注": "T21 全流程验收",
+        }
+    ]
 
 
 def test_authorized_sales_text_creates_a_personal_review_record(
@@ -243,6 +271,127 @@ def test_consumer_upgrades_temporary_lead_when_later_message_names_the_company(
     record = adapter.get_record(lead.smart_table_record_id or "")
     assert record is not None
     assert record.fields["线索名称"] == "无锡长广溪智能制造有限公司"
+
+
+def test_consumer_prefills_first_ambiguous_tyc_candidate_and_marks_name_pending(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证多候选公司在工作区首项预填且不发行候选确认卡。"""
+    event_id = persist_outbox_text(
+        session_factory,
+        message_id="ambiguous-company-workspace",
+        sales_user_id="sales-1",
+        text="公司：上海智造；联系人：张三；手机：13800000001",
+    )
+    candidates = (
+        QCCCandidate("上海智造有限公司", "qcc-1"),
+        QCCCandidate("上海智造科技有限公司", "qcc-2"),
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    company_service = CompanyLeadService(
+        session_factory,
+        adapter,
+        MockQCCAdapter({"上海智造": QCCLookupResult.ambiguous(candidates)}),
+    )
+
+    result = FirstTextLeadWorkspaceService(
+        session_factory, adapter, company_lead_service=company_service
+    ).consume(event_id)
+
+    assert result.status is LeadProcessingStatus.CREATED
+    assert result.smart_table_record_id is not None
+    record = adapter.get_record(result.smart_table_record_id)
+    assert record is not None
+    assert record.fields["线索名称"] == "上海智造有限公司"
+    assert record.fields["AI待确认"] == ["线索名称"]
+    with session_factory() as session:
+        lead = session.get(Lead, result.lead_id)
+        audits = session.scalars(
+            select(BusinessAuditEvent.event_type).where(
+                BusinessAuditEvent.message_id == "ambiguous-company-workspace"
+            )
+        ).all()
+    assert lead is not None
+    assert lead.standard_company_name == "上海智造有限公司"
+    assert lead.tyc_customer_id is None
+    assert lead.company_verification_status == "company_unverified"
+    assert "company_tyc_ambiguous_first_candidate_selected" in audits
+
+
+def test_consumer_repairs_stale_multiline_company_name_before_tyc_resolution(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证旧多行公司值只在 temporary 草稿中被新干净名称修复。"""
+    old_text = "公司：旧名称\n联系人：旧联系人\n手机：13800000000"
+    persist_outbox_text(
+        session_factory,
+        message_id="stale-company-source",
+        sales_user_id="sales-1",
+        text=old_text,
+    )
+    with session_factory.begin() as session:
+        old_event = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.message_id == "stale-company-source")
+        )
+        assert old_event is not None
+        old_event.status = "succeeded"
+        old_message = session.get(IncomingMessage, "stale-company-source")
+        assert old_message is not None
+        lead = Lead(
+            source_message_id=old_message.message_id,
+            original_capturing_sales_user_id="sales-1",
+            smart_table_owner_user_id="sales-1",
+            lifecycle_state="temporary",
+            field_values={"线索名称": old_text},
+        )
+        session.add(lead)
+        session.flush()
+        session.add(
+            SalesLeadContext(
+                sales_user_id="sales-1",
+                lead_id=lead.id,
+                last_message_received_at=old_message.received_at,
+            )
+        )
+
+    new_event_id = persist_outbox_text(
+        session_factory,
+        message_id="stale-company-repair",
+        sales_user_id="sales-1",
+        text="公司：希捷国际科技（无锡）有限公司\n联系人：杨总\n手机：13800000000",
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        company_lead_service=CompanyLeadService(
+            session_factory,
+            adapter,
+            MockQCCAdapter(
+                {
+                    "希捷国际科技（无锡）有限公司": QCCLookupResult.matched(
+                        QCCCandidate("希捷国际科技（无锡）有限公司", "tyc-1")
+                    )
+                }
+            ),
+        ),
+    )
+
+    result = service.consume(new_event_id)
+
+    assert result.status in {LeadProcessingStatus.CREATED, LeadProcessingStatus.UPDATED}
+    assert result.smart_table_record_id is not None
+    with session_factory() as session:
+        repaired = session.get(Lead, result.lead_id)
+        audits = session.scalars(
+            select(BusinessAuditEvent.event_type).where(
+                BusinessAuditEvent.message_id == "stale-company-repair"
+            )
+        ).all()
+    assert repaired is not None
+    assert repaired.field_values["线索名称"] == "希捷国际科技（无锡）有限公司"
+    assert repaired.standard_company_name == "希捷国际科技（无锡）有限公司"
+    assert "temporary_lead_stale_company_name_repaired" in audits
 
 
 def test_consumer_keeps_same_sales_company_as_a_new_smart_table_record(
@@ -800,6 +949,158 @@ def test_free_text_with_strong_identity_creates_new_lead_when_ai_says_update_wit
     assert resolution.lead_id == result.lead_id
 
 
+def test_ai_created_record_is_updated_when_tyc_resolves_company_name(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 AI 先建表格原始名称后，天眼查首候选仍会增量更新同一行。"""
+    event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-ai-tyc-name-update",
+        sales_user_id="sales-1",
+        text="汇川技术，张华杰经理，17318902311，做电气自动化，主要想做喷涂方面，预算25万左右",
+    )
+    provider = MockLLMProvider(
+        [
+            json.dumps(
+                {
+                    "intent": "NEW_LEAD",
+                    "customer_reference": {"company": "汇川技术"},
+                    "crm_fields": {
+                        "线索名称": "汇川技术",
+                        "联系人": "张华杰",
+                        "手机": "17318902311",
+                    },
+                    "enrichment": {"预算": "预算25万左右"},
+                    "confidence_by_field": {
+                        "线索名称": 0.95,
+                        "联系人": 0.95,
+                        "手机": 0.99,
+                    },
+                    "conflicts": [],
+                    "warnings": [],
+                }
+            )
+        ]
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    company_service = CompanyLeadService(
+        session_factory,
+        adapter,
+        MockTYCAdapter(
+            {
+                "汇川技术": QCCLookupResult.matched(
+                    QCCCandidate("深圳市汇川技术股份有限公司", "tyc-hc")
+                )
+            }
+        ),
+    )
+
+    result = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        ai_gateway=AIGateway(provider),
+        company_lead_service=company_service,
+    ).consume(event_id)
+
+    assert result.smart_table_record_id is not None
+    record = adapter.get_record(result.smart_table_record_id)
+    assert record is not None
+    assert record.fields["线索名称"] == "深圳市汇川技术股份有限公司"
+
+
+def test_free_text_company_hint_prevents_context_cross_lead_and_keeps_tyc_pending_name(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证连续自由文本客户不会串到当前线索，且多候选名称保留待确认标记。"""
+    first_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-ai-company-a",
+        sales_user_id="sales-1",
+        text="汇川技术，张华杰经理，17318902311，做电气自动化，主要想做喷涂方面，预算25万左右",
+    )
+    second_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-ai-company-b",
+        sales_user_id="sales-1",
+        text="艾利特，杨经理，17318902085，做智能机器人，主要想做视觉检测，预算25万左右",
+    )
+    provider = MockLLMProvider(
+        [
+            json.dumps(
+                {
+                    "intent": "NEW_LEAD",
+                    "customer_reference": {},
+                    "crm_fields": {
+                        "线索名称": "汇川技术",
+                        "联系人": "张华杰",
+                        "手机": "17318902311",
+                    },
+                    "enrichment": {"预算": "预算25万左右"},
+                    "confidence_by_field": {
+                        "线索名称": 0.95,
+                        "联系人": 0.95,
+                        "手机": 0.99,
+                    },
+                    "conflicts": [],
+                    "warnings": [],
+                }
+            ),
+            json.dumps(
+                {
+                    "intent": "UPDATE_LEAD",
+                    "customer_reference": {},
+                    "crm_fields": {"联系人": "杨经理", "手机": "17318902085"},
+                    "enrichment": {"预算": "预算25万左右"},
+                    "confidence_by_field": {"联系人": 0.95, "手机": 0.99},
+                    "conflicts": [],
+                    "warnings": [],
+                }
+            ),
+        ]
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    company_service = CompanyLeadService(
+        session_factory,
+        adapter,
+        MockTYCAdapter(
+            {
+                "汇川技术": QCCLookupResult.matched(
+                    QCCCandidate("深圳市汇川技术股份有限公司", "tyc-hc")
+                ),
+                "艾利特": QCCLookupResult.ambiguous(
+                    (
+                        QCCCandidate("艾利特智能机器人股份有限公司", "tyc-alt-1"),
+                        QCCCandidate("艾利特机器人科技有限公司", "tyc-alt-2"),
+                    )
+                ),
+            }
+        ),
+    )
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        ai_gateway=AIGateway(provider),
+        company_lead_service=company_service,
+    )
+
+    first = service.consume(first_event_id)
+    second = service.consume(second_event_id)
+
+    assert first.lead_id is not None
+    assert second.lead_id is not None
+    assert first.lead_id != second.lead_id
+    first_record = adapter.get_record(first.smart_table_record_id or "")
+    second_record = adapter.get_record(second.smart_table_record_id or "")
+    assert first_record is not None
+    assert second_record is not None
+    assert first_record.fields["联系人"] == "张华杰"
+    assert first_record.fields["手机"] == "17318902311"
+    assert second_record.fields["联系人"] == "杨经理"
+    assert second_record.fields["手机"] == "17318902085"
+    assert second_record.fields["线索名称"] == "艾利特智能机器人股份有限公司"
+    assert second_record.fields["AI待确认"] == ["线索名称"]
+
+
 def test_free_form_company_contact_phone_message_is_not_unassigned(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -868,6 +1169,103 @@ def test_free_form_company_contact_phone_message_is_not_unassigned(
         )
     assert resolution is not None
     assert resolution.status == "assigned"
+
+
+def test_different_company_with_shared_phone_gets_tyc_name_on_new_record(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证不同公司复用手机号时新建线索并同步天眼查首候选名称。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：消息串入旧线索、天眼查候选未同步或待确认标记缺失时由 pytest 报告断言失败。
+    副作用：写入两条测试线索及一条带候选审核元数据的智能表格记录。
+    """
+    first_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-company-phone-first",
+        sales_user_id="sales-1",
+        text="客户：汇川技术；手机：17318902311",
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    company_service = CompanyLeadService(
+        session_factory,
+        adapter,
+        MockTYCAdapter(
+            {
+                "汇川技术": QCCLookupResult.matched(
+                    QCCCandidate("深圳市汇川技术股份有限公司", "tyc-hc")
+                ),
+                "艾利特": QCCLookupResult.ambiguous(
+                    (
+                        QCCCandidate("艾利特智能机器人股份有限公司", "tyc-alt-1"),
+                        QCCCandidate("艾利特机器人科技有限公司", "tyc-alt-2"),
+                    )
+                ),
+            }
+        ),
+    )
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        company_lead_service=company_service,
+    )
+
+    first = service.consume(first_event_id)
+    second_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-company-phone-second",
+        sales_user_id="sales-1",
+        text="客户：艾利特；手机：17318902311",
+    )
+    second = service.consume(second_event_id)
+
+    assert first.status is LeadProcessingStatus.CREATED
+    assert second.status is LeadProcessingStatus.CREATED
+    assert second.lead_id != first.lead_id
+    assert second.smart_table_record_id is not None
+    record = adapter.get_record(second.smart_table_record_id)
+    assert record is not None
+    assert record.fields["线索名称"] == "艾利特智能机器人股份有限公司"
+    assert record.fields["AI待确认"] == ["线索名称"]
+
+    # 模拟历史链路先同步原始名称、再由天眼查升级后台名称的来源基线。
+    with session_factory.begin() as session:
+        provenance = session.scalar(
+            select(LeadFieldProvenance).where(
+                LeadFieldProvenance.lead_id == second.lead_id,
+                LeadFieldProvenance.field_name == "线索名称",
+            )
+        )
+        assert provenance is not None
+        provenance.last_ai_synced_value = "艾利特"
+    with session_factory() as session:
+        retry_message = session.get(IncomingMessage, "message-company-phone-second")
+        existing = session.get(Lead, second.lead_id)
+        assert retry_message is not None
+        assert existing is not None
+        assert (
+            service._get_strong_identity_lead(
+                session,
+                retry_message,
+                {"线索名称": "艾利特", "手机": "17318902311"},
+            )
+            == existing
+        )
+
+    retry_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-company-phone-retry",
+        sales_user_id="sales-1",
+        text="客户：艾利特；手机：17318902311",
+    )
+    retry = service.consume(retry_event_id)
+
+    assert retry.status is LeadProcessingStatus.UPDATED
+    assert retry.lead_id == second.lead_id
+    retried_record = adapter.get_record(second.smart_table_record_id)
+    assert retried_record is not None
+    assert retried_record.fields["线索名称"] == "艾利特智能机器人股份有限公司"
 
 
 def test_free_text_ai_failure_is_a_checkpoint_without_creating_a_lead(

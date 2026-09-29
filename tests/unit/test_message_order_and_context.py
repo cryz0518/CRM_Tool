@@ -604,3 +604,31 @@ def test_strong_identity_beats_an_active_context_from_another_lead(
 
     assert updated.status is LeadProcessingStatus.UPDATED
     assert updated.lead_id == second.lead_id
+
+
+def test_explicit_company_name_precedes_shared_phone_identity(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证消息含不同公司名时不会因复用手机号而串入旧线索。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：不同公司被错误归并或智能表格记录数量错误时由 pytest 报告断言失败。
+    副作用：创建两条使用同一测试手机号但公司身份不同的销售线索。
+    """
+    first_event_id = persist_outbox_texts(
+        session_factory, "sales-1", ["客户：汇川技术；手机：17318902311"]
+    )[0]
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+
+    first = service.consume(first_event_id)
+    second_event_id = persist_outbox_texts(
+        session_factory, "sales-1", ["客户：艾利特；手机：17318902311"]
+    )[0]
+    second = service.consume(second_event_id)
+
+    assert first.status is LeadProcessingStatus.CREATED
+    assert second.status is LeadProcessingStatus.CREATED
+    assert first.lead_id != second.lead_id
+    assert len(adapter.get_records()) == 2

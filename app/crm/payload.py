@@ -12,7 +12,7 @@ class CrmPayloadError(ValueError):
 
 
 CRM_FIELD_NAMES = {
-    "业务线": "product_line_data_permission",
+    "业务线": "businessLine",
     "线索名称": "name",
     "线索来源": "source",
     "联系人": "contactName",

@@ -32,6 +32,22 @@ from app.messaging.models import (
 logger = logging.getLogger(__name__)
 
 
+def retention_policy_is_configured(settings: Settings) -> bool:
+    """判断三类数据保留期是否都由部署显式配置。
+
+    参数：settings 为应用配置。
+    返回值：策略版本和媒体、消息、通知三类保留天数均存在时返回 True。
+    异常：无。
+    副作用：仅读取配置，不执行数据库或存储操作。
+    """
+    return bool(
+        settings.media_retention_policy_version
+        and settings.media_retention_days is not None
+        and settings.message_payload_retention_days is not None
+        and settings.notification_payload_retention_days is not None
+    )
+
+
 @dataclass(frozen=True)
 class RetentionPolicy:
     """冻结一次清理操作所需的 data class 保留配置，不包含法律默认年限。"""
@@ -64,14 +80,16 @@ class RetentionPolicy:
             settings.message_payload_retention_days,
             settings.notification_payload_retention_days,
         )
-        if not settings.media_retention_policy_version or any(value is None for value in values):
+        if not retention_policy_is_configured(settings):
             raise RuntimeError("retention_policy_not_configured")
         media_days, message_days, notification_days = values
         assert media_days is not None
         assert message_days is not None
         assert notification_days is not None
+        version = settings.media_retention_policy_version
+        assert version is not None
         return cls(
-            version=settings.media_retention_policy_version,
+            version=version,
             media_retention_days=media_days,
             message_payload_retention_days=message_days,
             notification_payload_retention_days=notification_days,

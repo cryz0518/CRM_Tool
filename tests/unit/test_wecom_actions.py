@@ -14,7 +14,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.crm.commands import parse_crm_submission_command
+from app.crm.commands import parse_company_submission_request, parse_crm_submission_command
 from app.crm.mock import MockCRMAdapter
 from app.leads.discard import LeadDiscardService
 from app.leads.models import (
@@ -28,6 +28,7 @@ from app.leads.service import LeadReassignmentService
 from app.messaging.models import (
     Base,
     IncomingMessage,
+    NotificationRecord,
     SalesAuthorization,
     WecomAction,
     WecomActionOutbox,
@@ -50,6 +51,7 @@ from app.wecom_bot.actions import (
     WecomActionStatus,
     _transition_action,
     build_action_card,
+    build_preview_markdown,
     parse_deterministic_action_command,
 )
 from app.wecom_bot.callback import WecomTemplateCardCallbackHandler
@@ -503,6 +505,90 @@ def test_exact_submission_commands_never_use_llm_intent_inference() -> None:
     assert parse_crm_submission_command("帮我提交今天的线索") is None
     assert parse_crm_submission_command("提交今天的线索。") is None
     assert parse_crm_submission_command("请提交我的更新") is None
+
+
+def test_company_submission_request_is_strict_and_returns_exact_company_name() -> None:
+    """验证公司提交句式只提取明确公司名，不放宽为自然语言意图。"""
+
+    text = "请帮我提交上海世界纵横智能科技有限公司这条线索"
+    assert parse_company_submission_request(text) == "上海世界纵横智能科技有限公司"
+    assert parse_crm_submission_command(text) == text
+    assert parse_company_submission_request("帮我提交上海世界纵横智能科技有限公司") is None
+    assert parse_company_submission_request("请帮我提交上海世界纵横智能科技有限公司。") is None
+
+
+def test_company_submission_confirmation_card_contains_preview_fields(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证单条公司确认动作把全字段放入卡片，而不是放入客户端目标参数。"""
+
+    _authorize(session_factory)
+    service = _service(session_factory)
+    action = service.issue_company_submission_confirmation_action(
+        actor_user_id="sales-a",
+        lead_id="lead-preview",
+        request_message_id="message-preview",
+        company_name="预览公司",
+        field_values={"线索名称": "预览公司", "备注": "销售确认"},
+    )
+
+    with session_factory() as session:
+        notices = session.scalars(select(NotificationRecord)).all()
+    assert action.action_type == "crm_company_submission_confirmation"
+    assert len(notices) == 2
+    card_notice = next(
+        notice for notice in notices if notice.notification_type == "wecom_action_card"
+    )
+    preview_notice = next(
+        notice for notice in notices if notice.notification_type == "wecom_action_preview"
+    )
+    assert (
+        card_notice.payload["template_card"]["horizontal_content_list"][0]["keyname"]
+        == "线索名称"
+    )
+    assert "备注" in preview_notice.payload["markdown"]["content"]
+
+
+def test_preview_card_and_markdown_fit_wecom_display_limits() -> None:
+    """验证卡片不超过六行，完整字段改由可换行 Markdown 展示。"""
+
+    preview = {f"字段{i}": f"值{i}" for i in range(1, 11)}
+    card = build_action_card(
+        task_id="task-preview-limit",
+        event_key="crm.company_submission.confirm",
+        title="确认提交线索",
+        description="请核对全部字段",
+        preview_fields=preview,
+    )
+    rows = card["horizontal_content_list"]
+    assert isinstance(rows, list)
+    assert 0 < len(rows) <= 6
+    rendered = "".join(str(row) for row in rows)
+    details = build_preview_markdown(preview)
+    for name, value in preview.items():
+        assert name in details
+        assert value in details
+    assert "字段7" not in rendered
+
+
+def test_company_submission_candidate_card_uses_single_selection() -> None:
+    """验证同名候选卡使用单选并固定服务端确认 action key。"""
+
+    card = build_action_card(
+        task_id="task-candidates",
+        event_key="crm.company_submission.confirm",
+        title="选择要提交的线索",
+        description="存在多个候选",
+        selection_options=[
+            {"lead_id": "lead-a", "company_name": "候选一"},
+            {"lead_id": "lead-b", "company_name": "候选二"},
+        ],
+        selection_key="crm.company_submission.confirm",
+    )
+
+    assert card["card_type"] == "vote_interaction"
+    assert card["checkbox"]["mode"] == 0  # type: ignore[index]
+    assert card["submit_button"]["key"] == "crm.company_submission.confirm"  # type: ignore[index]
 
 
 def test_duplicate_provider_msgid_and_different_msgid_claim_once(

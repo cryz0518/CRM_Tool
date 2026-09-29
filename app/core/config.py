@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,7 +21,21 @@ class Settings(BaseSettings):
     # 身份 Provider 必须由部署显式选择；production 下 development 会被统一 policy 拒绝。
     admin_identity_provider: str = "development"
     smart_table_adapter: Literal["mock", "unconfigured", "wecom_cli"] = "unconfigured"
-    crm_adapter: Literal["mock", "unconfigured"] = "unconfigured"
+    crm_adapter: Literal["mock", "unconfigured", "sop"] = "unconfigured"
+    crm_url: str | None = None
+    crm_app_id: str | None = None
+    crm_app_auth_token: str | None = None
+    crm_private_key: str | None = None
+    crm_authorization: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("Authorization", "CRM_AUTHORIZATION"),
+    )
+    crm_http_trust_env: bool = True
+    crm_http_proxy: str | None = None
+    tyc_provider: Literal["mock", "unconfigured", "tianyancha"] = "unconfigured"
+    tianyancha_api_key: str | None = None
+    tianyancha_url: str = "https://open.api.tianyancha.com/services/open/search/2.0"
+    employee_directory_path: str = "employee.csv"
     wecom_bot_id: str | None = None
     wecom_bot_secret: str | None = None
     wecom_card_callback_enabled: bool = False
@@ -30,6 +44,7 @@ class Settings(BaseSettings):
     wecom_card_callback_timeout_seconds: float = 4.0
     wecom_smart_table_doc_id: str | None = None
     wecom_smart_table_sheet_id: str | None = None
+    wecom_smart_table_sheet_title: str | None = None
     wecom_smart_table_sales_can_create_records: bool | None = None
     wecom_smart_table_sales_can_delete_records: bool | None = None
     wecom_cli_command: str = "wecom-cli"
@@ -100,6 +115,7 @@ class Settings(BaseSettings):
         "media_scanner_provider",
         "ocr_provider",
         "asr_provider",
+        "tyc_provider",
         mode="before",
     )
     @classmethod

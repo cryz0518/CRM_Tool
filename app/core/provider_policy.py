@@ -26,7 +26,8 @@ FORBIDDEN_PROVIDER_NAMES = frozenset({
 PROVIDER_IMPLEMENTATIONS = {
     "admin_identity_provider": frozenset({"development"}),
     "smart_table": frozenset({"mock", "wecom_cli"}),
-    "crm": frozenset({"mock"}),
+    "crm": frozenset({"mock", "sop"}),
+    "tyc": frozenset({"mock", "tianyancha"}),
     "llm": frozenset({"mock", "qwen"}),
     "ocr": frozenset({"mock", "qwen"}),
     "asr": frozenset({"mock", "qwen"}),
@@ -156,6 +157,7 @@ class ProviderPolicy:
             ("admin_identity_provider", getattr(settings, "admin_identity_provider", None)),
             ("smart_table", settings.smart_table_adapter),
             ("crm", settings.crm_adapter),
+            ("tyc", settings.tyc_provider),
             ("llm", settings.llm_provider),
             ("ocr", settings.ocr_provider),
             ("asr", settings.asr_provider),
@@ -188,6 +190,10 @@ class ProviderPolicy:
             )
         elif component == "smart_table" and provider == "wecom_cli":
             required = ("wecom_smart_table_doc_id", "wecom_smart_table_sheet_id")
+        elif component == "crm" and provider == "sop":
+            required = ("crm_url", "crm_app_id", "crm_app_auth_token", "crm_private_key")
+        elif component == "tyc" and provider == "tianyancha":
+            required = ("tianyancha_url", "tianyancha_api_key")
         return tuple(
             field
             for field in required

@@ -80,9 +80,9 @@ class _SafePatchPlan:
 
     fields_to_write: dict[str, object]
     written_names: tuple[str, ...]
-    synced_values: dict[str, str]
+    synced_values: dict[str, object]
     protected_fields: tuple[str, ...]
-    base_lead_values: dict[str, str | None]
+    base_lead_values: dict[str, object]
 
 
 class LeadReviewService:
@@ -243,13 +243,15 @@ class LeadReviewService:
             self._require_source_message(session, source_message_id)
             provenance = self._latest_provenance_by_field(session, lead_id)
             pending = self._confirmation_names(current_fields.get(AI_CONFIRMATION_FIELD))
+            # 系统决策也可能只新增审核元数据而不改业务字段，必须先合并本轮待确认声明。
+            pending.update(patch.pending_confirmation_fields)
             protected = self._detect_user_edits(
                 session, lead, provenance, current_fields, pending, source_message_id
             )
             pending.difference_update(protected)
             fields_to_write: dict[str, object] = {}
             written_names: list[str] = []
-            synced_values: dict[str, str] = {}
+            synced_values: dict[str, object] = {}
             # T08 已完成结构和业务校验；本层仅决定是否可安全写入，不重新解释 AI 内容。
             for field_name, value in patch.fields.items():
                 if field_name == "备注":

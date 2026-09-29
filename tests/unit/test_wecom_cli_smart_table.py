@@ -17,7 +17,6 @@ from app.smart_table.models import SmartTableFieldType
 from app.smart_table.wecom_cli import (
     WecomCliProcessError,
     WecomCliSmartTableAdapter,
-    WecomCliSmartTableAdapterError,
 )
 
 
@@ -49,7 +48,9 @@ class FakeCli:
         return response
 
 
-def _adapter(fake_cli: FakeCli, *, retry_count: int = 1) -> WecomCliSmartTableAdapter:
+def _adapter(
+    fake_cli: FakeCli, *, retry_count: int = 1, sheet_title: str | None = None
+) -> WecomCliSmartTableAdapter:
     """构造使用假 CLI 的真实适配器实例。
 
     参数：fake_cli 为注入的命令执行器；retry_count 控制重试次数。
@@ -60,6 +61,7 @@ def _adapter(fake_cli: FakeCli, *, retry_count: int = 1) -> WecomCliSmartTableAd
     return WecomCliSmartTableAdapter(
         doc_id="test-doc",
         sheet_id="test-sheet",
+        sheet_title=sheet_title,
         sales_can_create_records=False,
         sales_can_delete_records=False,
         retry_count=retry_count,
@@ -392,8 +394,8 @@ def test_get_record_normalizes_empty_text_and_single_select_cells_to_none(
     assert record.fields[field_name.removeprefix("*")] is None
 
 
-def test_get_record_rejects_multiple_text_cells_without_selecting_or_joining() -> None:
-    """验证文本字段的多个 CLI CellValue 仍被拒绝，避免猜测领域事实。
+def test_get_record_joins_multiple_text_cells_in_server_order() -> None:
+    """验证文本字段的多个 CLI CellValue 按服务端顺序还原为一段文本。
 
     参数：无。
     返回：无。
@@ -415,10 +417,9 @@ def test_get_record_rejects_multiple_text_cells_without_selecting_or_joining() -
         ]
     )
 
-    with pytest.raises(
-        WecomCliSmartTableAdapterError, match="文本或单选字段返回值不是唯一单元格"
-    ):
-        _adapter(fake_cli).get_record("record-1")
+    record = _adapter(fake_cli).get_record("record-1")
+    assert record is not None
+    assert record.fields == {"联系人": "AB"}
 
 
 def test_get_record_ignores_historical_multi_cell_text_when_target_is_valid() -> None:
@@ -459,8 +460,8 @@ def test_get_record_ignores_historical_multi_cell_text_when_target_is_valid() ->
     assert record.fields == {"备注": "正常备注"}
 
 
-def test_get_records_keeps_rejecting_historical_multi_cell_text() -> None:
-    """验证全量回读仍严格拒绝多片段文本，不能静默丢失历史数据。
+def test_get_records_joins_historical_multi_cell_text() -> None:
+    """验证全量回读可以保留历史多片段文本，不阻断其他记录。
 
     参数：无。
     返回：无。
@@ -490,10 +491,9 @@ def test_get_records_keeps_rejecting_historical_multi_cell_text() -> None:
         ]
     )
 
-    with pytest.raises(
-        WecomCliSmartTableAdapterError, match="文本或单选字段返回值不是唯一单元格"
-    ):
-        _adapter(fake_cli).get_records()
+    records = _adapter(fake_cli).get_records()
+    assert records[0].fields == {"备注": "片段一片段二片段三片段四"}
+    assert records[1].fields == {"备注": "正常备注"}
 
 
 def test_schema_reads_pages_and_preserves_real_option_identifiers() -> None:
@@ -565,6 +565,7 @@ def test_records_are_paginated_and_robot_writes_only_given_field_patch() -> None
 
     assert [record.record_id for record in records] == ["record-1", "record-2"]
     assert records[0].fields["负责人"] == "sales-user"
+    assert records[0].member_names == {"负责人": "测试销售"}
     create_payload = _payload(fake_cli.calls[3])
     assert create_payload["records"] == [
         {
@@ -578,6 +579,39 @@ def test_records_are_paginated_and_robot_writes_only_given_field_patch() -> None
     update_payload = _payload(fake_cli.calls[5])
     assert update_payload["records"] == [{"record_id": "record-3", "values": {"工艺": "装配"}}]
     assert updated.fields == {"工艺": "装配"}
+
+
+def test_configured_sheet_title_uses_full_query_and_parses_member_rows() -> None:
+    """验证配置子表名称后读取完整查询结果，不受 records list 可见范围影响。"""
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "values": [
+                    {
+                        "rows": [
+                            {
+                                "RECORD_ID": "record-full",
+                                "*线索名称": "完整查询线索",
+                                "AI待确认": None,
+                                "创建人": [{"id": "sales-user", "name": "测试销售"}],
+                                "负责人": [{"id": "sales-user", "name": "测试销售"}],
+                            }
+                        ]
+                    }
+                ],
+            },
+        ]
+    )
+    records = _adapter(fake_cli, sheet_title="CRM线索").get_records()
+
+    assert records[0].record_id == "record-full"
+    assert records[0].fields["线索名称"] == "完整查询线索"
+    assert records[0].fields["负责人"] == "sales-user"
+    assert records[0].member_names == {"创建人": "测试销售", "负责人": "测试销售"}
+    assert records[0].fields["AI待确认"] == []
+    assert fake_cli.calls[1][0:5] == ("wecom-cli", "smartsheet", "records", "query", "--docid")
 
 
 def test_robot_requires_owner_and_sales_cannot_be_impersonated() -> None:

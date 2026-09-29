@@ -171,6 +171,8 @@ def test_gateway_prompt_requires_registered_chinese_fields_and_scalar_values() -
     assert "不得使用数组塞入 CRM 字段" in prompt
     assert "confidence_by_field 的 key 必须与 crm_fields 的 key 完全一一对应" in prompt
     assert "业务线：协作机器人、车载机器人" in prompt
+    assert "做电气自动化" in prompt
+    assert "主要想做喷涂方面" in prompt
 
 
 def test_gateway_prompt_maps_input_labels_to_canonical_crm_field_names() -> None:
@@ -293,6 +295,90 @@ def test_gateway_quarantines_other_unknown_evidence_to_special_requirements() ->
 
     assert result.fields == {"线索名称": "长广溪智造"}
     assert result.enrichment == {"特殊要求": "采购数量：10台"}
+
+
+def test_gateway_normalizes_registered_field_aliases_without_creating_fields() -> None:
+    """验证已知“业务领域”别名被归入客户行业且工艺使用规范字段。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                customer_reference={},
+                crm_fields={
+                    "线索名称": "长广溪智造",
+                    "业务线": "协作机器人",
+                    "工艺": ["喷涂"],
+                },
+                enrichment={"业务领域": "电气自动化"},
+                confidence_by_field={
+                    "线索名称": 0.9,
+                    "业务线": 0.9,
+                    "工艺": 0.9,
+                },
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(
+        "汇川技术，做电气自动化，主要想做喷涂方面，预算25万左右"
+    )
+
+    assert result.fields == {
+        "线索名称": "长广溪智造",
+        "业务线": "协作机器人",
+        "客户行业": "其他",
+        "工艺": ["喷涂"],
+    }
+    assert result.enrichment == {"客户行业": "电气自动化"}
+
+
+def test_gateway_normalizes_aliases_across_identity_enum_and_enrichment_fields() -> None:
+    """验证不同字段类型都使用同一套精确别名和枚举“其他”规则。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                customer_reference={},
+                crm_fields={
+                    "公司名称": "长广溪智造",
+                    "手机号": "13800138000",
+                    "应用工艺": ["喷涂"],
+                    "行业": "电气自动化",
+                },
+                enrichment={"客户需求": "改造喷涂产线"},
+                confidence_by_field={
+                    "公司名称": 0.9,
+                    "手机号": 0.9,
+                    "应用工艺": 0.9,
+                    "行业": 0.9,
+                },
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(
+        "公司名称：长广溪智造，手机号：13800138000，电气自动化，喷涂，改造喷涂产线"
+    )
+
+    assert result.fields == {
+        "线索名称": "长广溪智造",
+        "手机": "13800138000",
+        "客户行业": "其他",
+        "工艺": ["喷涂"],
+    }
+    assert result.enrichment == {
+        "客户行业": "电气自动化",
+        "客户需求/痛点": "改造喷涂产线",
+    }
+
+
+def test_gateway_drops_unregistered_enrichment_key_instead_of_creating_field() -> None:
+    """验证除明确别名外的未知补充键不会进入任何业务或备注字段。"""
+    provider = MockLLMProvider(
+        responses=[valid_analysis(enrichment={"自造字段": "原文事实"})]
+    )
+
+    result = AIGateway(provider).extract_fields("客户：长广溪智造，原文事实")
+
+    assert result.enrichment == {}
 
 
 def test_gateway_recovers_explicit_title_adjacent_to_verified_contact() -> None:
@@ -442,8 +528,8 @@ def test_gateway_accepts_company_and_contact_in_canonical_fields() -> None:
     assert len(provider.requests) == 1
 
 
-def test_gateway_quarantines_unknown_customer_name_with_source_evidence() -> None:
-    """验证未知的客户名称字段有原文证据时保留到特殊要求，不阻塞整条消息。
+def test_gateway_normalizes_customer_name_alias_with_source_evidence() -> None:
+    """验证客户名称别名有原文证据时归一化到线索名称，不阻塞整条消息。
 
     参数：无。
     返回值：无。
@@ -457,21 +543,22 @@ def test_gateway_quarantines_unknown_customer_name_with_source_evidence() -> Non
 
     result = AIGateway(provider).extract_fields("客户名称王验收")
 
-    assert result.fields == {}
-    assert result.enrichment == {"特殊要求": "客户名称：王验收"}
+    assert result.fields == {"线索名称": "王验收"}
+    assert result.enrichment == {}
     assert len(provider.requests) == 1
 
 
-def test_gateway_rejects_remarks_without_alias_conversion() -> None:
-    """验证模型备注既不能绕过 T09，也不会被转换为补充信息。"""
+def test_gateway_moves_remarks_to_enrichment_without_bypassing_t09() -> None:
+    """验证模型误放的备注文本转为素材，最终仍由 T09 统一生成表格备注。"""
     response = valid_analysis(
         crm_fields={"备注": "客户预算充足"}, confidence_by_field={"备注": 0.9}
     )
     provider = MockLLMProvider(responses=[response])
 
-    with pytest.raises(BusinessValidationError, match="AI 禁止输出字段：备注"):
-        AIGateway(provider).extract_fields("客户预算充足")
+    result = AIGateway(provider).extract_fields("客户预算充足")
 
+    assert result.fields == {}
+    assert result.enrichment == {"特殊要求": "客户预算充足"}
     assert len(provider.requests) == 1
 
 

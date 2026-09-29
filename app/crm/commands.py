@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -11,10 +12,17 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import get_settings
 from app.crm.adapter import CRMAdapter
 from app.crm.service import CrmSubmissionService, SubmissionBatchResult, SubmissionCommand
-from app.leads.models import CrmSyncRecord
+from app.leads.models import CrmSyncRecord, Lead, new_lead_id
 from app.leads.review import LeadReviewService
-from app.messaging.models import IncomingMessage, NotificationRecord, OutboxEvent
+from app.messaging.models import (
+    BusinessAuditEvent,
+    IncomingMessage,
+    NotificationRecord,
+    OutboxEvent,
+    SalesAuthorization,
+)
 from app.smart_table.adapter import SmartTableAdapter
+from app.smart_table.models import SmartTableRecord
 from app.wecom_bot.actions import (
     CardCapabilityUnavailable,
     WecomActionService,
@@ -23,24 +31,62 @@ from app.wecom_bot.actions import (
 _LOGGER = logging.getLogger(__name__)
 
 CRM_SUBMISSION_COMMANDS = frozenset({"提交今天的线索", "提交我的更新"})
+_COMPANY_SUBMISSION_PATTERN = re.compile(r"^请帮我提交(?P<company>[^\r\n。]{1,128})这条线索$")
+_PREVIEW_FIELD_NAMES = (
+    "业务线",
+    "线索名称",
+    "线索来源",
+    "联系人",
+    "职务",
+    "沟通方式",
+    "手机",
+    "电话",
+    "邮箱",
+    "客户行业",
+    "客户级别",
+    "工艺",
+    "下次联系时间",
+    "备注",
+    "是否为国际客户",
+    "负责人",
+    "提交状态",
+)
+
+
+def parse_company_submission_request(text: str) -> str | None:
+    """严格解析按公司名称定位线索的固定机器人请求。
+
+    参数：text 为销售消息正文。
+    返回值：去除句式包装后的公司名称；不符合固定句式时返回 None。
+    异常：无。
+    副作用：无；不调用模型、不查询外部系统。
+    """
+
+    match = _COMPANY_SUBMISSION_PATTERN.fullmatch(text)
+    if match is None:
+        return None
+    company = match.group("company").strip()
+    return company or None
 
 
 def parse_crm_submission_command(text: str) -> str | None:
-    """只识别两个完整、逐字匹配的 CRM 提交命令。
+    """识别批量命令或固定公司定位提交句式。
 
     参数：text 为销售消息正文；不自动 trim、不做模糊匹配、不调用 LLM。
-    返回值：合法命令原文；其他文本返回 None。
+    返回值：合法命令原文；其他文本返回 None。公司定位句式只进入预览边界。
     异常：无。
     副作用：无。
     """
     # 精确相等是 CRM 写操作授权边界，任何相似自然语言都不能触发提交。
-    return text if text in CRM_SUBMISSION_COMMANDS else None
+    if text in CRM_SUBMISSION_COMMANDS or parse_company_submission_request(text) is not None:
+        return text
+    return None
 
 
 def consume_submission_command(
     session_factory: sessionmaker[Session],
     smart_table_adapter: SmartTableAdapter,
-    crm_adapter: CRMAdapter,
+    crm_adapter: CRMAdapter | None,
     outbox_event_id: int,
 ) -> str:
     """消费一条已认领命令 Outbox，并返回不含敏感数据的销售汇总文本。
@@ -62,6 +108,32 @@ def consume_submission_command(
             sales_user_id=message.sales_user_id,
             request_message_id=message.message_id,
         )
+    company_name = parse_company_submission_request(command.text)
+    if company_name is not None:
+        reply = prepare_company_submission_preview(
+            session_factory,
+            smart_table_adapter,
+            command,
+            company_name,
+        )
+        with session_factory.begin() as session:
+            event = session.get(OutboxEvent, outbox_event_id)
+            if event is not None:
+                event.status = "succeeded"
+            key = notification_key_for_message(command.request_message_id)
+            if session.get(NotificationRecord, key) is None:
+                session.add(
+                    NotificationRecord(
+                        notification_key=key,
+                        sales_user_id=command.sales_user_id,
+                        source_message_id=command.request_message_id,
+                        notification_type="crm_submission_preview",
+                        content=reply,
+                    )
+                )
+        return reply
+    if crm_adapter is None:
+        raise ValueError("批量 CRM 命令缺少 CRM Adapter")
     try:
         service = CrmSubmissionService(
             session_factory,
@@ -103,6 +175,221 @@ def consume_submission_command(
                 )
             )
     return reply
+
+
+def prepare_company_submission_preview(
+    session_factory: sessionmaker[Session],
+    smart_table_adapter: SmartTableAdapter,
+    command: SubmissionCommand,
+    company_name: str,
+) -> str:
+    """按公司名称精确或包含匹配定位线索并发行全字段确认卡，不调用 CRM。
+
+    参数：command 提供销售身份和消息幂等键；company_name 为固定句式解析结果。
+    返回值：可直接回复销售的定位状态文本。
+    异常：表格、数据库或卡片持久化异常向调用方传播。
+    副作用：读取智能表格和 Lead；唯一匹配时新增一张待确认卡片。
+    """
+
+    records, contains_match = _find_company_records(smart_table_adapter, company_name)
+    if not records:
+        return "未找到该公司名称的线索，请确认智能表格中的线索名称后重试。"
+
+    record_ids = tuple(record.record_id for record in records)
+    lead_ids_by_record: dict[str, str] = {}
+    with session_factory.begin() as session:
+        leads = list(
+            session.scalars(
+                select(Lead).where(
+                    Lead.smart_table_record_id.in_(record_ids),
+                    Lead.smart_table_owner_user_id == command.sales_user_id,
+                    Lead.lifecycle_state == "pending_create",
+                )
+            )
+        )
+        lead_ids_by_record.update(
+            {
+                record_id: lead.id
+                for lead in leads
+                if (record_id := lead.smart_table_record_id) is not None
+            }
+        )
+        # 新数据库可能没有旧表格记录对应的后台 Lead；仅在当前销售是表格负责人时建立受控映射。
+        # 跨负责人记录不会被导入，也不会借此改变原有权限边界。
+        for record in records:
+            if record.record_id in lead_ids_by_record:
+                continue
+            linked = _link_existing_smart_table_record(session, record, command)
+            if linked is not None:
+                lead_ids_by_record[record.record_id] = linked.id
+    with session_factory() as session:
+        leads = list(session.scalars(select(Lead).where(Lead.id.in_(lead_ids_by_record.values()))))
+    by_record_id = {lead.smart_table_record_id: lead for lead in leads}
+    eligible = [
+        (record, by_record_id[record.record_id])
+        for record in records
+        if record.record_id in by_record_id
+        and (record.fields.get("负责人") in (None, command.sales_user_id))
+    ]
+    if not eligible:
+        return "已找到同名表格记录，但当前账号没有可提交的本人待提交线索。"
+
+    action_service = WecomActionService(
+        session_factory,
+        card_callback_ready=get_settings().wecom_card_callback_ready(),
+    )
+    if len(eligible) > 1:
+        candidates = tuple(
+            {
+                "lead_id": lead.id,
+                "company_name": f"{record.fields.get('线索名称') or company_name}（候选{index}）",
+            }
+            for index, (record, lead) in enumerate(eligible, start=1)
+        )
+        try:
+            action_service.issue_company_candidate_confirmation_action(
+                actor_user_id=command.sales_user_id,
+                request_message_id=command.request_message_id,
+                company_name=company_name,
+                candidates=candidates,
+                contains_match=contains_match,
+            )
+        except CardCapabilityUnavailable:
+            return "找到多个同名线索，但当前机器人卡片能力未就绪，请先在智能表格中确认唯一记录。"
+        return f"找到 {len(eligible)} 条同名线索，请在卡片中选择要提交的一条。"
+
+    record, lead = eligible[0]
+    display_fields = {
+        name: record.fields.get(name)
+        for name in _PREVIEW_FIELD_NAMES
+    }
+    display_fields.update(
+        {
+            name: value
+            for name, value in record.fields.items()
+            if name not in display_fields
+        }
+    )
+    # 成员字段的 userId 仍保留在业务快照中；确认卡只展示同一响应附带的真实成员显示名。
+    for member_field in ("负责人", "创建人"):
+        display_name = record.member_names.get(member_field)
+        if isinstance(display_name, str) and display_name.strip():
+            display_fields[member_field] = display_name.strip()
+    try:
+        action_service.issue_company_submission_confirmation_action(
+            actor_user_id=command.sales_user_id,
+            lead_id=lead.id,
+            request_message_id=command.request_message_id,
+            company_name=str(record.fields.get("线索名称") or company_name),
+            field_values=display_fields,
+        )
+    except CardCapabilityUnavailable:
+        return "已精确找到线索，但当前机器人卡片能力未就绪；请先完成卡片配置后再确认提交。"
+    match_description = "按名称包含关系找到候选" if contains_match else "精确找到线索"
+    return (
+        f"已{match_description}，已发送包含全部字段的确认卡；"
+        "如需修改，请先编辑智能表格后再点击确认提交。"
+    )
+
+
+def _link_existing_smart_table_record(
+    session: Session, record: SmartTableRecord, command: SubmissionCommand
+) -> Lead | None:
+    """把当前销售负责的既有表格记录安全登记为待提交 Lead。
+
+    参数：session 为当前事务；record 为智能表格快照；command 提供当前销售和审计消息。
+    返回值：新建或已存在的 Lead；负责人不匹配、销售未授权或公司名无效时返回 None。
+    异常：数据库约束异常向调用方传播；不调用外部 CRM。
+    副作用：写入一条 pending_create Lead 和一条“既有表格记录已绑定”审计事件。
+    """
+    owner = record.fields.get("负责人")
+    company_name = record.fields.get("线索名称")
+    if owner != command.sales_user_id or not isinstance(company_name, str) or not company_name:
+        return None
+    authorization = session.get(SalesAuthorization, command.sales_user_id)
+    if (
+        authorization is None
+        or not authorization.is_authorized
+        or not authorization.is_active
+    ):
+        return None
+    existing = session.scalar(
+        select(Lead).where(Lead.smart_table_record_id == record.record_id).with_for_update()
+    )
+    if existing is not None:
+        if (
+            existing.smart_table_owner_user_id == command.sales_user_id
+            and existing.lifecycle_state == "pending_create"
+        ):
+            return existing
+        return None
+    # 只按稳定表格记录标识绑定，不按名称猜测或把另一条 Lead 强行合并进来。
+    field_values = {name: value for name, value in record.fields.items() if value is not None}
+    lead = Lead(
+        id=new_lead_id(),
+        source_message_id=None,
+        original_capturing_sales_user_id=command.sales_user_id,
+        smart_table_owner_user_id=command.sales_user_id,
+        smart_table_record_id=record.record_id,
+        lifecycle_state="pending_create",
+        field_values=field_values,
+        standard_company_name=company_name,
+        company_region="unknown",
+        company_verification_status="user_confirmed_unverified",
+        company_confirmed_by_user=True,
+    )
+    session.add(lead)
+    session.add(
+        BusinessAuditEvent(
+            message_id=command.request_message_id,
+            sales_user_id=command.sales_user_id,
+            event_type="smart_table_existing_lead_linked",
+            details={"mapping_type": "existing_record_to_pending_create"},
+        )
+    )
+    session.flush()
+    return lead
+
+
+def _find_company_records(
+    smart_table_adapter: SmartTableAdapter, company_name: str
+) -> tuple[list[SmartTableRecord], bool]:
+    """先精确查询，失败后按公司名称包含关系返回候选记录。
+
+    参数：smart_table_adapter 为智能表格读取边界；company_name 为机器人解析出的公司名称。
+    返回值：记录列表及是否使用了包含匹配；精确命中时标记为 False。
+    异常：智能表格读取失败时由适配器向上抛出。
+    副作用：精确无结果时读取当前子表快照，不执行任何写入或 CRM 调用。
+    """
+    exact_records = smart_table_adapter.find_records({"线索名称": company_name})
+    if exact_records:
+        return exact_records, False
+
+    normalized_query = _normalize_company_lookup_text(company_name)
+    if len(normalized_query) < 2:
+        return [], False
+    contains_records: list[SmartTableRecord] = []
+    for record in smart_table_adapter.get_records():
+        value = record.fields.get("线索名称")
+        if not isinstance(value, str):
+            continue
+        normalized_value = _normalize_company_lookup_text(value)
+        if normalized_value and (
+            normalized_query in normalized_value or normalized_value in normalized_query
+        ):
+            contains_records.append(record)
+    return contains_records, bool(contains_records)
+
+
+def _normalize_company_lookup_text(value: str) -> str:
+    """规范化公司名称查找文本，仅移除空白并统一大小写。
+
+    参数：value 为待查找的公司名称文本。
+    返回值：用于确定性包含匹配的规范文本。
+    异常：无。
+    副作用：无。
+    """
+    return "".join(value.split()).casefold()
 
 
 def _issue_field_confirmation_cards(

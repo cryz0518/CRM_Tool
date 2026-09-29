@@ -92,10 +92,11 @@ class MockSmartTableAdapter:
         fields: Mapping[str, object],
         *,
         actor: SmartTableActor,
+        member_names: Mapping[str, str] | None = None,
     ) -> SmartTableRecord:
         """创建记录；机器人必须写负责人且不受销售新增开关影响。
 
-        参数：fields 为待写入字段；actor 为发起操作的主体。
+        参数：fields 为待写入字段；actor 为发起操作的主体；member_names 为可选的成员显示名快照。
         返回：创建后的不可变记录快照。
         异常：销售无新增权限时抛出 SmartTablePermissionError；机器人未写负责人时抛出 ValueError。
         副作用：向内存记录集新增记录并递增记录编号。
@@ -110,7 +111,15 @@ class MockSmartTableAdapter:
         # 生成稳定的 Mock 记录标识，并复制输入避免调用方后续修改污染记录。
         record_id = f"mock-record-{self._next_record_number}"
         self._next_record_number += 1
-        record = SmartTableRecord(record_id=record_id, fields=dict(fields))
+        # 默认把 Mock 输入的负责人作为显示名，显式传入空映射可覆盖为“无可信显示名”。
+        resolved_member_names = (
+            dict(member_names)
+            if member_names is not None
+            else ({"负责人": str(fields["负责人"])} if fields.get("负责人") else {})
+        )
+        record = SmartTableRecord(
+            record_id=record_id, fields=dict(fields), member_names=resolved_member_names
+        )
         self._records[record_id] = record
         return record
 
@@ -129,7 +138,11 @@ class MockSmartTableAdapter:
         # 先复制旧字段再叠加补丁，严格模拟增量更新而非整行替换。
         updated_fields = dict(record.fields)
         updated_fields.update(fields)
-        updated_record = SmartTableRecord(record_id=record_id, fields=updated_fields)
+        updated_record = SmartTableRecord(
+            record_id=record_id,
+            fields=updated_fields,
+            member_names=record.member_names,
+        )
         self._records[record_id] = updated_record
         return updated_record
 
