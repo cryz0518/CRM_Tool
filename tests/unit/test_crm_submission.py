@@ -1526,6 +1526,53 @@ def test_historical_company_identity_does_not_bypass_crm_duplicate_search(
     assert crm.search_calls == 1
 
 
+@pytest.mark.parametrize(
+    ("duplicate_results", "expected_status"),
+    [
+        ((CRMSearchResult("crm-A", "crm-owner", "CRM 已有线索 A"),), "duplicate"),
+        ((), "conflict"),
+        ((CRMSearchResult("crm-B", "crm-owner", "CRM 已有线索 B"),), "conflict"),
+    ],
+)
+def test_active_company_identity_only_validates_current_crm_duplicate(
+    session_factory: sessionmaker[Session],
+    duplicate_results: tuple[CRMSearchResult, ...],
+    expected_status: str,
+) -> None:
+    """验证 active identity 不绕过查重，冲突时禁止 create/update。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    crm = MockCRMAdapter(search_results={"人工最终公司": duplicate_results})
+    with session_factory.begin() as session:
+        session.add(
+            CrmCompanyIdentity(
+                standard_company_name="人工最终公司",
+                state="active",
+                crm_lead_id="crm-A",
+                crm_lead_owner_user_id="crm-owner",
+            )
+        )
+
+    result = CrmSubmissionService(session_factory, adapter, crm).submit(
+        SubmissionCommand("提交今天的线索", "sales-1", "active-identity-check")
+    )
+
+    assert crm.search_calls == 1
+    assert crm.calls == 0 and crm.update_calls == 0
+    if expected_status == "duplicate":
+        assert len(result.duplicate_confirmations) == 1
+        assert result.failed_pending_review == 0
+    else:
+        assert result.failed_pending_review == 1
+        assert not result.duplicate_confirmations
+    with session_factory() as session:
+        sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
+    if expected_status == "duplicate":
+        assert sync is not None and sync.status == "awaiting_duplicate_confirmation"
+    else:
+        assert sync is None
+
+
 def test_identical_historical_company_identity_does_not_bypass_crm_create_search(
     session_factory: sessionmaker[Session],
 ) -> None:

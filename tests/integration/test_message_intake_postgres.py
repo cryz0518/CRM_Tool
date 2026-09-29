@@ -257,15 +257,23 @@ def test_concurrent_first_submission_reserves_exactly_one_global_crm_identity(
     assert identities[0].crm_lead_owner_user_id == f"crm-{winner}"
 
     loser = "sales-B" if winner == "sales-A" else "sales-A"
+    search_calls_before_retry = crm.search_calls
     reused = CrmSubmissionService(postgres_session_factory, adapter, crm).submit(
         SubmissionCommand("提交今天的线索", loser, f"message-{loser}-retry")
     )
-    assert reused.succeeded == 1 and crm.calls == 1 and crm.update_calls == 1
+    assert len(reused.duplicate_confirmations) == 1
+    assert crm.calls == 1 and crm.update_calls == 0
+    assert crm.search_calls == search_calls_before_retry + 1
     with postgres_session_factory() as session:
         loser_sync = session.scalar(
             select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_ids[loser])
         )
-    assert loser_sync is not None and loser_sync.crm_lead_id == identities[0].crm_lead_id
+    assert (
+        loser_sync is not None
+        and loser_sync.operation == "create"
+        and loser_sync.status == "awaiting_duplicate_confirmation"
+        and loser_sync.crm_lead_id == identities[0].crm_lead_id
+    )
 
 
 def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(

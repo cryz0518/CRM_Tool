@@ -689,37 +689,16 @@ class CrmSubmissionService:
             if identity is not None and identity.state == "active":
                 if identity.crm_lead_id is None:
                     return CreateSubmissionOutcome("failed_pending_review")
-                # 全局身份已激活时禁止再次 create，改为针对既有 CRM lead 的一次 update。
-                active_update_id = self._prepare_existing_identity_update(
-                    session,
-                    current_lead,
-                    command,
-                    canonical_payload,
-                    snapshot_hash,
-                    crm_user_id=self._resolve_crm_owner(current_lead),
-                    identity=identity,
-                )
-                if active_update_id is None:
-                    return CreateSubmissionOutcome("incomplete")
-                # 事务提交后再调用 CRM，保留 update 的冻结快照和幂等键。
-                session.flush()
-                active_update_id_value = active_update_id
             elif identity is not None and identity.state == "reserving":
                 if identity.creating_lead_id != current_lead.id:
                     return CreateSubmissionOutcome("processing")
-                active_update_id_value = None
             elif identity is None:
                 identity = self._reserve_global_identity(session, current_lead, command)
                 if identity is None:
                     return CreateSubmissionOutcome("processing")
-                active_update_id_value = None
             else:
                 # 历史身份仍需本次 CRM 查重决定，不能直接当作 create 事实。
-                active_update_id_value = None
-        if active_update_id_value is not None:
-            return CreateSubmissionOutcome(
-                self._claim_and_call(active_update_id_value, command.sales_user_id)
-            )
+                pass
         try:
             # CRM 查重是唯一的首次提交去重边界，智能表格阶段不读取同名线索。
             duplicate_results = tuple(self._crm_adapter.search_by_company_name(canonical_payload))
@@ -780,8 +759,28 @@ class CrmSubmissionService:
                         .with_for_update()
                     )
                 if identity is not None and identity.state == "active":
-                    # 已激活的全局 CRM 身份是不可再次 create 的冻结事实。
-                    return CreateSubmissionOutcome("incomplete")
+                    expected_crm_lead_id = identity.crm_lead_id
+                    matching_duplicate = (
+                        len(duplicate_results) == 1
+                        and expected_crm_lead_id is not None
+                        and duplicate_results[0].crm_lead_id == expected_crm_lead_id
+                    )
+                    if not matching_duplicate:
+                        # active identity 只能校验 CRM 查重事实，不能替代本次查重决策。
+                        self._record_audit(
+                            session,
+                            command,
+                            "crm_global_identity_conflict",
+                            details={
+                                "lead_id": lead.id,
+                                "record_id": lead.smart_table_record_id or "",
+                                "expected_crm_lead_id_hash": hashlib.sha256(
+                                    (expected_crm_lead_id or "").encode()
+                                ).hexdigest(),
+                                "duplicate_count": str(len(duplicate_results)),
+                            },
+                        )
+                        return CreateSubmissionOutcome("failed_pending_review")
                 if (
                     identity is not None
                     and identity.state == "reserving"
@@ -847,7 +846,7 @@ class CrmSubmissionService:
                 )
                 session.add(sync)
                 session.flush()
-                if identity is not None:
+                if identity is not None and identity.state == "reserving":
                     # reservation 始终指向当前 generation；历史 abandoned 行保持不可变。
                     identity.creating_lead_id = lead.id
                     identity.creating_sync_record_id = sync.id
@@ -969,52 +968,6 @@ class CrmSubmissionService:
             remaining=remaining,
             failed=failed,
         )
-
-    @staticmethod
-    def _prepare_existing_identity_update(
-        session: Session,
-        lead: Lead,
-        command: SubmissionCommand,
-        payload: dict[str, object],
-        snapshot_hash: str,
-        *,
-        crm_user_id: str | None,
-        identity: CrmCompanyIdentity,
-    ) -> int | None:
-        """为已激活的全局 CRM 身份登记一次 update，不创建新的 CRM lead。"""
-
-        if identity.crm_lead_id is None or crm_user_id is None:
-            return None
-        existing = session.scalar(
-            select(CrmSyncRecord)
-            .where(
-                CrmSyncRecord.lead_id == lead.id,
-                CrmSyncRecord.operation == "update",
-                CrmSyncRecord.snapshot_hash == snapshot_hash,
-            )
-            .with_for_update()
-        )
-        if existing is not None:
-            return existing.id
-        sync = CrmSyncRecord(
-            lead_id=lead.id,
-            operation="update",
-            smart_table_record_id=lead.smart_table_record_id or "",
-            idempotency_key=f"crm:update:{lead.id}:{snapshot_hash}",
-            canonical_payload=payload,
-            snapshot_hash=snapshot_hash,
-            request_message_id=command.request_message_id,
-            submitting_sales_user_id=command.sales_user_id,
-            submitting_crm_user_id=crm_user_id,
-            crm_lead_id=identity.crm_lead_id,
-            crm_lead_owner_user_id=identity.crm_lead_owner_user_id,
-        )
-        session.add(sync)
-        session.flush()
-        CrmSubmissionService._record_audit_for_sync(
-            session, sync, command.sales_user_id, "crm_update_created_from_global_identity"
-        )
-        return sync.id
 
     def _record_mapping_missing(
         self,
