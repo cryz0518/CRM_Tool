@@ -119,7 +119,7 @@ class MessageIntakeService:
                         message_id=command.message_id,
                         sales_user_id=command.sales_user_id,
                         sequence=authorization.next_message_sequence,
-                        # 固定命令在持久化时分类，Worker 因此绝不把它送入 AI 意图推断。
+                        # 精确命令保留快速路径；普通文本由 Worker 做结构化意图路由。
                         event_type=(
                             "crm_submission_command"
                             if parse_crm_submission_command(command.normalized_text or "")

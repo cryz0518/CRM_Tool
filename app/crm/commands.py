@@ -48,6 +48,7 @@ _SUBMISSION_COMMAND_ALIASES = {
     "帮我提交我的更新": "提交我的更新",
     "提交更新": "提交我的更新",
 }
+_INQUIRY_MARKERS = ("吗", "了吗", "是否", "有没有", "是不是", "能否", "可以吗", "?", "？")
 _PREVIEW_FIELD_NAMES = (
     "业务线",
     "线索名称",
@@ -93,8 +94,10 @@ def parse_crm_submission_command(text: str) -> str | None:
     异常：无。
     副作用：无；仅执行有限的确定性短语归一化，不调用 LLM 或外部系统。
     """
-    # 只去除输入两端空白和句末标点，避免聊天输入格式差异导致命令被静默忽略。
-    candidate = text.strip().rstrip("。！？!?").strip()
+    # 只接受明确执行请求；不能通过删除问号把疑问句变成写操作。
+    candidate = text.strip().rstrip("。").strip()
+    if not is_explicit_submission_request(candidate):
+        return None
     if parse_company_submission_request(candidate) is not None:
         return candidate
     if candidate in CRM_SUBMISSION_COMMANDS:
@@ -114,6 +117,34 @@ def looks_like_submission_intent(text: str) -> bool:
     副作用：无；仅作异步分类前置筛选，不授权任何 CRM 操作。
     """
     candidate = text.strip()
+    return "提交" in candidate and any(
+        marker in candidate
+        for marker in (
+            "线索",
+            "更新",
+            "今天",
+            "所有",
+            "全部",
+            "放弃",
+            "这条",
+            "这家公司",
+            "公司",
+            "企业",
+        )
+    )
+
+
+def is_explicit_submission_request(text: str) -> bool:
+    """判断文本是否明确要求执行提交动作，而不是询问提交状态。
+
+    参数：text 为销售原始消息文本。
+    返回值：存在提交动作且没有明显疑问结构时返回 True。
+    异常：无。
+    副作用：无，不调用模型或外部系统。
+    """
+    candidate = text.strip()
+    if not candidate or any(marker in candidate for marker in _INQUIRY_MARKERS):
+        return False
     return "提交" in candidate and any(
         marker in candidate
         for marker in ("线索", "更新", "今天", "所有", "全部", "放弃", "这条", "这家公司")

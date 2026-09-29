@@ -116,11 +116,24 @@ def test_gateway_classifies_submission_intent_without_crm_side_effect() -> None:
     """验证模型只把“所有线索”映射为规范命令，不直接执行 CRM。"""
     provider = MockLLMProvider(responses=['{"intent":"SUBMIT_ALL","company_name":null}'])
 
-    command = AIGateway(provider).classify_submission_intent("请把我所有能提交的线索都提交一下")
+    intent = AIGateway(provider).classify_submission_intent("请把我所有能提交的线索都提交一下")
 
-    assert command == "提交我所有线索"
+    assert intent.intent == "SUBMIT_ALL"
+    assert intent.company_name is None
     assert provider.requests
     assert "意图分类" in provider.requests[0].messages[0]["content"]
+
+
+def test_gateway_keeps_lead_capture_as_typed_intent() -> None:
+    """验证包含提交方案字样的普通客户消息仍返回 LEAD_CAPTURE。"""
+    provider = MockLLMProvider(responses=['{"intent":"LEAD_CAPTURE","company_name":null}'])
+
+    intent = AIGateway(provider).classify_submission_intent(
+        "这是今天的新线索，客户下周提交方案，联系人张总，手机号13800000000"
+    )
+
+    assert intent.intent == "LEAD_CAPTURE"
+    assert intent.company_name is None
 
 
 def test_gateway_recovers_unique_process_from_explicit_source_context() -> None:
@@ -971,12 +984,34 @@ def test_gateway_prefills_one_or_two_low_confidence_multi_select_values() -> Non
         ]
     )
 
-    result = AIGateway(provider).extract_fields("客户工艺：焊接和装配")
+    result = AIGateway(provider).extract_fields("工艺：焊接和装配")
 
     assert result.fields == {"工艺": ["焊接", "装配"]}
     assert result.pending_confirmation_fields == ("工艺",)
     assert result.pending_prefill_allowed_fields == ("工艺",)
     assert result.low_confidence_candidates == {}
+
+
+def test_gateway_does_not_split_generic_process_words_into_enum_options() -> None:
+    """验证“检测”和“应用”不会被拆词误映射为完整工艺枚举。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"工艺": "视觉检测"},
+                confidence_by_field={"工艺": 0.4},
+            ),
+            valid_analysis(
+                crm_fields={"工艺": "商业应用"},
+                confidence_by_field={"工艺": 0.4},
+            ),
+        ]
+    )
+
+    first = AIGateway(provider).extract_fields("想了解检测流程")
+    second = AIGateway(provider).extract_fields("想了解应用场景")
+
+    assert first.fields == {}
+    assert second.fields == {}
 
 
 def test_gateway_keeps_ambiguous_follow_up_communication_out_of_formal_fields() -> None:

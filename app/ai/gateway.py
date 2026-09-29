@@ -58,22 +58,22 @@ def _enum_option_evidence_terms(field_name: str, option: str) -> tuple[str, ...]
     """生成枚举选项的受控原文证据词，不改变最终枚举值。
 
     参数：field_name 为注册表字段名；option 为合法枚举选项。
-    返回值：用于逐字证据判断的完整词和结构化组成词，最长词优先。
+    返回值：用于逐字证据判断的完整词和受控别名，最长词优先。
     异常：无。
     副作用：无；不进行模糊匹配或外部查询。
     """
     if field_name != "工艺":
         return (option,)
     terms = {option}
-    # 允许“自助加油/充电”这类由多个受控组成词表达的选项被自然语言完整表达，
-    # 但仍要求语义提示（想做、用于、工艺等），不会按任意相似词自动选择。
-    for component in re.split(r"[/、|]", option):
-        component = component.strip()
-        if not component:
-            continue
-        terms.add(component)
-        if len(component) >= 4:
-            terms.update(component[index : index + 2] for index in range(0, len(component) - 1, 2))
+    # 仅维护明确业务别名；禁止把任意两个汉字拆成枚举候选。
+    terms.update(
+        {
+            "自助充电",
+            "自助加油",
+        }
+        if option == "自助加油/充电"
+        else set()
+    )
     return tuple(sorted(terms, key=len, reverse=True))
 _PHONE_PATTERN = re.compile(r"^\+?[0-9][0-9 -]{5,24}$")
 _EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -327,12 +327,12 @@ class AIGateway:
             pending_prefill_allowed,
         )
 
-    def classify_submission_intent(self, text: str) -> str | None:
-        """用结构化模型识别提交意图，并映射到既有安全命令。
+    def classify_submission_intent(self, text: str) -> SubmissionIntent:
+        """用结构化模型识别消息工作流意图，不生成任何 CRM 业务参数。
 
-        参数：text 为已持久化的销售消息；仅在消息具备提交意图候选时调用。
-        返回值：规范 CRM 命令，或表示录入/无法判断的 None。
-        异常：模型传输失败抛出 AIGatewayTransportError；结构不合法按 None 处理。
+        参数：text 为已持久化的销售消息，可为普通线索文本或提交请求。
+        返回值：受限的结构化意图；结构不合法时返回 UNKNOWN。
+        异常：模型传输失败抛出 AIGatewayTransportError。
         副作用：调用一次 LLM，不执行 CRM、数据库或智能表格写操作。
         """
         safe_text = _SENSITIVE_PATTERN.sub("[已遮蔽敏感号码]", text)
@@ -348,7 +348,8 @@ class AIGateway:
                         "‘提交今天/今天的线索’归类 SUBMIT_TODAY；‘提交所有/全部/我的所有线索’归类 "
                         "SUBMIT_ALL；‘提交放弃提交/放弃的线索’归类 SUBMIT_ABANDONED；"
                         "‘提交更新/我的更新’归类 SUBMIT_UPDATES；明确提交某一家公司归类 "
-                        "SUBMIT_SINGLE 并只填写 company_name。录入客户资料属于 LEAD_CAPTURE。"
+                        "SUBMIT_SINGLE 并只填写 company_name。录入客户资料属于 LEAD_CAPTURE；"
+                        "普通客户信息即使包含‘今天’或‘提交方案’也归类 LEAD_CAPTURE。"
                         "无法确定时返回 UNKNOWN。必须符合 JSON Schema："
                         f"{json.dumps(schema, ensure_ascii=False)}"
                     ),
@@ -362,25 +363,21 @@ class AIGateway:
             intent = SubmissionIntent.model_validate_json(response.content)
         except (ValidationError, ValueError, TypeError):
             logger.warning("submission_intent_invalid_structure")
-            return None
-        command_by_intent = {
-            "SUBMIT_TODAY": "提交今天的线索",
-            "SUBMIT_ALL": "提交我所有线索",
-            "SUBMIT_ABANDONED": "帮我提交放弃提交的线索",
-            "SUBMIT_UPDATES": "提交我的更新",
-        }
-        if intent.intent in command_by_intent:
-            return command_by_intent[intent.intent]
-        if intent.intent != "SUBMIT_SINGLE" or intent.company_name is None:
-            return None
+            return SubmissionIntent(intent="UNKNOWN")
+        if intent.intent != "SUBMIT_SINGLE":
+            if intent.company_name is not None:
+                return SubmissionIntent(intent="UNKNOWN")
+            return intent
+        if intent.company_name is None:
+            return SubmissionIntent(intent="UNKNOWN")
         company_name = intent.company_name.strip()
         if (
             not company_name
             or len(company_name) > 128
             or any(char in company_name for char in "\r\n。")
         ):
-            return None
-        return f"请帮我提交{company_name}这条线索"
+            return SubmissionIntent(intent="UNKNOWN")
+        return intent.model_copy(update={"company_name": company_name})
 
     @staticmethod
     def _recover_verified_identity_fields(
@@ -1032,7 +1029,7 @@ class AIGateway:
         if field_name == "工艺":
             # “想做装配相关”“工艺：装配”“用于装配”等表达均明确指向工艺。
             patterns = (
-                rf"(?:工艺|应用工艺)\s*[:：是为]?\s*{escaped}",
+                rf"(?:工艺|应用工艺)\s*[:：是为]?[^。；，,\n]{{0,16}}{escaped}",
                 rf"(?:主要)?想(?:做)?[^。；，,\n]{{0,16}}{escaped}",
                 rf"用于[^。；，,\n]{{0,16}}{escaped}(?:相关|方面|项目)?",
             )
@@ -1476,14 +1473,20 @@ class AIGateway:
             if "其他" not in options:
                 continue
             known_values = [item for item in raw_values if item in options and item != "其他"]
+            evidence_values = [
+                item
+                for item in unknown_values
+                if self._has_explicit_enum_evidence(field_name, item, source_text)
+            ]
+            if len(evidence_values) != len(unknown_values):
+                continue
+            normalized: LeadFieldValue
             if isinstance(value, list):
-                normalized: LeadFieldValue = [*known_values, "其他"]
+                normalized = [*known_values, "其他"]
             else:
                 normalized = "其他"
             fields[field_name] = normalized
-            evidence_values = [item for item in unknown_values if item in source_text]
-            if evidence_values:
-                enrichment[field_name] = "、".join(evidence_values)
+            enrichment[field_name] = "、".join(evidence_values)
             changed = True
         if not changed:
             return analysis
@@ -1510,6 +1513,29 @@ class AIGateway:
                 isinstance(item, str) and item in (options or ()) for item in values
             )
         return False
+
+    def _low_confidence_enum_has_evidence(
+        self, analysis: LeadAnalysis, field_name: str, value: LeadFieldValue, source_text: str
+    ) -> bool:
+        """确认低置信度枚举候选逐项具有当前原文的字段语义证据。
+
+        参数：analysis 为已归一化分析结果；field_name、value 为当前枚举候选；
+        source_text 为脱敏后的原始消息文本。
+        返回值：每个候选均有受控字段证据时返回 True。
+        异常：无。
+        副作用：无，不调用外部服务。
+        """
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            if item == "其他":
+                raw = analysis.enrichment.get(field_name)
+                if not raw or not self._has_explicit_enum_evidence(field_name, raw, source_text):
+                    return False
+            elif not isinstance(item, str) or not self._has_explicit_enum_evidence(
+                field_name, item, source_text
+            ):
+                return False
+        return True
 
     def _apply_confidence(
         self, analysis: LeadAnalysis, source_text: str
@@ -1544,8 +1570,10 @@ class AIGateway:
             elif confidence >= self._medium_confidence_threshold:
                 fields[field_name] = value
                 pending.append(field_name)
-            elif self._can_prefill_low_confidence_enum(field_name, value):
-                # 枚举候选数量受控且值已通过校验，写入正式字段但保留待确认标记。
+            elif self._can_prefill_low_confidence_enum(
+                field_name, value
+            ) and self._low_confidence_enum_has_evidence(analysis, field_name, value, source_text):
+                # 枚举候选数量受控且逐项有原文证据，写入正式字段并保留建议标记。
                 fields[field_name] = value
                 pending.append(field_name)
                 pending_prefill_allowed.append(field_name)

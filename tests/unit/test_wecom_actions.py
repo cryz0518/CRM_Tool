@@ -14,7 +14,11 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.crm.commands import parse_company_submission_request, parse_crm_submission_command
+from app.crm.commands import (
+    is_explicit_submission_request,
+    parse_company_submission_request,
+    parse_crm_submission_command,
+)
 from app.crm.mock import MockCRMAdapter
 from app.leads.discard import LeadDiscardService
 from app.leads.models import (
@@ -561,6 +565,10 @@ def test_submission_command_aliases_normalize_to_confirmed_intents() -> None:
     assert parse_crm_submission_command("帮我提交今天的线索") == "提交今天的线索"
     assert parse_crm_submission_command("提交今天的线索。") == "提交今天的线索"
     assert parse_crm_submission_command("请提交我的更新") is None
+    assert parse_crm_submission_command("提交我所有线索？") is None
+    assert is_explicit_submission_request("请帮我提交今天的线索") is True
+    assert is_explicit_submission_request("今天的线索提交了吗？") is False
+    assert is_explicit_submission_request("这个客户之前提交过吗？") is False
 
 
 def test_company_submission_request_is_strict_and_returns_exact_company_name() -> None:

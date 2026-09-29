@@ -267,10 +267,10 @@ def test_t09_does_not_treat_a_canonical_reread_as_a_user_edit(
     assert business_line.is_user_modified is False
 
 
-def test_required_pending_field_blocks_until_owner_explicitly_confirms(
+def test_ai_pending_field_is_advisory_and_explicit_confirmation_is_optional(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证 CRM 必填待确认字段只可由负责人显式确认后解除提交阻塞。
+    """验证 AI待确认 不阻塞提交，负责人仍可选择性记录确认审计。
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
@@ -286,8 +286,8 @@ def test_required_pending_field_blocks_until_owner_explicitly_confirms(
     blocked = service.get_submission_confirmation_state(lead_id)
     confirmed = service.confirm_submission_fields(lead_id, "sales-1", ("业务线",))
 
-    assert blocked.can_submit is False
-    assert blocked.blocking_fields == ("业务线",)
+    assert blocked.can_submit is True
+    assert blocked.blocking_fields == ()
     assert confirmed.can_submit is True
     record = adapter.get_record(record_id)
     assert record is not None
@@ -372,13 +372,13 @@ def test_medium_confidence_same_value_still_enters_confirmation_queue(
     assert record.fields["AI待确认"] == ["业务线"]
     assert LeadReviewService(session_factory, adapter).get_submission_confirmation_state(
         lead_id
-    ).blocking_fields == ("业务线",)
+    ).blocking_fields == ()
 
 
-def test_card_unavailable_does_not_prefill_required_medium_confidence_field(
+def test_card_unavailable_does_not_change_advisory_prefill_semantics(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证机器人卡片不可用时必填中置信度字段不写正式表格字段。
+    """验证机器人卡片不可用时仍按 T08 结果保留正式字段与待确认元数据。
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
