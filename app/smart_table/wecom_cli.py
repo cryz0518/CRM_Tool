@@ -447,6 +447,9 @@ class WecomCliSmartTableAdapter:
         """
         # 文档和子表标识只在进程参数中流转，日志和异常均不输出其原值。
         request = {"docid": self._doc_id, "sheet_id": self._sheet_id, **payload}
+        if action == "update":
+            # 更新契约显式固定字段标题键，避免 CLI 默认 key_type 随版本或环境变化。
+            request["key_type"] = "CELL_VALUE_KEY_TYPE_FIELD_TITLE"
         arguments = (
             self._command,
             "smartsheet",
@@ -547,7 +550,15 @@ class WecomCliSmartTableAdapter:
         normalized = stderr.casefold()
         if any(
             token in normalized
-            for token in ("permission", "forbidden", "unauthorized", "无权限", "权限")
+            for token in (
+                "permission",
+                "forbidden",
+                "unauthorized",
+                "no authority",
+                "851003",
+                "无权限",
+                "权限",
+            )
         ):
             return "permission_denied"
         if "not found" in normalized or "不存在" in normalized:

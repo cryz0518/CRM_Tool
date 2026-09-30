@@ -738,6 +738,45 @@ def test_subprocess_failure_keeps_only_controlled_error_code(
     assert "secret-value" not in str(error.value)
 
 
+def test_update_declares_field_title_key_type() -> None:
+    """验证更新请求显式声明使用字段标题，避免 CLI 默认键类型漂移。"""
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {"errcode": 0, "records": [{"record_id": "record-1", "values": {}}]},
+            {"errcode": 0, "records": [{"record_id": "record-1", "values": {}}]},
+            {"errcode": 0, "records": [{"record_id": "record-1", "values": {}}]},
+        ]
+    )
+
+    _adapter(fake_cli).update_record("record-1", {"备注": "更新后的备注"})
+
+    payload = _payload(fake_cli.calls[-1])
+    assert payload["key_type"] == "CELL_VALUE_KEY_TYPE_FIELD_TITLE"
+
+
+def test_no_authority_cli_failure_is_classified_as_permission_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证企业规模权限错误进入受控权限分类，不被当作暂态进程错误。"""
+
+    def failed_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        """返回企业微信明确的权限失败片段。"""
+        return subprocess.CompletedProcess(
+            args=["wecom-cli"],
+            returncode=1,
+            stdout="",
+            stderr="errcode=851003 errmsg=no authority",
+        )
+
+    monkeypatch.setattr(subprocess, "run", failed_run)
+
+    with pytest.raises(WecomCliProcessError) as error:
+        _adapter(FakeCli([]))._run_subprocess(("wecom-cli", "--json", "{}"))
+
+    assert error.value.error_code == "permission_denied"
+
+
 def test_cli_process_exit_during_add_is_not_retried() -> None:
     """验证新增记录遇到未知进程退出时不重放，避免服务端已成功而本地重复建行。"""
     fake_cli = FakeCli(
