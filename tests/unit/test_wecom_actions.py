@@ -567,8 +567,15 @@ def test_submission_command_aliases_normalize_to_confirmed_intents() -> None:
     assert parse_crm_submission_command("请提交我的更新") is None
     assert parse_crm_submission_command("提交我所有线索？") is None
     assert is_explicit_submission_request("请帮我提交今天的线索") is True
+    assert is_explicit_submission_request("请提交所有线索") is True
+    assert is_explicit_submission_request("帮我提交遨博这条线索") is True
     assert is_explicit_submission_request("今天的线索提交了吗？") is False
     assert is_explicit_submission_request("这个客户之前提交过吗？") is False
+    assert is_explicit_submission_request("不要提交今天的线索") is False
+    assert is_explicit_submission_request("先别提交我的更新") is False
+    assert is_explicit_submission_request("暂时不提交所有线索") is False
+    assert is_explicit_submission_request("我不想提交这条线索") is False
+    assert parse_crm_submission_command("不要提交今天的线索") is None
 
 
 def test_company_submission_request_is_strict_and_returns_exact_company_name() -> None:

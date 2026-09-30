@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from datetime import UTC, datetime
+from unittest.mock import Mock
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -10,6 +12,7 @@ from sqlalchemy.exc import StatementError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.ai.models import SubmissionIntent
 from app.messaging.models import (
     Base,
     BusinessAuditEvent,
@@ -19,6 +22,7 @@ from app.messaging.models import (
     SalesAuthorization,
 )
 from app.messaging.service import IncomingMessageCommand, MessageIntakeResult, MessageIntakeService
+from workers import tasks
 
 
 @pytest.fixture
@@ -99,6 +103,66 @@ def test_submission_like_natural_language_enters_async_intent_classification(
 
     assert event is not None
     assert event.event_type == "crm_submission_intent"
+
+
+@pytest.mark.parametrize(
+    ("text", "intent"),
+    [
+        ("不要提交今天的线索", "SUBMIT_TODAY"),
+        ("不用提交所有线索", "SUBMIT_ALL"),
+        ("先别提交遨博这条线索", "SUBMIT_SINGLE"),
+    ],
+)
+def test_negative_submission_intent_never_enters_submission_workflow(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+    intent: str,
+) -> None:
+    """验证模型即使误判为提交意图，原文否定表达仍不会发行动作或调用 CRM。"""
+    authorize_salesperson(session_factory, "sales-1")
+    claimed_at = datetime.now(UTC)
+    with session_factory.begin() as session:
+        message = IncomingMessage(
+            message_id=f"negative-{intent}",
+            sales_user_id="sales-1",
+            sequence=1,
+            raw_payload={"text": text},
+            normalized_text=text,
+        )
+        session.add(message)
+        event = OutboxEvent(
+            message_id=message.message_id,
+            sales_user_id="sales-1",
+            sequence=1,
+            event_type="crm_submission_intent",
+            status="processing",
+            processing_started_at=claimed_at,
+        )
+        session.add(event)
+        session.flush()
+        outbox_event_id = event.id
+
+    fake_gateway = Mock()
+    fake_gateway.classify_submission_intent.return_value = SubmissionIntent(intent=intent)
+    consume_submission = Mock(side_effect=AssertionError("否定请求不应进入提交工作流"))
+    get_crm = Mock(side_effect=AssertionError("否定请求不应构造 CRM 依赖"))
+    engine = session_factory.kw["bind"]
+    assert engine is not None
+    monkeypatch.setattr(tasks, "_take_lead_outbox_claim", lambda *_args: True)
+    monkeypatch.setattr(tasks, "get_smart_table_adapter", lambda: object())
+    monkeypatch.setattr(tasks, "_is_submission_command", lambda *_args: False)
+    monkeypatch.setattr(tasks, "_is_submission_intent", lambda *_args: True)
+    monkeypatch.setattr(tasks, "get_ai_gateway", lambda: fake_gateway)
+    monkeypatch.setattr(tasks, "consume_submission_command", consume_submission)
+    monkeypatch.setattr(tasks, "get_crm_adapter", get_crm)
+    monkeypatch.setattr(tasks, "_session_factory", lambda: (engine, session_factory))
+
+    result = tasks.consume_lead_outbox_event.run(outbox_event_id, claimed_at.isoformat())
+
+    assert result == "submission_intent_unrecognized"
+    consume_submission.assert_not_called()
+    get_crm.assert_not_called()
 
 
 def test_duplicate_authorized_message_has_no_second_business_side_effect(

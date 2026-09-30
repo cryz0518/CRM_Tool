@@ -49,6 +49,20 @@ _SUBMISSION_COMMAND_ALIASES = {
     "提交更新": "提交我的更新",
 }
 _INQUIRY_MARKERS = ("吗", "了吗", "是否", "有没有", "是不是", "能否", "可以吗", "?", "？")
+_NEGATIVE_SUBMISSION_MARKERS = (
+    "不要",
+    "别",
+    "不用",
+    "无需",
+    "不想",
+    "不需要",
+    "暂不",
+    "暂时不",
+    "先不",
+    "先别",
+    "禁止",
+    "取消",
+)
 _PREVIEW_FIELD_NAMES = (
     "业务线",
     "线索名称",
@@ -144,6 +158,9 @@ def is_explicit_submission_request(text: str) -> bool:
     """
     candidate = text.strip()
     if not candidate or any(marker in candidate for marker in _INQUIRY_MARKERS):
+        return False
+    # 否定或取消表达优先于模型意图，防止“不要提交”进入任何 CRM 工作流。
+    if any(marker in candidate for marker in _NEGATIVE_SUBMISSION_MARKERS):
         return False
     return "提交" in candidate and any(
         marker in candidate
