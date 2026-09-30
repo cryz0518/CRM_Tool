@@ -40,6 +40,18 @@ STRUCTURED_EXTRA_FIELDS = (
     "retry_attempt",
     "returncode",
     "error_code",
+    "callback_claim_duration_ms",
+    "card_update_duration_ms",
+    "remaining_deadline_ms",
+    "callback_total_duration_ms",
+)
+_CALLBACK_TIMING_FIELDS = frozenset(
+    {
+        "callback_claim_duration_ms",
+        "card_update_duration_ms",
+        "remaining_deadline_ms",
+        "callback_total_duration_ms",
+    }
 )
 _LOG_EMAIL_PATTERN = re.compile(r"(?P<local>[^\s@]+)@(?P<domain>[^\s@]+)")
 _LOG_PHONE_PATTERN = re.compile(r"(?<!\d)(?P<number>\+?[0-9][0-9 -]{6,22}[0-9])(?!\d)")
@@ -97,6 +109,9 @@ class JsonFormatter(logging.Formatter):
         for field in STRUCTURED_EXTRA_FIELDS:
             value = getattr(record, field, None)
             if value is not None:
+                # 时序字段只接受非负纯整数，避免外部字符串或 bool 混入结构化日志。
+                if field in _CALLBACK_TIMING_FIELDS and (type(value) is not int or value < 0):
+                    continue
                 # readiness 传入的 traceback 可能包含源码行，统一裁剪为安全的栈帧摘要。
                 payload[field] = (
                     _safe_traceback_text(str(value))

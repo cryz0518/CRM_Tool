@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -11,12 +12,18 @@ import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+import app.crm.sop as crm_sop
 from app.companies.service import TYCAdapterError
 from app.companies.tyc import TianYanChaAdapter
 from app.core.config import Settings
 from app.core.provider_policy import ProviderPolicy
 from app.crm.employee_directory import EmployeeDirectory, EmployeeDirectoryError
-from app.crm.sop import SopCRMAdapter, SopCRMError
+from app.crm.sop import (
+    SopCRMAdapter,
+    SopCRMError,
+    _classify_duplicate_entity_message,
+    _duplicate_entity_type_for_digest,
+)
 
 
 def _tyc(response: object, *, status: int = 200) -> TianYanChaAdapter:
@@ -199,9 +206,39 @@ def test_sop_duplicate_without_lead_id_fails_closed_and_no_duplicate_is_empty() 
     """驗證重複無安全目標不會被當成无重复。"""
     adapter, _ = _crm({"code": 0, "data": {"result": 0, "leadId": None}})
     assert adapter.search_by_company_name({"name": "样例", "businessLine": 2}) == ()
-    adapter, _ = _crm({"code": 0, "data": {"result": 100, "leadId": None}})
-    with pytest.raises(SopCRMError, match="manual review"):
+    adapter, _ = _crm(
+        {
+            "code": 0,
+            "data": {
+                "result": 100,
+                "leadId": None,
+                "customerId": None,
+                "message": "PRIVATE SOP RESPONSE",
+            },
+        }
+    )
+    with pytest.raises(SopCRMError) as error:
         adapter.search_by_company_name({"name": "样例", "businessLine": 2})
+    assert error.value.category == "duplicate_target_unavailable"
+    assert error.value.sub_code == "duplicate_detected_without_lead_id"
+    assert error.value.duplicate_entity_type == "unknown"
+    assert "PRIVATE SOP RESPONSE" not in str(error.value)
+
+
+def test_sop_duplicate_entity_allowlist_uses_exact_message_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 SOP 精确文案哈希映射，并将未登记消息归为 unknown。"""
+    assert _duplicate_entity_type_for_digest(
+        "3e767f7522343ef3d9328eafd549855a6e1aa55829509bf29dbe75a6e4686da6b8"
+    ) == "lead"
+    assert _duplicate_entity_type_for_digest("0" * 64) == "unknown"
+
+    customer_message = "synthetic customer fixture"
+    customer_digest = hashlib.sha256(customer_message.encode("utf-8")).hexdigest()
+    monkeypatch.setitem(crm_sop._DUPLICATE_ENTITY_MESSAGE_HASHES, customer_digest, "customer")
+    assert crm_sop._classify_duplicate_entity_message(customer_message) == "customer"
+    assert _classify_duplicate_entity_message("unlisted SOP message") == "unknown"
 
 
 def test_sop_duplicate_create_and_update_response_shapes() -> None:

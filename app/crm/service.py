@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, text
@@ -106,6 +106,7 @@ class SubmissionItemResult:
     adapter_category: str | None = None
     http_status: int | None = None
     failure_code: str | None = None
+    duplicate_entity_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -171,6 +172,7 @@ class CreateSubmissionOutcome:
     adapter_category: str | None = None
     http_status: int | None = None
     failure_code: str | None = None
+    duplicate_entity_type: str | None = None
 
 
 class CRMFailureEvidence(TypedDict):
@@ -180,6 +182,7 @@ class CRMFailureEvidence(TypedDict):
     adapter_category: str | None
     http_status: int | None
     failure_code: str | None
+    duplicate_entity_type: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -224,11 +227,12 @@ def _create_outcome(
     adapter_category: str | None = None,
     http_status: int | None = None,
     failure_code: str | None = None,
+    duplicate_entity_type: str | None = None,
 ) -> CreateSubmissionOutcome:
     """构造单条 create 结果并补齐受控原因码。
 
     参数：status 为领域状态；duplicate 为重复线索事实；missing_fields 为本条缺失字段；
-    reason_code 为可选的确定性原因码。
+    reason_code 与 duplicate_entity_type 为受控原因和对象类别。
     返回值：包含状态、原因和缺失字段的不可变结果。
     异常：无。
     副作用：无，不调用数据库或外部服务。
@@ -243,6 +247,7 @@ def _create_outcome(
         adapter_category=adapter_category,
         http_status=http_status,
         failure_code=failure_code,
+        duplicate_entity_type=duplicate_entity_type,
     )
 
 
@@ -269,6 +274,7 @@ def _append_create_result(
         adapter_category=outcome.adapter_category,
         http_status=outcome.http_status,
         failure_code=outcome.failure_code,
+        duplicate_entity_type=outcome.duplicate_entity_type,
     )
     return replace(
         result,
@@ -985,9 +991,13 @@ class CrmSubmissionService:
             return _create_outcome(
                 "retrying" if failure_category.value == "transient" else "failed_pending_review",
                 reason_code=(
-                    "crm_duplicate_search_retrying"
-                    if failure_category.value == "transient"
-                    else "crm_duplicate_search_failed"
+                    "duplicate_target_unavailable"
+                    if getattr(error, "category", None) == "duplicate_target_unavailable"
+                    else (
+                        "crm_duplicate_search_retrying"
+                        if failure_category.value == "transient"
+                        else "crm_duplicate_search_failed"
+                    )
                 ),
                 **failure_evidence,
             )
@@ -1768,7 +1778,7 @@ class CrmSubmissionService:
         """提取 CRM 失败的受控可观测证据，不保存异常正文。
 
         参数：error 为 CRM 适配器异常。
-        返回值：失败分类、HTTP 状态和安全协议码组成的审计字段。
+        返回值：失败分类、HTTP 状态、安全协议码及可选对象类别组成的审计字段。
         异常：无；未知字段会被忽略。
         副作用：无，不读取或记录原始响应内容。
         """
@@ -1784,10 +1794,14 @@ class CrmSubmissionService:
             "authentication",
             "business",
             "business_rejection",
+            "duplicate_target_unavailable",
             "gateway",
             "malformed_response",
         }:
             details["adapter_category"] = adapter_category
+        duplicate_entity_type = getattr(error, "duplicate_entity_type", None)
+        if duplicate_entity_type in {"lead", "customer", "dealer", "unknown"}:
+            details["duplicate_entity_type"] = duplicate_entity_type
         http_status = getattr(error, "http_status", None)
         if isinstance(http_status, int):
             details["http_status"] = http_status

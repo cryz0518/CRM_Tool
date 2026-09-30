@@ -169,6 +169,8 @@ class CallbackClaimResult:
         return {
             "card_type": "text_notice",
             "task_id": self.task_id,
+            # 企业微信更新模板卡也要求 card_action；type=0 表示状态卡不执行跳转。
+            "card_action": {"type": 0},
             "main_title": {"title": title, "desc": description},
         }
 

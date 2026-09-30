@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -15,12 +15,14 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.core.config import get_settings
+from app.crm.adapter import CRMSearchResult
 from app.crm.commands import (
     is_explicit_submission_request,
     parse_company_submission_request,
     parse_crm_submission_command,
 )
 from app.crm.mock import MockCRMAdapter
+from app.crm.sop import SopCRMError
 from app.leads.discard import LeadDiscardService
 from app.leads.models import (
     CrmSyncRecord,
@@ -51,6 +53,7 @@ from app.wecom_bot.actions import (
     CARD_EVENT_KEY_CRM_FIELD_CONFIRM,
     CARD_EVENT_KEY_DISCARD_CONFIRM,
     CARD_EVENT_KEY_REASSIGN_CONFIRM,
+    CallbackClaimResult,
     CallbackParseError,
     DeterministicWecomActionExecutor,
     InvalidActionTransition,
@@ -1032,6 +1035,63 @@ def test_today_callback_claim_executor_submits_only_selected_lead(
     assert [payload["name"] for payload in crm.payloads] == ["TODAY测试公司-0"]
 
 
+def test_duplicate_response_message_never_enters_result_notification(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 CRM 重复原文不会进入动作结果通知，且缺少 ID 时不创建 CRM 线索。"""
+    import app.crm.service as crm_service
+
+    employee_path = tmp_path / "employee.csv"
+    employee_path.write_text("id,name,nickname\ncrm-sales-a,测试销售,测试\n", encoding="utf-8")
+    settings = get_settings().model_copy(update={"employee_directory_path": str(employee_path)})
+    monkeypatch.setattr(crm_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(crm_service, "_TEST_EMPLOYEE_DIRECTORY_PATH", employee_path, raising=False)
+
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_ids = _seed_today_submission_leads(session_factory, adapter)
+    action_service = _service(session_factory)
+    action = _issue_today_action(action_service, lead_ids, message_id="duplicate-message-safe")
+    claim = action_service.claim_callback(
+        _batch_frame_for_action(action, (lead_ids[0],), msgid="duplicate-message-safe-1")
+    )
+
+    class DuplicateTargetCRM(MockCRMAdapter):
+        """返回安全分类，但异常正文模拟远端敏感文案。"""
+
+        def search_by_company_name(
+            self, payload: Mapping[str, object] | str
+        ) -> tuple[CRMSearchResult, ...]:
+            """阻止测试走 create，并验证远端正文不被结果路径读取。"""
+            del payload
+            self.search_calls += 1
+            raise SopCRMError(
+                "PRIVATE RAW SOP MESSAGE",
+                category="duplicate_target_unavailable",
+                sub_code="duplicate_detected_without_lead_id",
+                duplicate_entity_type="lead",
+            )
+
+    crm = DuplicateTargetCRM()
+    executor = DeterministicWecomActionExecutor(session_factory, adapter, crm, action_service)
+    execution = action_service.execute_action(action.id, executor)
+
+    assert claim.code == "claimed"
+    assert execution.executed is True
+    assert crm.search_calls == 1 and crm.calls == 0
+    with session_factory() as session:
+        notifications = session.scalars(
+            select(NotificationRecord).where(
+                NotificationRecord.notification_type == "wecom_action_result",
+                NotificationRecord.source_message_id == "duplicate-message-safe",
+            )
+        ).all()
+    assert notifications
+    assert all("PRIVATE RAW SOP MESSAGE" not in (item.content or "") for item in notifications)
+    assert any("CRM 检测到重复线索" in (item.content or "") for item in notifications)
+
+
 def test_today_callback_defers_temporary_lifecycle_to_worker_revalidation(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -1285,7 +1345,7 @@ def test_callback_nonzero_sdk_ack_is_transport_failure_without_ack_text(
         """模拟 SDK 对非零 ACK 抛出异常，且 errmsg 含敏感正文。"""
         del frame_value, card
         raise RuntimeError(
-            "Reply ack error: reqId=DO_NOT_LOG_REQID, errcode=48001, "
+            "Reply ack error: reqId=DO_NOT_LOG_REQID, errcode=42045, "
             "errmsg=PRIVATE RESPONSE TOKEN"
         )
 
@@ -1300,8 +1360,8 @@ def test_callback_nonzero_sdk_ack_is_transport_failure_without_ack_text(
         )
     assert delivery is not None
     assert delivery.transport_status == "failed"
-    assert delivery.transport_failure_code == "sdk_ack_errcode_48001"
-    assert delivery.transport_failure_summary == "企业微信 SDK 拒绝卡片更新（错误码 48001）"
+    assert delivery.transport_failure_code == "sdk_ack_errcode_42045"
+    assert delivery.transport_failure_summary == "企业微信 SDK 拒绝卡片更新（错误码 42045）"
     assert "PRIVATE RESPONSE" not in str(delivery.transport_failure_summary)
     assert "DO_NOT_LOG_REQID" not in str(delivery.transport_failure_summary)
     assert "PRIVATE RESPONSE" not in caplog.text
@@ -1339,6 +1399,7 @@ def test_callback_response_success_freezes_card_and_saves_transport_evidence(
 
     assert len(updates) == 1
     assert updates[0]["card_type"] == "text_notice"
+    assert updates[0]["card_action"] == {"type": 0}
     assert updates[0]["main_title"] == {
         "title": "已确认选择",
         "desc": "已受理，后台正在提交，请勿重复操作",
@@ -1370,6 +1431,21 @@ def test_callback_response_success_freezes_card_and_saves_transport_evidence(
     assert timing[0].card_update_duration_ms >= 0
     assert timing[1].card_update_duration_ms == 0
     assert "provider-msg" not in caplog.text
+
+
+def test_claimed_response_card_matches_text_notice_update_contract() -> None:
+    """验证冻结回调响应使用企业微信支持的无跳转 text_notice 结构。"""
+    card = CallbackClaimResult(
+        "claimed", "original-task", "action-1", "claimed", True
+    ).response_card()
+
+    assert card["card_type"] == "text_notice"
+    assert card["task_id"] == "original-task"
+    assert card["card_action"] == {"type": 0}
+    assert card["main_title"] == {
+        "title": "已确认选择",
+        "desc": "已受理，后台正在提交，请勿重复操作",
+    }
 
 
 def test_final_notification_retry_does_not_repeat_domain_action(

@@ -653,6 +653,96 @@ def test_duplicate_search_failure_reply_maps_safe_category(
     assert "traceback" not in reply.lower()
 
 
+def test_duplicate_target_without_lead_id_has_its_own_safe_result_and_reply() -> None:
+    """验证查重命中但无可操作线索 ID 使用重复待确认语义。"""
+    from app.crm.service import _append_create_result, _create_outcome
+
+    outcome = _create_outcome(
+        "failed_pending_review",
+        reason_code="duplicate_target_unavailable",
+        failure_category="permanent",
+        adapter_category="duplicate_target_unavailable",
+        failure_code="duplicate_detected_without_lead_id",
+        duplicate_entity_type="lead",
+    )
+    result = _append_create_result(SubmissionBatchResult(), "lead-seagate", outcome)
+    item = result.items[0]
+    reply = format_submission_reply(
+        result,
+        lead_labels={"lead-seagate": "希捷国际科技（无锡）有限公司｜杨总"},
+        selected_count=1,
+    )
+
+    assert item.reason_code == "duplicate_target_unavailable"
+    assert item.duplicate_entity_type == "lead"
+    assert "❌ 重复待人工确认 1 条" in reply
+    expected_detail = (
+        "希捷国际科技（无锡）有限公司｜杨总：CRM 检测到重复线索，"
+        "但未返回可操作的线索 ID，请人工确认。"
+    )
+    assert expected_detail in reply
+    assert "CRM 返回业务错误" not in reply
+    assert "leadId=null" not in reply
+
+
+def test_duplicate_target_unavailable_is_audited_and_never_calls_create(
+    session_factory: sessionmaker[Session], caplog: pytest.LogCaptureFixture
+) -> None:
+    """验证无可操作重复目标逐 Lead 保存受控事实且不会创建 CRM 线索。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+
+    class DuplicateTargetCRM(MockCRMAdapter):
+        """模拟已确认重复但没有可操作线索 ID 的查重响应。"""
+
+        def search_by_company_name(
+            self, payload: Mapping[str, object] | str
+        ) -> tuple[CRMSearchResult, ...]:
+            """只抛出不含远端正文的受控错误事实。"""
+            del payload
+            raise SopCRMError(
+                "controlled duplicate target unavailable",
+                category="duplicate_target_unavailable",
+                sub_code="duplicate_detected_without_lead_id",
+                duplicate_entity_type="lead",
+            )
+
+    crm = DuplicateTargetCRM()
+    result = submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, crm),
+        "sales-1",
+        "message-duplicate-target",
+    )
+
+    assert result.failed_pending_review == 1
+    assert crm.calls == 0
+    item = result.items[0]
+    assert item.lead_id == lead_id
+    assert item.reason_code == "duplicate_target_unavailable"
+    assert item.failure_category == "permanent"
+    assert item.adapter_category == "duplicate_target_unavailable"
+    assert item.failure_code == "duplicate_detected_without_lead_id"
+    assert item.duplicate_entity_type == "lead"
+    reply = format_submission_reply(
+        result, lead_labels={lead_id: "测试公司｜联系人"}, selected_count=1
+    )
+    assert "测试公司｜联系人：CRM 检测到重复线索" in reply
+    assert "controlled duplicate target unavailable" not in reply
+    assert "controlled duplicate target unavailable" not in caplog.text
+
+    with session_factory() as session:
+        audit = session.scalar(
+            select(BusinessAuditEvent).where(
+                BusinessAuditEvent.message_id == "message-duplicate-target",
+                BusinessAuditEvent.event_type.startswith("crm_duplicate_search_failed:"),
+            )
+        )
+    assert audit is not None
+    assert audit.details["duplicate_entity_type"] == "lead"
+    assert audit.details["failure_code"] == "duplicate_detected_without_lead_id"
+    assert "controlled duplicate target unavailable" not in str(audit.details)
+
+
 def test_sales_authorization_crm_mapping_is_not_required_when_owner_directory_matches(
     session_factory: sessionmaker[Session],
 ) -> None:

@@ -849,6 +849,14 @@ def _crm_duplicate_failure_detail(item: SubmissionItemResult) -> str:
     异常：无；非法状态码或 HTTP 状态会被忽略。
     副作用：无，不读取 CRM 响应正文或异常文本。
     """
+    if item.reason_code == "duplicate_target_unavailable":
+        entity_name = {
+            "lead": "线索",
+            "customer": "客户",
+            "dealer": "经销商",
+        }.get(item.duplicate_entity_type or "", "对象")
+        return f"CRM 检测到重复{entity_name}，但未返回可操作的线索 ID，请人工确认。"
+
     metadata: list[str] = []
     if isinstance(item.http_status, int) and not isinstance(item.http_status, bool):
         if 100 <= item.http_status <= 599:
@@ -985,16 +993,25 @@ def format_submission_reply(
         )
         if status in {"retrying", "failed_pending_review"}:
             duplicate_items = [item for item in items if item.reason_code == duplicate_reason]
-            other_items = [item for item in items if item.reason_code != duplicate_reason]
-            groups = [
-                (
-                    "⚠️ 查重暂时失败"
-                    if status == "retrying"
-                    else "❌ 查重失败",
-                    duplicate_items,
-                ),
-                (status_titles[status], other_items),
+            unavailable_targets = [
+                item for item in items if item.reason_code == "duplicate_target_unavailable"
             ]
+            other_items = [
+                item
+                for item in items
+                if item.reason_code not in {duplicate_reason, "duplicate_target_unavailable"}
+            ]
+            groups = []
+            if status == "failed_pending_review" and unavailable_targets:
+                groups.append(("❌ 重复待人工确认", unavailable_targets))
+            if duplicate_items:
+                groups.append(
+                    (
+                        "⚠️ 查重暂时失败" if status == "retrying" else "❌ 查重失败",
+                        duplicate_items,
+                    )
+                )
+            groups.append((status_titles[status], other_items))
         else:
             groups = [(status_titles[status], items)]
         for title_text, group_items in groups:
@@ -1009,7 +1026,11 @@ def format_submission_reply(
                     detail = (
                         _crm_duplicate_failure_detail(item)
                         if item.reason_code
-                        in {"crm_duplicate_search_failed", "crm_duplicate_search_retrying"}
+                        in {
+                            "crm_duplicate_search_failed",
+                            "crm_duplicate_search_retrying",
+                            "duplicate_target_unavailable",
+                        }
                         else reason_text.get(item.reason_code or "", "")
                     )
                     detail_lines.append(f"- {label}：{detail}".rstrip("："))
