@@ -363,9 +363,53 @@ def test_gateway_rejects_unregistered_communication_method_without_alias_convers
     )
 
     with pytest.raises(BusinessValidationError, match="枚举值不合法：沟通方式"):
-        AIGateway(provider).extract_fields("后续沟通")
+        AIGateway(provider).extract_fields("沟通方式：后续沟通")
 
     assert len(provider.requests) == 1
+
+
+def test_gateway_drops_unregistered_communication_without_field_evidence() -> None:
+    """验证模型臆造的非法枚举不会阻塞同一条消息的可靠字段。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "长广溪智造", "沟通方式": "后续沟通"},
+                confidence_by_field={"线索名称": 0.95, "沟通方式": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("客户：长广溪智造，手机号：13800138000")
+
+    assert result.fields == {"线索名称": "长广溪智造", "手机": "13800138000"}
+    assert len(provider.requests) == 1
+
+
+def test_gateway_splits_natural_company_contact_from_activity_sentence() -> None:
+    """验证“公司的人找我沟通事项”不会把整句活动描述写成线索名称。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                customer_reference={
+                    "company_name": "安生的罗总找我沟通 AISOP 事项",
+                    "contact": "罗总",
+                },
+                crm_fields={
+                    "线索名称": "安生的罗总找我沟通 AISOP 事项",
+                    "联系人": "罗总",
+                },
+                confidence_by_field={"线索名称": 0.95, "联系人": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(
+        "安生的罗总找我沟通 AISOP 事项，预计国庆之后正式开始实施，预算30万，手机号是13311112222"
+    )
+
+    assert result.fields["线索名称"] == "安生"
+    assert result.fields["联系人"] == "罗总"
+    assert "安生的罗总找我沟通 AISOP 事项" not in result.fields.values()
 
 
 def test_gateway_prompt_requires_registered_chinese_fields_and_scalar_values() -> None:

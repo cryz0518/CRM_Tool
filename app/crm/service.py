@@ -21,6 +21,7 @@ from app.core.failures import classify_task_failure, safe_failure_summary
 from app.crm.adapter import CRMAdapter
 from app.crm.employee_directory import EmployeeDirectory, EmployeeDirectoryError
 from app.crm.payload import CrmPayloadBuilder, CrmPayloadError
+from app.crm.user_mapping import CRMUserMapper, DatabaseCRMUserMapper
 from app.leads.models import (
     CrmCompanyIdentity,
     CrmSyncRecord,
@@ -311,11 +312,12 @@ class CrmSubmissionService:
         crm_create_retry_count: int | None = None,
         employee_directory: EmployeeDirectory | None = None,
         robot_submission_confirmation_available: bool | None = None,
+        crm_user_mapper: CRMUserMapper | None = None,
     ) -> None:
         """保存数据库、表格、CRM 与重试上限依赖。
 
-        参数：前三项分别提供持久化、规范表格回读和唯一 create 调用；最后参数可覆盖重试、映射
-        与卡片确认能力配置。
+        参数：前三项分别提供持久化、规范表格回读和唯一 create 调用；可选参数覆盖重试、
+        owner 目录、销售 CRM 映射与卡片确认能力配置。
         返回值：无。
         异常：无。
         副作用：只保存依赖，不读取数据库或调用外部系统。
@@ -329,6 +331,8 @@ class CrmSubmissionService:
             else crm_create_retry_count
         )
         self._employee_directory = employee_directory
+        # 提交销售的 CRM 映射由授权目录提供；线索原负责人解析仍沿用既有不可变 owner 语义。
+        self._crm_user_mapper = crm_user_mapper or DatabaseCRMUserMapper()
         self._crm_payload_builder = CrmPayloadBuilder(get_settings().crm_customer_level_scheme)
         self._robot_submission_confirmation_available = (
             get_settings().wecom_card_callback_ready()
@@ -713,7 +717,10 @@ class CrmSubmissionService:
             if lead is None or authorization is None:
                 return "incomplete"
             crm_user_id = self._resolve_crm_owner(lead)
-            if crm_user_id is None:
+            if (
+                self._crm_user_mapper.get_crm_user_id(session, command.sales_user_id) is None
+                or crm_user_id is None
+            ):
                 return self._record_mapping_missing(
                     session, lead, command, payload, snapshot_hash, "update"
                 )
@@ -864,7 +871,10 @@ class CrmSubmissionService:
             if current_lead.lifecycle_state == "temporary":
                 # 临时线索通过最终快照和 CRM payload 校验后，先晋升再进入 owner/查重状态机。
                 current_lead.lifecycle_state = "pending_create"
-            if self._resolve_crm_owner(current_lead) is None:
+            if (
+                self._crm_user_mapper.get_crm_user_id(session, command.sales_user_id) is None
+                or self._resolve_crm_owner(current_lead) is None
+            ):
                 return _create_outcome(
                     self._record_mapping_missing(
                         session, current_lead, command, canonical_payload, snapshot_hash, "create"
@@ -899,13 +909,14 @@ class CrmSubmissionService:
             duplicate_results = tuple(self._crm_adapter.search_by_company_name(canonical_payload))
         except Exception as error:
             failure_category = classify_task_failure(error)
-            self._audit(command, "crm_duplicate_search_failed")
+            failure_details = self._crm_failure_evidence(error)
+            self._audit(command, "crm_duplicate_search_failed", details=failure_details)
             _LOGGER.warning(
                 "crm_duplicate_search_failed",
                 extra={
                     "lead_id": lead_id,
                     "error_type": type(error).__name__,
-                    "failure_category": failure_category.value,
+                    **failure_details,
                 },
             )
             # 查重尚未创建 Sync 记录；暂态故障返回 retrying，下一次命令会重新执行查重。
@@ -938,7 +949,10 @@ class CrmSubmissionService:
                 ):
                     return _create_outcome("incomplete")
                 crm_user_id = self._resolve_crm_owner(lead)
-                if crm_user_id is None:
+                if (
+                    self._crm_user_mapper.get_crm_user_id(session, command.sales_user_id) is None
+                    or crm_user_id is None
+                ):
                     return _create_outcome(
                         self._record_mapping_missing(
                             session, lead, command, canonical_payload, snapshot_hash, "create"
@@ -1679,10 +1693,50 @@ class CrmSubmissionService:
         digest = hashlib.sha256(company_name.encode()).digest()
         return int.from_bytes(digest[:8], "big", signed=True)
 
-    def _audit(self, command: SubmissionCommand, event_type: str) -> None:
+    def _audit(
+        self,
+        command: SubmissionCommand,
+        event_type: str,
+        *,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
         """为未创建 CRM 同步记录的普通校验结果保存审计反馈。"""
         with self._session_factory.begin() as session:
-            self._record_audit(session, command, event_type)
+            self._record_audit(session, command, event_type, details=details)
+
+    @staticmethod
+    def _crm_failure_evidence(error: BaseException) -> dict[str, object]:
+        """提取 CRM 失败的受控可观测证据，不保存异常正文。
+
+        参数：error 为 CRM 适配器异常。
+        返回值：失败分类、HTTP 状态和安全协议码组成的审计字段。
+        异常：无；未知字段会被忽略。
+        副作用：无，不读取或记录原始响应内容。
+        """
+        details: dict[str, object] = {
+            "failure_category": classify_task_failure(error).value,
+        }
+        adapter_category = getattr(error, "category", None)
+        if isinstance(adapter_category, str) and adapter_category in {
+            "transport",
+            "authentication",
+            "business",
+            "business_rejection",
+            "gateway",
+            "malformed_response",
+        }:
+            details["adapter_category"] = adapter_category
+        http_status = getattr(error, "http_status", None)
+        if isinstance(http_status, int):
+            details["http_status"] = http_status
+        protocol_code = getattr(error, "sub_code", None) or getattr(error, "error_code", None)
+        if isinstance(protocol_code, (str, int)):
+            normalized = str(protocol_code).strip()
+            if normalized and len(normalized) <= 64 and all(
+                character.isalnum() or character in "._:-" for character in normalized
+            ):
+                details["failure_code"] = normalized
+        return details
 
     def _fail_company_identity(
         self, session: Session, sync: CrmSyncRecord, sales_user_id: str
@@ -1738,9 +1792,10 @@ class CrmSubmissionService:
             sync.status = "failed_pending_review"
             sync.failure_category = failure_category.value
             # 仅持久化 SOP 非敏感协议码，便于人工定位业务拒绝，不保存响应正文。
-            protocol_code = getattr(error, "sub_code", None) or getattr(error, "error_code", None)
-            if isinstance(protocol_code, (str, int)) and str(protocol_code).strip():
-                sync.failure_code = str(protocol_code)[:64]
+            failure_evidence = self._crm_failure_evidence(error)
+            protocol_code = failure_evidence.get("failure_code")
+            if isinstance(protocol_code, str):
+                sync.failure_code = protocol_code
             sync.failure_summary = safe_failure_summary(error)
             sync.failed_at = utc_now()
             sync.processing_started_at = None
@@ -1787,6 +1842,10 @@ class CrmSubmissionService:
                 return sync.status
             sync.status = "retrying"
             sync.failure_category = classify_task_failure(error).value
+            failure_evidence = self._crm_failure_evidence(error)
+            protocol_code = failure_evidence.get("failure_code")
+            if isinstance(protocol_code, str):
+                sync.failure_code = protocol_code
             sync.failure_summary = safe_failure_summary(error)
             sync.processing_started_at = None
             sync.processing_lease_expires_at = None
@@ -1934,7 +1993,7 @@ class CrmSubmissionService:
         command: SubmissionCommand,
         event_type: str,
         *,
-        details: dict[str, str] | None = None,
+        details: Mapping[str, object] | None = None,
     ) -> None:
         """在来源消息存在时幂等保存一条业务审计事件。"""
         existing = session.scalar(

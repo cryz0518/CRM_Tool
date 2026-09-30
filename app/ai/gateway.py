@@ -83,7 +83,7 @@ _NATURAL_COMPANY_CONTACT_PATTERN = re.compile(
     r"(?P<company>[^，,；;。\n]{2,80}?)的"
     r"(?P<contact>[\u4e00-\u9fffA-Za-z·]{1,6}"
     r"(?:总|经理|工|先生|女士|老师|主任|老板|主管))"
-    r"(?=\s*(?:[，,；;。]|手机号|手机|电话|邮箱|是|做|想|主要|他们))"
+    r"(?=\s*(?:[，,；;。]|手机号|手机|电话|邮箱|是|做|想|主要|他们|找我|沟通|联系|对接|交流|事项|预计|计划|实施))"
 )
 _NATURAL_ROLE_PREFIXES = (
     "副总经理",
@@ -438,11 +438,16 @@ class AIGateway:
                     and identity_pair[1]
                     and field_name in {"线索名称", "联系人"}
                     and isinstance(field_value, str)
-                    and AIGateway._is_combined_identity_value(
-                        field_value, identity_pair[0], identity_pair[1]
+                    and (
+                        AIGateway._is_combined_identity_value(
+                            field_value, identity_pair[0], identity_pair[1]
+                        )
+                        or AIGateway._is_expanded_identity_value(
+                            field_value, identity_pair[0], identity_pair[1]
+                        )
                     )
                 ):
-                    # 仅纠正模型已语义拆分、但把公司和联系人拼回单字段的格式错误；不依赖任何分隔符。
+                    # 纠正模型把公司、联系人及后续活动描述拼回单字段的错误；不依赖具体业务词。
                     fields[field_name] = value
                     confidence_by_field[field_name] = 1.0
                     changed = True
@@ -554,6 +559,24 @@ class AIGateway:
                 or normalized_relation_value == normalized_expected
             )
             and value.strip() != company.strip()
+        )
+
+    @staticmethod
+    def _is_expanded_identity_value(value: str, company: str, contact: str) -> bool:
+        """判断模型是否把身份与额外叙述拼在同一个 CRM 身份字段中。
+
+        参数：value 为模型候选；company 与 contact 为原文核验后的公司和联系人。
+        返回值：候选同时包含两类身份且明显长于身份组合时返回 True。
+        异常：无。
+        副作用：无；仅执行本地字符串规范化。
+        """
+        normalized_value = AIGateway._normalize_identity_text(value)
+        normalized_company = AIGateway._normalize_identity_text(company)
+        normalized_contact = AIGateway._normalize_identity_text(contact)
+        return (
+            normalized_company in normalized_value
+            and normalized_contact in normalized_value
+            and len(normalized_value) > len(normalized_company) + len(normalized_contact)
         )
 
     @staticmethod
@@ -978,9 +1001,9 @@ class AIGateway:
         fields = dict(analysis.crm_fields)
         confidences = dict(analysis.confidence_by_field)
         dropped_fields: list[str] = []
-        for field_name in ("客户行业", "客户级别"):
-            # 客户行业和客户级别不能由产品、金额或模型常识推断，必须有原文证据。
-            # “其他”允许通过同名 enrichment 保存原文实际内容。
+        for field_name in _ENUM_OPTIONS:
+            # 非法枚举只有在原文明确带字段语义时才交给业务校验；无语义证据的
+            # 模型臆造直接丢弃，避免一个错误枚举阻断同一消息的可靠身份字段。
             if field_name not in analysis.crm_fields:
                 continue
             value = fields.get(field_name)
@@ -989,11 +1012,20 @@ class AIGateway:
             values = value if isinstance(value, list) else [value]
             if not values or not all(isinstance(item, str) for item in values):
                 continue
-            evidence_ok = all(
-                AIGateway._has_explicit_enum_evidence(field_name, item, source_text)
-                or (field_name == "客户行业" and item in source_text)
-                for item in values
-            )
+            if field_name in {"客户行业", "客户级别"}:
+                # 行业和级别即使是合法选项，也不能从普通叙述或产品常识反推。
+                evidence_ok = all(
+                    AIGateway._has_explicit_enum_evidence(field_name, item, source_text)
+                    or (field_name == "客户行业" and item in source_text)
+                    for item in values
+                )
+            elif all(item in _ENUM_OPTIONS[field_name] for item in values):
+                continue
+            else:
+                evidence_ok = all(
+                    AIGateway._has_explicit_enum_evidence(field_name, item, source_text)
+                    for item in values
+                )
             if not evidence_ok and "其他" in values:
                 enrichment_value = analysis.enrichment.get(field_name)
                 evidence_ok = isinstance(enrichment_value, str) and bool(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -103,6 +104,51 @@ def test_submission_like_natural_language_enters_async_intent_classification(
 
     assert event is not None
     assert event.event_type == "crm_submission_intent"
+
+
+def test_ordinary_text_skips_submission_intent_classifier_and_enters_lead_pipeline(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证普通线索文本不会被提交意图路由提前结束。"""
+    authorize_salesperson(session_factory, "sales-1")
+    MessageIntakeService(session_factory).receive(
+        IncomingMessageCommand(
+            message_id="message-follow-up",
+            sales_user_id="sales-1",
+            raw_payload={"text": "电话号码是 13861699726"},
+            normalized_text="电话号码是 13861699726",
+        )
+    )
+    with session_factory.begin() as session:
+        event = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.message_id == "message-follow-up")
+        )
+        assert event is not None
+        event.status = "processing"
+        event.processing_started_at = datetime.now(UTC)
+        outbox_event_id = event.id
+
+    engine = session_factory.kw["bind"]
+    assert engine is not None
+    gateway = Mock()
+    gateway.classify_submission_intent.side_effect = AssertionError(
+        "普通线索文本不应调用提交意图分类"
+    )
+    consumed = Mock(return_value=SimpleNamespace(status=SimpleNamespace(value="succeeded")))
+    service = Mock()
+    service.consume = consumed
+    monkeypatch.setattr(tasks, "_take_lead_outbox_claim", lambda *_args: True)
+    monkeypatch.setattr(tasks, "get_smart_table_adapter", lambda: object())
+    monkeypatch.setattr(tasks, "get_ai_gateway", lambda **_kwargs: gateway)
+    monkeypatch.setattr(tasks, "get_media_attachment_service", lambda *_args: Mock())
+    monkeypatch.setattr(tasks, "FirstTextLeadWorkspaceService", lambda *_args, **_kwargs: service)
+    monkeypatch.setattr(tasks, "_session_factory", lambda: (engine, session_factory))
+
+    result = tasks.consume_lead_outbox_event.run(outbox_event_id, datetime.now(UTC).isoformat())
+
+    assert result == "succeeded"
+    consumed.assert_called_once_with(outbox_event_id, claimed_for_processing=True)
+    gateway.classify_submission_intent.assert_not_called()
 
 
 @pytest.mark.parametrize(

@@ -297,7 +297,12 @@ def test_owner_user_id_is_converted_to_employee_name_before_crm_submit(
     record = adapter.create_record(fields, actor=SmartTableActor.ROBOT)
     with session_factory.begin() as session:
         session.add(
-            SalesAuthorization(wecom_user_id="wecom-owner", is_authorized=True, is_active=True)
+            SalesAuthorization(
+                wecom_user_id="wecom-owner",
+                crm_user_id="crm-1",
+                is_authorized=True,
+                is_active=True,
+            )
         )
         session.add(
             IncomingMessage(
@@ -451,6 +456,76 @@ def test_sop_transport_during_duplicate_search_reports_retrying(
     )
 
     assert result.retrying == 1
+
+
+def test_duplicate_search_failure_persists_controlled_transport_evidence(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证查重失败审计保存分类、状态和协议码，不保存远端正文。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    _lead(session_factory, adapter)
+
+    class SearchFailureCRM(MockCRMAdapter):
+        """模拟带稳定协议码的 CRM 查重网关失败。"""
+
+        def search_by_company_name(
+            self, payload: Mapping[str, object] | str
+        ) -> tuple[CRMSearchResult, ...]:
+            """抛出受控的查重传输故障。"""
+            del payload
+            raise SopCRMError(
+                "raw SOP response must not persist",
+                category="gateway",
+                http_status=503,
+                error_code="GW_DUPLICATE",
+                sub_code="DUP_RETRY",
+            )
+
+    result = submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, SearchFailureCRM()),
+        "sales-1",
+        "message-12",
+    )
+
+    assert result.retrying == 1
+    with session_factory() as session:
+        audit = session.scalar(
+            select(BusinessAuditEvent).where(
+                BusinessAuditEvent.message_id == "message-12",
+                BusinessAuditEvent.event_type == "crm_duplicate_search_failed",
+            )
+        )
+    assert audit is not None
+    assert audit.details == {
+        "failure_category": "transient",
+        "adapter_category": "gateway",
+        "http_status": 503,
+        "failure_code": "DUP_RETRY",
+    }
+    assert "raw SOP" not in str(audit.details)
+
+
+def test_missing_sales_crm_mapping_blocks_duplicate_search(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证销售 CRM 映射缺失时 fail closed，不先调用 CRM 查重。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter, crm_user_id=None)
+    crm = MockCRMAdapter()
+
+    result = submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, crm),
+        "sales-1",
+        "message-12",
+    )
+
+    assert result.mapping_missing == 1
+    assert crm.search_calls == 0
+    assert crm.calls == 0
+    with session_factory() as session:
+        sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
+    assert sync is not None
+    assert sync.failure_code == "mapping_missing"
 
 
 def test_tyc_unique_identity_is_sent_to_crm(

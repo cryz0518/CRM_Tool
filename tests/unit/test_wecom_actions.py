@@ -207,7 +207,14 @@ def _seed_today_submission_leads(
     """创建具备 CRM 必填快照和可信负责人显示名的 TODAY 候选。"""
 
     with session_factory.begin() as session:
-        session.add(SalesAuthorization(wecom_user_id="sales-a", is_authorized=True, is_active=True))
+        session.add(
+            SalesAuthorization(
+                wecom_user_id="sales-a",
+                crm_user_id="crm-sales-a",
+                is_authorized=True,
+                is_active=True,
+            )
+        )
         lead_ids: list[str] = []
         for index in range(count):
             message_id = f"today-message-{index}"
