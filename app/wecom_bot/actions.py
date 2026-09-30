@@ -968,13 +968,19 @@ class WecomActionService:
                 outbox.domain_operation_payload = _safe_operation_payload(payload)
 
     def record_callback_transport_failure(
-        self, provider_msgid: str, failure: BaseException
+        self,
+        provider_msgid: str,
+        failure: BaseException,
+        *,
+        failure_code: str | None = None,
+        failure_summary: str | None = None,
     ) -> None:
         """持久化 callback card update 失败，不改变已认领的业务动作。
 
-        参数：provider_msgid 为已保存的 callback transport id；failure 为 SDK/网络异常。
+        参数：provider_msgid 为已保存的 callback transport id；failure 为 SDK/网络异常；
+        failure_code 和 failure_summary 为调用方生成的白名单诊断字段。
         返回值：无。
-        异常：数据库错误传播；异常摘要只保存类型，不保存原始 payload 或 secret。
+        异常：数据库错误传播；不保存异常正文、原始 payload 或 secret。
         副作用：更新 delivery transport evidence，供 Console/审计查询。
         """
 
@@ -988,14 +994,19 @@ class WecomActionService:
                 return
             delivery.transport_stage = "callback_card_update"
             delivery.transport_status = "failed"
-            delivery.transport_failure_code = type(failure).__name__[:64]
-            delivery.transport_failure_summary = "企业微信 callback card update 传输失败"
+            delivery.transport_failure_code = (
+                failure_code or type(failure).__name__[:64]
+            )[:64]
+            delivery.transport_failure_summary = (
+                failure_summary or "企业微信 callback card update 传输失败"
+            )[:128]
             delivery.transport_failed_at = utc_now()
             logger.warning(
                 "wecom_callback_card_update_failed",
                 extra={
                     "action_id": delivery.action_id,
                     "event": "callback_card_update_failed",
+                    "failure_code": delivery.transport_failure_code,
                 },
             )
 

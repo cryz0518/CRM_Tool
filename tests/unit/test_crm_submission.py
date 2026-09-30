@@ -507,7 +507,7 @@ def test_duplicate_search_failure_persists_controlled_transport_evidence(
 
 
 def test_duplicate_search_failure_evidence_is_persisted_per_lead(
-    session_factory: sessionmaker[Session],
+    session_factory: sessionmaker[Session], caplog: pytest.LogCaptureFixture
 ) -> None:
     """验证同一请求中的不同 Lead 各自保留独立受控查重失败证据。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
@@ -556,6 +556,33 @@ def test_duplicate_search_failure_evidence_is_persisted_per_lead(
     )
 
     assert result.failed_pending_review == 2
+    items = {item.lead_id: item for item in result.items}
+    malformed = items[first_id]
+    assert malformed.failure_category == "permanent"
+    assert malformed.adapter_category == "malformed_response"
+    assert malformed.http_status == 200
+    assert malformed.failure_code is None
+    business = items[second_id]
+    assert business.failure_category == "permanent"
+    assert business.adapter_category == "business"
+    assert business.http_status == 200
+    assert business.failure_code == "X"
+    reply = format_submission_reply(
+        result,
+        lead_labels={
+            first_id: "希捷国际科技（无锡）有限公司｜杨总",
+            second_id: "第二家测试公司｜李工",
+        },
+        selected_count=2,
+    )
+    assert "希捷国际科技（无锡）有限公司｜杨总：CRM 返回格式异常（HTTP 200）" in reply
+    assert "第二家测试公司｜李工：CRM 返回业务错误（HTTP 200，错误码：X）" in reply
+    assert "private malformed body" not in reply
+    assert "private business body" not in reply
+    assert "private malformed body" not in str(items)
+    assert "private business body" not in str(items)
+    assert "private malformed body" not in caplog.text
+    assert "private business body" not in caplog.text
     with session_factory() as session:
         evidence = session.scalars(
             select(BusinessAuditEvent).where(
@@ -569,7 +596,61 @@ def test_duplicate_search_failure_evidence_is_persisted_per_lead(
         (event.details.get("adapter_category"), event.details.get("failure_code"))
         for event in evidence
     } == {("malformed_response", None), ("business", "X")}
+    evidence_by_lead = {event.details["lead_id"]: event.details for event in evidence}
+    for lead_id, item in items.items():
+        event = evidence_by_lead[lead_id]
+        assert item.failure_category == event["failure_category"]
+        assert item.adapter_category == event["adapter_category"]
+        assert item.http_status == event["http_status"]
+        assert item.failure_code == event["failure_code"]
     assert "private" not in str([event.details for event in evidence])
+
+
+@pytest.mark.parametrize(
+    ("adapter_category", "http_status", "failure_code", "expected"),
+    [
+        (
+            "authentication",
+            401,
+            "AUTH_DENIED",
+            "CRM 鉴权失败",
+        ),
+        (
+            "transport",
+            None,
+            "timeout",
+            "CRM 网络连接或超时异常",
+        ),
+    ],
+)
+def test_duplicate_search_failure_reply_maps_safe_category(
+    adapter_category: str,
+    http_status: int | None,
+    failure_code: str,
+    expected: str,
+) -> None:
+    """验证查重鉴权与网络失败展示安全分类，不泄露外部异常正文。"""
+    from app.crm.service import _append_create_result, _create_outcome
+
+    outcome = _create_outcome(
+        "retrying" if adapter_category == "transport" else "failed_pending_review",
+        reason_code=(
+            "crm_duplicate_search_retrying"
+            if adapter_category == "transport"
+            else "crm_duplicate_search_failed"
+        ),
+        failure_category="transient" if adapter_category == "transport" else "permanent",
+        adapter_category=adapter_category,
+        http_status=http_status,
+        failure_code=failure_code,
+    )
+    result = _append_create_result(SubmissionBatchResult(), "lead-safe", outcome)
+    reply = format_submission_reply(result, lead_labels={"lead-safe": "测试公司｜联系人"})
+
+    assert expected in reply
+    assert "错误码：AUTH_DENIED" in reply if adapter_category == "authentication" else True
+    assert "本次未提交，请稍后重新提交" in reply if adapter_category == "transport" else True
+    assert "traceback" not in reply.lower()
 
 
 def test_sales_authorization_crm_mapping_is_not_required_when_owner_directory_matches(

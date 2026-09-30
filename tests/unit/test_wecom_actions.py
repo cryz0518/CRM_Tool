@@ -1271,8 +1271,45 @@ def test_callback_response_failure_does_not_repeat_business_action(
         assert replay_delivery is not None and replay_delivery.transport_status is None
 
 
+def test_callback_nonzero_sdk_ack_is_transport_failure_without_ack_text(
+    session_factory: sessionmaker[Session], caplog: pytest.LogCaptureFixture
+) -> None:
+    """验证 SDK 非零 ACK 被记为失败，只保存错误码而不保存 errmsg。"""
+    _authorize(session_factory)
+    action = _service(session_factory).issue_discard_action(
+        actor_user_id="sales-a", lead_id="lead-ack-error", reason="ACK 测试"
+    )
+    handler = WecomTemplateCardCallbackHandler(_service(session_factory))
+
+    async def rejected_ack(frame_value: object, card: dict[str, object]) -> dict[str, object]:
+        """模拟 SDK 对非零 ACK 抛出异常，且 errmsg 含敏感正文。"""
+        del frame_value, card
+        raise RuntimeError(
+            "Reply ack error: reqId=DO_NOT_LOG_REQID, errcode=48001, "
+            "errmsg=PRIVATE RESPONSE TOKEN"
+        )
+
+    frame = _frame_for_action(action, msgid="provider-msg-ack-error")
+    asyncio.run(handler.handle(frame, rejected_ack))
+
+    with session_factory() as session:
+        delivery = session.scalar(
+            select(WecomCallbackDelivery).where(
+                WecomCallbackDelivery.provider_msgid == "provider-msg-ack-error"
+            )
+        )
+    assert delivery is not None
+    assert delivery.transport_status == "failed"
+    assert delivery.transport_failure_code == "sdk_ack_errcode_48001"
+    assert delivery.transport_failure_summary == "企业微信 SDK 拒绝卡片更新（错误码 48001）"
+    assert "PRIVATE RESPONSE" not in str(delivery.transport_failure_summary)
+    assert "DO_NOT_LOG_REQID" not in str(delivery.transport_failure_summary)
+    assert "PRIVATE RESPONSE" not in caplog.text
+    assert "DO_NOT_LOG_REQID" not in caplog.text
+
+
 def test_callback_response_success_freezes_card_and_saves_transport_evidence(
-    session_factory: sessionmaker[Session],
+    session_factory: sessionmaker[Session], caplog: pytest.LogCaptureFixture
 ) -> None:
     """验证首次合法点击只更新一次卡片，并保存成功 transport evidence。"""
 
@@ -1284,12 +1321,17 @@ def test_callback_response_success_freezes_card_and_saves_transport_evidence(
     frame = _frame_for_action(action, msgid="provider-msg-success")
     updates: list[dict[str, object]] = []
 
-    async def successful_update(frame_value: object, card: dict[str, object]) -> None:
+    async def successful_update(
+        frame_value: object, card: dict[str, object]
+    ) -> dict[str, object]:
         """记录平台收到的唯一卡片冻结响应。"""
 
-        del frame_value
+        assert frame_value is frame
+        assert card["task_id"] == action.task_id
         updates.append(card)
+        return {"errcode": 0}
 
+    caplog.set_level("INFO", logger="app.wecom_bot.callback")
     asyncio.run(handler.handle(frame, successful_update))
     asyncio.run(
         handler.handle(_frame_for_action(action, msgid="provider-msg-replay"), successful_update)
@@ -1313,6 +1355,21 @@ def test_callback_response_success_freezes_card_and_saves_transport_evidence(
         assert delivery.transport_stage == "callback_card_update"
         assert delivery.transport_status == "succeeded"
         assert delivery.processed_at is not None
+    timing = [
+        record for record in caplog.records if record.msg == "wecom_template_card_callback_timing"
+    ]
+    assert len(timing) == 2
+    for metric in (
+        "callback_claim_duration_ms",
+        "remaining_deadline_ms",
+        "callback_total_duration_ms",
+    ):
+        for record in timing:
+            assert type(getattr(record, metric)) is int
+            assert getattr(record, metric) >= 0
+    assert timing[0].card_update_duration_ms >= 0
+    assert timing[1].card_update_duration_ms == 0
+    assert "provider-msg" not in caplog.text
 
 
 def test_final_notification_retry_does_not_repeat_domain_action(

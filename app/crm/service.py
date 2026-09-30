@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from typing import TypedDict
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, text
@@ -101,6 +102,10 @@ class SubmissionItemResult:
     status: SubmissionItemStatus
     reason_code: str | None = None
     missing_fields: tuple[str, ...] = ()
+    failure_category: str | None = None
+    adapter_category: str | None = None
+    http_status: int | None = None
+    failure_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -162,6 +167,19 @@ class CreateSubmissionOutcome:
     duplicate: DuplicateSubmission | None = None
     missing_fields: tuple[str, ...] = ()
     reason_code: str | None = None
+    failure_category: str | None = None
+    adapter_category: str | None = None
+    http_status: int | None = None
+    failure_code: str | None = None
+
+
+class CRMFailureEvidence(TypedDict):
+    """描述可同时用于查重审计和逐条结果的受控 CRM 失败字段。"""
+
+    failure_category: str
+    adapter_category: str | None
+    http_status: int | None
+    failure_code: str | None
 
 
 @dataclass(frozen=True)
@@ -202,6 +220,10 @@ def _create_outcome(
     duplicate: DuplicateSubmission | None = None,
     missing_fields: tuple[str, ...] = (),
     reason_code: str | None = None,
+    failure_category: str | None = None,
+    adapter_category: str | None = None,
+    http_status: int | None = None,
+    failure_code: str | None = None,
 ) -> CreateSubmissionOutcome:
     """构造单条 create 结果并补齐受控原因码。
 
@@ -217,6 +239,10 @@ def _create_outcome(
         duplicate=duplicate,
         missing_fields=missing_fields,
         reason_code=reason_code or _CREATE_REASON_CODES.get(status),
+        failure_category=failure_category,
+        adapter_category=adapter_category,
+        http_status=http_status,
+        failure_code=failure_code,
     )
 
 
@@ -239,6 +265,10 @@ def _append_create_result(
         status=item_status,
         reason_code=outcome.reason_code,
         missing_fields=outcome.missing_fields,
+        failure_category=outcome.failure_category,
+        adapter_category=outcome.adapter_category,
+        http_status=outcome.http_status,
+        failure_code=outcome.failure_code,
     )
     return replace(
         result,
@@ -933,10 +963,8 @@ class CrmSubmissionService:
             duplicate_results = tuple(self._crm_adapter.search_by_company_name(canonical_payload))
         except Exception as error:
             failure_category = classify_task_failure(error)
-            failure_details = {"lead_id": lead_id, **self._crm_failure_evidence(error)}
-            failure_details.setdefault("adapter_category", None)
-            failure_details.setdefault("http_status", None)
-            failure_details.setdefault("failure_code", None)
+            failure_evidence = self._crm_failure_evidence(error)
+            failure_details = {"lead_id": lead_id, **failure_evidence}
             # BusinessAuditEvent 的唯一键是 message + event_type；按 Lead 哈希扩展类型，
             # 让同一批次的失败证据可分别查询且仍能幂等重放。
             event_identity = hashlib.sha256(lead_id.encode()).hexdigest()[:32]
@@ -950,7 +978,7 @@ class CrmSubmissionService:
                 extra={
                     "lead_id": lead_id,
                     "error_type": type(error).__name__,
-                    **failure_details,
+                    **failure_evidence,
                 },
             )
             # 查重尚未创建 Sync 记录；暂态故障返回 retrying，下一次命令会重新执行查重。
@@ -961,6 +989,7 @@ class CrmSubmissionService:
                     if failure_category.value == "transient"
                     else "crm_duplicate_search_failed"
                 ),
+                **failure_evidence,
             )
 
         try:
@@ -1735,7 +1764,7 @@ class CrmSubmissionService:
             self._record_audit(session, command, event_type, details=details)
 
     @staticmethod
-    def _crm_failure_evidence(error: BaseException) -> dict[str, object]:
+    def _crm_failure_evidence(error: BaseException) -> CRMFailureEvidence:
         """提取 CRM 失败的受控可观测证据，不保存异常正文。
 
         参数：error 为 CRM 适配器异常。
@@ -1743,8 +1772,11 @@ class CrmSubmissionService:
         异常：无；未知字段会被忽略。
         副作用：无，不读取或记录原始响应内容。
         """
-        details: dict[str, object] = {
+        details: CRMFailureEvidence = {
             "failure_category": classify_task_failure(error).value,
+            "adapter_category": None,
+            "http_status": None,
+            "failure_code": None,
         }
         adapter_category = getattr(error, "category", None)
         if isinstance(adapter_category, str) and adapter_category in {
