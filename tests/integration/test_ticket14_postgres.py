@@ -18,7 +18,7 @@ from sqlalchemy.schema import CreateSchema, DropSchema
 from app.ai.models import ExtractedLeadPatch, LeadAnalysis
 from app.core.config import get_settings
 from app.crm.mock import MockCRMAdapter
-from app.crm.service import CrmSubmissionService, SubmissionCommand
+from app.crm.service import CrmSubmissionService
 from app.leads.discard import LeadDiscardService, LeadDiscardStatus
 from app.leads.models import (
     CrmCompanyIdentity,
@@ -33,6 +33,7 @@ from app.smart_table.adapter import SmartTableActor
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.models import SmartTableRecord
 from app.smart_table.registry import build_required_smart_table_schema
+from tests.crm_submission_test_utils import submit_today_via_selection
 
 
 @pytest.fixture
@@ -153,8 +154,10 @@ def test_crm_create_and_discard_wait_for_external_fact(
 
     def submit() -> object:
         """在独立线程中执行确定性 CRM 提交。"""
-        return CrmSubmissionService(postgres_session_factory, adapter, crm).submit(
-            SubmissionCommand("提交今天的线索", "sales-success", "submit-success")
+        return submit_today_via_selection(
+            CrmSubmissionService(postgres_session_factory, adapter, crm),
+            "sales-success",
+            "submit-success",
         )
 
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -194,9 +197,7 @@ def test_crm_create_and_discard_wait_for_external_fact(
     assert adapter.delete_calls == 0
     with postgres_session_factory() as session:
         identity = session.scalar(
-            select(CrmCompanyIdentity).where(
-                CrmCompanyIdentity.creating_lead_id == lead_id
-            )
+            select(CrmCompanyIdentity).where(CrmCompanyIdentity.creating_lead_id == lead_id)
         )
     assert identity is not None
     assert identity.state == "active"
@@ -245,9 +246,10 @@ def test_discard_rechecks_sync_after_lead_lock(
 
         # 在 T1 提交前，独立 session 确认 pending Sync 对其他事务不可见。
         with postgres_session_factory() as before_commit:
-            assert before_commit.scalar(
-                select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id)
-            ) is None
+            assert (
+                before_commit.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
+                is None
+            )
 
         engine = postgres_session_factory.kw["bind"]
         assert engine is not None
@@ -268,6 +270,7 @@ def test_discard_rechecks_sync_after_lead_lock(
 
         sqlalchemy_event.listen(engine, "before_cursor_execute", observe_discard_sql)
         try:
+
             def discard() -> object:
                 """在独立线程执行受控废弃请求。"""
                 return LeadDiscardService(postgres_session_factory).discard(
@@ -324,8 +327,10 @@ def test_crm_create_failure_preserves_failure_and_effective_discard(
 
     def submit() -> object:
         """在独立线程中执行会失败的 CRM 提交。"""
-        return CrmSubmissionService(postgres_session_factory, adapter, crm).submit(
-            SubmissionCommand("提交今天的线索", "sales-failure", "submit-failure")
+        return submit_today_via_selection(
+            CrmSubmissionService(postgres_session_factory, adapter, crm),
+            "sales-failure",
+            "submit-failure",
         )
 
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -471,17 +476,11 @@ def test_remote_success_then_timeout_reuses_frozen_create_operation(
             return result
 
     crm = RemoteSuccessThenTimeoutCRM()
-    service = CrmSubmissionService(
-        postgres_session_factory, adapter, crm, crm_create_retry_count=1
-    )
-    first = service.submit(
-        SubmissionCommand("提交今天的线索", "sales-timeout-recovery", "submit-timeout")
-    )
+    service = CrmSubmissionService(postgres_session_factory, adapter, crm, crm_create_retry_count=1)
+    first = submit_today_via_selection(service, "sales-timeout-recovery", "submit-timeout")
     assert first.retrying == 1
     with postgres_session_factory() as session:
-        sync_before = session.scalar(
-            select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id)
-        )
+        sync_before = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
     assert sync_before is not None
     frozen_snapshot_hash = sync_before.snapshot_hash
     frozen_payload = dict(sync_before.canonical_payload)
@@ -499,8 +498,10 @@ def test_remote_success_then_timeout_reuses_frozen_create_operation(
         sync.processing_started_at = datetime.now(UTC) - timedelta(minutes=10)
         sync.processing_lease_expires_at = datetime.now(UTC) - timedelta(minutes=5)
 
-    recovered = service.submit(
-        SubmissionCommand("提交今天的线索", "sales-timeout-recovery", "submit-timeout-retry")
+    recovered = submit_today_via_selection(
+        service,
+        "sales-timeout-recovery",
+        "submit-timeout-retry",
     )
     assert recovered.succeeded == 1
     assert crm.calls == 2
@@ -563,15 +564,11 @@ def test_expired_crm_claim_fences_late_worker_result(
             return result
 
     crm = LateTimeoutCRM()
-    service = CrmSubmissionService(
-        postgres_session_factory, adapter, crm, crm_create_retry_count=1
-    )
+    service = CrmSubmissionService(postgres_session_factory, adapter, crm, crm_create_retry_count=1)
 
     def submit() -> object:
         """执行一次独立 session 的 CRM 提交。"""
-        return service.submit(
-            SubmissionCommand("提交今天的线索", "sales-claim-fence", "submit-claim-fence")
-        )
+        return submit_today_via_selection(service, "sales-claim-fence", "submit-claim-fence")
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         first_future = executor.submit(submit)

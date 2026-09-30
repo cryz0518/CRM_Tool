@@ -23,6 +23,7 @@ from app.messaging.service import IncomingMessageCommand, MessageIntakeResult, M
 from app.smart_table.adapter import SmartTableActor
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.registry import build_required_smart_table_schema
+from tests.crm_submission_test_utils import submit_today_via_selection
 
 
 @pytest.fixture
@@ -234,8 +235,10 @@ def test_concurrent_first_submission_reserves_exactly_one_global_crm_identity(
     def submit(sales_user_id: str) -> object:
         """在独立服务调用中等待并发起同公司首次提交。"""
         barrier.wait()
-        return CrmSubmissionService(postgres_session_factory, adapter, crm).submit(
-            SubmissionCommand("提交今天的线索", sales_user_id, f"message-{sales_user_id}")
+        return submit_today_via_selection(
+            CrmSubmissionService(postgres_session_factory, adapter, crm),
+            sales_user_id,
+            f"message-{sales_user_id}",
         )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -259,8 +262,10 @@ def test_concurrent_first_submission_reserves_exactly_one_global_crm_identity(
 
     loser = "sales-B" if winner == "sales-A" else "sales-A"
     search_calls_before_retry = crm.search_calls
-    reused = CrmSubmissionService(postgres_session_factory, adapter, crm).submit(
-        SubmissionCommand("提交今天的线索", loser, f"message-{loser}-retry")
+    reused = submit_today_via_selection(
+        CrmSubmissionService(postgres_session_factory, adapter, crm),
+        loser,
+        f"message-{loser}-retry",
     )
     assert len(reused.duplicate_confirmations) == 1
     assert crm.calls == 1 and crm.update_calls == 0
@@ -305,9 +310,7 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
         member_names={"负责人": "sales-1"},
     )
     with postgres_session_factory.begin() as session:
-        session.add(
-            SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True)
-        )
+        session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
         session.flush()
         session.add(
             IncomingMessage(
@@ -335,17 +338,15 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
                 smart_table_record_id=record.record_id,
                 idempotency_key="create-z",
                 canonical_payload={
-                        "product_line_data_permission": 1,
-                        "name": "公司 Z",
-                        "source": 11,
-                        "contactName": "李四",
-                        "contactTitle": "技术负责人",
-                        "communicationWay": 6,
-                        "mobile": "13800000000",
-                        "remark": (
-                            "【AI录入】客户已确认自动化需求，预算和现场沟通安排待进一步确认。"
-                        ),
-                        "isInternational": False,
+                    "product_line_data_permission": 1,
+                    "name": "公司 Z",
+                    "source": 11,
+                    "contactName": "李四",
+                    "contactTitle": "技术负责人",
+                    "communicationWay": 6,
+                    "mobile": "13800000000",
+                    "remark": ("【AI录入】客户已确认自动化需求，预算和现场沟通安排待进一步确认。"),
+                    "isInternational": False,
                 },
                 snapshot_hash="c" * 64,
                 request_message_id="update-message",

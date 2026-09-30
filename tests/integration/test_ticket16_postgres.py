@@ -15,7 +15,7 @@ from sqlalchemy.schema import CreateSchema, DropSchema
 
 from app.core.config import get_settings
 from app.crm.mock import MockCRMAdapter
-from app.crm.service import CrmSubmissionService, SubmissionCommand
+from app.crm.service import CrmSubmissionService
 from app.leads.discard import LeadDiscardService
 from app.leads.models import Lead, SmartTableOwnerTransferOperation
 from app.leads.service import FirstTextLeadWorkspaceService
@@ -26,6 +26,7 @@ from app.smart_table.permissions import (
     SmartTablePermissionVerification,
     SmartTablePermissionVerificationUnavailable,
 )
+from tests.crm_submission_test_utils import submit_today_via_selection
 
 
 class BlockingTransferAdapter:
@@ -57,6 +58,7 @@ class BlockingTransferAdapter:
                     "客户行业": "机械加工",
                     "备注": "客户已确认自动化需求，预算和现场沟通安排待进一步确认。",
                     "负责人": "sales-old",
+                    "提交状态": "未提交",
                 },
             )
             return SmartTableRecord(
@@ -64,6 +66,13 @@ class BlockingTransferAdapter:
                 fields=dict(fields),
                 member_names={"负责人": "sales-old"},
             )
+
+    def get_records(self) -> list[SmartTableRecord]:
+        """返回已初始化的远端记录，供候选卡测试构建服务端 TODAY 列表。"""
+
+        with self._lock:
+            record_ids = tuple(self.records)
+        return [self.get_record(record_id) for record_id in record_ids]
 
     def update_record(self, record_id: str, fields: dict[str, object]) -> SmartTableRecord:
         """阻塞首个远端写入，随后返回记录快照。"""
@@ -208,9 +217,7 @@ def _transfer(
     )
 
 
-def _prepare_failed_retry(
-    session_factory: sessionmaker[Session], suffix: str
-) -> None:
+def _prepare_failed_retry(session_factory: sessionmaker[Session], suffix: str) -> None:
     """把来源消息置为 T14 可重试终态，供 transfer-vs-retry 竞态使用。"""
 
     with session_factory.begin() as session:
@@ -294,9 +301,14 @@ def test_two_admins_transfer_same_lead_have_one_remote_operation(
     with postgres_session_factory() as session:
         lead = session.get(Lead, lead_id)
         assert lead is not None and lead.smart_table_owner_user_id == "sales-a"
-        assert session.scalar(select(SmartTableOwnerTransferOperation).where(
-            SmartTableOwnerTransferOperation.lead_id == lead_id
-        )) is not None
+        assert (
+            session.scalar(
+                select(SmartTableOwnerTransferOperation).where(
+                    SmartTableOwnerTransferOperation.lead_id == lead_id
+                )
+            )
+            is not None
+        )
 
 
 def test_transfer_vs_discard_keeps_remote_fact_pending_recovery(
@@ -380,7 +392,14 @@ def test_transfer_vs_crm_submission_preserves_submitter_and_owner_boundary(
 
     lead_id = _seed(postgres_session_factory, "crm-race")
     adapter = BlockingTransferAdapter()
+    adapter.get_record("record-crm-race")
     crm = BlockingCRM()
+    service = CrmSubmissionService(
+        postgres_session_factory,
+        adapter,
+        crm,
+        crm_create_retry_count=1,
+    )
     with ThreadPoolExecutor(max_workers=2) as executor:
         transfer = executor.submit(
             _transfer,
@@ -393,13 +412,10 @@ def test_transfer_vs_crm_submission_preserves_submitter_and_owner_boundary(
         )
         assert adapter.entered.wait(timeout=5)
         submission = executor.submit(
-            CrmSubmissionService(
-                postgres_session_factory,
-                adapter,
-                crm,
-                crm_create_retry_count=1,
-            ).submit,
-            SubmissionCommand("提交今天的线索", "sales-old", "submit-crm-race"),
+            submit_today_via_selection,
+            service,
+            "sales-old",
+            "submit-crm-race",
         )
         assert crm.entered.wait(timeout=5)
         adapter.release.set()

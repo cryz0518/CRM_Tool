@@ -14,6 +14,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.core.config import get_settings
 from app.crm.commands import (
     is_explicit_submission_request,
     parse_company_submission_request,
@@ -22,6 +23,7 @@ from app.crm.commands import (
 from app.crm.mock import MockCRMAdapter
 from app.leads.discard import LeadDiscardService
 from app.leads.models import (
+    CrmSyncRecord,
     Lead,
     LeadFieldProvenance,
     LeadMessageResolution,
@@ -37,6 +39,7 @@ from app.messaging.models import (
     WecomAction,
     WecomActionOutbox,
     WecomCallbackDelivery,
+    utc_now,
 )
 from app.notifications.outbound import WecomOutboundNotificationSender
 from app.smart_table.adapter import SmartTableActor
@@ -162,13 +165,14 @@ def _seed_confirmable_lead(
         return lead.id
 
 
-def _seed_batch_leads(
-    session_factory: sessionmaker[Session], count: int = 3
-) -> tuple[str, ...]:
+def _seed_batch_leads(session_factory: sessionmaker[Session], count: int = 3) -> tuple[str, ...]:
     """创建供批量候选回调测试使用的同销售待提交线索。"""
 
     with session_factory.begin() as session:
-        session.add(SalesAuthorization(wecom_user_id="sales-a", is_authorized=True, is_active=True))
+        if session.get(SalesAuthorization, "sales-a") is None:
+            session.add(
+                SalesAuthorization(wecom_user_id="sales-a", is_authorized=True, is_active=True)
+            )
         leads: list[Lead] = []
         for index in range(count):
             message_id = f"batch-message-{index}"
@@ -194,6 +198,61 @@ def _seed_batch_leads(
         return tuple(lead.id for lead in leads)
 
 
+def _seed_today_submission_leads(
+    session_factory: sessionmaker[Session],
+    adapter: MockSmartTableAdapter,
+    count: int = 2,
+) -> tuple[str, ...]:
+    """创建具备 CRM 必填快照和可信负责人显示名的 TODAY 候选。"""
+
+    with session_factory.begin() as session:
+        session.add(SalesAuthorization(wecom_user_id="sales-a", is_authorized=True, is_active=True))
+        lead_ids: list[str] = []
+        for index in range(count):
+            message_id = f"today-message-{index}"
+            record = adapter.create_record(
+                {
+                    "负责人": "sales-a",
+                    "创建人": "sales-a",
+                    "线索名称": f"TODAY测试公司-{index}",
+                    "业务线": "协作机器人",
+                    "线索来源": "展会",
+                    "联系人": "王工",
+                    "职务": "项目经理",
+                    "沟通方式": "微信",
+                    "手机": f"1380000000{index}",
+                    "客户行业": "机械加工",
+                    "备注": "已确认机器人项目需求，正在评估方案和预算，销售需继续跟进。",
+                    "提交状态": "未提交",
+                },
+                actor=SmartTableActor.ROBOT,
+                member_names={"负责人": "测试销售"},
+            )
+            session.add(
+                IncomingMessage(
+                    message_id=message_id,
+                    sales_user_id="sales-a",
+                    sequence=index + 1,
+                    raw_payload={},
+                )
+            )
+            lead_id = f"today-lead-{index}"
+            session.add(
+                Lead(
+                    id=lead_id,
+                    source_message_id=message_id,
+                    original_capturing_sales_user_id="sales-a",
+                    smart_table_owner_user_id="sales-a",
+                    smart_table_record_id=record.record_id,
+                    lifecycle_state="pending_create",
+                    standard_company_name=f"TODAY测试公司-{index}",
+                    field_values=dict(record.fields),
+                )
+            )
+            lead_ids.append(lead_id)
+        return tuple(lead_ids)
+
+
 def _batch_frame_for_action(
     action: WecomAction, selected: tuple[str, ...], *, msgid: str
 ) -> dict[str, object]:
@@ -211,6 +270,22 @@ def _batch_frame_for_action(
         ]
     }
     return frame
+
+
+def _issue_today_action(
+    service: WecomActionService, lead_ids: tuple[str, ...], *, message_id: str
+) -> WecomAction:
+    """发行由服务端冻结目标的 TODAY 候选动作。"""
+
+    return service.issue_batch_submission_action(
+        actor_user_id="sales-a",
+        request_message_id=message_id,
+        command_text="提交今天的线索",
+        candidates=tuple(
+            {"lead_id": lead_id, "company_name": f"TODAY测试公司-{index}"}
+            for index, lead_id in enumerate(lead_ids)
+        ),
+    )
 
 
 def _seed_reassignment_case(session_factory: sessionmaker[Session]) -> str:
@@ -614,8 +689,7 @@ def test_company_submission_confirmation_card_contains_preview_fields(
         notice for notice in notices if notice.notification_type == "wecom_action_preview"
     )
     assert (
-        card_notice.payload["template_card"]["horizontal_content_list"][0]["keyname"]
-        == "线索名称"
+        card_notice.payload["template_card"]["horizontal_content_list"][0]["keyname"] == "线索名称"
     )
     assert "备注" in preview_notice.payload["markdown"]["content"]
 
@@ -704,9 +778,7 @@ def test_batch_submission_action_accepts_single_candidate_and_freezes_context(
         candidates=({"lead_id": "lead-a", "company_name": "候选一"},),
     )
 
-    assert action.context["candidate_leads"] == [
-        {"lead_id": "lead-a", "company_name": "候选一"}
-    ]
+    assert action.context["candidate_leads"] == [{"lead_id": "lead-a", "company_name": "候选一"}]
     assert action.context["page"] == 1
     assert action.context["page_count"] == 1
     with session_factory() as session:
@@ -726,8 +798,7 @@ def test_batch_submission_action_freezes_page_for_more_than_one_page(
 
     _authorize(session_factory)
     candidates = tuple(
-        {"lead_id": f"lead-{index}", "company_name": f"公司{index}"}
-        for index in range(20)
+        {"lead_id": f"lead-{index}", "company_name": f"公司{index}"} for index in range(20)
     )
     action = _service(session_factory).issue_batch_submission_action(
         actor_user_id="sales-a",
@@ -760,9 +831,7 @@ def test_batch_callback_accepts_only_selected_frozen_subset(
         actor_user_id="sales-a",
         request_message_id="message-subset",
         command_text="提交我所有线索",
-        candidates=tuple(
-            {"lead_id": lead_id, "company_name": "同名公司"} for lead_id in lead_ids
-        ),
+        candidates=tuple({"lead_id": lead_id, "company_name": "同名公司"} for lead_id in lead_ids),
     )
     result = _service(session_factory).claim_callback(
         _batch_frame_for_action(action, lead_ids[:2], msgid="provider-subset")
@@ -810,9 +879,7 @@ def test_batch_callback_rejects_injected_option_id(
         actor_user_id="sales-a",
         request_message_id="message-injected-option",
         command_text="提交我所有线索",
-        candidates=tuple(
-            {"lead_id": lead_id, "company_name": "同名公司"} for lead_id in lead_ids
-        ),
+        candidates=tuple({"lead_id": lead_id, "company_name": "同名公司"} for lead_id in lead_ids),
     )
     result = _service(session_factory).claim_callback(
         _batch_frame_for_action(action, ("not-frozen-lead",), msgid="provider-injected")
@@ -834,9 +901,7 @@ def test_batch_callback_rechecks_owner_transfer_and_status_change(
         actor_user_id="sales-a",
         request_message_id="message-owner-change",
         command_text="提交我所有线索",
-        candidates=tuple(
-            {"lead_id": lead_id, "company_name": "同名公司"} for lead_id in lead_ids
-        ),
+        candidates=tuple({"lead_id": lead_id, "company_name": "同名公司"} for lead_id in lead_ids),
     )
     with session_factory.begin() as session:
         lead = session.get(Lead, lead_ids[0])
@@ -881,6 +946,156 @@ def test_batch_callback_replay_is_idempotent(
     assert replay.code == "action_processing"
     with session_factory() as session:
         assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
+
+
+def test_today_callback_claim_executor_submits_only_selected_lead(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 TODAY callback 经持久化 claim 和 executor 后仅提交勾选线索一次。"""
+
+    import app.crm.service as crm_service
+
+    employee_path = tmp_path / "employee.csv"
+    employee_path.write_text("id,name,nickname\ncrm-sales-a,测试销售,测试\n", encoding="utf-8")
+    settings = get_settings().model_copy(update={"employee_directory_path": str(employee_path)})
+    monkeypatch.setattr(crm_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(crm_service, "_TEST_EMPLOYEE_DIRECTORY_PATH", employee_path, raising=False)
+
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_ids = _seed_today_submission_leads(session_factory, adapter)
+    action_service = _service(session_factory)
+    action = _issue_today_action(action_service, lead_ids, message_id="today-selection")
+    claim = action_service.claim_callback(
+        _batch_frame_for_action(action, (lead_ids[0],), msgid="today-provider-1")
+    )
+    replay = action_service.claim_callback(
+        _batch_frame_for_action(action, (lead_ids[0],), msgid="today-provider-2")
+    )
+    crm = MockCRMAdapter()
+    executor = DeterministicWecomActionExecutor(session_factory, adapter, crm, action_service)
+    execution = action_service.execute_action(action.id, executor)
+
+    assert claim.code == "claimed"
+    assert replay.code == "action_processing"
+    assert execution.executed is True
+    assert crm.search_calls == 1 and crm.calls == 1 and crm.update_calls == 0
+    assert [payload["name"] for payload in crm.payloads] == ["TODAY测试公司-0"]
+
+
+def test_today_callback_rejects_temporary_lifecycle_after_card_issue(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 TODAY 卡发行后 lifecycle 变成 temporary 时回调 fail closed。"""
+
+    _authorize(session_factory)
+    lead_ids = _seed_batch_leads(session_factory, count=1)
+    action_service = _service(session_factory)
+    action = _issue_today_action(action_service, lead_ids, message_id="today-state-change")
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_ids[0])
+        assert lead is not None
+        lead.lifecycle_state = "temporary"
+
+    result = action_service.claim_callback(
+        _batch_frame_for_action(action, lead_ids, msgid="today-provider-state-change")
+    )
+
+    assert result.code == "candidate_state_changed"
+    with session_factory() as session:
+        assert session.scalars(select(WecomActionOutbox)).all() == []
+
+
+def test_today_callback_rejects_owner_transfer_after_card_issue(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 TODAY 卡发行后负责人转移时回调以 owner_mismatch 拒绝。"""
+
+    _authorize(session_factory)
+    lead_ids = _seed_batch_leads(session_factory, count=1)
+    action_service = _service(session_factory)
+    action = _issue_today_action(action_service, lead_ids, message_id="today-owner-change")
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_ids[0])
+        assert lead is not None
+        lead.smart_table_owner_user_id = "sales-b"
+
+    result = action_service.claim_callback(
+        _batch_frame_for_action(action, lead_ids, msgid="today-provider-owner-change")
+    )
+
+    assert result.code == "owner_mismatch"
+    with session_factory() as session:
+        assert session.scalars(select(WecomActionOutbox)).all() == []
+
+
+@pytest.mark.parametrize("sync_status", ("succeeded", "abandoned"))
+def test_today_callback_rejects_terminal_create_status_after_card_issue(
+    session_factory: sessionmaker[Session], sync_status: str
+) -> None:
+    """验证 TODAY 卡发行后 create 变成 succeeded 或 abandoned 都会拒绝。"""
+
+    _authorize(session_factory)
+    lead_ids = _seed_batch_leads(session_factory, count=1)
+    action_service = _service(session_factory)
+    action = _issue_today_action(
+        action_service, lead_ids, message_id=f"today-terminal-{sync_status}"
+    )
+    with session_factory.begin() as session:
+        session.add(
+            CrmSyncRecord(
+                lead_id=lead_ids[0],
+                operation="create",
+                generation=1,
+                smart_table_record_id="record-terminal",
+                idempotency_key=f"crm:create:{lead_ids[0]}",
+                canonical_payload={},
+                snapshot_hash="a" * 64,
+                request_message_id=f"terminal-{sync_status}",
+                submitting_sales_user_id="sales-a",
+                submitting_crm_user_id="crm-a",
+                crm_lead_id="crm-A" if sync_status == "succeeded" else None,
+                status=sync_status,
+                completed_at=utc_now(),
+            )
+        )
+
+    result = action_service.claim_callback(
+        _batch_frame_for_action(action, lead_ids, msgid=f"today-provider-terminal-{sync_status}")
+    )
+
+    assert result.code == "candidate_state_changed"
+    with session_factory() as session:
+        assert session.scalars(select(WecomActionOutbox)).all() == []
+
+
+def test_today_callback_rejects_injected_lead_id_and_unknown_context(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 TODAY callback 拒绝客户端注入目标和被篡改的服务端命令上下文。"""
+
+    _authorize(session_factory)
+    lead_ids = _seed_batch_leads(session_factory, count=1)
+    action_service = _service(session_factory)
+    action = _issue_today_action(action_service, lead_ids, message_id="today-injected")
+    injected = action_service.claim_callback(
+        _batch_frame_for_action(action, ("injected-lead",), msgid="today-provider-injected")
+    )
+    assert injected.code == "selection_mismatch"
+
+    next_action = _issue_today_action(action_service, lead_ids, message_id="today-invalid-context")
+    with session_factory.begin() as session:
+        stored = session.get(WecomAction, next_action.id)
+        assert stored is not None
+        stored.context = {**stored.context, "command_text": "unknown command"}
+    invalid = action_service.claim_callback(
+        _batch_frame_for_action(next_action, lead_ids, msgid="today-provider-invalid-context")
+    )
+
+    assert invalid.code == "invalid_action_context"
+    with session_factory() as session:
+        assert session.scalars(select(WecomActionOutbox)).all() == []
 
 
 def test_abandoned_only_card_cannot_submit_normal_unsubmitted_lead(
@@ -1064,9 +1279,12 @@ def test_inactive_or_unauthorized_actor_is_denied(session_factory: sessionmaker[
         authorization = session.get(SalesAuthorization, "sales-a")
         assert authorization is not None
         authorization.is_active = False
-    assert _service(session_factory).claim_callback(
-        _frame_for_action(action, msgid="provider-msg-300")
-    ).code == "actor_unauthorized"
+    assert (
+        _service(session_factory)
+        .claim_callback(_frame_for_action(action, msgid="provider-msg-300"))
+        .code
+        == "actor_unauthorized"
+    )
 
     _authorize(session_factory, "sales-b")
     action_b = _service(session_factory).issue_discard_action(
@@ -1076,9 +1294,12 @@ def test_inactive_or_unauthorized_actor_is_denied(session_factory: sessionmaker[
         authorization = session.get(SalesAuthorization, "sales-b")
         assert authorization is not None
         authorization.is_authorized = False
-    assert _service(session_factory).claim_callback(
-        _frame_for_action(action_b, msgid="provider-msg-301", actor="sales-b")
-    ).code == "actor_unauthorized"
+    assert (
+        _service(session_factory)
+        .claim_callback(_frame_for_action(action_b, msgid="provider-msg-301", actor="sales-b"))
+        .code
+        == "actor_unauthorized"
+    )
 
 
 def test_field_confirmation_happy_path_reuses_lead_review_service(
@@ -1098,9 +1319,7 @@ def test_field_confirmation_happy_path_reuses_lead_review_service(
         request_message_id="message-action",
     )
     claim = service.claim_callback(_frame_for_action(action, msgid="provider-msg-400"))
-    executor = DeterministicWecomActionExecutor(
-        session_factory, adapter, MockCRMAdapter()
-    )
+    executor = DeterministicWecomActionExecutor(session_factory, adapter, MockCRMAdapter())
 
     result = service.execute_action(action.id, executor)
 
@@ -1109,12 +1328,15 @@ def test_field_confirmation_happy_path_reuses_lead_review_service(
     record = adapter.get_record(next(iter(adapter.get_records())).record_id)
     assert record is not None and record.fields["AI待确认"] == []
     with session_factory() as session:
-        assert session.scalars(
-            select(LeadFieldProvenance).where(
-                LeadFieldProvenance.lead_id == lead_id,
-                LeadFieldProvenance.is_user_confirmed.is_(True),
-            )
-        ).first() is not None
+        assert (
+            session.scalars(
+                select(LeadFieldProvenance).where(
+                    LeadFieldProvenance.lead_id == lead_id,
+                    LeadFieldProvenance.is_user_confirmed.is_(True),
+                )
+            ).first()
+            is not None
+        )
 
 
 def test_stale_field_confirmation_card_cannot_overwrite_latest_table_state(
@@ -1136,9 +1358,7 @@ def test_stale_field_confirmation_card_cannot_overwrite_latest_table_state(
     record_id = next(iter(adapter.get_records())).record_id
     adapter.update_record(record_id, {"AI待确认": [], "业务线": "车载机器人"})
     service.claim_callback(_frame_for_action(action, msgid="provider-msg-401"))
-    executor = DeterministicWecomActionExecutor(
-        session_factory, adapter, MockCRMAdapter()
-    )
+    executor = DeterministicWecomActionExecutor(session_factory, adapter, MockCRMAdapter())
 
     result = service.execute_action(action.id, executor)
 
@@ -1146,12 +1366,15 @@ def test_stale_field_confirmation_card_cannot_overwrite_latest_table_state(
     current = adapter.get_record(record_id)
     assert current is not None and current.fields["业务线"] == "车载机器人"
     with session_factory() as session:
-        assert session.scalars(
-            select(LeadFieldProvenance).where(
-                LeadFieldProvenance.lead_id == lead_id,
-                LeadFieldProvenance.is_user_confirmed.is_(True),
-            )
-        ).first() is not None
+        assert (
+            session.scalars(
+                select(LeadFieldProvenance).where(
+                    LeadFieldProvenance.lead_id == lead_id,
+                    LeadFieldProvenance.is_user_confirmed.is_(True),
+                )
+            ).first()
+            is not None
+        )
 
 
 def test_field_confirmation_remote_success_reconciles_without_blind_table_replay(
@@ -1185,17 +1408,19 @@ def test_field_confirmation_remote_success_reconciles_without_blind_table_replay
         outbox.remote_effect_status = "unknown"
         outbox.domain_operation_payload = {
             "field_values": {
-                "业务线": "sha256:"
-                + hashlib.sha256("协作机器人".encode("utf-8")).hexdigest()
+                "业务线": "sha256:" + hashlib.sha256("协作机器人".encode("utf-8")).hexdigest()
             }
         }
     result = service.reconcile_field_confirmation(action.id, adapter)
 
     assert result.code == "confirmation_recovered"
     with session_factory() as session:
-        assert session.scalars(
-            select(UserConfirmationEvent).where(UserConfirmationEvent.lead_id == lead_id)
-        ).first() is not None
+        assert (
+            session.scalars(
+                select(UserConfirmationEvent).where(UserConfirmationEvent.lead_id == lead_id)
+            ).first()
+            is not None
+        )
         stored = session.get(WecomAction, action.id)
         assert stored is not None and stored.status == "succeeded"
         outbox = session.scalar(
