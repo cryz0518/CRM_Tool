@@ -53,7 +53,6 @@ from app.wecom_bot.actions import (
     CARD_EVENT_KEY_CRM_FIELD_CONFIRM,
     CARD_EVENT_KEY_DISCARD_CONFIRM,
     CARD_EVENT_KEY_REASSIGN_CONFIRM,
-    CallbackClaimResult,
     CallbackParseError,
     DeterministicWecomActionExecutor,
     InvalidActionTransition,
@@ -1030,9 +1029,16 @@ def test_today_callback_claim_executor_submits_only_selected_lead(
 
     assert claim.code == "claimed"
     assert replay.code == "action_processing"
+    assert claim.should_update_card is True
+    assert replay.should_update_card is False
+    card = claim.response_card()
+    assert card["card_type"] == "vote_interaction"
+    assert card["checkbox"]["disable"] is True  # type: ignore[index]
     assert execution.executed is True
     assert crm.search_calls == 1 and crm.calls == 1 and crm.update_calls == 0
     assert [payload["name"] for payload in crm.payloads] == ["TODAY测试公司-0"]
+    with session_factory() as session:
+        assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
 
 
 def test_duplicate_response_message_never_enters_result_notification(
@@ -1433,19 +1439,86 @@ def test_callback_response_success_freezes_card_and_saves_transport_evidence(
     assert "provider-msg" not in caplog.text
 
 
-def test_claimed_response_card_matches_text_notice_update_contract() -> None:
-    """验证冻结回调响应使用企业微信支持的无跳转 text_notice 结构。"""
-    card = CallbackClaimResult(
-        "claimed", "original-task", "action-1", "claimed", True
-    ).response_card()
+def test_batch_callback_freezes_original_vote_card_and_ignores_client_names(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证首次批量确认以服务端候选更新同型投票卡，并且 replay 不再更新。"""
+    _authorize(session_factory)
+    service = _service(session_factory)
+    action = service.issue_batch_submission_action(
+        actor_user_id="sales-a",
+        request_message_id="message-vote-freeze",
+        command_text="提交我所有线索",
+        candidates=(
+            {"lead_id": "lead-a", "company_name": "冻结公司A", "display_text": "服务端名称A"},
+            {"lead_id": "lead-b", "company_name": "冻结公司B", "display_text": "服务端名称B"},
+        ),
+    )
+    frame = _batch_frame_for_action(action, ("lead-b",), msgid="provider-vote-freeze")
+    body = frame.get("body")
+    assert isinstance(body, dict)
+    event = body.get("event")
+    assert isinstance(event, dict)
+    card_event = event.get("template_card_event")
+    assert isinstance(card_event, dict)
+    selected_items = card_event.get("selected_items")
+    assert isinstance(selected_items, dict)
+    selected_list = selected_items.get("selected_item")
+    assert isinstance(selected_list, list) and isinstance(selected_list[0], dict)
+    selected_item = selected_list[0]
+    selected_item["company_name"] = "客户端伪造名称"
 
-    assert card["card_type"] == "text_notice"
-    assert card["task_id"] == "original-task"
-    assert card["card_action"] == {"type": 0}
+    updates: list[dict[str, object]] = []
+    frames: list[Mapping[str, object]] = []
+
+    async def update_card(
+        callback_frame: Mapping[str, object], card: dict[str, object]
+    ) -> dict[str, int]:
+        """记录单次更新，模拟企微 ACK 成功。"""
+        frames.append(callback_frame)
+        updates.append(card)
+        return {"errcode": 0}
+
+    handler = WecomTemplateCardCallbackHandler(service)
+    asyncio.run(handler.handle(frame, update_card))
+    replay_frame = _batch_frame_for_action(
+        action, ("lead-b",), msgid="provider-vote-freeze-replay"
+    )
+    asyncio.run(handler.handle(replay_frame, update_card))
+
+    assert len(updates) == 1
+    assert frames[0] is frame
+    card = updates[0]
+    assert card["card_type"] == "vote_interaction"
+    assert card["task_id"] == action.task_id
     assert card["main_title"] == {
-        "title": "已确认选择",
-        "desc": "已受理，后台正在提交，请勿重复操作",
+        "title": "选择要提交的线索",
+        "desc": "请勾选需要提交的线索；未勾选的线索不会调用 CRM",
     }
+    assert card["checkbox"] == {
+        "question_key": "crm_submission_candidates",
+        "mode": 1,
+        "option_list": [
+            {"id": "lead-a", "text": "1. 冻结公司A", "is_checked": False},
+            {"id": "lead-b", "text": "2. 冻结公司B", "is_checked": True},
+        ],
+        "disable": True,
+    }
+    assert card["submit_button"] == {
+        "text": "确认选择",
+        "key": CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
+    }
+    assert card["replace_text"] == "已确认选择"
+    assert "card_action" not in card
+    assert "客户端伪造名称" not in json.dumps(card, ensure_ascii=False)
+    with session_factory() as session:
+        assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
+        delivery = session.scalar(
+            select(WecomCallbackDelivery).where(
+                WecomCallbackDelivery.provider_msgid == "provider-vote-freeze"
+            )
+        )
+        assert delivery is not None and delivery.transport_status == "succeeded"
 
 
 def test_final_notification_retry_does_not_repeat_domain_action(

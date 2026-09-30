@@ -40,6 +40,7 @@ CARD_EVENT_KEY_DISCARD_CONFIRM = "lead.discard.confirm"
 CARD_EVENT_KEY_REASSIGN_CONFIRM = "lead.reassignment.confirm"
 CARD_TYPE_BUTTON_INTERACTION = "button_interaction"
 CARD_TYPE_VOTE_INTERACTION = "vote_interaction"
+_BATCH_SELECTION_QUESTION_KEY = "crm_submission_candidates"
 ALLOWED_CARD_EVENT_KEYS = frozenset(
     {
         CARD_EVENT_KEY_CRM_FIELD_CONFIRM,
@@ -141,6 +142,57 @@ class TemplateCardCallback:
 
 
 @dataclass(frozen=True)
+class FrozenCardOption:
+    """保存从服务端候选 context 构造的不可变投票选项。"""
+
+    lead_id: str
+    text: str
+    is_checked: bool
+
+
+@dataclass(frozen=True)
+class FrozenCardUpdate:
+    """保存首个合法批量 callback 对应的安全卡片更新快照。"""
+
+    task_id: str
+    title: str
+    description: str
+    question_key: str
+    mode: int
+    options: tuple[FrozenCardOption, ...]
+    submit_text: str
+    submit_key: str
+
+    def as_payload(self) -> dict[str, object]:
+        """构造同类型投票卡更新体，冻结选项并替换确认按钮文案。
+
+        返回值：只含已冻结服务端字段的 vote_interaction 更新体。
+        异常：无。
+        副作用：无。
+        """
+        return {
+            "card_type": CARD_TYPE_VOTE_INTERACTION,
+            "task_id": self.task_id,
+            "main_title": {"title": self.title, "desc": self.description},
+            "checkbox": {
+                "question_key": self.question_key,
+                "option_list": [
+                    {
+                        "id": option.lead_id,
+                        "text": option.text,
+                        "is_checked": option.is_checked,
+                    }
+                    for option in self.options
+                ],
+                "disable": True,
+                "mode": self.mode,
+            },
+            "submit_button": {"text": self.submit_text, "key": self.submit_key},
+            "replace_text": "已确认选择",
+        }
+
+
+@dataclass(frozen=True)
 class CallbackClaimResult:
     """描述一次 callback delivery 的认领结果及可安全返回的摘要。"""
 
@@ -149,6 +201,7 @@ class CallbackClaimResult:
     action_id: str | None
     summary: str
     should_update_card: bool
+    frozen_card_update: FrozenCardUpdate | None = None
 
     def response_card(self) -> dict[str, object]:
         """构造一次 callback response 使用的最小状态卡片。
@@ -159,7 +212,10 @@ class CallbackClaimResult:
         副作用：无。
         """
 
-        # task_id 必须原样回显服务端已解析的 opaque correlation，不读取客户端其他业务字段。
+        # 批量首个合法选择使用 claim 时从服务端冻结候选生成的同类型更新卡。
+        if self.code == "claimed" and self.frozen_card_update is not None:
+            return self.frozen_card_update.as_payload()
+        # 非批量交互沿用现有状态回执；task_id 只回显服务端已解析的 opaque correlation。
         title = "已确认选择" if self.code == "claimed" else "操作状态"
         description = (
             "已受理，后台正在提交，请勿重复操作"
@@ -624,6 +680,7 @@ class WecomActionService:
                     False,
                 )
 
+            frozen_card_update: FrozenCardUpdate | None = None
             if action.action_type in {
                 ACTION_TYPE_CRM_FIELD_CONFIRMATION,
                 ACTION_TYPE_CRM_COMPANY_CONFIRMATION,
@@ -704,6 +761,16 @@ class WecomActionService:
                         "selection_mismatch",
                         "请至少选择一条有效线索",
                     )
+                frozen_card_update = _freeze_batch_card_update(
+                    action, callback.selected_option_ids
+                )
+                if frozen_card_update is None:
+                    return self._deny_action(
+                        action,
+                        delivery,
+                        "invalid_action_context",
+                        "候选卡内容已失效，请重新发起",
+                    )
                 action.context = {
                     **action.context,
                     "selected_lead_ids": list(callback.selected_option_ids),
@@ -782,7 +849,12 @@ class WecomActionService:
                 extra={"action_id": action.id, "event": "callback_received"},
             )
             return CallbackClaimResult(
-                "claimed", action.task_id, action.id, "已受理，后台正在处理", True
+                "claimed",
+                action.task_id,
+                action.id,
+                "已受理，后台正在处理",
+                True,
+                frozen_card_update,
             )
 
     def execute_action(
@@ -1247,9 +1319,7 @@ class WecomActionService:
         target_id = hashlib.sha256(
             f"crm-batch-submission:{request_message_id}:{command_text}:page:{page}".encode()
         ).hexdigest()
-        title = "重新提交放弃线索" if "放弃提交" in command_text else "选择要提交的线索"
-        if page_count > 1:
-            title = f"{title}（第 {page}/{page_count} 批）"
+        title, description = _batch_submission_card_copy(command_text, page, page_count)
         return self.issue_action(
             actor_user_id=actor_user_id,
             action_type=ACTION_TYPE_CRM_BATCH_SUBMISSION,
@@ -1264,10 +1334,7 @@ class WecomActionService:
                 "page_count": page_count,
             },
             title=title,
-            description=(
-                "请勾选需要提交的线索；未勾选的线索不会调用 CRM"
-                + (f"（第 {page}/{page_count} 批）" if page_count > 1 else "")
-            ),
+            description=description,
             source_message_id=request_message_id,
             preview_markdown_chunks=preview_markdown_chunks,
         )
@@ -1580,6 +1647,22 @@ class WecomActionService:
         return CallbackClaimResult(code, action.task_id, action.id, summary, True)
 
 
+def _batch_submission_card_copy(
+    command_text: str, page: int, page_count: int
+) -> tuple[str, str]:
+    """按候选动作的冻结命令和分页生成原卡标题与说明。
+
+    参数：command_text 为服务端批量命令，page/page_count 为当前页及总页数。
+    返回值：与批量候选卡一致的标题、说明文本。
+    异常：无。
+    副作用：无。
+    """
+    title = "重新提交放弃线索" if "放弃提交" in command_text else "选择要提交的线索"
+    page_suffix = f"（第 {page}/{page_count} 批）" if page_count > 1 else ""
+    description = "请勾选需要提交的线索；未勾选的线索不会调用 CRM" + page_suffix
+    return title + page_suffix, description
+
+
 def build_action_card(
     *,
     task_id: str,
@@ -1614,7 +1697,7 @@ def build_action_card(
     if isinstance(options, list) and options:
         submit_key = selection_key or CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE
         question_key = (
-            "crm_submission_candidates"
+            _BATCH_SELECTION_QUESTION_KEY
             if selection_options is not None
             else "crm_duplicate_leads"
         )
@@ -1652,6 +1735,111 @@ def build_action_card(
     if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > _MAX_CARD_PAYLOAD_BYTES:
         raise ValueError("动作卡片 payload 超出大小限制")
     return payload
+
+
+def _freeze_batch_card_update(
+    action: WecomAction, selected_option_ids: tuple[str, ...]
+) -> FrozenCardUpdate | None:
+    """从持久化 action context 构造不可变、同类型批量卡片更新。
+
+    参数：action 为锁定的服务端动作；selected_option_ids 为已通过范围校验的 option ID。
+    返回值：仅含冻结候选及选中状态的安全更新结构；context 不完整时返回 None。
+    异常：无；不可重建的卡片结构由调用方拒绝本次 claim。
+    副作用：无，不读取 ORM 目标记录之外的客户端名称或展示字段。
+    """
+    context = action.context
+    candidates = context.get("candidate_leads")
+    command_text = context.get("command_text")
+    page = context.get("page")
+    page_count = context.get("page_count")
+    if (
+        not isinstance(candidates, list)
+        or not candidates
+        or command_text
+        not in {"帮我提交放弃提交的线索", "提交今天的线索", "提交我所有线索"}
+        or type(page) is not int
+        or type(page_count) is not int
+        or page < 1
+        or page_count < page
+        or action.expected_action_key != CARD_EVENT_KEY_CRM_BATCH_SUBMISSION
+    ):
+        return None
+
+    # 复用发行时卡片 builder 的同一套展示规则，避免更新时重排或改写候选标签。
+    title, description = _batch_submission_card_copy(command_text, page, page_count)
+    original_card = build_action_card(
+        task_id=action.task_id,
+        event_key=action.expected_action_key,
+        title=title,
+        description=description,
+        selection_options=candidates,
+        selection_key=action.expected_action_key,
+    )
+    main_title = original_card.get("main_title")
+    checkbox = original_card.get("checkbox")
+    submit_button = original_card.get("submit_button")
+    if (
+        original_card.get("card_type") != CARD_TYPE_VOTE_INTERACTION
+        or not isinstance(main_title, Mapping)
+        or not isinstance(checkbox, Mapping)
+        or not isinstance(submit_button, Mapping)
+    ):
+        return None
+    raw_options = checkbox.get("option_list")
+    candidate_ids = _context_lead_ids(candidates)
+    if (
+        not isinstance(raw_options, list)
+        or len(raw_options) != len(candidate_ids)
+        or tuple(
+            option.get("id")
+            for option in raw_options
+            if isinstance(option, Mapping)
+        )
+        != tuple(candidate_ids)
+    ):
+        return None
+
+    frozen_options: list[FrozenCardOption] = []
+    selected = frozenset(selected_option_ids)
+    for option in raw_options:
+        if (
+            not isinstance(option, Mapping)
+            or not isinstance(option.get("id"), str)
+            or not isinstance(option.get("text"), str)
+        ):
+            return None
+        frozen_options.append(
+            FrozenCardOption(
+                lead_id=option["id"],
+                text=option["text"],
+                is_checked=option["id"] in selected,
+            )
+        )
+    title_value = main_title.get("title")
+    description_value = main_title.get("desc")
+    question_key = checkbox.get("question_key")
+    mode = checkbox.get("mode")
+    submit_text = submit_button.get("text")
+    submit_key = submit_button.get("key")
+    if (
+        not isinstance(title_value, str)
+        or not isinstance(description_value, str)
+        or not isinstance(question_key, str)
+        or type(mode) is not int
+        or not isinstance(submit_text, str)
+        or not isinstance(submit_key, str)
+    ):
+        return None
+    return FrozenCardUpdate(
+        task_id=action.task_id,
+        title=title_value,
+        description=description_value,
+        question_key=question_key,
+        mode=mode,
+        options=tuple(frozen_options),
+        submit_text=submit_text,
+        submit_key=submit_key,
+    )
 
 
 def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
