@@ -90,6 +90,7 @@ class SubmissionItemStatus(StrEnum):
     RETRYING = "retrying"
     FAILED_PENDING_REVIEW = "failed_pending_review"
     COMPANY_IDENTITY_REVIEW = "company_identity_review"
+    NOT_SUBMITTED = "not_submitted"
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,7 @@ class SubmissionBatchResult:
     mapping_missing: int = 0
     duplicate_confirmations: tuple["DuplicateSubmission", ...] = ()
     items: tuple[SubmissionItemResult, ...] = ()
+    not_submitted: int = 0
 
 
 @dataclass(frozen=True)
@@ -177,6 +179,7 @@ _CREATE_REASON_CODES = {
     "processing": "sync_processing",
     "retrying": "crm_create_retrying",
     "failed_pending_review": "crm_create_failed_pending_review",
+    "not_submitted": "candidate_state_changed",
 }
 _ITEM_STATUS_BY_OUTCOME = {
     "succeeded": SubmissionItemStatus.CREATED,
@@ -189,6 +192,7 @@ _ITEM_STATUS_BY_OUTCOME = {
     "retrying": SubmissionItemStatus.RETRYING,
     "failed_pending_review": SubmissionItemStatus.FAILED_PENDING_REVIEW,
     "company_identity_review": SubmissionItemStatus.COMPANY_IDENTITY_REVIEW,
+    "not_submitted": SubmissionItemStatus.NOT_SUBMITTED,
 }
 
 
@@ -255,6 +259,7 @@ def _append_create_result(
         mapping_missing=result.mapping_missing + (outcome.status == "mapping_missing"),
         company_identity_review=result.company_identity_review
         + (outcome.status == "company_identity_review"),
+        not_submitted=result.not_submitted + (outcome.status == "not_submitted"),
         duplicate_confirmations=(
             result.duplicate_confirmations + (outcome.duplicate,)
             if outcome.duplicate is not None
@@ -275,20 +280,24 @@ def _append_update_result(
     副作用：无，不修改输入对象或执行外部调用。
     """
 
-    item_status = _ITEM_STATUS_BY_OUTCOME.get(
-        status, SubmissionItemStatus.FAILED_PENDING_REVIEW
-    )
+    item_status = {
+        "succeeded": SubmissionItemStatus.UPDATED,
+        "unchanged": SubmissionItemStatus.UNCHANGED,
+        "incomplete": SubmissionItemStatus.INCOMPLETE,
+    }.get(status, _ITEM_STATUS_BY_OUTCOME.get(status, SubmissionItemStatus.FAILED_PENDING_REVIEW))
     reason_code = {
+        "incomplete": "crm_update_incomplete",
         "mapping_missing": "crm_user_mapping_missing",
         "processing": "sync_processing",
-        "retrying": "crm_create_retrying",
+        "retrying": "crm_update_retrying",
         "company_identity_review": "company_identity_change_pending_review",
-        "failed_pending_review": "crm_create_failed_pending_review",
+        "failed_pending_review": "crm_update_failed_pending_review",
     }.get(status)
     item = SubmissionItemResult(lead_id, item_status, reason_code)
     return replace(
         result,
         retrying=result.retrying + (status == "retrying"),
+        incomplete=result.incomplete + (status == "incomplete"),
         processing=result.processing + (status == "processing"),
         failed_pending_review=result.failed_pending_review + (status == "failed_pending_review"),
         updated=result.updated + (status == "succeeded"),
@@ -437,9 +446,9 @@ class CrmSubmissionService:
         """列出当前销售可在机器人卡片中选择的线索，不调用 CRM。
 
         参数：command_text 为精确命令；sales_user_id 为当前销售身份。
-        返回值：只包含本人、待创建且符合系统状态的线索候选。
+        返回值：只包含本人、日期与实时表格状态符合所选卡片范围的线索候选。
         异常：销售未授权或命令不支持时抛出 ValueError。
-        副作用：读取数据库及智能表格；必要时把已补齐当前表格必填字段的临时线索晋升为待创建。
+        副作用：只读取数据库及智能表格，不改变 Lead 生命周期。
         """
         if command_text not in {_TODAY_COMMAND, _ALL_COMMAND, _ABANDONED_COMMAND}:
             raise ValueError("不支持候选卡片的 CRM 命令")
@@ -463,7 +472,6 @@ class CrmSubmissionService:
                 )
             )
             candidates: list[SubmissionCandidate] = []
-            promoted_temporary = False
             for lead in leads:
                 sync = latest_crm_create_sync(session, lead.id)
                 if command_text == _ABANDONED_COMMAND:
@@ -474,28 +482,11 @@ class CrmSubmissionService:
                     ):
                         continue
                 elif command_text == _TODAY_COMMAND:
-                    # 后台 Lead 可能因异步同步暂存为 temporary；
-                    # 候选发卡前以当前表格快照补回生命周期。
-                    if lead.lifecycle_state == "temporary":
-                        record = smart_table_snapshot.get(lead.smart_table_record_id or "")
-                        if (
-                            record is not None
-                            and record.fields.get("提交状态") == "未提交"
-                            and not self._missing_crm_minimum(dict(record.fields))
-                        ):
-                            # 只晋升状态并合并当前必填事实，具体提交仍会再次 reconcile 表格快照。
-                            lead.lifecycle_state = "pending_create"
-                            lead.field_values = {
-                                **lead.field_values,
-                                **{
-                                    name: record.fields[name]
-                                    for name in _CRM_REQUIRED_FIELDS
-                                    if name in record.fields
-                                },
-                            }
-                            promoted_temporary = True
-                    # “今天”也必须以候选卡冻结目标；日期和未提交状态在发卡时服务端确认。
-                    if not self._is_today_owned_candidate(lead, sales_user_id):
+                    # 今日候选可包括后台 temporary，但只以当前表格完整快照确认其提交资格。
+                    if (
+                        lead.lifecycle_state not in {"pending_create", "temporary"}
+                        or not self._is_today_owned_candidate(lead, sales_user_id)
+                    ):
                         continue
                     if sync is not None and sync.status in {"succeeded", "abandoned"}:
                         continue
@@ -503,6 +494,10 @@ class CrmSubmissionService:
                         lead, snapshot=smart_table_snapshot
                     ):
                         continue
+                    if lead.lifecycle_state == "temporary":
+                        record = smart_table_snapshot.get(lead.smart_table_record_id or "")
+                        if record is None or self._missing_crm_minimum(dict(record.fields)):
+                            continue
                 else:
                     # 只有待创建和仍在补全的草稿能进入卡片；已同步、废弃或失败终态保持冻结。
                     if lead.lifecycle_state not in {"pending_create", "temporary"}:
@@ -544,9 +539,6 @@ class CrmSubmissionService:
                             tuple(display_snapshot.items()),
                         )
                     )
-            if promoted_temporary:
-                # 晋升必须在发卡前落库，确保后续 callback 的服务端状态校验与候选卡一致。
-                session.commit()
             return tuple(candidates)
 
     def submit_selected(
@@ -558,8 +550,8 @@ class CrmSubmissionService:
 
         参数：command 为原始精确命令；selected_lead_ids 为 callback 中的服务端候选标识。
         返回值：与普通批量提交相同的部分成功汇总。
-        异常：销售未授权或命令不支持时抛出 ValueError；无效目标被安全忽略。
-        副作用：对通过复核的目标调用既有首次提交流程。
+        异常：销售未授权或命令不支持时抛出 ValueError。
+        副作用：每个 callback 已接受的目标均得到结果；仅仍有效的目标调用首次提交流程。
         """
         if command.text not in {_TODAY_COMMAND, _ALL_COMMAND, _ABANDONED_COMMAND}:
             raise ValueError("不支持卡片选择提交")
@@ -576,14 +568,9 @@ class CrmSubmissionService:
             smart_table_snapshot = {
                 record.record_id: record for record in self._smart_table_adapter.get_records()
             }
-            valid_ids: list[str] = []
+            valid_ids: set[str] = set()
             for lead_id in selected:
-                lead = session.scalar(
-                    select(Lead).where(
-                        Lead.id == lead_id,
-                        Lead.smart_table_owner_user_id == command.sales_user_id,
-                    )
-                )
+                lead = session.get(Lead, lead_id)
                 if lead is None:
                     continue
                 sync = latest_crm_create_sync(session, lead_id)
@@ -593,36 +580,52 @@ class CrmSubmissionService:
                         and sync is not None
                         and sync.status == "abandoned"
                     ):
-                        valid_ids.append(lead_id)
+                        valid_ids.add(lead_id)
                 elif command.text == _TODAY_COMMAND:
-                    # “今天”候选在发行与回调时都必须仍是本人当日的 pending_create。
+                    # frozen candidate 的 temporary 状态必须靠当前完整表格快照重新确认。
                     if (
-                        self._is_today_owned_candidate(lead, command.sales_user_id)
+                        lead.smart_table_owner_user_id == command.sales_user_id
+                        and lead.lifecycle_state in {"pending_create", "temporary"}
+                        and self._is_today_owned_candidate(lead, command.sales_user_id)
                         and (sync is None or sync.status not in {"succeeded", "abandoned"})
                         and self._is_unsubmitted_smart_table_record(
                             lead, snapshot=smart_table_snapshot
                         )
+                        and (
+                            lead.lifecycle_state != "temporary"
+                            or not self._missing_crm_minimum(
+                                dict(
+                                    smart_table_snapshot[
+                                        lead.smart_table_record_id or ""
+                                    ].fields
+                                )
+                            )
+                        )
                     ):
-                        valid_ids.append(lead_id)
+                        valid_ids.add(lead_id)
                 elif (
                     command.text == _ALL_COMMAND
+                    and lead.smart_table_owner_user_id == command.sales_user_id
                     and lead.lifecycle_state in {"pending_create", "temporary"}
                     and (sync is None or sync.status not in {"succeeded", "abandoned"})
                     and self._is_unsubmitted_smart_table_record(
                         lead, snapshot=smart_table_snapshot
                     )
                 ):
-                    valid_ids.append(lead_id)
+                    valid_ids.add(lead_id)
         result = SubmissionBatchResult()
-        for lead_id in valid_ids:
-            outcome = self._submit_create(
-                lead_id,
-                SubmissionCommand(
-                    command.text,
-                    command.sales_user_id,
-                    command.request_message_id,
-                ),
-            )
+        for lead_id in selected:
+            if lead_id not in valid_ids:
+                outcome = _create_outcome("not_submitted")
+            else:
+                outcome = self._submit_create(
+                    lead_id,
+                    SubmissionCommand(
+                        command.text,
+                        command.sales_user_id,
+                        command.request_message_id,
+                    ),
+                )
             result = _append_create_result(result, lead_id, outcome)
         return result
 
@@ -801,7 +804,7 @@ class CrmSubmissionService:
             _ABANDONED_COMMAND,
         } or command.target_lead_id is not None
         # 单条确认卡已冻结唯一 Lead 目标；它可提交 temporary 草稿，但仍须通过后续字段校验。
-        allow_temporary = command.text == _ALL_COMMAND or (
+        allow_temporary = command.text in {_ALL_COMMAND, _TODAY_COMMAND} or (
             command.text == "提交指定线索" and command.target_lead_id == lead_id
         )
         with self._session_factory() as session:
@@ -812,13 +815,13 @@ class CrmSubmissionService:
                 allow_non_today_target,
                 allow_temporary=allow_temporary,
             ):
-                return _create_outcome("incomplete")
+                return _create_outcome("not_submitted")
             # temporary 草稿可以展示在“所有未提交”卡片中；后续统一按八项必填字段判定，
             # 字段完整的记录允许继续查重，字段不完整的记录返回具体缺失项且不调用 CRM。
             existing = latest_crm_create_sync(session, lead_id)
             if existing is not None:
                 if existing.status == "succeeded":
-                    return _create_outcome("incomplete")
+                    return _create_outcome("not_submitted")
                 if existing.status == "awaiting_duplicate_confirmation":
                     duplicate = self._duplicate_from_sync(lead, existing)
                     return _create_outcome(
@@ -843,6 +846,12 @@ class CrmSubmissionService:
             self._smart_table_adapter,
             robot_submission_confirmation_available=self._robot_submission_confirmation_available,
         ).reconcile_submission(lead_id)
+        allowed_submission_statuses = {"未提交"}
+        if command.text == _ABANDONED_COMMAND:
+            allowed_submission_statuses.add("放弃提交")
+        if reconciled.fields.get("提交状态") not in allowed_submission_statuses:
+            # Final Snapshot 已显示该记录并非未提交，保留逐 Lead 结果且不调用 CRM。
+            return _create_outcome("not_submitted")
         missing_business = self._missing_business_fields(reconciled.fields)
         missing_minimum = self._missing_crm_minimum(reconciled.fields)
         if missing_business:
@@ -885,7 +894,7 @@ class CrmSubmissionService:
                     allow_temporary=allow_temporary,
                 )
             ):
-                return _create_outcome("incomplete")
+                return _create_outcome("not_submitted")
             if current_lead.lifecycle_state == "temporary":
                 # 临时线索通过最终快照和 CRM payload 校验后，先晋升再进入 owner/查重状态机。
                 current_lead.lifecycle_state = "pending_create"
@@ -924,8 +933,18 @@ class CrmSubmissionService:
             duplicate_results = tuple(self._crm_adapter.search_by_company_name(canonical_payload))
         except Exception as error:
             failure_category = classify_task_failure(error)
-            failure_details = self._crm_failure_evidence(error)
-            self._audit(command, "crm_duplicate_search_failed", details=failure_details)
+            failure_details = {"lead_id": lead_id, **self._crm_failure_evidence(error)}
+            failure_details.setdefault("adapter_category", None)
+            failure_details.setdefault("http_status", None)
+            failure_details.setdefault("failure_code", None)
+            # BusinessAuditEvent 的唯一键是 message + event_type；按 Lead 哈希扩展类型，
+            # 让同一批次的失败证据可分别查询且仍能幂等重放。
+            event_identity = hashlib.sha256(lead_id.encode()).hexdigest()[:32]
+            self._audit(
+                command,
+                f"crm_duplicate_search_failed:{event_identity}",
+                details=failure_details,
+            )
             _LOGGER.warning(
                 "crm_duplicate_search_failed",
                 extra={
@@ -1507,12 +1526,11 @@ class CrmSubmissionService:
 
     @staticmethod
     def _is_today_owned_candidate(lead: Lead, sales_user_id: str) -> bool:
-        """判定 Lead 是否为提交销售本人负责、当日且仍待首次创建的候选。"""
+        """判定 Lead 是否由提交销售负责且首次采集日期为上海时区当天。"""
         shanghai = ZoneInfo("Asia/Shanghai")
         created = lead.created_at if lead.created_at.tzinfo else lead.created_at.replace(tzinfo=UTC)
         return (
             lead.smart_table_owner_user_id == sales_user_id
-            and lead.lifecycle_state == "pending_create"
             and created.astimezone(shanghai).date() == datetime.now(shanghai).date()
         )
 

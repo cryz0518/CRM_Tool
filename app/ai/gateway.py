@@ -275,10 +275,12 @@ class AIGateway:
             analysis = self._drop_enum_candidates_without_evidence(analysis, safe_text)
             # 对“是做某产品”“想了解某工艺”等逐字事实补充备注素材，避免模型漏返回导致备注为空。
             analysis = self._recover_explicit_enrichment_fields(analysis, safe_text)
-            # 兼容 Qwen 兼容模式偶发漏返回置信度键的结果；无置信度字段不参与写入，但不阻塞其他字段。
-            analysis = self._drop_fields_missing_confidence(analysis)
             # 低置信度枚举按字段类型做受控预填，文本字段仍保留在后台候选。
             analysis = self._normalize_low_confidence_enum_candidates(analysis, safe_text)
+            # 单个无法映射的正式枚举只留作待确认候选，不阻断同消息其它可靠字段。
+            analysis, rejected_enum_candidates = self._drop_invalid_enum_candidates(analysis)
+            # 兼容 Qwen 兼容模式偶发漏返回置信度键；非法枚举已先保留为待确认候选。
+            analysis = self._drop_fields_missing_confidence(analysis)
             self._validate_business(analysis)
             validated_enrichment = self._validate_enrichment_evidence(analysis, safe_text)
             # 补充信息只是备注素材；证据不足时丢弃该字段，不能阻塞已通过校验的 CRM 主字段。
@@ -286,6 +288,8 @@ class AIGateway:
             fields, pending, low_candidates, pending_prefill_allowed = self._apply_confidence(
                 analysis, safe_text
             )
+            pending = tuple(dict.fromkeys((*pending, *rejected_enum_candidates)))
+            low_candidates = {**low_candidates, **rejected_enum_candidates}
         except AIGatewayError as error:
             self._log(trace_id, started_at, "failed", error_type=type(error).__name__)
             self._record_execution(
@@ -838,6 +842,43 @@ class AIGateway:
                 raise FailedStructuredOutputError(
                     response.content, repaired_response.content, str(error)
                 ) from error
+
+    @staticmethod
+    def _drop_invalid_enum_candidates(
+        analysis: LeadAnalysis,
+    ) -> tuple[LeadAnalysis, dict[str, LeadFieldValue]]:
+        """将不属于受控选项的枚举候选移出正式字段并标记待确认。
+
+        参数：analysis 为已完成受控别名归一化的结构化结果。
+        返回值：移除非法枚举后的分析结果及可后台留存的原始候选。
+        异常：无；字段名、权限字段和非枚举业务校验仍由后续严格校验处理。
+        副作用：只记录字段名称，不记录客户候选值。
+        """
+        fields = dict(analysis.crm_fields)
+        confidences = dict(analysis.confidence_by_field)
+        candidates: dict[str, LeadFieldValue] = {}
+        for field_name, value in tuple(fields.items()):
+            options = _ENUM_OPTIONS.get(field_name)
+            if options is None:
+                continue
+            values = value if isinstance(value, list) else [value]
+            if not all(isinstance(item, str) for item in values):
+                continue
+            if values and all(item in options for item in values):
+                continue
+            fields.pop(field_name)
+            confidences.pop(field_name, None)
+            if any(item.strip() for item in values):
+                candidates[field_name] = value
+        if candidates or fields != analysis.crm_fields:
+            logger.warning(
+                "ai_enum_candidates_pending_confirmation",
+                extra={"field_names": list(candidates)},
+            )
+            analysis = analysis.model_copy(
+                update={"crm_fields": fields, "confidence_by_field": confidences}
+            )
+        return analysis, candidates
 
     def _validate_business(self, analysis: LeadAnalysis) -> None:
         """以确定性规则校验字段名、枚举、格式及置信度完整性。

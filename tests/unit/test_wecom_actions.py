@@ -961,9 +961,9 @@ def test_batch_callback_rechecks_owner_transfer_and_status_change(
         _batch_frame_for_action(action, (lead_ids[0],), msgid="provider-owner-change")
     )
 
-    assert result.code == "owner_mismatch"
+    assert result.code == "claimed"
     with session_factory() as session:
-        assert session.scalars(select(WecomActionOutbox)).all() == []
+        assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
 
 
 def test_batch_callback_replay_is_idempotent(
@@ -1032,10 +1032,10 @@ def test_today_callback_claim_executor_submits_only_selected_lead(
     assert [payload["name"] for payload in crm.payloads] == ["TODAY测试公司-0"]
 
 
-def test_today_callback_rejects_temporary_lifecycle_after_card_issue(
+def test_today_callback_defers_temporary_lifecycle_to_worker_revalidation(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证 TODAY 卡发行后 lifecycle 变成 temporary 时回调 fail closed。"""
+    """验证冻结候选回调允许 temporary 进入 worker 最终快照复核。"""
 
     _authorize(session_factory)
     lead_ids = _seed_batch_leads(session_factory, count=1)
@@ -1050,15 +1050,15 @@ def test_today_callback_rejects_temporary_lifecycle_after_card_issue(
         _batch_frame_for_action(action, lead_ids, msgid="today-provider-state-change")
     )
 
-    assert result.code == "candidate_state_changed"
+    assert result.code == "claimed"
     with session_factory() as session:
-        assert session.scalars(select(WecomActionOutbox)).all() == []
+        assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
 
 
-def test_today_callback_rejects_owner_transfer_after_card_issue(
+def test_today_callback_defers_owner_transfer_to_worker_revalidation(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证 TODAY 卡发行后负责人转移时回调以 owner_mismatch 拒绝。"""
+    """验证负责人变更不使已接受选择静默消失，留给 worker 逐条复核。"""
 
     _authorize(session_factory)
     lead_ids = _seed_batch_leads(session_factory, count=1)
@@ -1073,16 +1073,16 @@ def test_today_callback_rejects_owner_transfer_after_card_issue(
         _batch_frame_for_action(action, lead_ids, msgid="today-provider-owner-change")
     )
 
-    assert result.code == "owner_mismatch"
+    assert result.code == "claimed"
     with session_factory() as session:
-        assert session.scalars(select(WecomActionOutbox)).all() == []
+        assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
 
 
 @pytest.mark.parametrize("sync_status", ("succeeded", "abandoned"))
-def test_today_callback_rejects_terminal_create_status_after_card_issue(
+def test_today_callback_defers_terminal_create_status_to_worker_revalidation(
     session_factory: sessionmaker[Session], sync_status: str
 ) -> None:
-    """验证 TODAY 卡发行后 create 变成 succeeded 或 abandoned 都会拒绝。"""
+    """验证 CRM 状态变化后 callback 仍由 worker 形成逐条未提交结果。"""
 
     _authorize(session_factory)
     lead_ids = _seed_batch_leads(session_factory, count=1)
@@ -1113,9 +1113,9 @@ def test_today_callback_rejects_terminal_create_status_after_card_issue(
         _batch_frame_for_action(action, lead_ids, msgid=f"today-provider-terminal-{sync_status}")
     )
 
-    assert result.code == "candidate_state_changed"
+    assert result.code == "claimed"
     with session_factory() as session:
-        assert session.scalars(select(WecomActionOutbox)).all() == []
+        assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
 
 
 def test_today_callback_rejects_injected_lead_id_and_unknown_context(
@@ -1146,10 +1146,10 @@ def test_today_callback_rejects_injected_lead_id_and_unknown_context(
         assert session.scalars(select(WecomActionOutbox)).all() == []
 
 
-def test_abandoned_only_card_cannot_submit_normal_unsubmitted_lead(
+def test_abandoned_only_card_defers_stale_candidate_to_worker(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证放弃提交卡只允许最新 abandoned generation，不能提交普通未提交线索。"""
+    """验证放弃提交候选失效时由 worker 逐条拒绝而不是静默丢项。"""
 
     lead_ids = _seed_batch_leads(session_factory, count=1)
     action = _service(session_factory).issue_batch_submission_action(
@@ -1162,9 +1162,9 @@ def test_abandoned_only_card_cannot_submit_normal_unsubmitted_lead(
         _batch_frame_for_action(action, lead_ids, msgid="provider-abandoned-only")
     )
 
-    assert result.code == "candidate_state_changed"
+    assert result.code == "claimed"
     with session_factory() as session:
-        assert session.scalars(select(WecomActionOutbox)).all() == []
+        assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
 
 
 def test_duplicate_provider_msgid_and_different_msgid_claim_once(

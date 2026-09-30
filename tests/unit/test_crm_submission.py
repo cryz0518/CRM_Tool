@@ -463,7 +463,7 @@ def test_duplicate_search_failure_persists_controlled_transport_evidence(
 ) -> None:
     """验证查重失败审计保存分类、状态和协议码，不保存远端正文。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
-    _lead(session_factory, adapter)
+    lead_id = _lead(session_factory, adapter)
 
     class SearchFailureCRM(MockCRMAdapter):
         """模拟带稳定协议码的 CRM 查重网关失败。"""
@@ -492,17 +492,84 @@ def test_duplicate_search_failure_persists_controlled_transport_evidence(
         audit = session.scalar(
             select(BusinessAuditEvent).where(
                 BusinessAuditEvent.message_id == "message-12",
-                BusinessAuditEvent.event_type == "crm_duplicate_search_failed",
+                BusinessAuditEvent.event_type.startswith("crm_duplicate_search_failed:"),
             )
         )
     assert audit is not None
     assert audit.details == {
+        "lead_id": lead_id,
         "failure_category": "transient",
         "adapter_category": "gateway",
         "http_status": 503,
         "failure_code": "DUP_RETRY",
     }
     assert "raw SOP" not in str(audit.details)
+
+
+def test_duplicate_search_failure_evidence_is_persisted_per_lead(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证同一请求中的不同 Lead 各自保留独立受控查重失败证据。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    first_id = _lead(session_factory, adapter)
+    second_fields = dict(adapter.get_records()[0].fields)
+    second_fields.update({"线索名称": "第二家测试公司", "联系人": "李工"})
+    second_record = adapter.create_record(second_fields, actor=SmartTableActor.ROBOT)
+    with session_factory.begin() as session:
+        second = Lead(
+            source_message_id="message-12",
+            source_segment_index=1,
+            original_capturing_sales_user_id="sales-1",
+            smart_table_owner_user_id="sales-1",
+            smart_table_record_id=second_record.record_id,
+            lifecycle_state="pending_create",
+            standard_company_name="第二家测试公司",
+            field_values={"线索名称": "第二家测试公司"},
+        )
+        session.add(second)
+        session.flush()
+        second_id = second.id
+
+    class PerLeadSearchFailureCRM(MockCRMAdapter):
+        """按公司返回两类受控 HTTP 200 查重失败，不保留响应正文。"""
+
+        def search_by_company_name(
+            self, payload: Mapping[str, object] | str
+        ) -> tuple[CRMSearchResult, ...]:
+            """分别模拟格式错误响应和业务错误码。"""
+            company = payload if isinstance(payload, str) else payload.get("name")
+            if company == "人工最终公司":
+                raise SopCRMError(
+                    "private malformed body", category="malformed_response", http_status=200
+                )
+            raise SopCRMError(
+                "private business body",
+                category="business",
+                http_status=200,
+                error_code="X",
+            )
+
+    result = submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, PerLeadSearchFailureCRM()),
+        "sales-1",
+        "per-lead-search-failure",
+    )
+
+    assert result.failed_pending_review == 2
+    with session_factory() as session:
+        evidence = session.scalars(
+            select(BusinessAuditEvent).where(
+                BusinessAuditEvent.message_id == "per-lead-search-failure",
+                BusinessAuditEvent.event_type.startswith("crm_duplicate_search_failed:"),
+            )
+        ).all()
+    assert {event.details["lead_id"] for event in evidence} == {first_id, second_id}
+    assert {event.details.get("http_status") for event in evidence} == {200}
+    assert {
+        (event.details.get("adapter_category"), event.details.get("failure_code"))
+        for event in evidence
+    } == {("malformed_response", None), ("business", "X")}
+    assert "private" not in str([event.details for event in evidence])
 
 
 def test_sales_authorization_crm_mapping_is_not_required_when_owner_directory_matches(
@@ -821,22 +888,18 @@ def test_today_submission_rejects_temporary_lead_at_card_and_callback(
     service = CrmSubmissionService(session_factory, adapter, crm)
 
     candidates = service.list_submission_candidates("提交今天的线索", "sales-1")
-    result = service.submit_selected(
-        SubmissionCommand("提交今天的线索", "sales-1", "today-temporary-message"),
-        (lead_id,),
-    )
-
     assert candidates == ()
-    assert result.succeeded == 0
-    assert result.incomplete == 0
     assert crm.search_calls == 0
     assert crm.calls == 0
+    with session_factory() as session:
+        lead = session.get(Lead, lead_id)
+    assert lead is not None and lead.lifecycle_state == "temporary"
 
 
 def test_today_submission_promotes_temporary_lead_from_complete_table_snapshot(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证当前智能表格已补齐必填字段时，临时线索会先晋升再进入今天候选。"""
+    """验证完整 temporary 可进入 TODAY 候选，发卡只读，最终提交时才晋升。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter)
     with session_factory.begin() as session:
@@ -847,6 +910,9 @@ def test_today_submission_promotes_temporary_lead_from_complete_table_snapshot(
     service = CrmSubmissionService(session_factory, adapter, crm)
 
     candidates = service.list_submission_candidates("提交今天的线索", "sales-1")
+    with session_factory() as session:
+        lead_before_submit = session.get(Lead, lead_id)
+    assert lead_before_submit is not None and lead_before_submit.lifecycle_state == "temporary"
     result = service.submit_selected(
         SubmissionCommand("提交今天的线索", "sales-1", "today-temporary-complete-message"),
         tuple(item.lead_id for item in candidates),
@@ -856,6 +922,36 @@ def test_today_submission_promotes_temporary_lead_from_complete_table_snapshot(
     assert result.succeeded == 1
     assert crm.search_calls == 1
     assert crm.calls == 1
+    with session_factory() as session:
+        lead_after_submit = session.get(Lead, lead_id)
+    assert lead_after_submit is not None and lead_after_submit.lifecycle_state == "synced"
+
+
+def test_selected_candidate_invalidated_before_worker_revalidation_returns_item(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 callback 已接受的线索转移负责人后，逐条返回未提交且不调用 CRM。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    service = CrmSubmissionService(session_factory, adapter, MockCRMAdapter())
+    candidates = service.list_submission_candidates("提交今天的线索", "sales-1")
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.smart_table_owner_user_id = "sales-2"
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+
+    result = service.submit_selected(
+        SubmissionCommand("提交今天的线索", "sales-1", "state-changed-message"),
+        (candidates[0].lead_id,),
+    )
+
+    assert len(result.items) == 1
+    assert result.items[0].status is SubmissionItemStatus.NOT_SUBMITTED
+    assert result.items[0].reason_code == "candidate_state_changed"
+    assert result.not_submitted == 1
+    assert crm.search_calls == 0 and crm.calls == 0
 
 
 def test_today_submission_processes_only_card_selected_candidate(
@@ -1905,6 +2001,41 @@ def test_submission_reply_is_count_only_and_includes_update_categories() -> None
     assert "缺少必填字段：业务线、手机" in incomplete_reply
 
 
+def test_update_item_results_are_operation_aware() -> None:
+    """验证 update 成功、无变化、不完整和重试不复用 create 语义。"""
+    from app.crm.service import _append_update_result
+
+    succeeded = _append_update_result(SubmissionBatchResult(), "lead-updated", "succeeded")
+    unchanged = _append_update_result(SubmissionBatchResult(), "lead-same", "unchanged")
+    incomplete = _append_update_result(SubmissionBatchResult(), "lead-incomplete", "incomplete")
+    retrying = _append_update_result(SubmissionBatchResult(), "lead-retry", "retrying")
+
+    assert succeeded.items[0].status is SubmissionItemStatus.UPDATED
+    assert unchanged.items[0].status is SubmissionItemStatus.UNCHANGED
+    assert incomplete.items[0].status is SubmissionItemStatus.INCOMPLETE
+    assert incomplete.incomplete == 1
+    assert retrying.items[0].reason_code == "crm_update_retrying"
+
+
+def test_submission_reply_explains_selected_candidate_skipped_after_state_change() -> None:
+    """验证 callback 已接受但最终复核失效的线索会显示为未提交并说明原因。"""
+    reply = format_submission_reply(
+        SubmissionBatchResult(
+            not_submitted=1,
+            items=(
+                SubmissionItemResult(
+                    "lead-stale", SubmissionItemStatus.NOT_SUBMITTED, "candidate_state_changed"
+                ),
+            ),
+        ),
+        lead_labels={"lead-stale": "XX公司｜张总"},
+        selected_count=1,
+    )
+
+    assert "⚪ 未提交 1 条" in reply
+    assert "XX公司｜张总：线索状态已变化，请重新发起提交" in reply
+
+
 def test_submission_reply_keeps_per_lead_results_and_frozen_display_labels() -> None:
     """验证批量回复逐条保留状态、原因和缺失字段，不接受 callback 注入名称。"""
 
@@ -1940,7 +2071,7 @@ def test_submission_reply_keeps_per_lead_results_and_frozen_display_labels() -> 
     )
 
     assert "CRM 提交结果（已选择 6 条）" in reply
-    assert "创建 4｜更新 0｜待完善 1｜处理中 1｜失败 0" in reply
+    assert "创建 4｜更新 0｜待完善 1｜处理中 1｜未提交 0｜失败 0" in reply
     assert "公司E｜刘工：缺少「客户行业、职务」" in reply
     assert "公司F｜陈工：已有提交任务正在处理，本次未重复创建" in reply
     assert "injected-lead" not in reply

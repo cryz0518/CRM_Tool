@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from collections.abc import Mapping
@@ -35,6 +36,7 @@ from app.messaging.models import (
     BusinessAuditEvent,
     IncomingMessage,
     MessageAttachment,
+    NotificationRecord,
     OutboxEvent,
     SalesAuthorization,
     utc_now,
@@ -629,6 +631,10 @@ class FirstTextLeadWorkspaceService:
                     select(OutboxEvent).where(OutboxEvent.message_id == message_id)
                 )
                 if event is not None:
+                    if isinstance(error, AIGatewayError):
+                        source_message = session.get(IncomingMessage, message_id)
+                        if source_message is not None:
+                            self._record_lead_processing_failed_notice(session, source_message)
                     self._record_audit(
                         session,
                         event,
@@ -1538,6 +1544,7 @@ class FirstTextLeadWorkspaceService:
             event.failure_summary = safe_failure_summary(error)
             event.failed_at = utc_now()
             self._record_audit(session, event, "ai_gateway_failed_pending_review")
+            self._record_lead_processing_failed_notice(session, message)
             logger.exception(
                 "ai_gateway_first_text_failed", extra={"error_type": type(error).__name__}
             )
@@ -1867,6 +1874,32 @@ class FirstTextLeadWorkspaceService:
             sync.smart_table_record_id = record.record_id
             sync.status = "processing"
         return record.record_id
+
+    @staticmethod
+    def _record_lead_processing_failed_notice(
+        session: Session, message: IncomingMessage
+    ) -> None:
+        """为失败待人工处理的线索消息登记一次不含客户内容的销售通知。
+
+        参数：session 为失败状态事务；message 为已持久化来源消息。
+        返回值：无。
+        异常：数据库写入异常由事务调用方处理。
+        副作用：按销售、来源消息和通知类型写入可靠出站通知，不保存原文或模型错误正文。
+        """
+        notification_type = "lead_processing_failed"
+        key = hashlib.sha256(
+            f"{message.sales_user_id}:{message.message_id}:{notification_type}".encode()
+        ).hexdigest()
+        if session.get(NotificationRecord, key) is None:
+            session.add(
+                NotificationRecord(
+                    notification_key=key,
+                    sales_user_id=message.sales_user_id,
+                    source_message_id=message.message_id,
+                    notification_type=notification_type,
+                    content="这条线索消息未能完成解析，已进入待人工处理，请稍后重试或补充信息。",
+                )
+            )
 
     def _mark_ai_review_failed(self, request: AIReviewRequest, error: Exception) -> None:
         """把 AI 或审核表格失败固定为失败待审，避免重放模型结果或伪造成功。

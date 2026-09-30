@@ -33,6 +33,7 @@ from app.messaging.models import (
     BusinessAuditEvent,
     IncomingMessage,
     MessageAttachment,
+    NotificationRecord,
     OutboxEvent,
     SalesAuthorization,
 )
@@ -1303,8 +1304,10 @@ def test_free_text_ai_failure_is_a_checkpoint_without_creating_a_lead(
     )
 
     result = service.consume(first_event_id)
+    replay = service.consume(first_event_id)
 
     assert result.status is LeadProcessingStatus.SYNC_FAILED
+    assert replay.status is LeadProcessingStatus.ALREADY_PROCESSED
     with session_factory() as session:
         first_event = session.get(OutboxEvent, first_event_id)
         follow_up = session.scalar(
@@ -1319,10 +1322,21 @@ def test_free_text_ai_failure_is_a_checkpoint_without_creating_a_lead(
         failed_lead = session.scalar(
             select(Lead).where(Lead.source_message_id == "message-ai-failure")
         )
+        notices = session.scalars(
+            select(NotificationRecord).where(
+                NotificationRecord.source_message_id == "message-ai-failure",
+                NotificationRecord.notification_type == "lead_processing_failed",
+            )
+        ).all()
     assert first_event is not None
     assert first_event.status == "failed_pending_review"
     assert failed_audit is not None
     assert failed_lead is None
+    assert len(notices) == 1
+    assert notices[0].content == (
+        "这条线索消息未能完成解析，已进入待人工处理，请稍后重试或补充信息。"
+    )
+    assert "network" not in (notices[0].content or "")
     assert follow_up is not None
     assert follow_up.status == "succeeded"
     assert len(adapter.get_records()) == 1

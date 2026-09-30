@@ -675,24 +675,12 @@ class WecomActionService:
                         )
 
             if action.action_type == ACTION_TYPE_CRM_BATCH_SUBMISSION:
-                # 批量卡只允许选择发行时冻结、且仍属于当前销售的 Lead。
-                from app.leads.models import Lead, latest_crm_create_sync
-
+                # claim 只校验 option ID 属于服务端冻结候选；worker 逐条重验 owner、
+                # 生命周期、提交状态和最终表格快照，并为每条已接受选择保留结果。
                 candidate_ids = _context_lead_ids(action.context.get("candidate_leads"))
-                owned_ids = set(
-                    session.scalars(
-                        select(Lead.id).where(
-                            Lead.id.in_(candidate_ids),
-                            Lead.smart_table_owner_user_id == callback.actor_user_id,
-                        )
-                    ).all()
-                )
-                if not candidate_ids or owned_ids != set(candidate_ids):
+                if not candidate_ids:
                     return self._deny_action(
-                        action,
-                        delivery,
-                        "owner_mismatch",
-                        "候选线索中存在当前账号无权操作的记录",
+                        action, delivery, "invalid_action_context", "候选线索列表已失效，请重新发起"
                     )
                 command_text = action.context.get("command_text")
                 if command_text not in {
@@ -706,37 +694,6 @@ class WecomActionService:
                         "invalid_action_context",
                         "候选提交动作类型无效，请重新发起",
                     )
-                for candidate_id in candidate_ids:
-                    lead = session.scalar(
-                        select(Lead).where(Lead.id == candidate_id).with_for_update()
-                    )
-                    latest = latest_crm_create_sync(session, candidate_id, for_update=True)
-                    current_status = latest.status if latest is not None else None
-                    if command_text == "帮我提交放弃提交的线索":
-                        valid_state = current_status == "abandoned"
-                        valid_lifecycle = (
-                            lead is not None and lead.lifecycle_state == "pending_create"
-                        )
-                    elif command_text == "提交今天的线索":
-                        valid_state = current_status not in {"succeeded", "abandoned"}
-                        valid_lifecycle = (
-                            lead is not None and lead.lifecycle_state == "pending_create"
-                        )
-                    else:
-                        valid_state = current_status not in {"succeeded", "abandoned"}
-                        # “提交全部未提交线索”允许卡片展示资料不完整的 temporary 记录；
-                        # submit_selected() 会将其归为待完善，不会调用 CRM。
-                        valid_lifecycle = lead is not None and lead.lifecycle_state in {
-                            "pending_create",
-                            "temporary",
-                        }
-                    if not valid_lifecycle or not valid_state:
-                        return self._deny_action(
-                            action,
-                            delivery,
-                            "candidate_state_changed",
-                            "候选线索状态已变化，请重新发起提交",
-                        )
                 selected = set(callback.selected_option_ids)
                 if not selected or selected - set(candidate_ids):
                     return self._deny_action(

@@ -785,6 +785,7 @@ def _include_persisted_results(
         mapping_missing=result.mapping_missing,
         duplicate_confirmations=result.duplicate_confirmations,
         items=result.items,
+        not_submitted=result.not_submitted,
     )
 
 
@@ -868,12 +869,14 @@ def format_submission_reply(
         f"✅ 无变化 {result.unchanged} 条",
         f"⚠️ 待完善 {result.incomplete} 条",
         f"⏳ 处理中 {result.processing} 条",
+        f"⚪ 未提交 {result.not_submitted} 条",
         f"🔄 重试中 {result.retrying} 条",
         f"需人工处理 {failed_count} 条",
         "",
         (
             f"汇总：创建 {result.succeeded}｜更新 {result.updated}｜"
-            f"待完善 {result.incomplete}｜处理中 {result.processing}｜失败 {failed_count}"
+            f"待完善 {result.incomplete}｜处理中 {result.processing}｜"
+            f"未提交 {result.not_submitted}｜失败 {failed_count}"
         ),
     ]
     detail_lines: list[str] = []
@@ -888,6 +891,7 @@ def format_submission_reply(
         "mapping_missing": "CRM 用户映射缺失",
         "company_identity_review": "需人工处理",
         "failed_pending_review": "需人工处理",
+        "not_submitted": "⚪ 未提交",
     }
     reason_text = {
         "duplicate_confirmation_required": "CRM 已存在同公司线索，请在后续确认卡决定是否覆盖",
@@ -899,7 +903,11 @@ def format_submission_reply(
         "crm_duplicate_search_failed": "CRM 查重失败，需要人工处理",
         "crm_create_retrying": "CRM 创建暂时失败，系统将自动重试",
         "crm_create_failed_pending_review": "CRM 提交失败，需要人工处理",
+        "crm_update_retrying": "CRM 更新暂时失败，系统将自动重试",
+        "crm_update_failed_pending_review": "CRM 更新失败，需要人工处理",
+        "crm_update_incomplete": "CRM 更新前校验未通过，请检查当前线索信息",
         "company_identity_change_pending_review": "公司名称发生变化，需要人工处理",
+        "candidate_state_changed": "线索状态已变化，请重新发起提交",
     }
     grouped_statuses = (
         "created",
@@ -912,6 +920,7 @@ def format_submission_reply(
         "retrying",
         "company_identity_review",
         "failed_pending_review",
+        "not_submitted",
     )
     for status in grouped_statuses:
         items = [
