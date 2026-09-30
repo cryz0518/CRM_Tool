@@ -19,11 +19,20 @@ class SopCRMError(RuntimeError):
     """表示 SOP Gateway 或 CRM 业务拒绝。"""
 
     def __init__(
-        self, message: str, *, category: str = "business_rejection", http_status: int | None = None
+        self,
+        message: str,
+        *,
+        category: str = "business_rejection",
+        http_status: int | None = None,
+        error_code: str | None = None,
+        sub_code: str | None = None,
     ) -> None:
-        """保存脱敏错误分类，供任务层区分永久拒绝与传输失败。"""
+        """保存脱敏错误分类和协议错误码，供任务层区分失败并支持人工诊断。"""
         self.category = category
         self.http_status = http_status
+        # 仅保存 Gateway 的非敏感枚举码，不保存 message、签名或业务内容。
+        self.error_code = error_code
+        self.sub_code = sub_code
         super().__init__(message)
 
 
@@ -170,7 +179,23 @@ class SopCRMAdapter:
             )
             raise SopCRMError("CRM response missing code", category=category, http_status=status)
         if code not in (0, 200):
-            error_code = str(payload.get("sub_code") or payload.get("error_code") or "")
+            raw_error_code = payload.get("error_code")
+            raw_sub_code = payload.get("sub_code")
+            error_code = (
+                str(raw_error_code)
+                if isinstance(raw_error_code, (str, int))
+                else None
+            )
+            sub_code = (
+                str(raw_sub_code)
+                if isinstance(raw_sub_code, (str, int))
+                else None
+            )
+            reported_error_code = error_code or (
+                str(code) if isinstance(code, (str, int)) else None
+            )
+            # 仅 sub_code/error_code 参与精确分类；纯数字顶层 code 不能单独证明是业务错误。
+            classification_code = sub_code or error_code or ""
             auth_codes = (
                 "missing-signature", "invalid-signature", "invalid-app-id",
                 "invalid-timestamp", "invalid-auth-token", "invalid-app-auth-token",
@@ -179,11 +204,11 @@ class SopCRMAdapter:
             gateway_codes = (
                 "route-no-permissions", "invalid-content-type", "insufficient-isv-permissions"
             )
-            if any(token in error_code for token in auth_codes):
+            if any(token in classification_code for token in auth_codes):
                 category = "authentication"
-            elif any(token in error_code for token in gateway_codes):
+            elif any(token in classification_code for token in gateway_codes):
                 category = "gateway"
-            elif error_code:
+            elif classification_code:
                 category = "business"
             elif "status" in payload or "message" in payload or "msg" in payload:
                 # SOP 的另一种合法错误 envelope 可能只有 code/data/status/message；
@@ -195,7 +220,13 @@ class SopCRMAdapter:
                 category = "authentication"
             elif status >= 400 and category == "business":
                 category = "gateway"
-            raise SopCRMError("CRM gateway rejected request", category=category, http_status=status)
+            raise SopCRMError(
+                "CRM gateway rejected request",
+                category=category,
+                http_status=status,
+                error_code=reported_error_code,
+                sub_code=sub_code,
+            )
         data = payload.get("data")
         if isinstance(data, Mapping):
             return data

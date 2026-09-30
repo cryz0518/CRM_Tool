@@ -51,13 +51,13 @@ class ReviewSyncResult:
 
 @dataclass(frozen=True)
 class SubmissionConfirmationState:
-    """描述提交前仍需机器人显式确认的 CRM 必填字段。"""
+    """描述提交前的审核元数据；AI待确认本身不阻塞 CRM 提交。"""
 
     blocking_fields: tuple[str, ...]
 
     @property
     def can_submit(self) -> bool:
-        """返回当前审核状态是否已不再被 AI 待确认字段阻塞。
+        """返回当前审核状态是否允许继续进入字段有效性校验。
 
         返回值：不存在阻塞字段时返回 True。
         异常：无。
@@ -272,14 +272,15 @@ class LeadReviewService:
                     protected.add(field_name)
                     pending.discard(field_name)
                     continue
-                if current_value not in (None, "") and (
+                # 多选字段的空值由智能表格返回 []；空数组与 None/空字符串一样不能阻止首次写入。
+                if current_value and (
                     field_provenance is None
                     or not field_values_equal(current_value, field_provenance.last_ai_synced_value)
                 ):
                     # 未由 AI 写入过的非空值同样不能被本轮建议静默覆盖。
                     protected.add(field_name)
                     continue
-                if protected_supplement and current_value not in (None, ""):
+                if protected_supplement and current_value:
                     # 历史失败消息只能补充当前空字段，不能覆盖后续消息已经形成的非空事实。
                     protected.add(field_name)
                     pending.discard(field_name)
@@ -336,10 +337,10 @@ class LeadReviewService:
             )
 
     def get_submission_confirmation_state(self, lead_id: str) -> SubmissionConfirmationState:
-        """重读审核表并返回当前 CRM 最小必填集中仍待显式确认的字段。
+        """重读审核表并返回非阻塞的审核状态。
 
         参数：lead_id 为准备进入确定性 CRM 提交阶段的线索。
-        返回值：仅含阻塞字段的提交前确认状态；本方法不调用 CRM。
+        返回值：AI待确认仅作为 advisory metadata，不产生阻塞字段；本方法不调用 CRM。
         异常：线索或表格记录缺失时抛出 ValueError；适配器读取异常向调用方传播。
         副作用：发现销售修改时会持久化人工确认状态并维护 AI待确认。
         """
@@ -391,7 +392,8 @@ class LeadReviewService:
         if lead.smart_table_owner_user_id != sales_user_id:
             raise ValueError("只有当前智能表格负责人可以确认待提交字段")
         current_pending = self._confirmation_names(record.fields.get(AI_CONFIRMATION_FIELD))
-        blocking = self._required_pending_fields(current_pending, record.fields)
+        # 显式确认仍可作为审计动作，但字段是否 AI待确认不再决定提交阻塞。
+        blocking = current_pending
         requested = set(field_names)
         if not requested or not requested.issubset(blocking):
             raise ValueError("确认字段必须是当前阻塞的 AI待确认 字段")
@@ -617,32 +619,29 @@ class LeadReviewService:
     def _required_pending_fields(
         self, pending: set[str], current_fields: Mapping[str, object]
     ) -> set[str]:
-        """按项目 CRM 最小必填集计算哪些待确认字段会阻塞确定性提交。
+        """保留旧接口兼容性，但不再把 AI待确认作为 CRM 提交阻塞条件。
 
         参数：pending 为表格 AI待确认 名称；current_fields 为当前业务字段快照。
-        返回值：仍需机器人显式确认的字段集合。
+        返回值：始终为空集合；实际必填校验由 CRM Submission Service 统一执行。
         异常：无。
         副作用：无。
         """
-        # CRM 提交契约逐项要求八个字段；电话和邮箱不能替代必填手机。
-        return pending & CRM_REQUIRED_CORE_FIELDS
+        # 销售提交动作本身确认当前可见快照；AI待确认只用于审阅提示。
+        return set()
 
     def _must_not_prefill_without_confirmation(
         self, field_name: str, pending_prefill_allowed_fields: tuple[str, ...] = ()
     ) -> bool:
-        """判断卡片不可用时某个中置信度字段是否必须按降级策略留空。
+        """保留旧调用边界并声明卡片能力不改变建议字段的预填策略。
 
         参数：field_name 为已通过 T08 校验的业务字段名称；
         pending_prefill_allowed_fields 为明确业务来源允许无卡片预填的字段。
-        返回值：机器人无法可靠确认且字段属于项目 CRM 最小必填集时返回 True。
+        返回值：始终返回 False；候选是否可预填由 AI Gateway 的证据规则决定。
         异常：无。
         副作用：无。
         """
-        return (
-            not self._robot_submission_confirmation_available
-            and field_name in CRM_REQUIRED_CORE_FIELDS
-            and field_name not in pending_prefill_allowed_fields
-        )
+        # 卡片是否可用不再改变字段写入；低置信度枚举是否预填由 T08 的证据规则决定。
+        return False
 
     def _confirmation_names(self, value: object) -> set[str]:
         """将适配器返回的 AI待确认 多选值规范化为字段名称集合。

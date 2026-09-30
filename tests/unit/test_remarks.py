@@ -37,6 +37,16 @@ def test_builder_marks_absent_evidence_as_not_provided_without_invention() -> No
     )
 
 
+def test_builder_prefers_original_company_name_over_standardized_candidate() -> None:
+    """验证备注企业信息优先使用销售原始企业称呼。"""
+    remark = RemarksBuilder().build(
+        {"线索名称": "埃维塔温控技术（苏州）有限公司"},
+        {"原始企业名称": "埃维塔"},
+    )
+
+    assert remark.startswith("基本信息：埃维塔")
+
+
 def test_builder_appends_generic_other_enum_details_to_remark_tail() -> None:
     """验证所有带“其他”的枚举字段都按字段名保留实际补充内容。"""
     remark = RemarksBuilder().build(

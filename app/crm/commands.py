@@ -34,6 +34,35 @@ CRM_SUBMISSION_COMMANDS = frozenset(
     {"提交今天的线索", "提交我所有线索", "帮我提交放弃提交的线索", "提交我的更新"}
 )
 _COMPANY_SUBMISSION_PATTERN = re.compile(r"^请帮我提交(?P<company>[^\r\n。]{1,128})这条线索$")
+_SUBMISSION_COMMAND_ALIASES = {
+    "提交今天线索": "提交今天的线索",
+    "提交我今天的线索": "提交今天的线索",
+    "帮我提交今天的线索": "提交今天的线索",
+    "提交所有线索": "提交我所有线索",
+    "提交我所有的线索": "提交我所有线索",
+    "提交我的所有线索": "提交我所有线索",
+    "帮我提交所有线索": "提交我所有线索",
+    "帮我提交放弃的线索": "帮我提交放弃提交的线索",
+    "提交放弃的线索": "帮我提交放弃提交的线索",
+    "提交放弃提交的线索": "帮我提交放弃提交的线索",
+    "帮我提交我的更新": "提交我的更新",
+    "提交更新": "提交我的更新",
+}
+_INQUIRY_MARKERS = ("吗", "了吗", "是否", "有没有", "是不是", "能否", "可以吗", "?", "？")
+_NEGATIVE_SUBMISSION_MARKERS = (
+    "不要",
+    "别",
+    "不用",
+    "无需",
+    "不想",
+    "不需要",
+    "暂不",
+    "暂时不",
+    "先不",
+    "先别",
+    "禁止",
+    "取消",
+)
 _PREVIEW_FIELD_NAMES = (
     "业务线",
     "线索名称",
@@ -72,17 +101,71 @@ def parse_company_submission_request(text: str) -> str | None:
 
 
 def parse_crm_submission_command(text: str) -> str | None:
-    """识别批量命令或固定公司定位提交句式。
+    """识别提交意图并归一化为内部安全命令。
 
-    参数：text 为销售消息正文；不自动 trim、不做模糊匹配、不调用 LLM。
-    返回值：合法命令原文；其他文本返回 None。公司定位句式只进入预览边界。
+    参数：text 为销售消息正文。
+    返回值：内部规范命令；其他文本返回 None。公司定位句式只进入预览边界。
     异常：无。
-    副作用：无。
+    副作用：无；仅执行有限的确定性短语归一化，不调用 LLM 或外部系统。
     """
-    # 精确相等是 CRM 写操作授权边界，任何相似自然语言都不能触发提交。
-    if text in CRM_SUBMISSION_COMMANDS or parse_company_submission_request(text) is not None:
-        return text
+    # 只接受明确执行请求；不能通过删除问号把疑问句变成写操作。
+    candidate = text.strip().rstrip("。").strip()
+    if not is_explicit_submission_request(candidate):
+        return None
+    if parse_company_submission_request(candidate) is not None:
+        return candidate
+    if candidate in CRM_SUBMISSION_COMMANDS:
+        return candidate
+    alias = _SUBMISSION_COMMAND_ALIASES.get(candidate)
+    if alias is not None:
+        return alias
     return None
+
+
+def looks_like_submission_intent(text: str) -> bool:
+    """判断消息是否值得交给模型做提交意图分类。
+
+    参数：text 为销售消息正文。
+    返回值：含提交动作且同时出现线索范围、更新或公司定位词时返回 True。
+    异常：无。
+    副作用：无；仅作异步分类前置筛选，不授权任何 CRM 操作。
+    """
+    candidate = text.strip()
+    return "提交" in candidate and any(
+        marker in candidate
+        for marker in (
+            "线索",
+            "更新",
+            "今天",
+            "所有",
+            "全部",
+            "放弃",
+            "这条",
+            "这家公司",
+            "公司",
+            "企业",
+        )
+    )
+
+
+def is_explicit_submission_request(text: str) -> bool:
+    """判断文本是否明确要求执行提交动作，而不是询问提交状态。
+
+    参数：text 为销售原始消息文本。
+    返回值：存在提交动作且没有明显疑问结构时返回 True。
+    异常：无。
+    副作用：无，不调用模型或外部系统。
+    """
+    candidate = text.strip()
+    if not candidate or any(marker in candidate for marker in _INQUIRY_MARKERS):
+        return False
+    # 否定或取消表达优先于模型意图，防止“不要提交”进入任何 CRM 工作流。
+    if any(marker in candidate for marker in _NEGATIVE_SUBMISSION_MARKERS):
+        return False
+    return "提交" in candidate and any(
+        marker in candidate
+        for marker in ("线索", "更新", "今天", "所有", "全部", "放弃", "这条", "这家公司")
+    )
 
 
 def consume_submission_command(
@@ -90,23 +173,31 @@ def consume_submission_command(
     smart_table_adapter: SmartTableAdapter,
     crm_adapter: CRMAdapter | None,
     outbox_event_id: int,
+    command_text: str | None = None,
 ) -> str:
     """消费一条已认领命令 Outbox，并返回不含敏感数据的销售汇总文本。
 
-    参数：前三项为业务依赖，outbox_event_id 为现有可靠消息事件标识。
+    参数：前三项为业务依赖，outbox_event_id 为现有可靠消息事件标识；command_text 为可选的
+    模型意图归一化命令，仅允许映射到既有安全命令集合。
     返回值：可安全发送给当前销售的确定性中文汇总。
     异常：消息或事件事实缺失时抛出 ValueError；业务依赖异常被转换为可靠重试状态。
     副作用：调用 T12 submission service，写入脱敏通知，并结束或重试本命令事件。
     """
     with session_factory() as session:
         event = session.get(OutboxEvent, outbox_event_id)
-        if event is None or event.event_type != "crm_submission_command":
+        if event is None or event.event_type not in {
+            "crm_submission_command",
+            "crm_submission_intent",
+        }:
             raise ValueError("不是 CRM 提交命令 Outbox")
         message = session.get(IncomingMessage, event.message_id)
         if message is None:
             raise ValueError("CRM 提交命令缺少来源消息")
+        raw_text = message.normalized_text or ""
+        # 消费端再次归一化，确保自然说法仍进入既有候选卡流程，而不是绕过确认卡直写 CRM。
+        resolved_command_text = command_text or parse_crm_submission_command(raw_text) or raw_text
         command = SubmissionCommand(
-            text=message.normalized_text or "",
+            text=resolved_command_text,
             sales_user_id=message.sales_user_id,
             request_message_id=message.message_id,
         )
@@ -173,7 +264,6 @@ def consume_submission_command(
         return _record_command_failure(session_factory, outbox_event_id, command)
     # 重放时必须将本请求已成功的同步事实重新计入汇总，不能因 Lead 已 synced 漏报成功。
     result = _include_persisted_results(session_factory, command, result)
-    _issue_field_confirmation_cards(session_factory, smart_table_adapter, command, result)
     _issue_duplicate_confirmation_card(command, result, session_factory)
     reply = format_submission_reply(result)
     with session_factory.begin() as session:
@@ -222,6 +312,9 @@ def prepare_batch_submission_selection(
         crm_adapter,
         robot_submission_confirmation_available=get_settings().wecom_card_callback_ready(),
     )
+    if command.text == "提交我所有线索":
+        # 新数据库可能只保存了部分后台 Lead；按稳定 record_id 受控补齐当前销售的未提交表格行。
+        _link_unsubmitted_smart_table_records(session_factory, smart_table_adapter, command)
     candidates = service.list_submission_candidates(command.text, command.sales_user_id)
     if not candidates:
         if command.text == "帮我提交放弃提交的线索":
@@ -259,6 +352,54 @@ def prepare_batch_submission_selection(
     title = "重新提交放弃线索" if command.text == "帮我提交放弃提交的线索" else "选择要提交的线索"
     page_suffix = f"，共 {len(pages)} 张候选卡" if len(pages) > 1 else ""
     return f"{title}：已发送候选卡，请勾选后确认提交（共 {len(candidates)} 条{page_suffix}）。"
+
+
+def _link_unsubmitted_smart_table_records(
+    session_factory: sessionmaker[Session],
+    smart_table_adapter: SmartTableAdapter,
+    command: SubmissionCommand,
+) -> None:
+    """为批量候选补齐当前销售负责且仍未提交的既有表格行本地映射。
+
+    参数：session_factory 为数据库会话工厂；smart_table_adapter 为真实表格边界；
+    command 提供销售身份和审计消息标识。
+    返回值：无。
+    异常：表格协议、数据库或授权错误向调用方传播；不调用 CRM。
+    副作用：仅按稳定 record_id 新增缺失 Lead 和绑定审计事实，不覆盖已有 Lead。
+    """
+    records = smart_table_adapter.get_records()
+    with session_factory.begin() as session:
+        linked_count = 0
+        for record in records:
+            # 只补当前销售、状态仍为未提交的行；已提交和他人记录不进入本地候选范围。
+            if (
+                record.fields.get("负责人") != command.sales_user_id
+                or record.fields.get("提交状态") != "未提交"
+            ):
+                continue
+            linked = _link_existing_smart_table_record(
+                session, record, command, write_audit=False
+            )
+            if linked is not None and linked.source_message_id is None:
+                linked_count += 1
+        if linked_count and session.scalar(
+            select(BusinessAuditEvent).where(
+                BusinessAuditEvent.message_id == command.request_message_id,
+                BusinessAuditEvent.event_type == "smart_table_existing_leads_linked",
+            )
+        ) is None:
+            # 同一批量命令只登记一次汇总事件，避免 message_id/event_type 唯一约束冲突。
+            session.add(
+                BusinessAuditEvent(
+                    message_id=command.request_message_id,
+                    sales_user_id=command.sales_user_id,
+                    event_type="smart_table_existing_leads_linked",
+                    details={
+                        "mapping_type": "existing_records_to_pending_create",
+                        "linked_count": linked_count,
+                    },
+                )
+            )
 
 
 def prepare_company_submission_preview(
@@ -377,14 +518,18 @@ def prepare_company_submission_preview(
 
 
 def _link_existing_smart_table_record(
-    session: Session, record: SmartTableRecord, command: SubmissionCommand
+    session: Session,
+    record: SmartTableRecord,
+    command: SubmissionCommand,
+    *,
+    write_audit: bool = True,
 ) -> Lead | None:
     """把当前销售负责的既有表格记录安全登记为待提交 Lead。
 
     参数：session 为当前事务；record 为智能表格快照；command 提供当前销售和审计消息。
     返回值：新建或已存在的 Lead；负责人不匹配、销售未授权或公司名无效时返回 None。
     异常：数据库约束异常向调用方传播；不调用外部 CRM。
-    副作用：写入一条 pending_create Lead 和一条“既有表格记录已绑定”审计事件。
+    副作用：写入一条 pending_create Lead；write_audit 为 True 时追加绑定审计事件。
     """
     owner = record.fields.get("负责人")
     company_name = record.fields.get("线索名称")
@@ -423,14 +568,16 @@ def _link_existing_smart_table_record(
         company_confirmed_by_user=True,
     )
     session.add(lead)
-    session.add(
-        BusinessAuditEvent(
-            message_id=command.request_message_id,
-            sales_user_id=command.sales_user_id,
-            event_type="smart_table_existing_lead_linked",
-            details={"mapping_type": "existing_record_to_pending_create"},
+    if write_audit:
+        # 单条公司定位沿用原事件名；批量补齐由调用方写一条汇总审计，避免唯一键冲突。
+        session.add(
+            BusinessAuditEvent(
+                message_id=command.request_message_id,
+                sales_user_id=command.sales_user_id,
+                event_type="smart_table_existing_lead_linked",
+                details={"mapping_type": "existing_record_to_pending_create"},
+            )
         )
-    )
     session.flush()
     return lead
 
@@ -671,7 +818,7 @@ def _record_command_failure(
 
 
 def format_submission_reply(result: SubmissionBatchResult) -> str:
-    """将批次结果格式化为只含计数的销售回复。
+    """将批次结果格式化为计数及必填缺失提示的销售回复。
 
     参数：result 为 T12 application service 返回的批次汇总。
     返回值：不包含线索名称、联系方式、payload 或异常堆栈的中文文本。
@@ -680,11 +827,16 @@ def format_submission_reply(result: SubmissionBatchResult) -> str:
     """
     if result.updates_not_implemented:
         return "提交我的更新将在 T13 实现；本次未调用 CRM。"
+    missing_fields = (
+        f"缺少必填字段：{'、'.join(result.incomplete_missing_fields)}；"
+        if result.incomplete_missing_fields
+        else ""
+    )
     return (
         f"CRM 提交结果：创建成功 {result.succeeded} 条；更新成功 {result.updated} 条；"
         f"无变化 {result.unchanged} 条；"
         f"公司身份变化待人工审查 {result.company_identity_review} 条；"
-        f"待完善或待明确确认 {result.incomplete} 条；"
+        f"待完善或待明确确认 {result.incomplete} 条；{missing_fields}"
         f"重复待确认 {len(result.duplicate_confirmations)} 条；"
         f"CRM 用户映射缺失 {result.mapping_missing} 条；"
         f"提交处理中 {result.processing} 条；可重试失败 {result.retrying} 条；"

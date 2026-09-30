@@ -745,6 +745,12 @@ class CompanyLeadService:
                 table_patch["线索名称"] = display_name
             elif name_changed:
                 table_patch["线索名称"] = display_name
+            if display_name != company_name:
+                # 天眼查标准名只用于正式公司字段；备注保留销售本次输入的原始企业称呼。
+                lead.enrichment_values = {
+                    **lead.enrichment_values,
+                    "原始企业名称": company_name,
+                }
             lead.field_values = values
             lead.standard_company_name = standard_name
         # 查询候选和人工确认均为后台审计信息，不能混入 CRM 业务字段。

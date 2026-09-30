@@ -12,7 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.logging import bind_log_context, reset_log_context
-from app.crm.commands import parse_crm_submission_command
+from app.crm.commands import looks_like_submission_intent, parse_crm_submission_command
 from app.messaging.models import (
     BusinessAuditEvent,
     IncomingMessage,
@@ -119,16 +119,22 @@ class MessageIntakeService:
                         message_id=command.message_id,
                         sales_user_id=command.sales_user_id,
                         sequence=authorization.next_message_sequence,
-                        # 固定命令在持久化时分类，Worker 因此绝不把它送入 AI 意图推断。
+                        # 精确命令保留快速路径；普通文本由 Worker 做结构化意图路由。
                         event_type=(
                             "crm_submission_command"
                             if parse_crm_submission_command(command.normalized_text or "")
                             is not None
                             else (
-                                "wecom_action_command"
-                                if parse_deterministic_action_command(command.normalized_text or "")
-                                is not None
-                                else "message_received"
+                                "crm_submission_intent"
+                                if looks_like_submission_intent(command.normalized_text or "")
+                                else (
+                                    "wecom_action_command"
+                                    if parse_deterministic_action_command(
+                                        command.normalized_text or ""
+                                    )
+                                    is not None
+                                    else "message_received"
+                                )
                             )
                         ),
                     )

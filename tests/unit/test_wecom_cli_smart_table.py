@@ -13,7 +13,7 @@ from app.smart_table.adapter import (
     SmartTableAdapterConfigurationError,
     SmartTablePermissionError,
 )
-from app.smart_table.models import SmartTableFieldType
+from app.smart_table.models import SmartTableField, SmartTableFieldType
 from app.smart_table.wecom_cli import (
     WecomCliProcessError,
     WecomCliSmartTableAdapter,
@@ -612,6 +612,19 @@ def test_configured_sheet_title_uses_full_query_and_parses_member_rows() -> None
     assert records[0].member_names == {"创建人": "测试销售", "负责人": "测试销售"}
     assert records[0].fields["AI待确认"] == []
     assert fake_cli.calls[1][0:5] == ("wecom-cli", "smartsheet", "records", "query", "--docid")
+
+
+def test_empty_multi_select_string_is_normalized_to_empty_list() -> None:
+    """验证真实 CLI 对空多选返回空字符串时不会被误判为协议错误。"""
+    field = SmartTableField(
+        field_id="pending",
+        name="AI待确认",
+        field_type=SmartTableFieldType.MULTI_SELECT,
+    )
+
+    value = WecomCliSmartTableAdapter._from_cli_value("AI待确认", field, "")
+
+    assert value == []
 
 
 def test_robot_requires_owner_and_sales_cannot_be_impersonated() -> None:

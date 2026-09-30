@@ -790,6 +790,9 @@ class WecomCliSmartTableAdapter:
                 raise WecomCliProtocolError("MEMBER 字段返回值不符合单成员 CLI 契约")
             return value[0]["userId"]
         if field is not None and field.field_type is SmartTableFieldType.MULTI_SELECT:
+            # wecom-cli 对未填多选有时返回空字符串；它与 null/空数组同义，不能误报协议损坏。
+            if value is None or value == "":
+                return []
             if not isinstance(value, list):
                 raise WecomCliProtocolError("多选字段返回值不是选项列表")
             values = [WecomCliSmartTableAdapter._cell_text(item) for item in value]

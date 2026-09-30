@@ -40,6 +40,23 @@ class LeadAnalysis(BaseModel):
         return self
 
 
+class SubmissionIntent(BaseModel):
+    """约束模型只识别 CRM 提交意图，不承载 CRM 写入参数。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    intent: Literal[
+        "LEAD_CAPTURE",
+        "SUBMIT_TODAY",
+        "SUBMIT_ALL",
+        "SUBMIT_SINGLE",
+        "SUBMIT_ABANDONED",
+        "SUBMIT_UPDATES",
+        "UNKNOWN",
+    ]
+    company_name: str | None = None
+
+
 @dataclass(frozen=True)
 class LLMRequest:
     """定义 Provider 接收的最小化模型请求。"""

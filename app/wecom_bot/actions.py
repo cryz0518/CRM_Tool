@@ -687,9 +687,18 @@ class WecomActionService:
                     current_status = latest.status if latest is not None else None
                     if command_text == "帮我提交放弃提交的线索":
                         valid_state = current_status == "abandoned"
+                        valid_lifecycle = (
+                            lead is not None and lead.lifecycle_state == "pending_create"
+                        )
                     else:
                         valid_state = current_status not in {"succeeded", "abandoned"}
-                    if lead is None or lead.lifecycle_state != "pending_create" or not valid_state:
+                        # “提交全部未提交线索”允许卡片展示资料不完整的 temporary 记录；
+                        # submit_selected() 会将其归为待完善，不会调用 CRM。
+                        valid_lifecycle = lead is not None and lead.lifecycle_state in {
+                            "pending_create",
+                            "temporary",
+                        }
+                    if not valid_lifecycle or not valid_state:
                         return self._deny_action(
                             action,
                             delivery,
@@ -1944,7 +1953,9 @@ class DeterministicWecomActionExecutor:
         review_service = LeadReviewService(self._session_factory, self._smart_table_adapter)
         # 卡片发行后表格可能已被销售处理；只对最新仍 pending 的字段继续确认，旧字段绝不覆盖。
         reconciled = review_service.reconcile_submission(action.target_id)
-        current_fields = tuple(field for field in fields if field in reconciled.blocking_fields)
+        # 旧字段确认卡仍可作为审计入口；AI待确认不再是提交阻塞条件，实际 pending
+        # 校验由 LeadReviewService.confirm_submission_fields 再次完成。
+        current_fields = tuple(field for field in fields if field in reconciled.fields)
         if not current_fields:
             return "confirmation_stale", "字段已按最新表格状态处理，未覆盖销售修改"
         field_values = {

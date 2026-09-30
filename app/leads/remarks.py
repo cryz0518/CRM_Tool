@@ -18,7 +18,8 @@ class RemarksBuilder:
         异常：无。
         副作用：无。
         """
-        company = self._text(fields.get("线索名称"))
+        # 备注优先展示销售原始企业称呼，避免把天眼查候选名误当成用户原始信息。
+        company = self._text(enrichment.get("原始企业名称")) or self._text(fields.get("线索名称"))
         industry = self._text(fields.get("客户行业"))
         city = self._text(enrichment.get("城市/地区"))
         product = self._text(enrichment.get("主营产品"))

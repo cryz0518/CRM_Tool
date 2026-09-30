@@ -89,6 +89,7 @@ def prepare_pending_create_case(
             "职务": "项目经理",
             "沟通方式": "微信",
             "手机": "13800000000",
+            "客户行业": "机械加工",
             "备注": "客户已确认自动化需求，预算和现场沟通安排待进一步确认。",
         },
         actor=SmartTableActor.ROBOT,
