@@ -811,6 +811,8 @@ def test_today_submission_rejects_temporary_lead_at_card_and_callback(
     """验证“今天”只允许当日 pending_create，回调不能把 temporary 重新放行。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter)
+    record = next(iter(adapter.get_records()))
+    adapter.update_record(record.record_id, {"客户行业": ""})
     with session_factory.begin() as session:
         lead = session.get(Lead, lead_id)
         assert lead is not None
@@ -829,6 +831,31 @@ def test_today_submission_rejects_temporary_lead_at_card_and_callback(
     assert result.incomplete == 0
     assert crm.search_calls == 0
     assert crm.calls == 0
+
+
+def test_today_submission_promotes_temporary_lead_from_complete_table_snapshot(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证当前智能表格已补齐必填字段时，临时线索会先晋升再进入今天候选。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.lifecycle_state = "temporary"
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+
+    candidates = service.list_submission_candidates("提交今天的线索", "sales-1")
+    result = service.submit_selected(
+        SubmissionCommand("提交今天的线索", "sales-1", "today-temporary-complete-message"),
+        tuple(item.lead_id for item in candidates),
+    )
+
+    assert tuple(item.lead_id for item in candidates) == (lead_id,)
+    assert result.succeeded == 1
+    assert crm.search_calls == 1
+    assert crm.calls == 1
 
 
 def test_today_submission_processes_only_card_selected_candidate(

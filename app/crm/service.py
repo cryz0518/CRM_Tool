@@ -439,7 +439,7 @@ class CrmSubmissionService:
         参数：command_text 为精确命令；sales_user_id 为当前销售身份。
         返回值：只包含本人、待创建且符合系统状态的线索候选。
         异常：销售未授权或命令不支持时抛出 ValueError。
-        副作用：读取数据库及智能表格，不修改任何状态。
+        副作用：读取数据库及智能表格；必要时把已补齐当前表格必填字段的临时线索晋升为待创建。
         """
         if command_text not in {_TODAY_COMMAND, _ALL_COMMAND, _ABANDONED_COMMAND}:
             raise ValueError("不支持候选卡片的 CRM 命令")
@@ -463,6 +463,7 @@ class CrmSubmissionService:
                 )
             )
             candidates: list[SubmissionCandidate] = []
+            promoted_temporary = False
             for lead in leads:
                 sync = latest_crm_create_sync(session, lead.id)
                 if command_text == _ABANDONED_COMMAND:
@@ -473,6 +474,26 @@ class CrmSubmissionService:
                     ):
                         continue
                 elif command_text == _TODAY_COMMAND:
+                    # 后台 Lead 可能因异步同步暂存为 temporary；
+                    # 候选发卡前以当前表格快照补回生命周期。
+                    if lead.lifecycle_state == "temporary":
+                        record = smart_table_snapshot.get(lead.smart_table_record_id or "")
+                        if (
+                            record is not None
+                            and record.fields.get("提交状态") == "未提交"
+                            and not self._missing_crm_minimum(dict(record.fields))
+                        ):
+                            # 只晋升状态并合并当前必填事实，具体提交仍会再次 reconcile 表格快照。
+                            lead.lifecycle_state = "pending_create"
+                            lead.field_values = {
+                                **lead.field_values,
+                                **{
+                                    name: record.fields[name]
+                                    for name in _CRM_REQUIRED_FIELDS
+                                    if name in record.fields
+                                },
+                            }
+                            promoted_temporary = True
                     # “今天”也必须以候选卡冻结目标；日期和未提交状态在发卡时服务端确认。
                     if not self._is_today_owned_candidate(lead, sales_user_id):
                         continue
@@ -523,6 +544,9 @@ class CrmSubmissionService:
                             tuple(display_snapshot.items()),
                         )
                     )
+            if promoted_temporary:
+                # 晋升必须在发卡前落库，确保后续 callback 的服务端状态校验与候选卡一致。
+                session.commit()
             return tuple(candidates)
 
     def submit_selected(
