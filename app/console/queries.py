@@ -349,7 +349,7 @@ class ConsoleQueryService:
             )
             for status in self._health_provider.snapshot()
         ]
-        # 只展示授权与 CRM 映射的计数，不在配置页暴露成员姓名或凭据。
+        # CRM 提交身份由当前智能表格负责人和员工目录解析，不再要求授权目录预填 CRM 映射。
         with self._session_factory() as session:
             authorized_count = session.scalar(
                 select(func.count(SalesAuthorization.wecom_user_id)).where(
@@ -357,22 +357,13 @@ class ConsoleQueryService:
                     SalesAuthorization.is_active.is_(True),
                 )
             ) or 0
-            missing_mapping_count = session.scalar(
-                select(func.count(SalesAuthorization.wecom_user_id)).where(
-                    SalesAuthorization.is_authorized.is_(True),
-                    SalesAuthorization.is_active.is_(True),
-                    or_(
-                        SalesAuthorization.crm_user_id.is_(None),
-                        func.trim(SalesAuthorization.crm_user_id) == "",
-                    ),
-                )
-            ) or 0
         items.append(
             ConsoleConfigIssueDTO(
                 source="sales_authorization",
-                status="ok" if missing_mapping_count == 0 else "not_ready",
+                status="ok",
                 issues=[
-                    f"已启用销售授权 {authorized_count} 条；CRM 映射缺失 {missing_mapping_count} 条"
+                    f"已启用销售授权 {authorized_count} 条；"
+                    "CRM 提交身份按智能表格负责人目录解析"
                 ],
             )
         )
@@ -381,7 +372,7 @@ class ConsoleQueryService:
     def list_sales_authorizations(
         self, *, limit: int = 50, cursor: str | None = None
     ) -> ConsolePage[ConsoleSalesAuthorizationDTO]:
-        """分页返回销售授权目录及其 CRM 映射异常影响范围。
+        """分页返回销售授权目录和当前智能表格负责人提交范围。
 
         参数：limit 与 cursor 控制只读分页。
         返回值：不含 CRM 用户标识的销售授权目录 DTO 分页结果。
@@ -391,24 +382,15 @@ class ConsoleQueryService:
         offset = self._parse_cursor(cursor)
         bounded_limit = self._bounded_limit(limit)
         with self._session_factory() as session:
-            # 目录和待同步线索均为既有事实；聚合不回填 CRM 映射，也不改写负责人。
+            # 目录和待同步线索均为既有事实；查询不回填 CRM 映射，也不改写负责人。
             authorizations = session.scalars(
                 select(SalesAuthorization)
                 .order_by(SalesAuthorization.updated_at.desc(), SalesAuthorization.wecom_user_id)
                 .offset(offset)
                 .limit(bounded_limit + 1)
             ).all()
-            pending_counts: dict[str, int] = {
-                owner_user_id: count
-                for owner_user_id, count in session.execute(
-                    select(Lead.smart_table_owner_user_id, func.count())
-                    .where(Lead.lifecycle_state.in_(("pending_create", "pending_update")))
-                    .group_by(Lead.smart_table_owner_user_id)
-                ).tuples()
-            }
         return self._page(
             [
-                # 仅把待处理线索归因给实际阻塞 CRM 提交的有效销售映射异常。
                 ConsoleSalesAuthorizationDTO(
                     wecom_user_id=item.wecom_user_id,
                     display_name=item.display_name,
@@ -418,14 +400,7 @@ class ConsoleQueryService:
                     crm_mapping_status=self._crm_mapping_status(
                         item.crm_user_id, item.is_authorized, item.is_active
                     ),
-                    affected_pending_lead_count=(
-                        pending_counts.get(item.wecom_user_id, 0)
-                        if self._crm_mapping_status(
-                            item.crm_user_id, item.is_authorized, item.is_active
-                        )
-                        == "mapping_missing"
-                        else 0
-                    ),
+                    affected_pending_lead_count=0,
                     created_by=item.created_by,
                     updated_by=item.updated_by,
                 )
@@ -438,31 +413,15 @@ class ConsoleQueryService:
     def list_mapping_missing_leads(
         self, sales_user_id: str, *, limit: int = 50, cursor: str | None = None
     ) -> ConsolePage[ConsoleLeadDTO]:
-        """返回指定映射异常销售名下、当前等待 CRM 提交的脱敏线索。
+        """兼容旧查询端点；当前不存在授权目录 CRM 映射阻塞。
 
-        参数：sales_user_id 为授权目录中的企业微信用户标识；limit 与 cursor 控制分页。
-        返回值：仅含 pending_create 与 pending_update 的线索 DTO。
-        异常：非法游标抛出 ValueError；数据库读取失败时向上传播。
-        副作用：仅读取目录和线索，不修改授权、映射或线索状态。
+        参数：sales_user_id、limit 和 cursor 保留旧接口契约。
+        返回值：空分页结果。
+        异常：无。
+        副作用：无，不读取或修改业务数据。
         """
-        with self._session_factory() as session:
-            authorization = session.get(SalesAuthorization, sales_user_id)
-            if authorization is None or self._crm_mapping_status(
-                authorization.crm_user_id, authorization.is_authorized, authorization.is_active
-            ) != "mapping_missing":
-                return ConsolePage(items=[])
-            offset = self._parse_cursor(cursor)
-            leads = session.scalars(
-                select(Lead)
-                .where(
-                    Lead.smart_table_owner_user_id == sales_user_id,
-                    Lead.lifecycle_state.in_(("pending_create", "pending_update")),
-                )
-                .order_by(Lead.updated_at.desc(), Lead.id.desc())
-                .offset(offset)
-                .limit(self._bounded_limit(limit) + 1)
-            ).all()
-        return self._page([self._lead_dto(lead) for lead in leads], limit, offset)
+        del sales_user_id, limit, cursor
+        return ConsolePage(items=[])
 
     def list_conflicts(
         self,
@@ -756,7 +715,10 @@ class ConsoleQueryService:
     def _lead_dto(self, lead: Lead) -> ConsoleLeadDTO:
         """将 Lead ORM 对象转换为不含原始字段值的 DTO。"""
         masked_values = {
-            field_name: self._masking_policy.mask_field(field_name, value) or "[已隐藏]"
+            field_name: self._masking_policy.mask_field(
+                field_name, value if isinstance(value, str) else None
+            )
+            or "[已隐藏]"
             for field_name, value in lead.field_values.items()
         }
         return ConsoleLeadDTO(
@@ -800,13 +762,12 @@ class ConsoleQueryService:
         """将 CRM 用户标识和销售有效状态转换为控制台可展示的非敏感映射状态。
 
         参数：crm_user_id 为目录中的 CRM 用户标识；is_authorized 和 is_active 为销售有效状态。
-        返回值：mapped、mapping_missing 或不要求 CRM 映射的 not_required。
+        返回值：当前提交不依赖授权目录映射，所有状态均返回 not_required。
         异常：无。
         副作用：无，不修改授权目录或 CRM 映射。
         """
-        if not is_authorized or not is_active:
-            return "not_required"
-        return "mapped" if crm_user_id is not None and crm_user_id.strip() else "mapping_missing"
+        del crm_user_id, is_authorized, is_active
+        return "not_required"
 
     @staticmethod
     def _normalise_datetime(value: datetime) -> datetime:

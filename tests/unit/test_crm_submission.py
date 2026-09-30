@@ -505,10 +505,10 @@ def test_duplicate_search_failure_persists_controlled_transport_evidence(
     assert "raw SOP" not in str(audit.details)
 
 
-def test_missing_sales_crm_mapping_blocks_duplicate_search(
+def test_sales_authorization_crm_mapping_is_not_required_when_owner_directory_matches(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证销售 CRM 映射缺失时 fail closed，不先调用 CRM 查重。"""
+    """验证当前销售仅凭表格负责人和员工目录匹配即可提交 CRM。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter, crm_user_id=None)
     crm = MockCRMAdapter()
@@ -519,13 +519,15 @@ def test_missing_sales_crm_mapping_blocks_duplicate_search(
         "message-12",
     )
 
-    assert result.mapping_missing == 1
-    assert crm.search_calls == 0
-    assert crm.calls == 0
+    assert result.succeeded == 1
+    assert result.mapping_missing == 0
+    assert crm.search_calls == 1
+    assert crm.calls == 1
+    assert crm.crm_user_ids == ["crm-1"]
     with session_factory() as session:
         sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
     assert sync is not None
-    assert sync.failure_code == "mapping_missing"
+    assert sync.submitting_crm_user_id == "crm-1"
 
 
 def test_tyc_unique_identity_is_sent_to_crm(

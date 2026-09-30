@@ -45,6 +45,9 @@ _FIELD_TYPES = {
     "user": SmartTableFieldType.MEMBER,
 }
 _RECENT_WRITE_VISIBILITY_SECONDS = 30.0
+_PERMANENT_PROCESS_ERROR_CODES = frozenset(
+    {"permission_denied", "record_not_found", "invalid_request"}
+)
 
 
 class WecomCliSmartTableAdapterError(RuntimeError):
@@ -61,6 +64,17 @@ class WecomCliProtocolError(WecomCliSmartTableAdapterError, PermanentTaskFailure
 
 class WecomCliProcessError(WecomCliProtocolError):
     """表示 wecom-cli 子进程非零退出，具体动作由调用层判断是否可重试。"""
+
+    def __init__(self, message: str, *, error_code: str = "process_exit") -> None:
+        """保存不含原始 stderr 的受控进程错误分类。
+
+        参数：message 为安全异常摘要；error_code 为有限白名单中的错误分类。
+        返回值：无。
+        异常：无。
+        副作用：仅保存异常对象状态，不记录原始 CLI 输出。
+        """
+        super().__init__(message)
+        self.error_code = error_code
 
 
 class WecomCliSmartTableAdapter:
@@ -449,11 +463,13 @@ class WecomCliSmartTableAdapter:
             except WecomCliProcessError as error:
                 # records list/update 是幂等操作，进程异常可以安全重放；records add
                 # 可能已经在服务端成功，不能因客户端退出异常再次创建重复记录。
-                if action == "add":
+                if action == "add" or error.error_code in _PERMANENT_PROCESS_ERROR_CODES:
                     raise
                 if attempt == self._retry_count:
-                    raise WecomCliTransportError("wecom-cli 进程调用失败") from error
-                self._log_retry(resource, action, attempt, "ProcessExit")
+                    raise WecomCliTransportError(
+                        f"wecom-cli 进程调用失败：{error.error_code}"
+                    ) from error
+                self._log_retry(resource, action, attempt, f"ProcessExit:{error.error_code}")
                 time.sleep(0.2 * (attempt + 1))
                 continue
             except (OSError, subprocess.TimeoutExpired) as error:
@@ -497,17 +513,19 @@ class WecomCliSmartTableAdapter:
             timeout=self._timeout_seconds,
         )
         if completed.returncode != 0:
-            # 保留有限的 stderr 诊断信息，便于区分网络、权限和参数错误；不记录请求 JSON。
-            stderr_preview = " ".join(completed.stderr.split())[:512]
+            # 只把 stderr 映射为受控错误码，既保留排障方向又不把外部正文写入日志。
+            error_code = self._process_error_code(completed.stderr)
             logger.error(
-                "wecom_cli_process_failed",
+                "wecom_cli_process_failed error_code=%s",
+                error_code,
                 extra={
                     "returncode": completed.returncode,
-                    "stderr_preview": stderr_preview or None,
+                    "error_code": error_code,
                 },
             )
             raise WecomCliProcessError(
-                f"wecom-cli 退出失败，退出码：{completed.returncode}"
+                f"wecom-cli 退出失败，退出码：{completed.returncode}",
+                error_code=error_code,
             )
         try:
             parsed: Any = json.loads(completed.stdout)
@@ -515,6 +533,32 @@ class WecomCliSmartTableAdapter:
             # CLI 成功退出但协议异常时，拒绝将非 JSON 文本当作业务数据继续处理。
             raise WecomCliProtocolError("wecom-cli 未返回 JSON 对象") from error
         return self._as_mapping(parsed, "CLI 响应")
+
+    @staticmethod
+    def _process_error_code(stderr: str) -> str:
+        """将 CLI stderr 转换为不含原文的稳定错误分类。
+
+        参数：stderr 为外部 wecom-cli 的标准错误输出。
+        返回值：permission_denied、record_not_found、invalid_request、timeout、network_error
+        或 process_exit 之一。
+        异常：无；无法识别时保守返回 process_exit。
+        副作用：无，不返回或记录 stderr 原文。
+        """
+        normalized = stderr.casefold()
+        if any(
+            token in normalized
+            for token in ("permission", "forbidden", "unauthorized", "无权限", "权限")
+        ):
+            return "permission_denied"
+        if "not found" in normalized or "不存在" in normalized:
+            return "record_not_found"
+        if any(token in normalized for token in ("invalid", "validation", "参数", "字段校验")):
+            return "invalid_request"
+        if "timeout" in normalized or "timed out" in normalized or "超时" in normalized:
+            return "timeout"
+        if any(token in normalized for token in ("network", "connect", "connection", "连接")):
+            return "network_error"
+        return "process_exit"
 
     @staticmethod
     def _is_transient_network_error(response: Mapping[str, object]) -> bool:

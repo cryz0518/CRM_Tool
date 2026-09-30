@@ -700,6 +700,44 @@ def test_idempotent_cli_process_exit_is_retried() -> None:
     assert len(fake_cli.calls) == 2
 
 
+def test_permanent_cli_process_error_is_not_retried() -> None:
+    """验证 CLI 明确报告权限或参数错误时不重复提交同一更新。"""
+    fake_cli = FakeCli(
+        [
+            WecomCliProcessError("wecom-cli 退出失败", error_code="permission_denied"),
+            {"errcode": 0, "fields": []},
+        ]
+    )
+
+    with pytest.raises(WecomCliProcessError):
+        _adapter(fake_cli).get_schema()
+    assert len(fake_cli.calls) == 1
+
+
+def test_subprocess_failure_keeps_only_controlled_error_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证子进程 stderr 只转换为受控分类，不进入异常正文。"""
+
+    def failed_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        """返回包含敏感片段的模拟 CLI 失败结果。"""
+        return subprocess.CompletedProcess(
+            args=["wecom-cli"],
+            returncode=1,
+            stdout="",
+            stderr="permission denied for customer@example.com token=secret-value",
+        )
+
+    monkeypatch.setattr(subprocess, "run", failed_run)
+
+    with pytest.raises(WecomCliProcessError) as error:
+        _adapter(FakeCli([]))._run_subprocess(("wecom-cli", "--json", "{}"))
+
+    assert error.value.error_code == "permission_denied"
+    assert "customer@example.com" not in str(error.value)
+    assert "secret-value" not in str(error.value)
+
+
 def test_cli_process_exit_during_add_is_not_retried() -> None:
     """验证新增记录遇到未知进程退出时不重放，避免服务端已成功而本地重复建行。"""
     fake_cli = FakeCli(

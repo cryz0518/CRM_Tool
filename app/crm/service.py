@@ -21,7 +21,6 @@ from app.core.failures import classify_task_failure, safe_failure_summary
 from app.crm.adapter import CRMAdapter
 from app.crm.employee_directory import EmployeeDirectory, EmployeeDirectoryError
 from app.crm.payload import CrmPayloadBuilder, CrmPayloadError
-from app.crm.user_mapping import CRMUserMapper, DatabaseCRMUserMapper
 from app.leads.models import (
     CrmCompanyIdentity,
     CrmSyncRecord,
@@ -312,12 +311,11 @@ class CrmSubmissionService:
         crm_create_retry_count: int | None = None,
         employee_directory: EmployeeDirectory | None = None,
         robot_submission_confirmation_available: bool | None = None,
-        crm_user_mapper: CRMUserMapper | None = None,
     ) -> None:
         """保存数据库、表格、CRM 与重试上限依赖。
 
         参数：前三项分别提供持久化、规范表格回读和唯一 create 调用；可选参数覆盖重试、
-        owner 目录、销售 CRM 映射与卡片确认能力配置。
+        owner 目录与卡片确认能力配置。
         返回值：无。
         异常：无。
         副作用：只保存依赖，不读取数据库或调用外部系统。
@@ -331,8 +329,7 @@ class CrmSubmissionService:
             else crm_create_retry_count
         )
         self._employee_directory = employee_directory
-        # 提交销售的 CRM 映射由授权目录提供；线索原负责人解析仍沿用既有不可变 owner 语义。
-        self._crm_user_mapper = crm_user_mapper or DatabaseCRMUserMapper()
+        # 当前销售只能提交本人负责且已从智能表格读取到的线索，CRM headerId 由负责人目录解析。
         self._crm_payload_builder = CrmPayloadBuilder(get_settings().crm_customer_level_scheme)
         self._robot_submission_confirmation_available = (
             get_settings().wecom_card_callback_ready()
@@ -717,10 +714,7 @@ class CrmSubmissionService:
             if lead is None or authorization is None:
                 return "incomplete"
             crm_user_id = self._resolve_crm_owner(lead)
-            if (
-                self._crm_user_mapper.get_crm_user_id(session, command.sales_user_id) is None
-                or crm_user_id is None
-            ):
+            if crm_user_id is None:
                 return self._record_mapping_missing(
                     session, lead, command, payload, snapshot_hash, "update"
                 )
@@ -871,10 +865,7 @@ class CrmSubmissionService:
             if current_lead.lifecycle_state == "temporary":
                 # 临时线索通过最终快照和 CRM payload 校验后，先晋升再进入 owner/查重状态机。
                 current_lead.lifecycle_state = "pending_create"
-            if (
-                self._crm_user_mapper.get_crm_user_id(session, command.sales_user_id) is None
-                or self._resolve_crm_owner(current_lead) is None
-            ):
+            if self._resolve_crm_owner(current_lead) is None:
                 return _create_outcome(
                     self._record_mapping_missing(
                         session, current_lead, command, canonical_payload, snapshot_hash, "create"
@@ -949,10 +940,7 @@ class CrmSubmissionService:
                 ):
                     return _create_outcome("incomplete")
                 crm_user_id = self._resolve_crm_owner(lead)
-                if (
-                    self._crm_user_mapper.get_crm_user_id(session, command.sales_user_id) is None
-                    or crm_user_id is None
-                ):
+                if crm_user_id is None:
                     return _create_outcome(
                         self._record_mapping_missing(
                             session, lead, command, canonical_payload, snapshot_hash, "create"

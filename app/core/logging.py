@@ -35,6 +35,11 @@ STRUCTURED_EXTRA_FIELDS = (
     "attempt",
     "duplicate",
     "has_reason",
+    "smart_table_resource",
+    "smart_table_action",
+    "retry_attempt",
+    "returncode",
+    "error_code",
 )
 _LOG_EMAIL_PATTERN = re.compile(r"(?P<local>[^\s@]+)@(?P<domain>[^\s@]+)")
 _LOG_PHONE_PATTERN = re.compile(r"(?<!\d)(?P<number>\+?[0-9][0-9 -]{6,22}[0-9])(?!\d)")
