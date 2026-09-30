@@ -6,8 +6,9 @@ import hashlib
 import json
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, text
@@ -76,6 +77,31 @@ class SubmissionCommand:
     target_lead_id: str | None = None
 
 
+class SubmissionItemStatus(StrEnum):
+    """定义单条 CRM 提交结果允许对外展示的状态集合。"""
+
+    CREATED = "created"
+    UPDATED = "updated"
+    UNCHANGED = "unchanged"
+    INCOMPLETE = "incomplete"
+    DUPLICATE_CONFIRMATION = "duplicate_confirmation"
+    MAPPING_MISSING = "mapping_missing"
+    PROCESSING = "processing"
+    RETRYING = "retrying"
+    FAILED_PENDING_REVIEW = "failed_pending_review"
+    COMPANY_IDENTITY_REVIEW = "company_identity_review"
+
+
+@dataclass(frozen=True)
+class SubmissionItemResult:
+    """保存一条线索的脱敏提交结果及受控原因。"""
+
+    lead_id: str
+    status: SubmissionItemStatus
+    reason_code: str | None = None
+    missing_fields: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True)
 class SubmissionBatchResult:
     """汇总一条确定性提交命令的部分成功结果。"""
@@ -93,6 +119,7 @@ class SubmissionBatchResult:
     company_identity_review: int = 0
     mapping_missing: int = 0
     duplicate_confirmations: tuple["DuplicateSubmission", ...] = ()
+    items: tuple[SubmissionItemResult, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -112,6 +139,7 @@ class SubmissionCandidate:
     lead_id: str
     company_name: str
     display_text: str | None = None
+    snapshot_fields: tuple[tuple[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -131,6 +159,7 @@ class CreateSubmissionOutcome:
     status: str
     duplicate: DuplicateSubmission | None = None
     missing_fields: tuple[str, ...] = ()
+    reason_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -139,6 +168,136 @@ class GlobalIdentityResolution:
 
     state: str
     identity: CrmCompanyIdentity | None = None
+
+
+_CREATE_REASON_CODES = {
+    "incomplete": "missing_required_fields",
+    "duplicate_confirmation": "duplicate_confirmation_required",
+    "mapping_missing": "crm_user_mapping_missing",
+    "processing": "sync_processing",
+    "retrying": "crm_create_retrying",
+    "failed_pending_review": "crm_create_failed_pending_review",
+}
+_ITEM_STATUS_BY_OUTCOME = {
+    "succeeded": SubmissionItemStatus.CREATED,
+    "updated": SubmissionItemStatus.UPDATED,
+    "unchanged": SubmissionItemStatus.UNCHANGED,
+    "incomplete": SubmissionItemStatus.INCOMPLETE,
+    "duplicate_confirmation": SubmissionItemStatus.DUPLICATE_CONFIRMATION,
+    "mapping_missing": SubmissionItemStatus.MAPPING_MISSING,
+    "processing": SubmissionItemStatus.PROCESSING,
+    "retrying": SubmissionItemStatus.RETRYING,
+    "failed_pending_review": SubmissionItemStatus.FAILED_PENDING_REVIEW,
+    "company_identity_review": SubmissionItemStatus.COMPANY_IDENTITY_REVIEW,
+}
+
+
+def _create_outcome(
+    status: str,
+    *,
+    duplicate: DuplicateSubmission | None = None,
+    missing_fields: tuple[str, ...] = (),
+    reason_code: str | None = None,
+) -> CreateSubmissionOutcome:
+    """构造单条 create 结果并补齐受控原因码。
+
+    参数：status 为领域状态；duplicate 为重复线索事实；missing_fields 为本条缺失字段；
+    reason_code 为可选的确定性原因码。
+    返回值：包含状态、原因和缺失字段的不可变结果。
+    异常：无。
+    副作用：无，不调用数据库或外部服务。
+    """
+
+    return CreateSubmissionOutcome(
+        status=status,
+        duplicate=duplicate,
+        missing_fields=missing_fields,
+        reason_code=reason_code or _CREATE_REASON_CODES.get(status),
+    )
+
+
+def _append_create_result(
+    result: SubmissionBatchResult, lead_id: str, outcome: CreateSubmissionOutcome
+) -> SubmissionBatchResult:
+    """把单条 create 结果追加到批次汇总，保留逐线索身份和缺失字段。
+
+    参数：result 为当前批次累计结果；lead_id 为服务端接受的线索标识；outcome 为单条结果。
+    返回值：追加一个且仅一个 SubmissionItemResult 的新批次结果。
+    异常：无。
+    副作用：无，不修改输入对象或执行外部调用。
+    """
+
+    item_status = _ITEM_STATUS_BY_OUTCOME.get(
+        outcome.status, SubmissionItemStatus.FAILED_PENDING_REVIEW
+    )
+    item = SubmissionItemResult(
+        lead_id=lead_id,
+        status=item_status,
+        reason_code=outcome.reason_code,
+        missing_fields=outcome.missing_fields,
+    )
+    return replace(
+        result,
+        succeeded=result.succeeded + (outcome.status == "succeeded"),
+        incomplete=result.incomplete + (outcome.status == "incomplete"),
+        incomplete_missing_fields=_merge_missing_fields(
+            result.incomplete_missing_fields, outcome.missing_fields
+        ),
+        retrying=result.retrying + (outcome.status == "retrying"),
+        processing=result.processing + (outcome.status == "processing"),
+        failed_pending_review=result.failed_pending_review
+        + (outcome.status == "failed_pending_review"),
+        incomplete_lead_ids=(
+            result.incomplete_lead_ids + (lead_id,)
+            if outcome.status == "incomplete"
+            else result.incomplete_lead_ids
+        ),
+        mapping_missing=result.mapping_missing + (outcome.status == "mapping_missing"),
+        company_identity_review=result.company_identity_review
+        + (outcome.status == "company_identity_review"),
+        duplicate_confirmations=(
+            result.duplicate_confirmations + (outcome.duplicate,)
+            if outcome.duplicate is not None
+            else result.duplicate_confirmations
+        ),
+        items=(*result.items, item),
+    )
+
+
+def _append_update_result(
+    result: SubmissionBatchResult, lead_id: str, status: str
+) -> SubmissionBatchResult:
+    """把单条 update 结果追加到批次汇总并转换为统一单条状态。
+
+    参数：result 为当前批次累计结果；lead_id 为服务端线索标识；status 为既有领域状态。
+    返回值：追加一个逐线索结果的新批次对象。
+    异常：无。
+    副作用：无，不修改输入对象或执行外部调用。
+    """
+
+    item_status = _ITEM_STATUS_BY_OUTCOME.get(
+        status, SubmissionItemStatus.FAILED_PENDING_REVIEW
+    )
+    reason_code = {
+        "mapping_missing": "crm_user_mapping_missing",
+        "processing": "sync_processing",
+        "retrying": "crm_create_retrying",
+        "company_identity_review": "company_identity_change_pending_review",
+        "failed_pending_review": "crm_create_failed_pending_review",
+    }.get(status)
+    item = SubmissionItemResult(lead_id, item_status, reason_code)
+    return replace(
+        result,
+        retrying=result.retrying + (status == "retrying"),
+        processing=result.processing + (status == "processing"),
+        failed_pending_review=result.failed_pending_review + (status == "failed_pending_review"),
+        updated=result.updated + (status == "succeeded"),
+        unchanged=result.unchanged + (status == "unchanged"),
+        company_identity_review=result.company_identity_review
+        + (status == "company_identity_review"),
+        mapping_missing=result.mapping_missing + (status == "mapping_missing"),
+        items=(*result.items, item),
+    )
 
 
 class CrmSubmissionService:
@@ -268,29 +427,7 @@ class CrmSubmissionService:
         for lead_id in candidate_ids:
             # 每条独立执行；任何一条失败都不得影响后续候选。
             outcome = self._submit_create(lead_id, command)
-            result = SubmissionBatchResult(
-                succeeded=result.succeeded + (outcome.status == "succeeded"),
-                incomplete=result.incomplete + (outcome.status == "incomplete"),
-                incomplete_missing_fields=_merge_missing_fields(
-                    result.incomplete_missing_fields, outcome.missing_fields
-                ),
-                retrying=result.retrying + (outcome.status == "retrying"),
-                processing=result.processing + (outcome.status == "processing"),
-                failed_pending_review=(
-                    result.failed_pending_review + (outcome.status == "failed_pending_review")
-                ),
-                incomplete_lead_ids=(
-                    result.incomplete_lead_ids + (lead_id,)
-                    if outcome.status == "incomplete"
-                    else result.incomplete_lead_ids
-                ),
-                mapping_missing=result.mapping_missing + (outcome.status == "mapping_missing"),
-                duplicate_confirmations=(
-                    result.duplicate_confirmations + (outcome.duplicate,)
-                    if outcome.duplicate is not None
-                    else result.duplicate_confirmations
-                ),
-            )
+            result = _append_create_result(result, lead_id, outcome)
         return result
 
     def list_submission_candidates(
@@ -371,8 +508,19 @@ class CrmSubmissionService:
                     display_text = "｜".join(
                         part for part in (company_name.strip(), contact, created_text) if part
                     )
+                    # 候选 Markdown 必须使用发行时的同一份 Smart Table 快照，避免卡片与明细错位。
+                    display_snapshot = dict(snapshot_fields)
+                    if record is not None:
+                        for member_field, display_name in record.member_names.items():
+                            if isinstance(display_name, str) and display_name.strip():
+                                display_snapshot[member_field] = display_name.strip()
                     candidates.append(
-                        SubmissionCandidate(lead.id, company_name.strip(), display_text)
+                        SubmissionCandidate(
+                            lead.id,
+                            company_name.strip(),
+                            display_text,
+                            tuple(display_snapshot.items()),
+                        )
                     )
             return tuple(candidates)
 
@@ -450,28 +598,7 @@ class CrmSubmissionService:
                     command.request_message_id,
                 ),
             )
-            result = SubmissionBatchResult(
-                succeeded=result.succeeded + (outcome.status == "succeeded"),
-                incomplete=result.incomplete + (outcome.status == "incomplete"),
-                incomplete_missing_fields=_merge_missing_fields(
-                    result.incomplete_missing_fields, outcome.missing_fields
-                ),
-                retrying=result.retrying + (outcome.status == "retrying"),
-                processing=result.processing + (outcome.status == "processing"),
-                failed_pending_review=result.failed_pending_review
-                + (outcome.status == "failed_pending_review"),
-                incomplete_lead_ids=(
-                    result.incomplete_lead_ids + (lead_id,)
-                    if outcome.status == "incomplete"
-                    else result.incomplete_lead_ids
-                ),
-                mapping_missing=result.mapping_missing + (outcome.status == "mapping_missing"),
-                duplicate_confirmations=(
-                    result.duplicate_confirmations + (outcome.duplicate,)
-                    if outcome.duplicate is not None
-                    else result.duplicate_confirmations
-                ),
-            )
+            result = _append_create_result(result, lead_id, outcome)
         return result
 
     def _submit_updates(self, command: SubmissionCommand) -> SubmissionBatchResult:
@@ -496,19 +623,7 @@ class CrmSubmissionService:
         result = SubmissionBatchResult()
         for lead_id in candidate_ids:
             outcome = self._submit_update(lead_id, command)
-            result = SubmissionBatchResult(
-                succeeded=result.succeeded,
-                incomplete=result.incomplete + (outcome == "incomplete"),
-                retrying=result.retrying + (outcome == "retrying"),
-                processing=result.processing + (outcome == "processing"),
-                failed_pending_review=result.failed_pending_review
-                + (outcome == "failed_pending_review"),
-                updated=result.updated + (outcome == "succeeded"),
-                unchanged=result.unchanged + (outcome == "unchanged"),
-                company_identity_review=result.company_identity_review
-                + (outcome == "company_identity_review"),
-                mapping_missing=result.mapping_missing + (outcome == "mapping_missing"),
-            )
+            result = _append_update_result(result, lead_id, outcome)
         return result
 
     def _submit_update(self, lead_id: str, command: SubmissionCommand) -> str:
@@ -672,29 +787,29 @@ class CrmSubmissionService:
                 allow_non_today_target,
                 allow_temporary=allow_temporary,
             ):
-                return CreateSubmissionOutcome("incomplete")
+                return _create_outcome("incomplete")
             # temporary 草稿可以展示在“所有未提交”卡片中；后续统一按八项必填字段判定，
             # 字段完整的记录允许继续查重，字段不完整的记录返回具体缺失项且不调用 CRM。
             existing = latest_crm_create_sync(session, lead_id)
             if existing is not None:
                 if existing.status == "succeeded":
-                    return CreateSubmissionOutcome("incomplete")
+                    return _create_outcome("incomplete")
                 if existing.status == "awaiting_duplicate_confirmation":
                     duplicate = self._duplicate_from_sync(lead, existing)
-                    return CreateSubmissionOutcome(
+                    return _create_outcome(
                         (
                             "duplicate_confirmation"
                             if duplicate is not None
                             else "failed_pending_review"
                         ),
-                        duplicate,
+                        duplicate=duplicate,
                     )
                 if existing.status == "abandoned" and command.text == _ABANDONED_COMMAND:
                     # 只有专用“重新提交放弃线索”命令允许重开服务端放弃事实。
                     pass
                 else:
                     # retry 必须使用现有冻结快照，绝不重新读表替换 payload。
-                    return CreateSubmissionOutcome(
+                    return _create_outcome(
                         self._claim_and_call(existing.id, command.sales_user_id)
                     )
 
@@ -710,9 +825,7 @@ class CrmSubmissionService:
             self._audit(command, "crm_business_fields_incomplete")
         if missing_minimum:
             self._audit(command, "crm_create_incomplete")
-            return CreateSubmissionOutcome(
-                "incomplete", missing_fields=missing_minimum
-            )
+            return _create_outcome("incomplete", missing_fields=missing_minimum)
 
         try:
             canonical_payload = self._canonical_payload(
@@ -722,10 +835,10 @@ class CrmSubmissionService:
         except CrmPayloadError:
             # CRM DTO 校验失败属于当前线索待完善，禁止进入远端写操作。
             self._audit(command, "crm_create_payload_invalid")
-            return CreateSubmissionOutcome("incomplete")
+            return _create_outcome("incomplete")
         company_name = canonical_payload.get("name")
         if not isinstance(company_name, str) or not company_name:
-            return CreateSubmissionOutcome("incomplete")
+            return _create_outcome("incomplete")
         snapshot_hash = self._snapshot_hash(canonical_payload)
         # CRM 用户映射缺失时连查重接口也不能调用，先完成本地确定性校验。
         with self._session_factory.begin() as session:
@@ -747,12 +860,12 @@ class CrmSubmissionService:
                     allow_temporary=allow_temporary,
                 )
             ):
-                return CreateSubmissionOutcome("incomplete")
+                return _create_outcome("incomplete")
             if current_lead.lifecycle_state == "temporary":
                 # 临时线索通过最终快照和 CRM payload 校验后，先晋升再进入 owner/查重状态机。
                 current_lead.lifecycle_state = "pending_create"
             if self._resolve_crm_owner(current_lead) is None:
-                return CreateSubmissionOutcome(
+                return _create_outcome(
                     self._record_mapping_missing(
                         session, current_lead, command, canonical_payload, snapshot_hash, "create"
                     )
@@ -764,14 +877,20 @@ class CrmSubmissionService:
             )
             if identity is not None and identity.state == "active":
                 if identity.crm_lead_id is None:
-                    return CreateSubmissionOutcome("failed_pending_review")
+                    return _create_outcome(
+                        "failed_pending_review", reason_code="company_identity_conflict"
+                    )
             elif identity is not None and identity.state == "reserving":
                 if identity.creating_lead_id != current_lead.id:
-                    return CreateSubmissionOutcome("processing")
+                    return _create_outcome(
+                        "processing", reason_code="company_identity_reserved"
+                    )
             elif identity is None:
                 identity = self._reserve_global_identity(session, current_lead, command)
                 if identity is None:
-                    return CreateSubmissionOutcome("processing")
+                    return _create_outcome(
+                        "processing", reason_code="company_identity_reserved"
+                    )
             else:
                 # 历史身份仍需本次 CRM 查重决定，不能直接当作 create 事实。
                 pass
@@ -790,10 +909,13 @@ class CrmSubmissionService:
                 },
             )
             # 查重尚未创建 Sync 记录；暂态故障返回 retrying，下一次命令会重新执行查重。
-            return CreateSubmissionOutcome(
-                "retrying"
-                if failure_category.value == "transient"
-                else "failed_pending_review"
+            return _create_outcome(
+                "retrying" if failure_category.value == "transient" else "failed_pending_review",
+                reason_code=(
+                    "crm_duplicate_search_retrying"
+                    if failure_category.value == "transient"
+                    else "crm_duplicate_search_failed"
+                ),
             )
 
         try:
@@ -814,10 +936,10 @@ class CrmSubmissionService:
                         allow_temporary=allow_temporary,
                     )
                 ):
-                    return CreateSubmissionOutcome("incomplete")
+                    return _create_outcome("incomplete")
                 crm_user_id = self._resolve_crm_owner(lead)
                 if crm_user_id is None:
-                    return CreateSubmissionOutcome(
+                    return _create_outcome(
                         self._record_mapping_missing(
                             session, lead, command, canonical_payload, snapshot_hash, "create"
                         )
@@ -859,28 +981,32 @@ class CrmSubmissionService:
                                 "duplicate_count": str(len(duplicate_results)),
                             },
                         )
-                        return CreateSubmissionOutcome("failed_pending_review")
+                        return _create_outcome(
+                            "failed_pending_review", reason_code="company_identity_conflict"
+                        )
                 if (
                     identity is not None
                     and identity.state == "reserving"
                     and identity.creating_lead_id != lead.id
                 ):
                     # 首创 reservation 已由另一条 Lead 持有；并发调用不得各自创建 CRM。
-                    return CreateSubmissionOutcome("processing")
+                    return _create_outcome(
+                        "processing", reason_code="company_identity_reserved"
+                    )
                 existing = latest_crm_create_sync(session, lead_id, for_update=True)
                 if existing is not None:
                     if existing.status == "succeeded":
-                        return CreateSubmissionOutcome("incomplete")
+                        return _create_outcome("incomplete")
                     if existing.status == "awaiting_duplicate_confirmation":
                         duplicate = self._duplicate_from_sync(lead, existing)
-                        return CreateSubmissionOutcome(
+                        return _create_outcome(
                             "duplicate_confirmation"
                             if duplicate is not None
                             else "failed_pending_review",
-                            duplicate,
+                            duplicate=duplicate,
                         )
                     if existing.status != "abandoned" or command.text != _ABANDONED_COMMAND:
-                        return CreateSubmissionOutcome(existing.status)
+                        return _create_outcome(existing.status)
                     # abandoned 是不可修改的冻结事实；专用重提只能追加下一 generation。
                     previous_generation = existing.generation or 1
                     generation = previous_generation + 1
@@ -888,7 +1014,7 @@ class CrmSubmissionService:
                 else:
                     if command.text == _ABANDONED_COMMAND:
                         # 卡片发行后若历史候选已消失，禁止无旧事实地凭命令创建。
-                        return CreateSubmissionOutcome("incomplete")
+                        return _create_outcome("incomplete")
                     generation = 1
                     supersedes_sync_record_id = None
 
@@ -940,12 +1066,12 @@ class CrmSubmissionService:
                         crm_lead_id=first_duplicate.crm_lead_id,
                         crm_lead_owner_user_id=first_duplicate.crm_lead_owner_user_id,
                     )
-                    return CreateSubmissionOutcome("duplicate_confirmation", duplicate)
+                    return _create_outcome("duplicate_confirmation", duplicate=duplicate)
                 sync_id = sync.id
         except IntegrityError:
             # 数据库唯一索引只保护同一 Lead 的 create 幂等，不再承担公司名称查重。
-            return CreateSubmissionOutcome("processing")
-        return CreateSubmissionOutcome(self._claim_and_call(sync_id, command.sales_user_id))
+            return _create_outcome("processing", reason_code="company_identity_reserved")
+        return _create_outcome(self._claim_and_call(sync_id, command.sales_user_id))
 
     @staticmethod
     def _duplicate_from_sync(lead: Lead, sync: CrmSyncRecord) -> DuplicateSubmission | None:

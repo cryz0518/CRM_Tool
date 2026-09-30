@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from collections.abc import Mapping
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -26,6 +27,7 @@ from app.smart_table.models import SmartTableRecord
 from app.wecom_bot.actions import (
     CardCapabilityUnavailable,
     WecomActionService,
+    build_batch_submission_markdown,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -332,6 +334,15 @@ def prepare_batch_submission_selection(
         ]
         for page_number, page in enumerate(pages, start=1):
             # 每一页都由服务端冻结候选 ID；销售只能在对应卡片内选择，不能传任意 offset。
+            page_details = tuple(
+                {
+                    "lead_id": item.lead_id,
+                    "company_name": item.company_name,
+                    "display_text": item.display_text or item.company_name,
+                    "field_values": dict(item.snapshot_fields),
+                }
+                for item in page
+            )
             action_service.issue_batch_submission_action(
                 actor_user_id=command.sales_user_id,
                 request_message_id=command.request_message_id,
@@ -343,6 +354,11 @@ def prepare_batch_submission_selection(
                         "display_text": item.display_text or item.company_name,
                     }
                     for item in page
+                ),
+                preview_markdown_chunks=build_batch_submission_markdown(
+                    page_details,
+                    page=page_number,
+                    page_count=len(pages),
                 ),
                 page=page_number,
                 page_count=len(pages),
@@ -757,6 +773,7 @@ def _include_persisted_results(
     return SubmissionBatchResult(
         succeeded=statuses.count("succeeded"),
         incomplete=result.incomplete,
+        incomplete_missing_fields=result.incomplete_missing_fields,
         retrying=max(result.retrying, statuses.count("retrying")),
         processing=max(result.processing, statuses.count("processing")),
         failed_pending_review=max(result.failed_pending_review, generic_terminal_failure_count),
@@ -767,6 +784,7 @@ def _include_persisted_results(
         company_identity_review=result.company_identity_review,
         mapping_missing=result.mapping_missing,
         duplicate_confirmations=result.duplicate_confirmations,
+        items=result.items,
     )
 
 
@@ -817,28 +835,109 @@ def _record_command_failure(
         return reply
 
 
-def format_submission_reply(result: SubmissionBatchResult) -> str:
-    """将批次结果格式化为计数及必填缺失提示的销售回复。
+def format_submission_reply(
+    result: SubmissionBatchResult,
+    *,
+    lead_labels: Mapping[str, str] | None = None,
+    selected_count: int | None = None,
+) -> str:
+    """将批次结果格式化为汇总加逐条明细的销售回复。
 
-    参数：result 为 T12 application service 返回的批次汇总。
-    返回值：不包含线索名称、联系方式、payload 或异常堆栈的中文文本。
+    参数：result 为确定性提交结果；lead_labels 为服务端冻结的线索展示名称；
+    selected_count 为 callback 已确认的选择数量。
+    返回值：不包含异常正文、凭据或原始 CRM 响应的中文 Markdown 文本。
     异常：无。
     副作用：无。
     """
+
     if result.updates_not_implemented:
         return "提交我的更新将在 T13 实现；本次未调用 CRM。"
-    missing_fields = (
-        f"缺少必填字段：{'、'.join(result.incomplete_missing_fields)}；"
-        if result.incomplete_missing_fields
-        else ""
+    labels = lead_labels or {}
+    chosen = selected_count if selected_count is not None else (len(result.items) or None)
+    title = f"CRM 提交结果（已选择 {chosen} 条）" if chosen is not None else "CRM 提交结果"
+    failed_count = (
+        result.failed_pending_review
+        + result.mapping_missing
+        + result.company_identity_review
     )
-    return (
-        f"CRM 提交结果：创建成功 {result.succeeded} 条；更新成功 {result.updated} 条；"
-        f"无变化 {result.unchanged} 条；"
-        f"公司身份变化待人工审查 {result.company_identity_review} 条；"
-        f"待完善或待明确确认 {result.incomplete} 条；{missing_fields}"
-        f"重复待确认 {len(result.duplicate_confirmations)} 条；"
-        f"CRM 用户映射缺失 {result.mapping_missing} 条；"
-        f"提交处理中 {result.processing} 条；可重试失败 {result.retrying} 条；"
-        f"需人工处理失败 {result.failed_pending_review} 条。"
+    lines = [
+        title,
+        "",
+        f"✅ 创建成功 {result.succeeded} 条",
+        f"✅ 更新成功 {result.updated} 条",
+        f"✅ 无变化 {result.unchanged} 条",
+        f"⚠️ 待完善 {result.incomplete} 条",
+        f"⏳ 处理中 {result.processing} 条",
+        f"🔄 重试中 {result.retrying} 条",
+        f"需人工处理 {failed_count} 条",
+        "",
+        (
+            f"汇总：创建 {result.succeeded}｜更新 {result.updated}｜"
+            f"待完善 {result.incomplete}｜处理中 {result.processing}｜失败 {failed_count}"
+        ),
+    ]
+    detail_lines: list[str] = []
+    status_titles = {
+        "created": "✅ 创建成功",
+        "updated": "✅ 更新成功",
+        "unchanged": "✅ 无变化",
+        "incomplete": "⚠️ 待完善",
+        "processing": "⏳ 处理中",
+        "retrying": "🔄 重试中",
+        "duplicate_confirmation": "重复待确认",
+        "mapping_missing": "CRM 用户映射缺失",
+        "company_identity_review": "需人工处理",
+        "failed_pending_review": "需人工处理",
+    }
+    reason_text = {
+        "duplicate_confirmation_required": "CRM 已存在同公司线索，请在后续确认卡决定是否覆盖",
+        "crm_user_mapping_missing": "当前负责人无法映射 CRM 用户，请联系管理员",
+        "company_identity_conflict": "公司身份与 CRM 查重结果不一致，需要人工处理",
+        "company_identity_reserved": "已有提交任务正在处理，本次未重复创建",
+        "sync_processing": "已有提交任务正在处理，本次未重复创建",
+        "crm_duplicate_search_retrying": "CRM 查重暂时失败，系统将自动重试",
+        "crm_duplicate_search_failed": "CRM 查重失败，需要人工处理",
+        "crm_create_retrying": "CRM 创建暂时失败，系统将自动重试",
+        "crm_create_failed_pending_review": "CRM 提交失败，需要人工处理",
+        "company_identity_change_pending_review": "公司名称发生变化，需要人工处理",
+    }
+    grouped_statuses = (
+        "created",
+        "updated",
+        "unchanged",
+        "incomplete",
+        "duplicate_confirmation",
+        "mapping_missing",
+        "processing",
+        "retrying",
+        "company_identity_review",
+        "failed_pending_review",
     )
+    for status in grouped_statuses:
+        items = [
+            item
+            for item in result.items
+            if getattr(item.status, "value", str(item.status)) == status
+            and item.lead_id in labels
+        ]
+        if not items:
+            continue
+        detail_lines.append(f"{status_titles[status]} {len(items)} 条")
+        for item in items:
+            label = labels[item.lead_id]
+            if status == "incomplete" and item.missing_fields:
+                detail_lines.append(f"- {label}：缺少「{'、'.join(item.missing_fields)}」")
+            else:
+                detail = reason_text.get(item.reason_code or "", "")
+                detail_lines.append(f"- {label}：{detail}".rstrip("："))
+    if detail_lines:
+        lines.extend(["", "明细：", *detail_lines])
+    elif not result.items and result.incomplete_missing_fields:
+        # 保留旧调用方的兼容汇总；真实批量结果始终走上面的逐条字段来源。
+        lines.extend(
+            [
+                "",
+                f"待完善汇总：缺少必填字段：{'、'.join(result.incomplete_missing_fields)}",
+            ]
+        )
+    return "\n".join(lines)

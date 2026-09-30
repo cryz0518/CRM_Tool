@@ -84,6 +84,14 @@ class WecomTemplateCardCallbackHandler:
                 },
             )
             self._record_update_failure(frame, error)
+        else:
+            try:
+                # 只有 transport 成功才写 evidence；业务 action 仍由服务端状态机控制。
+                callback = TemplateCardCallbackParser.parse(frame)
+                self._action_service.record_callback_transport_success(callback.provider_msgid)
+            except Exception:
+                # 卡片已成功更新时，evidence 写入故障不能伪装成 transport failure 或重做业务动作。
+                logger.error("wecom_template_card_update_evidence_failed")
 
     def _record_update_failure(self, frame: Mapping[str, object], error: BaseException) -> None:
         """按白名单 msgid 保存 card update transport failure，不重做业务 action。"""

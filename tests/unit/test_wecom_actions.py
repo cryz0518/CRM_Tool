@@ -59,6 +59,7 @@ from app.wecom_bot.actions import (
     WecomActionStatus,
     _transition_action,
     build_action_card,
+    build_batch_submission_markdown,
     build_preview_markdown,
     parse_deterministic_action_command,
 )
@@ -763,6 +764,46 @@ def test_batch_submission_card_allows_multi_selection() -> None:
     assert card["submit_button"]["key"] == CARD_EVENT_KEY_CRM_BATCH_SUBMISSION  # type: ignore[index]
     options = card["checkbox"]["option_list"]  # type: ignore[index]
     assert options[0]["text"] != options[1]["text"]  # type: ignore[index]
+    assert [option["text"] for option in options] == ["1. 候选一", "2. 候选二"]  # type: ignore[index]
+
+
+def test_batch_markdown_and_checkbox_share_frozen_page_order() -> None:
+    """验证批量 Markdown 完整字段与卡片短选项按同一页序号对应。"""
+
+    candidates = [
+        {
+            "lead_id": "lead-a",
+            "company_name": "候选一",
+            "display_text": "候选一｜王工｜2026-09-30",
+            "field_values": {"业务线": "协作机器人", "联系人": "王工", "AI待确认": ["职务"]},
+        },
+        {
+            "lead_id": "lead-b",
+            "company_name": "候选二",
+            "display_text": "候选二｜李工｜2026-09-30",
+            "field_values": {"业务线": "车载机器人", "联系人": "李工"},
+        },
+    ]
+    markdown = build_batch_submission_markdown(candidates, page=1, page_count=1)
+    card = build_action_card(
+        task_id="task-batch-details",
+        event_key=CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
+        title="选择要提交的线索",
+        description="请勾选需要提交的线索",
+        selection_options=[
+            {"lead_id": item["lead_id"], "company_name": item["company_name"]}
+            for item in candidates
+        ],
+        selection_key=CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
+    )
+
+    assert len(markdown) == 1
+    assert "【1】候选一｜王工｜2026-09-30" in markdown[0]
+    assert "【2】候选二｜李工｜2026-09-30" in markdown[0]
+    assert "- AI待确认：[\"职务\"]" in markdown[0]
+    options = card["checkbox"]["option_list"]  # type: ignore[index]
+    assert [option["id"] for option in options] == ["lead-a", "lead-b"]  # type: ignore[index]
+    assert [option["text"] for option in options] == ["1. 候选一", "2. 候选二"]  # type: ignore[index]
 
 
 def test_batch_submission_action_accepts_single_candidate_and_freezes_context(
@@ -1204,17 +1245,67 @@ def test_callback_response_failure_does_not_repeat_business_action(
     service = _service(session_factory)
     service.execute_action(action.id, executor)
 
-    assert updates == 2
+    assert updates == 1
     assert calls == 1
     with session_factory() as session:
-        deliveries = session.scalars(
-            select(WecomCallbackDelivery).where(WecomCallbackDelivery.action_id == action.id)
-        ).all()
-        assert all(
-            delivery.transport_stage == "callback_card_update"
-            and delivery.transport_status == "failed"
-            for delivery in deliveries
+        failed_delivery = session.scalar(
+            select(WecomCallbackDelivery).where(
+                WecomCallbackDelivery.provider_msgid == "provider-msg-200"
+            )
         )
+        replay_delivery = session.scalar(
+            select(WecomCallbackDelivery).where(
+                WecomCallbackDelivery.provider_msgid == "provider-msg-201"
+            )
+        )
+        assert failed_delivery is not None
+        assert failed_delivery.transport_stage == "callback_card_update"
+        assert failed_delivery.transport_status == "failed"
+        assert replay_delivery is not None and replay_delivery.transport_status is None
+
+
+def test_callback_response_success_freezes_card_and_saves_transport_evidence(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证首次合法点击只更新一次卡片，并保存成功 transport evidence。"""
+
+    _authorize(session_factory)
+    action = _service(session_factory).issue_discard_action(
+        actor_user_id="sales-a", lead_id="lead-success", reason="确认"
+    )
+    handler = WecomTemplateCardCallbackHandler(_service(session_factory))
+    frame = _frame_for_action(action, msgid="provider-msg-success")
+    updates: list[dict[str, object]] = []
+
+    async def successful_update(frame_value: object, card: dict[str, object]) -> None:
+        """记录平台收到的唯一卡片冻结响应。"""
+
+        del frame_value
+        updates.append(card)
+
+    asyncio.run(handler.handle(frame, successful_update))
+    asyncio.run(
+        handler.handle(_frame_for_action(action, msgid="provider-msg-replay"), successful_update)
+    )
+
+    assert len(updates) == 1
+    assert updates[0]["card_type"] == "text_notice"
+    assert updates[0]["main_title"] == {
+        "title": "已确认选择",
+        "desc": "已受理，后台正在提交，请勿重复操作",
+    }
+    with session_factory() as session:
+        assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
+        delivery = session.scalar(
+            select(WecomCallbackDelivery).where(
+                WecomCallbackDelivery.provider_msgid == "provider-msg-success"
+            )
+        )
+        assert delivery is not None
+        assert delivery.action_id == action.id
+        assert delivery.transport_stage == "callback_card_update"
+        assert delivery.transport_status == "succeeded"
+        assert delivery.processed_at is not None
 
 
 def test_final_notification_retry_does_not_repeat_domain_action(

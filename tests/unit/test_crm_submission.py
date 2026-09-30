@@ -26,7 +26,13 @@ from app.crm.commands import (
 )
 from app.crm.employee_directory import EmployeeDirectory
 from app.crm.mock import MockCRMAdapter
-from app.crm.service import CrmSubmissionService, SubmissionCommand
+from app.crm.service import (
+    CrmSubmissionService,
+    SubmissionBatchResult,
+    SubmissionCommand,
+    SubmissionItemResult,
+    SubmissionItemStatus,
+)
 from app.crm.sop import SopCRMError
 from app.leads.discard import LeadDiscardService, LeadDiscardStatus
 from app.leads.models import (
@@ -987,6 +993,91 @@ def test_batch_submission_issues_server_frozen_pages(
         assert "张候选卡" in reply
 
 
+def test_batch_submission_sends_full_snapshot_markdown_before_short_selection_card(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证候选明细先发 Markdown，checkbox 只展示短编号且 ID 仍为 lead_id。"""
+
+    import app.crm.commands as crm_commands
+
+    settings = get_settings().model_copy(
+        update={
+            "wecom_card_callback_enabled": True,
+            "wecom_card_transport_configured": True,
+            "wecom_card_callback_handler_configured": True,
+        }
+    )
+    monkeypatch.setattr(crm_commands, "get_settings", lambda: settings)
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    with session_factory.begin() as session:
+        session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
+        for index in range(2):
+            record = adapter.create_record(
+                {
+                    "负责人": "sales-1",
+                    "线索名称": f"冻结公司-{index}",
+                    "业务线": "协作机器人",
+                    "线索来源": "展会",
+                    "联系人": f"联系人-{index}",
+                    "职务": "技术经理",
+                    "沟通方式": "微信",
+                    "手机": f"1380000000{index}",
+                    "客户行业": "机械加工",
+                    "备注": "当前智能表格备注",
+                    "AI待确认": ["职务"],
+                    "提交状态": "未提交",
+                },
+                actor=SmartTableActor.ROBOT,
+            )
+            message_id = f"batch-detail-message-{index}"
+            session.add(
+                IncomingMessage(
+                    message_id=message_id,
+                    sales_user_id="sales-1",
+                    sequence=index + 1,
+                    raw_payload={},
+                )
+            )
+            session.add(
+                Lead(
+                    id=f"batch-detail-lead-{index}",
+                    source_message_id=message_id,
+                    original_capturing_sales_user_id="sales-1",
+                    smart_table_owner_user_id="sales-1",
+                    smart_table_record_id=record.record_id,
+                    lifecycle_state="pending_create",
+                    field_values=dict(record.fields),
+                    standard_company_name=record.fields["线索名称"],
+                )
+            )
+
+    prepare_batch_submission_selection(
+        session_factory,
+        adapter,
+        MockCRMAdapter(),
+        SubmissionCommand("提交我所有线索", "sales-1", "batch-detail-command"),
+    )
+
+    with session_factory() as session:
+        notices = session.scalars(
+            select(NotificationRecord).order_by(NotificationRecord.created_at)
+        ).all()
+    preview = next(
+        notice for notice in notices if notice.notification_type == "wecom_action_preview"
+    )
+    card = next(notice for notice in notices if notice.notification_type == "wecom_action_card")
+    markdown = str(preview.payload["markdown"]["content"])
+    options = card.payload["template_card"]["checkbox"]["option_list"]  # type: ignore[index]
+    assert "**待提交线索明细（第 1/1 页）**" in markdown
+    assert "- 客户行业：机械加工" in markdown
+    assert "- AI待确认：[\"职务\"]" in markdown
+    assert [option["id"] for option in options] == [
+        "batch-detail-lead-0",
+        "batch-detail-lead-1",
+    ]
+    assert [option["text"] for option in options] == ["1. 冻结公司-0", "2. 冻结公司-1"]
+
+
 def test_company_preview_links_existing_owner_record_into_local_lead(
     session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1708,6 +1799,49 @@ def test_submission_reply_is_count_only_and_includes_update_categories() -> None
     assert "手机号" not in create_reply and "payload" not in create_reply.lower()
     assert "更新成功 1 条" in update_reply and "无变化 2 条" in update_reply
     assert "缺少必填字段：业务线、手机" in incomplete_reply
+
+
+def test_submission_reply_keeps_per_lead_results_and_frozen_display_labels() -> None:
+    """验证批量回复逐条保留状态、原因和缺失字段，不接受 callback 注入名称。"""
+
+    items = tuple(
+        [
+            SubmissionItemResult(f"created-{index}", SubmissionItemStatus.CREATED)
+            for index in range(4)
+        ]
+        + [
+            SubmissionItemResult(
+                "lead-e",
+                SubmissionItemStatus.INCOMPLETE,
+                "missing_required_fields",
+                ("客户行业", "职务"),
+            ),
+            SubmissionItemResult("lead-f", SubmissionItemStatus.PROCESSING, "sync_processing"),
+        ]
+    )
+    result = SubmissionBatchResult(
+        succeeded=4,
+        incomplete=1,
+        processing=1,
+        items=items,
+    )
+    reply = format_submission_reply(
+        result,
+        selected_count=6,
+        lead_labels={
+            **{f"created-{index}": f"公司{index}｜联系人{index}" for index in range(4)},
+            "lead-e": "公司E｜刘工",
+            "lead-f": "公司F｜陈工",
+        },
+    )
+
+    assert "CRM 提交结果（已选择 6 条）" in reply
+    assert "创建 4｜更新 0｜待完善 1｜处理中 1｜失败 0" in reply
+    assert "公司E｜刘工：缺少「客户行业、职务」" in reply
+    assert "公司F｜陈工：已有提交任务正在处理，本次未重复创建" in reply
+    assert "injected-lead" not in reply
+    assert "待完善或待明确确认" not in reply
+    assert len(result.items) == 6
 
 
 def test_submission_reconcile_keeps_sales_edit_and_clears_its_pending_marker(

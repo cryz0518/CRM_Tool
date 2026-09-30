@@ -6,7 +6,7 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -81,6 +81,7 @@ _ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _ACTION_LEASE = timedelta(minutes=5)
 _ACTION_DEFAULT_EXPIRY = timedelta(minutes=10)
 _MAX_CARD_PAYLOAD_BYTES = 8192
+_MAX_MARKDOWN_BYTES = 4096
 _PII_EMAIL = re.compile(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b")
 _PII_PHONE = re.compile(r"(?<!\d)\+?\d[\d ()-]{6,}\d(?!\d)")
 
@@ -159,10 +160,16 @@ class CallbackClaimResult:
         """
 
         # task_id 必须原样回显服务端已解析的 opaque correlation，不读取客户端其他业务字段。
+        title = "已确认选择" if self.code == "claimed" else "操作状态"
+        description = (
+            "已受理，后台正在提交，请勿重复操作"
+            if self.code == "claimed"
+            else self.summary
+        )
         return {
             "card_type": "text_notice",
             "task_id": self.task_id,
-            "main_title": {"title": "操作状态", "desc": self.summary},
+            "main_title": {"title": title, "desc": description},
         }
 
 
@@ -363,12 +370,14 @@ class WecomActionService:
         source_message_id: str | None = None,
         expires_at: datetime | None = None,
         preview_fields: Mapping[str, object] | None = None,
+        preview_markdown_chunks: Sequence[str] | None = None,
     ) -> WecomAction:
         """持久化业务动作并在同一事务中登记待发送卡片通知。
 
         参数：actor_user_id、动作类型、服务端目标、预期 action key 和白名单 context
         共同冻结业务事实；
-        title/description 为卡片展示摘要；source_message_id 为可选的已持久化来源消息。
+        title/description 为卡片展示摘要；source_message_id 为可选的已持久化来源消息；
+        preview_markdown_chunks 为卡片前发送的完整 Markdown 明细分片。
         返回值：已持久化的动作副本。
         异常：能力未就绪、动作参数非法或销售未授权时抛出 ValueError/PermissionError。
         副作用：新增 WecomAction 与 NotificationRecord，但不直接调用企业微信。
@@ -441,9 +450,16 @@ class WecomActionService:
                 session.expunge(existing)
                 return existing
             # 事务提交前先把完整卡片 body 固化；通知重试只重发卡片，不重建 action。
+            markdown_chunks = tuple(preview_markdown_chunks or ())
             if preview_fields is not None:
+                # 单条确认沿用既有完整快照 Markdown；批量候选由调用方提供按候选边界分片的内容。
+                markdown_chunks = (build_preview_markdown(preview_fields),)
+            preview_created_at = utc_now()
+            for chunk_index, markdown in enumerate(markdown_chunks):
+                if not isinstance(markdown, str) or not markdown:
+                    raise ValueError("动作 Markdown 明细不能为空")
                 preview_notification_key = hashlib.sha256(
-                    f"wecom_action_preview:{action_id}".encode()
+                    f"wecom_action_preview:{action_id}:{chunk_index}".encode()
                 ).hexdigest()
                 session.add(
                     NotificationRecord(
@@ -454,10 +470,10 @@ class WecomActionService:
                         content="提交前字段明细",
                         payload={
                             "msgtype": "markdown",
-                            "markdown": {
-                                "content": build_preview_markdown(preview_fields)
-                            },
+                            "markdown": {"content": markdown},
                         },
+                        # 显式微调同一页分片时间，出站 sender 可保持候选顺序且无需 migration。
+                        created_at=preview_created_at + timedelta(microseconds=chunk_index),
                     )
                 )
             notification_key = hashlib.sha256(f"wecom_action_card:{action_id}".encode()).hexdigest()
@@ -603,7 +619,7 @@ class WecomActionService:
                     action.task_id,
                     action.id,
                     action.result_summary or "该操作已受理，业务动作不会重复执行",
-                    True,
+                    False,
                 )
 
             if action.action_type in {
@@ -1026,6 +1042,38 @@ class WecomActionService:
                 },
             )
 
+    def record_callback_transport_success(self, provider_msgid: str) -> None:
+        """保存 callback card update 成功证据，不改变已认领的业务动作。
+
+        参数：provider_msgid 为已保存的 callback transport id。
+        返回值：无。
+        异常：数据库错误传播；不会保存原始 callback payload。
+        副作用：更新 delivery 的 callback_card_update 成功状态与时间证据。
+        """
+
+        with self._session_factory.begin() as session:
+            delivery = session.scalar(
+                select(WecomCallbackDelivery)
+                .where(WecomCallbackDelivery.provider_msgid == provider_msgid)
+                .with_for_update()
+            )
+            if delivery is None:
+                return
+            delivery.transport_stage = "callback_card_update"
+            delivery.transport_status = "succeeded"
+            delivery.transport_failure_code = None
+            delivery.transport_failure_summary = None
+            delivery.transport_failed_at = None
+            # 现有 processed_at 是 callback delivery 的最后处理时间，作为 updated_at 证据复用。
+            delivery.processed_at = utc_now()
+            logger.info(
+                "wecom_callback_card_update_succeeded",
+                extra={
+                    "action_id": delivery.action_id,
+                    "event": "callback_card_update_succeeded",
+                },
+            )
+
     def reconcile_field_confirmation(
         self,
         action_id: str,
@@ -1210,6 +1258,7 @@ class WecomActionService:
         request_message_id: str,
         command_text: str,
         candidates: tuple[dict[str, str], ...],
+        preview_markdown_chunks: Sequence[str] | None = None,
         page: int = 1,
         page_count: int = 1,
     ) -> WecomAction:
@@ -1217,6 +1266,7 @@ class WecomActionService:
 
         参数：actor_user_id 为销售身份；request_message_id 为命令消息；command_text 为固定命令；
         candidates 仅含服务端线索标识和展示名称。
+        preview_markdown_chunks 为同一页 Smart Table 快照的完整 Markdown 分片。
         返回值：已持久化的候选选择动作。
         异常：候选数据、卡片能力或权限不满足时抛出异常。
         副作用：写入动作、卡片通知和发送 outbox，不调用 CRM。
@@ -1249,6 +1299,7 @@ class WecomActionService:
                 + (f"（第 {page}/{page_count} 批）" if page_count > 1 else "")
             ),
             source_message_id=request_message_id,
+            preview_markdown_chunks=preview_markdown_chunks,
         )
 
     def issue_company_submission_confirmation_action(
@@ -1430,7 +1481,8 @@ class WecomActionService:
             action.processed_at = utc_now()
             action.processing_lease_expires_at = None
             action.result_code = result_code
-            action.result_summary = result_summary
+            # action.result_summary 只保存短摘要；逐条明细由同一事务拆成幂等通知发送。
+            action.result_summary = _split_result_notifications(result_summary)[0][:256]
             outbox.status = outbox_status
             outbox.processing_started_at = None
             outbox.processing_lease_expires_at = None
@@ -1459,24 +1511,25 @@ class WecomActionService:
         参数：session 为当前事务，action 为动作，summary 为脱敏摘要。
         返回值：无。
         异常：数据库写入错误向调用方传播。
-        副作用：最多创建一条幂等的最终通知记录。
+        副作用：按完整结果边界创建一组幂等的最终通知记录。
         """
 
-        key = hashlib.sha256(f"wecom_action_result:{action.id}".encode()).hexdigest()
-        if session.get(NotificationRecord, key) is not None:
-            return
         source_message_id = action.context.get("request_message_id")
-        session.add(
-            NotificationRecord(
-                notification_key=key,
-                sales_user_id=action.bound_actor_wecom_user_id,
-                source_message_id=(
-                    source_message_id if isinstance(source_message_id, str) else action.id
-                ),
-                notification_type="wecom_action_result",
-                content=summary,
+        for index, content in enumerate(_split_result_notifications(summary)):
+            key = hashlib.sha256(f"wecom_action_result:{action.id}:{index}".encode()).hexdigest()
+            if session.get(NotificationRecord, key) is not None:
+                continue
+            session.add(
+                NotificationRecord(
+                    notification_key=key,
+                    sales_user_id=action.bound_actor_wecom_user_id,
+                    source_message_id=(
+                        source_message_id if isinstance(source_message_id, str) else action.id
+                    ),
+                    notification_type="wecom_action_result",
+                    content=content,
+                )
             )
-        )
 
     @staticmethod
     def _validate_action_definition(
@@ -1606,10 +1659,11 @@ def build_action_card(
             "option_list": [
                 {
                     "id": item["lead_id"],
-                    "text": str(item.get("display_text") or item["company_name"])[:64],
+                    # 完整字段已经在前置 Markdown 展示，checkbox 只保留页内序号和公司短名。
+                    "text": f"{index}. {str(item['company_name'])[:56]}",
                     "is_checked": False,
                 }
-                for item in options
+                for index, item in enumerate(options, start=1)
                 if isinstance(item, dict)
                 and isinstance(item.get("lead_id"), str)
                 and isinstance(item.get("company_name"), str)
@@ -1827,6 +1881,134 @@ def build_preview_markdown(preview_fields: Mapping[str, object]) -> str:
             lines.append(f"- {rendered_name}：{rendered_value}")
     lines.append("\n请核对以上全部字段后，点击下方确认卡片提交。")
     return "\n".join(lines)
+
+
+def build_batch_submission_markdown(
+    candidates: Sequence[Mapping[str, object]], *, page: int, page_count: int
+) -> tuple[str, ...]:
+    """构造按候选边界分页的批量提交 Markdown 明细。
+
+    参数：candidates 为同一页冻结顺序的候选快照；page/page_count 为页码信息。
+    返回值：按安全字节长度切分的 Markdown 消息元组，每条消息都只包含完整候选。
+    异常：页码、公司名称或候选快照结构非法时抛出 ValueError。
+    副作用：无，不写数据库、不调用企业微信。
+    """
+
+    if page < 1 or page_count < page or not candidates:
+        raise ValueError("批量候选 Markdown 分页参数非法")
+    ordered_fields = (
+        "业务线",
+        "线索名称",
+        "线索来源",
+        "联系人",
+        "职务",
+        "沟通方式",
+        "手机",
+        "电话",
+        "邮箱",
+        "客户行业",
+        "客户级别",
+        "工艺",
+        "下次联系时间",
+        "备注",
+        "AI待确认",
+    )
+    blocks: list[str] = []
+    for index, candidate_data in enumerate(candidates, start=1):
+        company_name = candidate_data.get("company_name")
+        display_text = candidate_data.get("display_text")
+        if not isinstance(company_name, str) or not company_name:
+            raise ValueError("批量候选缺少公司名称")
+        label = display_text if isinstance(display_text, str) and display_text else company_name
+        fields = candidate_data.get("field_values")
+        if not isinstance(fields, Mapping):
+            fields = {}
+        field_lines: list[str] = []
+        seen_fields: set[str] = set()
+        # 先按 CRM 业务字段固定顺序展示，再补充 Smart Table 快照中的其它字段。
+        for field_name in (*ordered_fields, *fields.keys()):
+            if not isinstance(field_name, str) or field_name in seen_fields:
+                continue
+            value = fields.get(field_name)
+            if field_name not in fields:
+                continue
+            seen_fields.add(field_name)
+            field_lines.append(
+                f"- {_escape_markdown(field_name)}："
+                f"{_escape_markdown(_preview_card_value(value))}"
+            )
+        blocks.append(
+            "\n".join(
+                [
+                    f"【{index}】{_escape_markdown(label)}",
+                    *field_lines,
+                ]
+            )
+        )
+
+    header = f"**待提交线索明细（第 {page}/{page_count} 页）**"
+    chunks: list[str] = []
+    current = header
+    for block in blocks:
+        candidate = f"{current}\n\n{block}"
+        if len(candidate.encode("utf-8")) > _MAX_MARKDOWN_BYTES and current != header:
+            chunks.append(current)
+            current = f"{header}\n\n{block}"
+        else:
+            current = candidate
+    chunks.append(current)
+    return tuple(chunks)
+
+
+def _split_result_notifications(summary: str) -> tuple[str, ...]:
+    """按完整 Markdown 行拆分过长的最终结果通知，避免截断单条线索结果。
+
+    参数：summary 为已脱敏的最终结果 Markdown。
+    返回值：不超过通知安全长度的消息元组；含批量明细时保留 overview 和 item 边界。
+    异常：无。
+    副作用：无，不修改输入文本或持久化状态。
+    """
+
+    if len(summary) <= 480:
+        return (summary,)
+    overview, separator, detail_text = summary.partition("\n\n明细：\n")
+    if not separator:
+        return _split_markdown_lines(summary)
+    chunks = [overview]
+    current = "明细："
+    for line in detail_text.splitlines():
+        candidate = f"{current}\n{line}"
+        if len(candidate) > 480 and current != "明细：":
+            chunks.append(current)
+            current = f"明细：\n{line}"
+        else:
+            current = candidate
+    if current != "明细：":
+        chunks.append(current)
+    return tuple(chunks)
+
+
+def _split_markdown_lines(summary: str) -> tuple[str, ...]:
+    """按换行边界拆分没有显式明细分隔符的兼容结果文本。
+
+    参数：summary 为兼容旧动作的纯 Markdown 文本。
+    返回值：按完整换行边界切分的消息元组。
+    异常：无。
+    副作用：无。
+    """
+
+    chunks: list[str] = []
+    current = ""
+    for line in summary.splitlines():
+        candidate = line if not current else f"{current}\n{line}"
+        if len(candidate) > 480 and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return tuple(chunks) or (summary,)
 
 
 def _escape_markdown(value: str) -> str:
@@ -2095,7 +2277,25 @@ class DeterministicWecomActionExecutor:
                 request_message_id=request_message_id,
                 duplicates=result.duplicate_confirmations,
             )
-        return "crm_batch_submission_completed", format_submission_reply(result)
+        candidate_leads = action.context.get("candidate_leads")
+        labels: dict[str, str] = {}
+        if isinstance(candidate_leads, list):
+            # 最终名称只来自服务端冻结候选，绝不读取 callback 注入的展示文本。
+            for candidate in candidate_leads:
+                if not isinstance(candidate, dict):
+                    continue
+                lead_id = candidate.get("lead_id")
+                company_name = candidate.get("company_name")
+                display_text = candidate.get("display_text")
+                if not isinstance(lead_id, str) or not isinstance(company_name, str):
+                    continue
+                labels[lead_id] = (
+                    display_text if isinstance(display_text, str) and display_text else company_name
+                )
+        return (
+            "crm_batch_submission_completed",
+            format_submission_reply(result, lead_labels=labels, selected_count=len(selected)),
+        )
 
     def _confirm_company_submission(self, action: ActionSnapshot) -> tuple[str, str]:
         """重读智能表格后复用 CRM 提交服务执行单条公司线索提交。"""

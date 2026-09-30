@@ -64,6 +64,7 @@ class WecomOutboundNotificationSender:
                         ),
                     ),
                 )
+                .order_by(NotificationRecord.created_at, NotificationRecord.notification_key)
             ).all()
         sent = 0
         for notice in notices:
