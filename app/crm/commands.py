@@ -227,7 +227,7 @@ def consume_submission_command(
         return reply
     if crm_adapter is None:
         raise ValueError("批量 CRM 命令缺少 CRM Adapter")
-    if command.text in {"提交我所有线索", "帮我提交放弃提交的线索"}:
+    if command.text in {"提交今天的线索", "提交我所有线索", "帮我提交放弃提交的线索"}:
         try:
             reply = prepare_batch_submission_selection(
                 session_factory, smart_table_adapter, crm_adapter, command
@@ -428,7 +428,7 @@ def prepare_company_submission_preview(
                 select(Lead).where(
                     Lead.smart_table_record_id.in_(record_ids),
                     Lead.smart_table_owner_user_id == command.sales_user_id,
-                    Lead.lifecycle_state == "pending_create",
+                    Lead.lifecycle_state.in_(("pending_create", "temporary")),
                 )
             )
         )
@@ -548,7 +548,7 @@ def _link_existing_smart_table_record(
     if existing is not None:
         if (
             existing.smart_table_owner_user_id == command.sales_user_id
-            and existing.lifecycle_state == "pending_create"
+            and existing.lifecycle_state in {"pending_create", "temporary"}
         ):
             return existing
         return None

@@ -46,6 +46,7 @@ services:
       Authorization: ${Authorization:-}
       CRM_AUTHORIZATION: ${CRM_AUTHORIZATION:-}
       CRM_HTTP_TRUST_ENV: ${CRM_HTTP_TRUST_ENV:-true}
+      CRM_HTTP_PROXY: ${CRM_HTTP_PROXY:-}
       EMPLOYEE_DIRECTORY_PATH: ${EMPLOYEE_DIRECTORY_PATH:-/app/employee.csv}
       TYC_PROVIDER: ${TYC_PROVIDER:-unconfigured}
       TIANYANCHA_API_KEY: ${TIANYANCHA_API_KEY:-}

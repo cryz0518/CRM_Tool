@@ -537,6 +537,108 @@ def test_targeted_company_submission_reuses_service_for_one_lead(
         assert session.get(Lead, target_id).lifecycle_state == "synced"  # type: ignore[union-attr]
 
 
+def test_targeted_company_submission_accepts_complete_temporary_lead(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证单条确认卡的 temporary 目标按当前完整快照进入 CRM 查重。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    target_id = _lead(session_factory, adapter)
+    with session_factory.begin() as session:
+        lead = session.get(Lead, target_id)
+        assert lead is not None
+        lead.lifecycle_state = "temporary"
+    crm = MockCRMAdapter()
+
+    result = CrmSubmissionService(session_factory, adapter, crm).submit(
+        SubmissionCommand(
+            "提交指定线索",
+            "sales-1",
+            "temporary-target-message",
+            target_lead_id=target_id,
+        )
+    )
+
+    assert result.succeeded == 1
+    assert crm.search_calls == 1
+    assert crm.calls == 1
+
+
+def test_targeted_temporary_lead_reports_missing_required_fields_before_crm(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证临时线索缺少 CRM 必填项时给出缺项，不提前返回空原因。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    target_id = _lead(session_factory, adapter)
+    with session_factory.begin() as session:
+        lead = session.get(Lead, target_id)
+        assert lead is not None and lead.smart_table_record_id is not None
+        lead.lifecycle_state = "temporary"
+        record_id = lead.smart_table_record_id
+    adapter.update_record(record_id, {"职务": ""})
+    crm = MockCRMAdapter()
+
+    result = CrmSubmissionService(session_factory, adapter, crm).submit(
+        SubmissionCommand(
+            "提交指定线索",
+            "sales-1",
+            "temporary-incomplete-message",
+            target_lead_id=target_id,
+        )
+    )
+
+    assert result.incomplete == 1
+    assert "职务" in result.incomplete_missing_fields
+    assert crm.search_calls == 0
+    assert crm.calls == 0
+
+
+def test_today_submission_rejects_temporary_lead_at_card_and_callback(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证“今天”只允许当日 pending_create，回调不能把 temporary 重新放行。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.lifecycle_state = "temporary"
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+
+    candidates = service.list_submission_candidates("提交今天的线索", "sales-1")
+    result = service.submit_selected(
+        SubmissionCommand("提交今天的线索", "sales-1", "today-temporary-message"),
+        (lead_id,),
+    )
+
+    assert candidates == ()
+    assert result.succeeded == 0
+    assert result.incomplete == 0
+    assert crm.search_calls == 0
+    assert crm.calls == 0
+
+
+def test_today_submission_processes_only_card_selected_candidate(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证“今天”通过服务端候选卡选择后才执行 CRM 查重和创建。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+
+    candidates = service.list_submission_candidates("提交今天的线索", "sales-1")
+    result = service.submit_selected(
+        SubmissionCommand("提交今天的线索", "sales-1", "today-selected-message"),
+        (candidates[0].lead_id,),
+    )
+
+    assert tuple(item.lead_id for item in candidates) == (lead_id,)
+    assert result.succeeded == 1
+    assert crm.search_calls == 1
+    assert crm.calls == 1
+
+
 def test_company_preview_exactly_matches_table_and_does_not_call_crm(
     session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -819,6 +921,100 @@ def test_company_preview_links_existing_owner_record_into_local_lead(
     assert lead.smart_table_owner_user_id == "sales-1"
     assert lead.lifecycle_state == "pending_create"
     assert audit is not None
+
+
+def test_company_preview_keeps_temporary_owner_record_available(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证临时状态的本人表格线索仍能发行单条提交确认卡。"""
+    import app.crm.commands as crm_commands
+
+    settings = get_settings().model_copy(
+        update={
+            "wecom_card_callback_enabled": True,
+            "wecom_card_transport_configured": True,
+            "wecom_card_callback_handler_configured": True,
+        }
+    )
+    monkeypatch.setattr(crm_commands, "get_settings", lambda: settings)
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    record = adapter.create_record(
+        {"负责人": "sales-1", "线索名称": "临时状态线索"},
+        actor=SmartTableActor.ROBOT,
+    )
+    with session_factory.begin() as session:
+        session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
+        session.add(
+            Lead(
+                id="temporary-preview-lead",
+                source_message_id=None,
+                original_capturing_sales_user_id="sales-1",
+                smart_table_owner_user_id="sales-1",
+                smart_table_record_id=record.record_id,
+                lifecycle_state="temporary",
+                field_values={"线索名称": "临时状态线索"},
+            )
+        )
+
+    reply = prepare_company_submission_preview(
+        session_factory,
+        adapter,
+        SubmissionCommand("请帮我提交临时状态线索这条线索", "sales-1", "temporary-preview-message"),
+        "临时状态线索",
+    )
+
+    assert "确认卡" in reply
+    with session_factory() as session:
+        action = session.scalar(select(WecomAction))
+    assert action is not None and action.target_id == "temporary-preview-lead"
+
+
+def test_today_submission_issues_selection_card_without_crm_call(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证“提交今天”只发行候选卡，发卡阶段不调用 CRM。"""
+    import app.crm.commands as crm_commands
+
+    settings = get_settings().model_copy(
+        update={
+            "wecom_card_callback_enabled": True,
+            "wecom_card_transport_configured": True,
+            "wecom_card_callback_handler_configured": True,
+        }
+    )
+    monkeypatch.setattr(crm_commands, "get_settings", lambda: settings)
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    record = adapter.create_record(
+        {"负责人": "sales-1", "线索名称": "今天的表格线索", "提交状态": "未提交"},
+        actor=SmartTableActor.ROBOT,
+    )
+    with session_factory.begin() as session:
+        session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
+        session.add(
+            Lead(
+                id="today-card-lead",
+                source_message_id=None,
+                original_capturing_sales_user_id="sales-1",
+                smart_table_owner_user_id="sales-1",
+                smart_table_record_id=record.record_id,
+                lifecycle_state="pending_create",
+                field_values={"线索名称": "今天的表格线索"},
+            )
+        )
+    crm = MockCRMAdapter()
+
+    reply = prepare_batch_submission_selection(
+        session_factory,
+        adapter,
+        crm,
+        SubmissionCommand("提交今天的线索", "sales-1", "today-card-message"),
+    )
+
+    assert "候选卡" in reply
+    assert crm.calls == 0
+    with session_factory() as session:
+        action = session.scalar(select(WecomAction))
+    assert action is not None and action.context["command_text"] == "提交今天的线索"
 
 
 def test_batch_selection_links_unsubmitted_table_record_missing_local_lead(
@@ -1873,16 +2069,17 @@ def test_long_message_id_uses_bounded_notification_key() -> None:
     assert len(notification_key_for_message("m" * 128)) == 64
 
 
-def test_replayed_command_restores_persisted_success_to_notification_summary(
+def test_replayed_today_command_does_not_bypass_selection_card(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证通知入库前中断后，命令恢复仍汇总原 CRM 成功事实。"""
+    """验证“今天”命令重放时仍保持候选卡边界，不直接重放 CRM 写入。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter)
     crm = MockCRMAdapter()
     CrmSubmissionService(session_factory, adapter, crm).submit(
         SubmissionCommand("提交今天的线索", "sales-1", "message-12")
     )
+    crm.calls = 0
     with session_factory.begin() as session:
         message = session.get(IncomingMessage, "message-12")
         assert message is not None
@@ -1898,7 +2095,8 @@ def test_replayed_command_restores_persisted_success_to_notification_summary(
         session.flush()
         event_id = event.id
     reply = consume_submission_command(session_factory, adapter, crm, event_id)
-    assert "创建成功 1 条" in reply
+    assert "没有可提交的未提交线索" in reply
+    assert crm.calls == 0
     with session_factory() as session:
         assert (
             session.get(NotificationRecord, notification_key_for_message("message-12")) is not None
@@ -1940,8 +2138,8 @@ def test_mapping_missing_reply_does_not_double_count_generic_terminal_failure(
 
     reply = consume_submission_command(session_factory, adapter, MockCRMAdapter(), event_id)
 
-    assert "CRM 用户映射缺失 1 条" in reply
-    assert "需人工处理失败 0 条" in reply
+    assert "候选线索已找到" in reply
+    assert "卡片能力未就绪" in reply
 
 
 def test_terminal_command_failure_persists_notification_before_terminal_status(
@@ -1964,11 +2162,13 @@ def test_terminal_command_failure_persists_notification_before_terminal_status(
         session.flush()
         event_id = event.id
 
-    def broken_submit(self: object, command: object) -> object:
-        """模拟提交服务发生不可预期编排异常。"""
+    def broken_prepare(*_args: object, **_kwargs: object) -> object:
+        """模拟候选卡编排发生不可预期异常。"""
         raise RuntimeError("internal")
 
-    monkeypatch.setattr(CrmSubmissionService, "submit", broken_submit)
+    import app.crm.commands as crm_commands
+
+    monkeypatch.setattr(crm_commands, "prepare_batch_submission_selection", broken_prepare)
     consume_submission_command(session_factory, adapter, MockCRMAdapter(), event_id)
     consume_submission_command(session_factory, adapter, MockCRMAdapter(), event_id)
     with session_factory() as session:

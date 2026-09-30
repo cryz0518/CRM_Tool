@@ -244,7 +244,7 @@ class CrmSubmissionService:
                     select(Lead).where(
                         Lead.id == command.target_lead_id,
                         Lead.smart_table_owner_user_id == command.sales_user_id,
-                        Lead.lifecycle_state == "pending_create",
+                        Lead.lifecycle_state.in_(("pending_create", "temporary")),
                     )
                 )
                 target_missing = target is None
@@ -306,7 +306,7 @@ class CrmSubmissionService:
         异常：销售未授权或命令不支持时抛出 ValueError。
         副作用：读取数据库及智能表格，不修改任何状态。
         """
-        if command_text not in {_ALL_COMMAND, _ABANDONED_COMMAND}:
+        if command_text not in {_TODAY_COMMAND, _ALL_COMMAND, _ABANDONED_COMMAND}:
             raise ValueError("不支持候选卡片的 CRM 命令")
         with self._session_factory() as session:
             authorization = session.get(SalesAuthorization, sales_user_id)
@@ -335,6 +335,16 @@ class CrmSubmissionService:
                         lead.lifecycle_state != "pending_create"
                         or sync is None
                         or sync.status != "abandoned"
+                    ):
+                        continue
+                elif command_text == _TODAY_COMMAND:
+                    # “今天”也必须以候选卡冻结目标；日期和未提交状态在发卡时服务端确认。
+                    if not self._is_today_owned_candidate(lead, sales_user_id):
+                        continue
+                    if sync is not None and sync.status in {"succeeded", "abandoned"}:
+                        continue
+                    if not self._is_unsubmitted_smart_table_record(
+                        lead, snapshot=smart_table_snapshot
                     ):
                         continue
                 else:
@@ -381,7 +391,7 @@ class CrmSubmissionService:
         异常：销售未授权或命令不支持时抛出 ValueError；无效目标被安全忽略。
         副作用：对通过复核的目标调用既有首次提交流程。
         """
-        if command.text not in {_ALL_COMMAND, _ABANDONED_COMMAND}:
+        if command.text not in {_TODAY_COMMAND, _ALL_COMMAND, _ABANDONED_COMMAND}:
             raise ValueError("不支持卡片选择提交")
         selected = tuple(dict.fromkeys(selected_lead_ids))
         with self._session_factory() as session:
@@ -414,8 +424,19 @@ class CrmSubmissionService:
                         and sync.status == "abandoned"
                     ):
                         valid_ids.append(lead_id)
+                elif command.text == _TODAY_COMMAND:
+                    # “今天”候选在发行与回调时都必须仍是本人当日的 pending_create。
+                    if (
+                        self._is_today_owned_candidate(lead, command.sales_user_id)
+                        and (sync is None or sync.status not in {"succeeded", "abandoned"})
+                        and self._is_unsubmitted_smart_table_record(
+                            lead, snapshot=smart_table_snapshot
+                        )
+                    ):
+                        valid_ids.append(lead_id)
                 elif (
-                    lead.lifecycle_state in {"pending_create", "temporary"}
+                    command.text == _ALL_COMMAND
+                    and lead.lifecycle_state in {"pending_create", "temporary"}
                     and (sync is None or sync.status not in {"succeeded", "abandoned"})
                     and self._is_unsubmitted_smart_table_record(
                         lead, snapshot=smart_table_snapshot
@@ -642,13 +663,17 @@ class CrmSubmissionService:
             _ALL_COMMAND,
             _ABANDONED_COMMAND,
         } or command.target_lead_id is not None
+        # 单条确认卡已冻结唯一 Lead 目标；它可提交 temporary 草稿，但仍须通过后续字段校验。
+        allow_temporary = command.text == _ALL_COMMAND or (
+            command.text == "提交指定线索" and command.target_lead_id == lead_id
+        )
         with self._session_factory() as session:
             lead = session.get(Lead, lead_id)
             if lead is None or not self._is_create_candidate(
                 lead,
                 command.sales_user_id,
                 allow_non_today_target,
-                allow_temporary=command.text == _ALL_COMMAND,
+                allow_temporary=allow_temporary,
             ):
                 return CreateSubmissionOutcome("incomplete")
             # temporary 草稿可以展示在“所有未提交”卡片中；后续统一按八项必填字段判定，
@@ -722,7 +747,7 @@ class CrmSubmissionService:
                     current_lead,
                     command.sales_user_id,
                     allow_non_today_target,
-                    allow_temporary=command.text == _ALL_COMMAND,
+                    allow_temporary=allow_temporary,
                 )
             ):
                 return CreateSubmissionOutcome("incomplete")
@@ -786,7 +811,7 @@ class CrmSubmissionService:
                         lead,
                         command.sales_user_id,
                         allow_non_today_target,
-                        allow_temporary=command.text == _ALL_COMMAND,
+                        allow_temporary=allow_temporary,
                     )
                 ):
                     return CreateSubmissionOutcome("incomplete")
