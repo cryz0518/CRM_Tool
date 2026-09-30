@@ -679,6 +679,17 @@ class WecomActionService:
                         "候选线索中存在当前账号无权操作的记录",
                     )
                 command_text = action.context.get("command_text")
+                if command_text not in {
+                    "帮我提交放弃提交的线索",
+                    "提交今天的线索",
+                    "提交我所有线索",
+                }:
+                    return self._deny_action(
+                        action,
+                        delivery,
+                        "invalid_action_context",
+                        "候选提交动作类型无效，请重新发起",
+                    )
                 for candidate_id in candidate_ids:
                     lead = session.scalar(
                         select(Lead).where(Lead.id == candidate_id).with_for_update()
@@ -687,6 +698,11 @@ class WecomActionService:
                     current_status = latest.status if latest is not None else None
                     if command_text == "帮我提交放弃提交的线索":
                         valid_state = current_status == "abandoned"
+                        valid_lifecycle = (
+                            lead is not None and lead.lifecycle_state == "pending_create"
+                        )
+                    elif command_text == "提交今天的线索":
+                        valid_state = current_status not in {"succeeded", "abandoned"}
                         valid_lifecycle = (
                             lead is not None and lead.lifecycle_state == "pending_create"
                         )

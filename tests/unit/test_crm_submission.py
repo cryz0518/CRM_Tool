@@ -51,6 +51,7 @@ from app.smart_table.adapter import SmartTableActor
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.models import SmartTableRecord
 from app.smart_table.registry import build_required_smart_table_schema
+from tests.crm_submission_test_utils import submit_today_via_selection
 
 
 @pytest.fixture(autouse=True)
@@ -174,10 +175,10 @@ def test_create_uses_stable_lead_key_and_current_smart_table_values(
     crm = MockCRMAdapter()
     service = CrmSubmissionService(session_factory, adapter, crm)
 
-    first = service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12"))
+    first = submit_today_via_selection(service, "sales-1", "message-12")
     record_id = next(iter(adapter.get_records())).record_id
     adapter.update_record(record_id, {"手机": "13900000000"})
-    second = service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12"))
+    second = submit_today_via_selection(service, "sales-1", "message-12")
 
     assert first.succeeded == 1
     assert second.succeeded == 0
@@ -207,9 +208,9 @@ def test_all_submission_includes_historical_pending_lead(
     crm = MockCRMAdapter()
     service = CrmSubmissionService(session_factory, adapter, crm)
 
-    today_result = service.submit(
-        SubmissionCommand("提交今天的线索", "sales-1", "message-today")
-    )
+    with pytest.raises(ValueError, match="批量提交必须通过"):
+        service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-today"))
+    assert crm.search_calls == 0 and crm.calls == 0
     with pytest.raises(ValueError, match="批量提交必须通过"):
         service.submit(SubmissionCommand("提交我所有线索", "sales-1", "message-all"))
     all_result = service.submit_selected(
@@ -217,8 +218,6 @@ def test_all_submission_includes_historical_pending_lead(
         (lead_id,),
     )
 
-    assert today_result.succeeded == 0
-    assert today_result.incomplete == 0
     assert all_result.succeeded == 1
     assert crm.calls == 1
 
@@ -237,9 +236,7 @@ def test_all_submission_does_not_reopen_abandoned_sync_after_table_tampering(
     )
     service = CrmSubmissionService(session_factory, adapter, crm)
 
-    first = service.submit(
-        SubmissionCommand("提交今天的线索", "sales-1", "message-abandoned")
-    )
+    first = submit_today_via_selection(service, "sales-1", "message-abandoned")
     service.resolve_duplicate_confirmation(
         "message-abandoned", "sales-1", continue_submission=False
     )
@@ -259,7 +256,7 @@ def test_all_submission_does_not_turn_submitted_record_into_update(
     crm = MockCRMAdapter()
     service = CrmSubmissionService(session_factory, adapter, crm)
 
-    created = service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-create"))
+    created = submit_today_via_selection(service, "sales-1", "message-create")
     assert created.succeeded == 1
     record = adapter.get_records()[0]
     adapter.update_record(
@@ -289,13 +286,12 @@ def test_owner_user_id_is_converted_to_employee_name_before_crm_submit(
         "手机": "13800000000",
         "客户行业": "其他",
         "备注": "验证提交前的成员身份转换，不包含真实客户信息，内容仅用于离线测试。",
+        "提交状态": "未提交",
     }
     record = adapter.create_record(fields, actor=SmartTableActor.ROBOT)
     with session_factory.begin() as session:
         session.add(
-            SalesAuthorization(
-                wecom_user_id="wecom-owner", is_authorized=True, is_active=True
-            )
+            SalesAuthorization(wecom_user_id="wecom-owner", is_authorized=True, is_active=True)
         )
         session.add(
             IncomingMessage(
@@ -333,8 +329,10 @@ def test_owner_user_id_is_converted_to_employee_name_before_crm_submit(
     monkeypatch.setattr(adapter, "get_record", get_record_with_member_name)
     crm = MockCRMAdapter()
 
-    result = CrmSubmissionService(session_factory, adapter, crm).submit(
-        SubmissionCommand("提交今天的线索", "wecom-owner", "message-member-name")
+    result = submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, crm),
+        "wecom-owner",
+        "message-member-name",
     )
 
     assert result.succeeded == 1
@@ -359,8 +357,10 @@ def test_missing_member_display_name_rejects_opaque_owner_id(
     monkeypatch.setattr(adapter, "get_record", get_record_without_member_name)
     crm = MockCRMAdapter()
 
-    result = CrmSubmissionService(session_factory, adapter, crm).submit(
-        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+    result = submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, crm),
+        "sales-1",
+        "message-12",
     )
 
     assert result.mapping_missing == 1
@@ -402,12 +402,12 @@ def test_sop_error_category_controls_submission_failure_semantics(
         ) -> CRMCreateResult:
             """不发送外部请求，返回指定分类的错误。"""
             del payload, idempotency_key, crm_user_id
-            raise SopCRMError(
-                "sanitized CRM failure", category=category, http_status=http_status
-            )
+            raise SopCRMError("sanitized CRM failure", category=category, http_status=http_status)
 
-    result = CrmSubmissionService(session_factory, adapter, CategorizedCRM()).submit(
-        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+    result = submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, CategorizedCRM()),
+        "sales-1",
+        "message-12",
     )
 
     if expected_status == "retrying":
@@ -438,8 +438,10 @@ def test_sop_transport_during_duplicate_search_reports_retrying(
             del payload
             raise SopCRMError("sanitized transport", category="transport")
 
-    result = CrmSubmissionService(session_factory, adapter, SearchTransportCRM()).submit(
-        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+    result = submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, SearchTransportCRM()),
+        "sales-1",
+        "message-12",
     )
 
     assert result.retrying == 1
@@ -458,8 +460,10 @@ def test_tyc_unique_identity_is_sent_to_crm(
         lead.tyc_customer_id = "tyc-verified"
     crm = RecordingCRMAdapter()
 
-    result = CrmSubmissionService(session_factory, adapter, crm).submit(
-        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+    result = submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, crm),
+        "sales-1",
+        "message-12",
     )
 
     assert result.succeeded == 1
@@ -480,8 +484,10 @@ def test_tyc_ambiguous_candidate_id_never_enters_crm(
         lead.tyc_customer_id = "stale-ambiguous-id"
     crm = RecordingCRMAdapter()
 
-    result = CrmSubmissionService(session_factory, adapter, crm).submit(
-        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+    result = submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, crm),
+        "sales-1",
+        "message-12",
     )
 
     assert result.succeeded == 1
@@ -505,8 +511,10 @@ def test_salesperson_company_name_edit_drops_old_tyc_candidate_id(
     adapter.update_record(record.record_id, {"线索名称": "销售修改后的公司"})
     crm = RecordingCRMAdapter()
 
-    result = CrmSubmissionService(session_factory, adapter, crm).submit(
-        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+    result = submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, crm),
+        "sales-1",
+        "message-12",
     )
 
     assert result.succeeded == 1
@@ -590,6 +598,128 @@ def test_targeted_temporary_lead_reports_missing_required_fields_before_crm(
     assert "职务" in result.incomplete_missing_fields
     assert crm.search_calls == 0
     assert crm.calls == 0
+    with session_factory() as session:
+        lead = session.get(Lead, target_id)
+    assert lead is not None and lead.lifecycle_state == "temporary"
+
+
+def test_complete_temporary_duplicate_stop_promotes_and_allows_abandoned_resubmit(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证完整 temporary 命中重复后先晋升，再可进入 abandoned 候选。"""
+
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.lifecycle_state = "temporary"
+    crm = MockCRMAdapter(
+        search_results={"人工最终公司": (CRMSearchResult("crm-A", "crm-owner", "CRM 命中"),)}
+    )
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    command = SubmissionCommand(
+        "提交指定线索",
+        "sales-1",
+        "temporary-duplicate-stop",
+        target_lead_id=lead_id,
+    )
+
+    first = service.submit(command)
+    assert len(first.duplicate_confirmations) == 1
+    assert crm.search_calls == 1 and crm.calls == 0 and crm.update_calls == 0
+    with session_factory() as session:
+        lead = session.get(Lead, lead_id)
+        sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
+    assert lead is not None and lead.lifecycle_state == "pending_create"
+    assert sync is not None and sync.status == "awaiting_duplicate_confirmation"
+
+    stopped = service.resolve_duplicate_confirmation(
+        command.request_message_id, "sales-1", continue_submission=False
+    )
+    assert stopped.abandoned == 1
+    assert lead.smart_table_record_id is not None
+    record = adapter.get_record(lead.smart_table_record_id)
+    assert record is not None and record.fields["提交状态"] == "放弃提交"
+    with session_factory() as session:
+        lead = session.get(Lead, lead_id)
+        sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
+    assert lead is not None and lead.lifecycle_state == "pending_create"
+    assert sync is not None and sync.status == "abandoned"
+    candidates = service.list_submission_candidates("帮我提交放弃提交的线索", "sales-1")
+    assert [candidate.lead_id for candidate in candidates] == [lead_id]
+
+
+def test_complete_temporary_duplicate_continue_updates_existing_crm_identity(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证完整 temporary 的重复确认继续只更新已有 CRM identity。"""
+
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.lifecycle_state = "temporary"
+
+    class RecordingCRMAdapter(MockCRMAdapter):
+        """记录重复确认继续时服务实际传入的 CRM lead id。"""
+
+        def __init__(self) -> None:
+            """初始化 Mock CRM 和 update 目标记录。"""
+
+            super().__init__(
+                search_results={
+                    "人工最终公司": (CRMSearchResult("crm-A", "crm-owner", "CRM 命中"),)
+                }
+            )
+            self.updated_lead_ids: list[str] = []
+
+        def update_lead(
+            self,
+            crm_lead_id: str,
+            payload: Mapping[str, object],
+            *,
+            idempotency_key: str,
+            crm_user_id: str,
+        ) -> CRMCreateResult:
+            """记录 update 目标后委托给 MockCRMAdapter。"""
+
+            self.updated_lead_ids.append(crm_lead_id)
+            return super().update_lead(
+                crm_lead_id,
+                payload,
+                idempotency_key=idempotency_key,
+                crm_user_id=crm_user_id,
+            )
+
+    crm = RecordingCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    command = SubmissionCommand(
+        "提交指定线索",
+        "sales-1",
+        "temporary-duplicate-continue",
+        target_lead_id=lead_id,
+    )
+
+    first = service.submit(command)
+    assert len(first.duplicate_confirmations) == 1
+    continued = service.resolve_duplicate_confirmation(
+        command.request_message_id,
+        "sales-1",
+        continue_submission=True,
+        selected_lead_ids=(lead_id,),
+    )
+
+    assert continued.submitted == 1
+    assert crm.search_calls == 1 and crm.calls == 0 and crm.update_calls == 1
+    assert crm.updated_lead_ids == ["crm-A"]
+    assert crm.update_crm_user_ids == ["crm-1"]
+    with session_factory() as session:
+        lead = session.get(Lead, lead_id)
+        sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
+    assert lead is not None and lead.lifecycle_state == "synced"
+    assert sync is not None and sync.crm_lead_id == "crm-A" and sync.status == "succeeded"
 
 
 def test_today_submission_rejects_temporary_lead_at_card_and_callback(
@@ -685,9 +815,7 @@ def test_company_preview_exactly_matches_table_and_does_not_call_crm(
 
     monkeypatch.setattr(adapter, "find_records", find_records_with_member_names)
     with session_factory.begin() as session:
-        session.add(
-            SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True)
-        )
+        session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
         session.add(
             IncomingMessage(
                 message_id="preview-message",
@@ -756,9 +884,7 @@ def test_company_preview_contains_match_still_requires_confirmation_card(
         actor=SmartTableActor.ROBOT,
     )
     with session_factory.begin() as session:
-        session.add(
-            SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True)
-        )
+        session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
         session.add(
             IncomingMessage(
                 message_id="contains-preview-message",
@@ -782,9 +908,7 @@ def test_company_preview_contains_match_still_requires_confirmation_card(
     reply = prepare_company_submission_preview(
         session_factory,
         adapter,
-        SubmissionCommand(
-            "请帮我提交世界纵横这条线索", "sales-1", "contains-preview-message"
-        ),
+        SubmissionCommand("请帮我提交世界纵横这条线索", "sales-1", "contains-preview-message"),
         "世界纵横",
     )
 
@@ -888,9 +1012,7 @@ def test_company_preview_links_existing_owner_record_into_local_lead(
         actor=SmartTableActor.ROBOT,
     )
     with session_factory.begin() as session:
-        session.add(
-            SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True)
-        )
+        session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
         session.add(
             IncomingMessage(
                 message_id="link-existing-message",
@@ -903,9 +1025,7 @@ def test_company_preview_links_existing_owner_record_into_local_lead(
     reply = prepare_company_submission_preview(
         session_factory,
         adapter,
-        SubmissionCommand(
-            "请帮我提交已有表格线索这条线索", "sales-1", "link-existing-message"
-        ),
+        SubmissionCommand("请帮我提交已有表格线索这条线索", "sales-1", "link-existing-message"),
         "已有表格线索",
     )
 
@@ -1099,12 +1219,15 @@ def test_batch_linking_multiple_records_writes_one_audit_event(
 
     with session_factory() as session:
         assert session.scalar(select(func.count(Lead.id))) == 2
-        assert session.scalar(
-            select(func.count(BusinessAuditEvent.id)).where(
-                BusinessAuditEvent.message_id == "batch-audit-message",
-                BusinessAuditEvent.event_type == "smart_table_existing_leads_linked",
+        assert (
+            session.scalar(
+                select(func.count(BusinessAuditEvent.id)).where(
+                    BusinessAuditEvent.message_id == "batch-audit-message",
+                    BusinessAuditEvent.event_type == "smart_table_existing_leads_linked",
+                )
             )
-        ) == 1
+            == 1
+        )
 
 
 def test_batch_card_can_show_temporary_unsubmitted_lead_but_never_calls_crm(
@@ -1175,7 +1298,7 @@ def test_duplicate_crm_match_waits_for_confirmation_and_stop_marks_table_status(
             SubmissionCommand("帮我提交放弃提交的线索", "sales-1", "message-abandoned-direct")
         )
     assert crm.search_calls == 0 and crm.calls == 0
-    first = service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12"))
+    first = submit_today_via_selection(service, "sales-1", "message-12")
     stopped = service.resolve_duplicate_confirmation(
         "message-12", "sales-1", continue_submission=False
     )
@@ -1264,7 +1387,7 @@ def test_duplicate_crm_match_selected_continue_uses_update_and_marks_submitted(
         }
     )
     service = CrmSubmissionService(session_factory, adapter, crm)
-    service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12"))
+    submit_today_via_selection(service, "sales-1", "message-12")
 
     continued = service.resolve_duplicate_confirmation(
         "message-12", "sales-1", continue_submission=True, selected_lead_ids=(lead_id,)
@@ -1282,7 +1405,7 @@ def test_duplicate_crm_match_selected_continue_uses_update_and_marks_submitted(
 
 @pytest.mark.parametrize(
     "latest_status, expected_processing, expected_incomplete",
-    [("processing", 1, 0), ("succeeded", 0, 1)],
+    [("processing", 1, 0), ("succeeded", 0, 0)],
 )
 def test_latest_generation_state_never_forks_new_create_generation(
     session_factory: sessionmaker[Session],
@@ -1337,16 +1460,16 @@ def test_latest_generation_state_never_forks_new_create_generation(
                 crm_lead_id="crm-existing" if latest_status == "succeeded" else None,
                 completed_at=utc_now() if latest_status == "succeeded" else None,
                 processing_lease_expires_at=(
-                    utc_now() + timedelta(minutes=5)
-                    if latest_status == "processing"
-                    else None
+                    utc_now() + timedelta(minutes=5) if latest_status == "processing" else None
                 ),
             )
         )
 
     crm = MockCRMAdapter()
-    result = CrmSubmissionService(session_factory, adapter, crm).submit(
-        SubmissionCommand("提交今天的线索", "sales-1", "generation-retry")
+    result = submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, crm),
+        "sales-1",
+        "generation-retry",
     )
 
     assert result.processing == expected_processing
@@ -1375,9 +1498,7 @@ def test_missing_crm_mapping_creates_auditable_terminal_record_without_calling_c
         session_factory, adapter, crm, employee_directory=EmployeeDirectory(settings_path)
     )
 
-    result = service.submit(
-        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
-    )
+    result = submit_today_via_selection(service, "sales-1", "message-12")
 
     assert result.mapping_missing == 1
     assert crm.calls == 0
@@ -1396,9 +1517,13 @@ def test_missing_crm_mapping_creates_auditable_terminal_record_without_calling_c
     with session_factory.begin() as session:
         settings_path.write_text("id,name,nickname\ncrm-1,sales-1,sales-1\n", encoding="utf-8")
 
-    recovered = CrmSubmissionService(
-        session_factory, adapter, crm, employee_directory=EmployeeDirectory(settings_path)
-    ).submit(SubmissionCommand("提交今天的线索", "sales-1", "message-13"))
+    recovered = submit_today_via_selection(
+        CrmSubmissionService(
+            session_factory, adapter, crm, employee_directory=EmployeeDirectory(settings_path)
+        ),
+        "sales-1",
+        "message-13",
+    )
 
     assert recovered.succeeded == 1
     assert crm.calls == 1
@@ -1420,7 +1545,7 @@ def test_mapping_missing_audit_key_is_bounded_for_a_maximum_length_message_id(
         employee_directory=EmployeeDirectory(settings_path),
     )
 
-    result = service.submit(SubmissionCommand("提交今天的线索", "sales-1", "m" * 128))
+    result = submit_today_via_selection(service, "sales-1", "m" * 128)
 
     assert result.mapping_missing == 1
     with session_factory() as session:
@@ -1440,7 +1565,7 @@ def test_ai_pending_confirmation_does_not_block_when_core_values_present(
     crm = MockCRMAdapter()
     service = CrmSubmissionService(session_factory, adapter, crm)
 
-    first = service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12"))
+    first = submit_today_via_selection(service, "sales-1", "message-12")
     assert first.succeeded == 1
     assert crm.calls == 1
 
@@ -1458,9 +1583,9 @@ def test_ai_pending_confirmation_does_not_block_when_core_values_present(
             )
         )
         session.query(CrmSyncRecord).delete()
-    adapter.update_record(record_id, {"AI待确认": ["手机"]})
+    adapter.update_record(record_id, {"AI待确认": ["手机"], "提交状态": "未提交"})
 
-    second = service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12"))
+    second = submit_today_via_selection(service, "sales-1", "message-12")
     assert second.incomplete == 0
     assert len(second.duplicate_confirmations) == 1
     assert crm.calls == 1
@@ -1486,18 +1611,14 @@ def test_transport_retry_reuses_frozen_payload_and_key_after_table_edit(
         return original(payload, idempotency_key=idempotency_key, crm_user_id=crm_user_id)  # type: ignore[arg-type]
 
     monkeypatch.setattr(crm, "create_lead", timeout_once)
-    assert (
-        service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12")).retrying == 1
-    )
+    assert submit_today_via_selection(service, "sales-1", "message-12").retrying == 1
     with session_factory.begin() as session:
         authorization = session.get(SalesAuthorization, "sales-1")
         assert authorization is not None
         authorization.crm_user_id = "crm-2"
     record_id = next(iter(adapter.get_records())).record_id
     adapter.update_record(record_id, {"手机": "13900000000"})
-    assert (
-        service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12")).succeeded == 1
-    )
+    assert submit_today_via_selection(service, "sales-1", "message-12").succeeded == 1
     with session_factory() as session:
         sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
     assert sync is not None
@@ -1516,20 +1637,16 @@ def test_unknown_crm_failure_does_not_finalize_discard_request(
     class UnknownCRM(MockCRMAdapter):
         """模拟无法判定远端是否已提交的未知 CRM 调用结果。"""
 
-        def create_lead(
-            self, payload: object, *, idempotency_key: str, crm_user_id: str
-        ) -> object:
+        def create_lead(self, payload: object, *, idempotency_key: str, crm_user_id: str) -> object:
             """抛出未分类异常，表示响应边界发生未知故障。"""
             raise RuntimeError("unknown remote outcome")
 
     crm = UnknownCRM()
     service = CrmSubmissionService(session_factory, adapter, crm)
-    result = service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12"))
+    result = submit_today_via_selection(service, "sales-1", "message-12")
 
     assert result.failed_pending_review == 1
-    discard = LeadDiscardService(session_factory).discard(
-        lead_id, "sales-1", "等待核实 CRM 结果"
-    )
+    discard = LeadDiscardService(session_factory).discard(lead_id, "sales-1", "等待核实 CRM 结果")
     assert discard.status is LeadDiscardStatus.WAITING_FOR_CRM
     with session_factory() as session:
         lead = session.get(Lead, lead_id)
@@ -1672,22 +1789,35 @@ def test_expired_create_lease_recovers_remote_success_with_original_frozen_fact(
     }
     with session_factory.begin() as session:
         sync = CrmSyncRecord(
-            lead_id=lead_id, operation="create", generation=1, smart_table_record_id=record_id,
-            idempotency_key=f"crm:create:{lead_id}", canonical_payload=frozen,
-            snapshot_hash="a" * 64, request_message_id="message-12",
-            submitting_sales_user_id="sales-1", submitting_crm_user_id="crm-1",
-            status="processing", processing_lease_expires_at=utc_now() - timedelta(seconds=1),
+            lead_id=lead_id,
+            operation="create",
+            generation=1,
+            smart_table_record_id=record_id,
+            idempotency_key=f"crm:create:{lead_id}",
+            canonical_payload=frozen,
+            snapshot_hash="a" * 64,
+            request_message_id="message-12",
+            submitting_sales_user_id="sales-1",
+            submitting_crm_user_id="crm-1",
+            status="processing",
+            processing_lease_expires_at=utc_now() - timedelta(seconds=1),
         )
         session.add(sync)
         session.flush()
-        session.add(CrmCompanyIdentity(
-            standard_company_name="人工最终公司", state="reserving", creating_lead_id=lead_id,
-            creating_sync_record_id=sync.id,
-        ))
+        session.add(
+            CrmCompanyIdentity(
+                standard_company_name="人工最终公司",
+                state="reserving",
+                creating_lead_id=lead_id,
+                creating_sync_record_id=sync.id,
+            )
+        )
     monkeypatch.setattr(adapter, "update_record", lambda *_args, **_kwargs: None)
     recovered = MockCRMAdapter()
-    result = CrmSubmissionService(session_factory, adapter, recovered).submit(
-        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+    result = submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, recovered),
+        "sales-1",
+        "message-12",
     )
     assert result.succeeded == 1 and recovered.calls == 1 and recovered.payloads == [frozen]
     with session_factory() as session:
@@ -1707,8 +1837,10 @@ def test_t13_audit_and_logs_keep_identity_metadata_without_sensitive_payload(
     _lead(session_factory, adapter)
     crm = MockCRMAdapter()
     with caplog.at_level(logging.INFO, logger="app.crm.service"):
-        result = CrmSubmissionService(session_factory, adapter, crm).submit(
-            SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+        result = submit_today_via_selection(
+            CrmSubmissionService(session_factory, adapter, crm),
+            "sales-1",
+            "message-12",
         )
     assert result.succeeded == 1
     with session_factory() as session:
@@ -1738,9 +1870,7 @@ def test_update_uses_current_table_values_once_and_skips_equal_snapshot(
     _lead(session_factory, adapter)
     crm = MockCRMAdapter()
     service = CrmSubmissionService(session_factory, adapter, crm)
-    assert (
-        service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12")).succeeded == 1
-    )
+    assert submit_today_via_selection(service, "sales-1", "message-12").succeeded == 1
     record_id = next(iter(adapter.get_records())).record_id
     adapter.update_record(record_id, {"手机": "13900000000", "AI待确认": ["客户行业"]})
 
@@ -1765,7 +1895,7 @@ def test_update_mapping_missing_keeps_pending_update_until_a_later_submit(
     lead_id = _lead(session_factory, adapter)
     crm = MockCRMAdapter()
     service = CrmSubmissionService(session_factory, adapter, crm)
-    assert service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12")).succeeded
+    assert submit_today_via_selection(service, "sales-1", "message-12").succeeded
     adapter.update_record(next(iter(adapter.get_records())).record_id, {"手机": "13900000000"})
     settings_path = employee_directory_for_crm_submission_tests
     settings_path.write_text("id,name,nickname\ncrm-2,其他销售,其他\n", encoding="utf-8")
@@ -1805,7 +1935,7 @@ def test_update_company_identity_change_enters_review_without_crm_call(
     lead_id = _lead(session_factory, adapter)
     crm = MockCRMAdapter()
     service = CrmSubmissionService(session_factory, adapter, crm)
-    service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12"))
+    submit_today_via_selection(service, "sales-1", "message-12")
     adapter.update_record(next(iter(adapter.get_records())).record_id, {"线索名称": "新公司"})
 
     result = service.submit(SubmissionCommand("提交我的更新", "sales-1", "message-13"))
@@ -1821,8 +1951,13 @@ def test_update_company_identity_change_enters_review_without_crm_call(
             )
         )
     assert audit is not None
-    assert {"old_standard_company_name", "new_candidate_company_name", "lead_id",
-            "smart_table_record_id", "smart_table_owner_user_id"} <= set(audit.details)
+    assert {
+        "old_standard_company_name",
+        "new_candidate_company_name",
+        "lead_id",
+        "smart_table_record_id",
+        "smart_table_owner_user_id",
+    } <= set(audit.details)
 
 
 def test_historical_company_identity_does_not_bypass_crm_duplicate_search(
@@ -1861,8 +1996,10 @@ def test_historical_company_identity_does_not_bypass_crm_duplicate_search(
                 )
             )
 
-    result = CrmSubmissionService(session_factory, adapter, crm).submit(
-        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+    result = submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, crm),
+        "sales-1",
+        "message-12",
     )
 
     assert len(result.duplicate_confirmations) == 1
@@ -1900,8 +2037,10 @@ def test_active_company_identity_only_validates_current_crm_duplicate(
             )
         )
 
-    result = CrmSubmissionService(session_factory, adapter, crm).submit(
-        SubmissionCommand("提交今天的线索", "sales-1", "active-identity-check")
+    result = submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, crm),
+        "sales-1",
+        "active-identity-check",
     )
 
     assert crm.search_calls == 1
@@ -1949,8 +2088,10 @@ def test_identical_historical_company_identity_does_not_bypass_crm_create_search
                 )
             )
 
-    result = CrmSubmissionService(session_factory, adapter, crm).submit(
-        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+    result = submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, crm),
+        "sales-1",
+        "message-12",
     )
 
     assert result.succeeded == 1
@@ -1970,10 +2111,7 @@ def test_retrying_update_does_not_read_changed_smart_table_before_frozen_retry(
     _lead(session_factory, adapter)
     crm = MockCRMAdapter()
     service = CrmSubmissionService(session_factory, adapter, crm)
-    assert (
-        service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12")).succeeded
-        == 1
-    )
+    assert submit_today_via_selection(service, "sales-1", "message-12").succeeded == 1
     record_id = next(iter(adapter.get_records())).record_id
     adapter.update_record(record_id, {"手机": "13900000000"})
     original_update = crm.update_lead
@@ -2037,25 +2175,26 @@ def test_processing_update_never_reads_table_before_lease_recovery(
     lead_id = _lead(session_factory, adapter)
     crm = MockCRMAdapter()
     service = CrmSubmissionService(session_factory, adapter, crm)
-    assert (
-        service.submit(SubmissionCommand("提交今天的线索", "sales-1", "message-12")).succeeded
-        == 1
-    )
+    assert submit_today_via_selection(service, "sales-1", "message-12").succeeded == 1
     record_id = next(iter(adapter.get_records())).record_id
     with session_factory.begin() as session:
         baseline = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
         assert baseline is not None
         session.add(
             CrmSyncRecord(
-                lead_id=lead_id, operation="update", smart_table_record_id=record_id,
-                idempotency_key="frozen-update", canonical_payload=dict(baseline.canonical_payload),
-                snapshot_hash="f" * 64, request_message_id="message-13",
-                submitting_sales_user_id="sales-1", submitting_crm_user_id="crm-1",
+                lead_id=lead_id,
+                operation="update",
+                smart_table_record_id=record_id,
+                idempotency_key="frozen-update",
+                canonical_payload=dict(baseline.canonical_payload),
+                snapshot_hash="f" * 64,
+                request_message_id="message-13",
+                submitting_sales_user_id="sales-1",
+                submitting_crm_user_id="crm-1",
                 crm_lead_id=baseline.crm_lead_id,
                 crm_lead_owner_user_id=baseline.crm_lead_owner_user_id,
                 status="processing",
-                processing_lease_expires_at=utc_now()
-                + timedelta(seconds=-1 if expired else 60),
+                processing_lease_expires_at=utc_now() + timedelta(seconds=-1 if expired else 60),
             )
         )
     monkeypatch.setattr(adapter, "get_record", lambda _: pytest.fail("不得回读 Smart Table"))
@@ -2076,8 +2215,10 @@ def test_replayed_today_command_does_not_bypass_selection_card(
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter)
     crm = MockCRMAdapter()
-    CrmSubmissionService(session_factory, adapter, crm).submit(
-        SubmissionCommand("提交今天的线索", "sales-1", "message-12")
+    submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, crm),
+        "sales-1",
+        "message-12",
     )
     crm.calls = 0
     with session_factory.begin() as session:
@@ -2116,12 +2257,17 @@ def test_mapping_missing_reply_does_not_double_count_generic_terminal_failure(
     settings_path.write_text("id,name,nickname\ncrm-2,其他销售,其他\n", encoding="utf-8")
     import app.crm.dependencies as crm_dependencies
     import app.crm.service as crm_service
-    monkeypatch.setattr(crm_service, "get_settings", lambda: get_settings().model_copy(
-        update={"employee_directory_path": str(settings_path)}
-    ))
-    monkeypatch.setattr(crm_dependencies, "get_settings", lambda: get_settings().model_copy(
-        update={"employee_directory_path": str(settings_path)}
-    ))
+
+    monkeypatch.setattr(
+        crm_service,
+        "get_settings",
+        lambda: get_settings().model_copy(update={"employee_directory_path": str(settings_path)}),
+    )
+    monkeypatch.setattr(
+        crm_dependencies,
+        "get_settings",
+        lambda: get_settings().model_copy(update={"employee_directory_path": str(settings_path)}),
+    )
     with session_factory.begin() as session:
         message = session.get(IncomingMessage, "message-12")
         assert message is not None

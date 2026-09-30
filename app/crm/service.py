@@ -217,13 +217,10 @@ class CrmSubmissionService:
         """
         if command.text == _UPDATES_COMMAND:
             return self._submit_updates(command)
-        if command.text in {_ALL_COMMAND, _ABANDONED_COMMAND}:
+        if command.text in {_TODAY_COMMAND, _ALL_COMMAND, _ABANDONED_COMMAND}:
             # 批量命令只能发行候选确认动作，不能由服务层直接触发 CRM。
             raise ValueError("批量提交必须通过服务端候选确认动作")
-        if command.text not in {
-            _TODAY_COMMAND,
-            "提交指定线索",
-        }:
+        if command.text != "提交指定线索":
             raise ValueError("不支持的 CRM 提交命令")
         if command.target_lead_id is not None and command.text != "提交指定线索":
             raise ValueError("目标线索只能用于指定线索提交命令")
@@ -751,6 +748,9 @@ class CrmSubmissionService:
                 )
             ):
                 return CreateSubmissionOutcome("incomplete")
+            if current_lead.lifecycle_state == "temporary":
+                # 临时线索通过最终快照和 CRM payload 校验后，先晋升再进入 owner/查重状态机。
+                current_lead.lifecycle_state = "pending_create"
             if self._resolve_crm_owner(current_lead) is None:
                 return CreateSubmissionOutcome(
                     self._record_mapping_missing(
