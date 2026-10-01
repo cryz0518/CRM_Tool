@@ -660,6 +660,12 @@ def test_write_cells_match_wecom_cli_134_json_string_values_contract() -> None:
         {"下次联系时间": "2026-10-03"}, schema
     )
     assert json.loads(date_only["下次联系时间"]) == "2026-10-03 00:00:00"
+    # 无法无歧义解析的自然语言日期只跳过该字段，不阻断同一增量补丁。
+    invalid_date = _adapter(FakeCli([]))._to_cli_fields(
+        {"线索名称": "公司样例", "下次联系时间": "下周联系"}, schema
+    )
+    assert json.loads(invalid_date["线索名称"]) == "公司样例"
+    assert "下次联系时间" not in invalid_date
 
 
 def test_configured_sheet_title_uses_full_query_and_parses_member_rows() -> None:

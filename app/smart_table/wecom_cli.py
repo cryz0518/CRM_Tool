@@ -836,7 +836,9 @@ class WecomCliSmartTableAdapter:
                 logger.warning("wecom_cli_location_value_skipped")
                 continue
             # 字段名称唯一由 schema 解析，业务层绝不拼接管理员维护的必填前缀。
-            converted[field.name] = self._to_cli_value(canonical_name, field, value)
+            cli_value = self._to_cli_value(canonical_name, field, value)
+            if cli_value is not None:
+                converted[field.name] = cli_value
         return converted
 
     @staticmethod
@@ -861,23 +863,26 @@ class WecomCliSmartTableAdapter:
 
     def _to_cli_value(
         self, canonical_name: str, field: SmartTableField, value: object
-    ) -> str:
+    ) -> str | None:
         """先按字段类型构造 CellValue，再序列化为 CLI map 中的字符串。
 
         参数：canonical_name 为业务规范字段名；field 为真实字段定义；value 为业务层值。
-        返回：CLI 1.3.x `values` map 所需的 JSON 序列化值。
+        返回：CLI 1.3.x `values` map 所需的 JSON 序列化值；不合法日期返回 None 并跳过该字段。
         异常：成员身份或 AI待确认选项格式不合法时抛出异常。
         副作用：无。
         """
         cli_value = value
         if field.field_type is SmartTableFieldType.DATE:
             if not isinstance(value, str):
-                raise ValueError("DATE 字段必须传入 ISO 日期或日期时间字符串")
+                logger.warning("wecom_cli_date_value_skipped")
+                return None
             try:
                 # wecom-cli 1.3.4 的 date_time 写入契约要求东八区年月日时分秒。
                 parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            except ValueError as error:
-                raise ValueError("DATE 字段格式不符合 CLI 1.3.4 契约") from error
+            except ValueError:
+                # 不猜自然语言日期；单个可选日期无效时不应阻断同批可靠字段。
+                logger.warning("wecom_cli_date_value_skipped")
+                return None
             shanghai = ZoneInfo("Asia/Shanghai")
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=shanghai)
