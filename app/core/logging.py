@@ -43,6 +43,10 @@ STRUCTURED_EXTRA_FIELDS = (
     "external_error_code",
     "external_error_type",
     "http_status",
+    "planned_fields",
+    "persisted_fields",
+    "missing_or_mismatched_fields",
+    "remote_rejected_field_candidates",
     "callback_claim_duration_ms",
     "card_update_duration_ms",
     "remaining_deadline_ms",
@@ -117,9 +121,7 @@ class JsonFormatter(logging.Formatter):
                     continue
                 # readiness 传入的 traceback 可能包含源码行，统一裁剪为安全的栈帧摘要。
                 payload[field] = (
-                    _safe_traceback_text(str(value))
-                    if field == "error_traceback"
-                    else value
+                    _safe_traceback_text(str(value)) if field == "error_traceback" else value
                 )
         if record.exc_info:
             # 保留文件、行号和异常类型，移除异常消息与源码行，防止 traceback 携带正文或凭据。
@@ -160,9 +162,7 @@ def _safe_exception_traceback(
         for frame in traceback_module.extract_tb(traceback_obj):
             # 文件路径和函数名也经过同一规则处理，避免异常栈元数据携带凭据片段。
             lines.append(
-                _redact_log_text(
-                    f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}'
-                )
+                _redact_log_text(f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}')
             )
 
     current: BaseException | None = exception

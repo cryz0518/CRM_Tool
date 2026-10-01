@@ -19,11 +19,13 @@ from app.smart_table.models import (
     SmartTableField,
     SmartTableFieldType,
     SmartTableOption,
+    SmartTableRecord,
     SmartTableSchema,
 )
 from app.smart_table.wecom_cli import (
     WecomCliProcessError,
     WecomCliSmartTableAdapter,
+    WecomCliSmartTableAdapterError,
 )
 
 
@@ -154,9 +156,7 @@ def test_canonical_fields_and_pending_options_are_mapped_to_real_schema_names() 
                             "*手机": "13800138000",
                             "*线索名称": "长广溪智造",
                             "客户行业": "机械加工",
-                            "AI待确认": [
-                                {"id": "pending-business-line", "text": "*业务线"}
-                            ],
+                            "AI待确认": [{"id": "pending-business-line", "text": "*业务线"}],
                             "创建人": [{"userId": "sales-1", "userName": "销售一"}],
                             "负责人": [{"userId": "sales-1", "userName": "销售一"}],
                         },
@@ -536,9 +536,7 @@ def test_schema_reads_pages_and_preserves_real_option_identifiers() -> None:
             },
             {
                 "errcode": 0,
-                "fields": [
-                    {"field_id": "field-2", "field_title": "负责人", "field_type": "user"}
-                ],
+                "fields": [{"field_id": "field-2", "field_title": "负责人", "field_type": "user"}],
             },
         ]
     )
@@ -568,6 +566,7 @@ def test_records_are_paginated_and_robot_writes_only_given_field_patch() -> None
             {"errcode": 0, "records": [{"record_id": "record-2", "values": {"工艺": "装配"}}]},
             {"errcode": 0, "records": [{"record_id": "record-3", "values": {"负责人": member}}]},
             {"errcode": 0, "records": [{"record_id": "record-3", "values": {"负责人": member}}]},
+            {"errcode": 0, "records": [{"record_id": "record-3", "values": {"工艺": "装配"}}]},
             {"errcode": 0, "records": [{"record_id": "record-3", "values": {"工艺": "装配"}}]},
         ]
     )
@@ -656,9 +655,7 @@ def test_write_cells_match_wecom_cli_134_json_string_values_contract() -> None:
         "负责人": [{"userId": "sales-user"}],
         "AI待确认": [{"id": "pending-id", "text": "线索名称"}],
     }
-    date_only = _adapter(FakeCli([]))._to_cli_fields(
-        {"下次联系时间": "2026-10-03"}, schema
-    )
+    date_only = _adapter(FakeCli([]))._to_cli_fields({"下次联系时间": "2026-10-03"}, schema)
     assert json.loads(date_only["下次联系时间"]) == "2026-10-03 00:00:00"
     # 无法无歧义解析的自然语言日期只跳过该字段，不阻断同一增量补丁。
     invalid_date = _adapter(FakeCli([]))._to_cli_fields(
@@ -875,6 +872,77 @@ def test_subprocess_network_error_parses_only_safe_stdout_fields(
     assert "ignored private stderr" not in caplog.text
 
 
+def test_remote_parameter_error_extracts_only_exact_schema_field_title(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """验证 640027 只输出精确匹配的规范字段名，不传播远端 errmsg。
+
+    参数：monkeypatch 替换子进程回执；caplog 捕获安全错误日志。
+    返回值：无。异常：通过 pytest 捕获受控 CLI 错误对象。
+    副作用：加载模拟 schema 并执行一次模拟非零子进程。
+    """
+    adapter = _adapter(FakeCli([_field_response()]))
+    adapter.get_schema()
+
+    def failed_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        """返回包含字段名和不得外泄数据的模拟远端错误。"""
+        return subprocess.CompletedProcess(
+            args=["wecom-cli"],
+            returncode=1,
+            stdout=(
+                '{"errcode":640027,"errmsg":"invalid 手机 for 客户甲 13800138000 private body"}'
+            ),
+            stderr="private stderr",
+        )
+
+    monkeypatch.setattr(subprocess, "run", failed_run)
+    caplog.set_level(logging.ERROR)
+
+    with pytest.raises(WecomCliProcessError) as captured:
+        adapter._run_subprocess(("wecom-cli", "--json", "{}"))
+
+    error = captured.value
+    assert error.error_code == "remote_business_error"
+    assert error.external_error_code == 640027
+    assert error.retryable is False
+    assert error.rejected_field_candidates == ("手机",)
+    formatted = JsonFormatter().format(caplog.records[-1])
+    assert json.loads(formatted)["remote_rejected_field_candidates"] == ["手机"]
+    for sensitive in ("客户甲", "13800138000", "private body", "private stderr"):
+        assert sensitive not in str(error.__dict__)
+        assert sensitive not in str(error)
+        assert sensitive not in formatted
+
+
+def test_remote_parameter_error_without_exact_title_has_no_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证非精确或未知远端描述不会被模糊映射成业务字段。
+
+    参数：monkeypatch 替换子进程回执。
+    返回值：无。异常：通过 pytest 捕获受控 CLI 错误对象。
+    副作用：加载模拟 schema 并执行一次模拟非零子进程。
+    """
+    adapter = _adapter(FakeCli([_field_response()]))
+    adapter.get_schema()
+
+    def failed_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        """返回不含完整 schema 标题的参数错误。"""
+        return subprocess.CompletedProcess(
+            args=["wecom-cli"],
+            returncode=1,
+            stdout='{"errcode":640027,"errmsg":"手机号号码字段 rejected"}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", failed_run)
+
+    with pytest.raises(WecomCliProcessError) as captured:
+        adapter._run_subprocess(("wecom-cli", "--json", "{}"))
+
+    assert captured.value.rejected_field_candidates == ()
+
+
 def test_non_json_stdout_falls_back_to_limited_stderr_classification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -911,13 +979,11 @@ def test_unclassified_nonzero_exit_is_permanent_and_not_retried(
         nonlocal subprocess_calls
         subprocess_calls += 1
         return subprocess.CompletedProcess(
-            args=["wecom-cli"], returncode=1, stdout="{\"other\":true}", stderr="unclassified"
+            args=["wecom-cli"], returncode=1, stdout='{"other":true}', stderr="unclassified"
         )
 
     monkeypatch.setattr(subprocess, "run", failed_run)
-    adapter = WecomCliSmartTableAdapter(
-        doc_id="test-doc", sheet_id="test-sheet", retry_count=1
-    )
+    adapter = WecomCliSmartTableAdapter(doc_id="test-doc", sheet_id="test-sheet", retry_count=1)
 
     with pytest.raises(WecomCliProcessError) as error:
         adapter.get_schema()
@@ -952,14 +1018,247 @@ def test_update_declares_field_title_key_type() -> None:
             _field_response(),
             {"errcode": 0, "records": [{"record_id": "record-1", "values": {}}]},
             {"errcode": 0, "records": [{"record_id": "record-1", "values": {}}]},
-            {"errcode": 0, "records": [{"record_id": "record-1", "values": {}}]},
+            {
+                "errcode": 0,
+                "records": [{"record_id": "record-1", "values": {"备注": "更新后的备注"}}],
+            },
         ]
     )
 
     _adapter(fake_cli).update_record("record-1", {"备注": "更新后的备注"})
 
-    payload = _payload(fake_cli.calls[-1])
+    payload = _payload(fake_cli.calls[2])
     assert payload["key_type"] == "CELL_VALUE_KEY_TYPE_FIELD_TITLE"
+
+
+def test_update_ack_requires_matching_remote_readback() -> None:
+    """验证 update ACK 后的远端 uncached 回读才是字段写入成功证据。
+
+    参数：无。返回值：无。异常：断言失败时由 pytest 报告。
+    副作用：消费模拟 schema、原记录、update ACK 与远端 readback 响应。
+    """
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "values": [
+                    {
+                        "rows": [
+                            {
+                                "RECORD_ID": "record-1",
+                                "备注": "旧值",
+                                "创建人": [{"userId": "sales-1"}],
+                                "负责人": [{"userId": "sales-1"}],
+                            }
+                        ]
+                    }
+                ],
+            },
+            {
+                "errcode": 0,
+                "records": [{"record_id": "record-1", "values": {"备注": "新值"}}],
+            },
+            {
+                "errcode": 0,
+                "values": [
+                    {
+                        "rows": [
+                            {
+                                "RECORD_ID": "record-1",
+                                "备注": "新值",
+                                "创建人": [{"userId": "sales-1"}],
+                                "负责人": [{"userId": "sales-1"}],
+                            }
+                        ]
+                    }
+                ],
+            },
+        ]
+    )
+
+    record = _adapter(fake_cli, sheet_title="CRM线索").update_record("record-1", {"备注": "新值"})
+
+    assert record.fields["备注"] == "新值"
+    assert len(fake_cli.calls) == 4
+
+
+def test_update_waits_for_eventually_consistent_remote_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证有限最终一致性窗口中首次旧值会重读，后续匹配才成功。
+
+    参数：monkeypatch 将退避 sleep 替换为无等待函数。返回值：无。
+    异常：断言失败时由 pytest 报告。
+    副作用：消费两次远端回读，不执行额外写请求。
+    """
+    monkeypatch.setattr("app.smart_table.wecom_cli.time.sleep", lambda _delay: None)
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "values": [
+                    {
+                        "rows": [
+                            {
+                                "RECORD_ID": "record-1",
+                                "备注": "旧值",
+                                "创建人": [{"userId": "sales-1"}],
+                                "负责人": [{"userId": "sales-1"}],
+                            }
+                        ]
+                    }
+                ],
+            },
+            {
+                "errcode": 0,
+                "records": [{"record_id": "record-1", "values": {"备注": "新值"}}],
+            },
+            {
+                "errcode": 0,
+                "values": [
+                    {
+                        "rows": [
+                            {
+                                "RECORD_ID": "record-1",
+                                "备注": "旧值",
+                                "创建人": [{"userId": "sales-1"}],
+                                "负责人": [{"userId": "sales-1"}],
+                            }
+                        ]
+                    }
+                ],
+            },
+            {
+                "errcode": 0,
+                "values": [
+                    {
+                        "rows": [
+                            {
+                                "RECORD_ID": "record-1",
+                                "备注": "新值",
+                                "创建人": [{"userId": "sales-1"}],
+                                "负责人": [{"userId": "sales-1"}],
+                            }
+                        ]
+                    }
+                ],
+            },
+        ]
+    )
+
+    record = _adapter(fake_cli, sheet_title="CRM线索").update_record("record-1", {"备注": "新值"})
+
+    assert record.fields["备注"] == "新值"
+    assert len(fake_cli.calls) == 5
+
+
+def test_update_verification_bypasses_recent_write_cache_and_hides_values() -> None:
+    """验证远端目标缺失时近期写缓存不能伪造成功，异常只暴露规范字段名。
+
+    参数：无。返回值：无。异常：通过 pytest 捕获受控核实异常。
+    副作用：最多执行四次只读远端回查，不重复发送 update。
+    """
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "records": [{"record_id": "record-1", "values": {"备注": "旧值"}}],
+            },
+            {
+                "errcode": 0,
+                "records": [{"record_id": "record-1", "values": {"备注": "敏感目标值"}}],
+            },
+            {"errcode": 0, "records": []},
+            {"errcode": 0, "records": []},
+            {"errcode": 0, "records": []},
+            {"errcode": 0, "records": []},
+        ]
+    )
+
+    with pytest.raises(WecomCliSmartTableAdapterError) as error:
+        _adapter(fake_cli).update_record("record-1", {"备注": "敏感目标值"})
+
+    assert type(error.value).__name__ == "SmartTableWriteVerificationError"
+    assert error.value.missing_or_mismatched_fields == ("备注",)
+    assert "敏感目标值" not in str(error.value)
+    assert len(fake_cli.calls) == 7
+
+
+def test_remote_verification_normalizes_schema_value_types() -> None:
+    """验证文本、手机号、日期、选择和成员按领域语义回读比较。
+
+    参数：无。返回值：无。异常：断言失败时由 pytest 报告。
+    副作用：只在内存中比较虚构字段，不访问外部服务。
+    """
+    schema = SmartTableSchema(
+        fields=(
+            SmartTableField("remark", "备注", SmartTableFieldType.LONG_TEXT),
+            SmartTableField("phone", "手机", SmartTableFieldType.PHONE_NUMBER),
+            SmartTableField("email", "邮箱", SmartTableFieldType.EMAIL),
+            SmartTableField("date", "下次联系时间", SmartTableFieldType.DATE),
+            SmartTableField(
+                "line",
+                "业务线",
+                SmartTableFieldType.SINGLE_SELECT,
+                (SmartTableOption("line-id", "协作机器人"),),
+            ),
+            SmartTableField(
+                "pending",
+                "AI待确认",
+                SmartTableFieldType.MULTI_SELECT,
+                (SmartTableOption("pending-id", "联系人"),),
+            ),
+            SmartTableField("owner", "负责人", SmartTableFieldType.MEMBER),
+        )
+    )
+    target = {
+        "备注": "安全备注",
+        "手机": "138 0013-8000",
+        "邮箱": "sales@example.invalid",
+        "下次联系时间": "2026-10-02T01:00:00+00:00",
+        "业务线": "协作机器人",
+        "AI待确认": ["联系人"],
+        "负责人": "sales-1",
+    }
+    remote = SmartTableRecord(
+        record_id="record-1",
+        fields={
+            "备注": "安全备注",
+            "手机": "13800138000",
+            "邮箱": "sales@example.invalid",
+            "下次联系时间": "2026-10-02 09:00:00",
+            "业务线": "协作机器人",
+            "AI待确认": ["联系人"],
+            "负责人": "sales-1",
+        },
+    )
+
+    mismatches = _adapter(FakeCli([]))._mismatched_write_fields(target, remote, schema)
+
+    assert mismatches == ()
+
+
+def test_remote_verification_does_not_require_business_line_or_date_outside_plan() -> None:
+    """验证不在本轮字段计划中的业务线和日期不会成为写入成功门槛。
+
+    参数：无。返回值：无。异常：断言失败时由 pytest 报告。
+    副作用：只在内存中核实计划字段，不访问外部服务。
+    """
+    schema = SmartTableSchema(
+        fields=(
+            SmartTableField("line", "业务线", SmartTableFieldType.SINGLE_SELECT),
+            SmartTableField("date", "下次联系时间", SmartTableFieldType.DATE),
+            SmartTableField("remark", "备注", SmartTableFieldType.TEXT),
+        )
+    )
+    remote = SmartTableRecord(record_id="record-1", fields={"备注": "已写入"})
+
+    mismatches = _adapter(FakeCli([]))._mismatched_write_fields({"备注": "已写入"}, remote, schema)
+
+    assert mismatches == ()
 
 
 def test_no_authority_cli_failure_is_classified_as_permission_denied(

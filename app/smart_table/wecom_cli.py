@@ -47,6 +47,7 @@ _FIELD_TYPES = {
     "user": SmartTableFieldType.MEMBER,
 }
 _RECENT_WRITE_VISIBILITY_SECONDS = 30.0
+_WRITE_VERIFICATION_DELAYS = (0.0, 0.3, 1.0, 2.0)
 _SAFE_PROCESS_ERROR_TYPES = frozenset(
     {
         "ApiError",
@@ -74,6 +75,21 @@ class WecomCliProtocolError(WecomCliSmartTableAdapterError, PermanentTaskFailure
     """表示 wecom-cli 返回结构、参数或权限业务失败，不应自动重试。"""
 
 
+class SmartTableWriteVerificationError(WecomCliProtocolError):
+    """表示远端写入未能在有限回读窗口内逐字段核实。"""
+
+    def __init__(self, missing_or_mismatched_fields: Sequence[str]) -> None:
+        """构造不含字段值的写入核实失败。
+
+        参数：missing_or_mismatched_fields 为本次补丁中未能远端核实的规范字段名。
+        返回值：无。
+        异常：无。
+        副作用：仅在异常对象中保存字段名元组，继承永久失败分类以阻止自动重放。
+        """
+        self.missing_or_mismatched_fields = tuple(missing_or_mismatched_fields)
+        super().__init__("智能表格写入未通过远端字段核实")
+
+
 class WecomCliProcessError(WecomCliProtocolError):
     """表示 wecom-cli 子进程非零退出，具体动作由调用层判断是否可重试。"""
 
@@ -85,6 +101,7 @@ class WecomCliProcessError(WecomCliProtocolError):
         external_error_code: int | None = None,
         external_error_type: str | None = None,
         http_status: int | None = None,
+        rejected_field_candidates: Sequence[str] = (),
     ) -> None:
         """保存不含原始输出的受控 CLI 错误诊断字段。
 
@@ -98,6 +115,7 @@ class WecomCliProcessError(WecomCliProtocolError):
         self.external_error_code = external_error_code
         self.external_error_type = external_error_type
         self.http_status = http_status
+        self.rejected_field_candidates = tuple(rejected_field_candidates)
 
     @property
     def retryable(self) -> bool:
@@ -214,6 +232,28 @@ class WecomCliSmartTableAdapter:
         self._recent_written_records.pop(record_id, None)
         return None
 
+    def _get_record_remote_uncached(
+        self, record_id: str, schema: SmartTableSchema
+    ) -> SmartTableRecord | None:
+        """直接从企业微信读取记录，完全绕过本地近期写入缓存。
+
+        参数：record_id 为目标记录标识；schema 为已读取的字段定义。
+        返回值：远端记录快照；远端暂不可见或不存在时返回 None。
+        异常：CLI 传输、权限和响应协议错误向调用方传播。
+        副作用：配置 sheet_title 时执行 records query，否则分页执行 records list。
+        """
+        if self._sheet_title:
+            # 有完整查询配置时绕过权限受限的 list，并直接按远端查询结果定位记录。
+            return next(
+                (record for record in self._query_records(schema) if record.record_id == record_id),
+                None,
+            )
+        # list 分页是该配置下唯一可用的远端读路径；本方法刻意不查 _recent_written_records。
+        for item in self._list_pages("records"):
+            if item.get("record_id") == record_id:
+                return self._parse_record(item, schema)
+        return None
+
     def find_records(self, filters: Mapping[str, object]) -> list[SmartTableRecord]:
         """以冻结契约定义的全部字段精确匹配筛选记录。
 
@@ -269,33 +309,113 @@ class WecomCliSmartTableAdapter:
         return record
 
     def update_record(self, record_id: str, fields: Mapping[str, object]) -> SmartTableRecord:
-        """对指定记录执行单次字段补丁更新。
+        """更新指定记录并在返回成功前远端回读核实每个补丁字段。
 
         参数：record_id 为目标记录标识；fields 只包含本次变更的字段和值。
-        返回：CLI 返回的更新后记录快照。
-        异常：记录不存在或 CLI 写入失败时抛出异常。
-        副作用：只修改目标记录的传入字段，不传递任何旧字段。
+        返回：远端回读且逐字段匹配后的记录快照。
+        异常：记录不存在、CLI 写入失败或有限核实窗口后仍有字段不匹配时抛出异常。
+        副作用：只修改目标记录的传入字段，并在 ACK 后执行有上限的只读回查。
         """
         current_record = self.get_record(record_id)
         if current_record is None:
             raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
 
         schema = self.get_schema()
-        response = self._call(
+        planned_fields = [
+            field.name.removeprefix("*")
+            for name in fields
+            if (field := schema.get_field(name)) is not None
+        ]
+        logger.info("wecom_cli_write_planned", extra={"planned_fields": planned_fields})
+        self._call(
             "records",
             "update",
-            {
-                "records": [
-                    {"record_id": record_id, "values": self._to_cli_fields(fields, schema)}
-                ]
-            },
+            {"records": [{"record_id": record_id, "values": self._to_cli_fields(fields, schema)}]},
         )
-        record = self._parse_written_record(response, schema)
-        if record.record_id != record_id:
-            raise WecomCliProtocolError("wecom-cli 更新响应的记录标识与请求不一致")
-        # 更新响应同样不作为字段真相；远端已读快照叠加本次补丁才是安全的短期兜底。
-        self._remember_written_record(record_id, {**current_record.fields, **fields})
-        return record
+        # CLI ACK 只代表请求被接受；有限回读以远端实际字段为唯一成功证据。
+        mismatched_fields = tuple(fields)
+        for delay in _WRITE_VERIFICATION_DELAYS:
+            if delay:
+                time.sleep(delay)
+            try:
+                remote_record = self._get_record_remote_uncached(record_id, schema)
+            except Exception as error:
+                # ACK 已成功后读回失败也不能重放写请求；以永久核实失败交给人工恢复。
+                logger.error(
+                    "wecom_cli_write_verification_read_failed",
+                    extra={
+                        "error_type": type(error).__name__,
+                        "missing_or_mismatched_fields": list(fields),
+                    },
+                )
+                raise SmartTableWriteVerificationError(tuple(fields)) from None
+            if remote_record is None:
+                continue
+            mismatched_fields = self._mismatched_write_fields(fields, remote_record, schema)
+            if not mismatched_fields:
+                logger.info(
+                    "wecom_cli_write_verified",
+                    extra={"persisted_fields": planned_fields},
+                )
+                self._remember_written_record(record_id, remote_record.fields)
+                return remote_record
+
+        logger.error(
+            "wecom_cli_write_verification_failed",
+            extra={"missing_or_mismatched_fields": list(mismatched_fields)},
+        )
+        raise SmartTableWriteVerificationError(mismatched_fields)
+
+    def _mismatched_write_fields(
+        self,
+        fields: Mapping[str, object],
+        remote_record: SmartTableRecord,
+        schema: SmartTableSchema,
+    ) -> tuple[str, ...]:
+        """逐项比较本次补丁字段与远端记录中的规范领域值。
+
+        参数：fields 为本次 SafePatchPlan 字段补丁；remote_record 为 uncached 远端快照；
+        schema 为目标智能表格结构。
+        返回值：缺失或不匹配的规范字段名元组，不包含任何字段值。
+        异常：字段编码无法解析时传播受控 CLI 协议异常。
+        副作用：无。
+        """
+        mismatched: list[str] = []
+        for canonical_name, target in fields.items():
+            # 只核实本次计划字段，不把缺少于计划之外的 CRM 字段当作写入失败。
+            field = schema.get_field(canonical_name)
+            if field is None:
+                mismatched.append(canonical_name)
+                continue
+            encoded = self._to_cli_value(canonical_name, field, target)
+            if encoded is None:
+                mismatched.append(canonical_name)
+                continue
+            expected = json.loads(encoded)
+            # 反向恢复 CLI option/member 编码，使远端读值与领域目标值可直接比较。
+            if (
+                field.field_type
+                in {SmartTableFieldType.SINGLE_SELECT, SmartTableFieldType.MULTI_SELECT}
+                or canonical_name == "AI待确认"
+            ):
+                if isinstance(expected, list):
+                    if expected and isinstance(expected[0], Mapping):
+                        expected = [item.get("text") for item in expected]
+                    if field.field_type is SmartTableFieldType.SINGLE_SELECT:
+                        expected = expected[0] if expected else None
+            elif field.field_type is SmartTableFieldType.MEMBER:
+                expected = (
+                    expected[0].get("userId")
+                    if isinstance(expected, list) and expected and isinstance(expected[0], Mapping)
+                    else None
+                )
+
+            actual = remote_record.fields.get(canonical_name)
+            if field.field_type is SmartTableFieldType.MULTI_SELECT and actual is None:
+                actual = []
+            if actual != expected:
+                mismatched.append(canonical_name)
+        return tuple(mismatched)
 
     def _remember_written_record(self, record_id: str, fields: Mapping[str, object]) -> None:
         """暂存刚由本进程确认写入的记录，覆盖企业微信列表的短暂可见性延迟。
@@ -457,9 +577,7 @@ class WecomCliSmartTableAdapter:
                 # 没有后续游标即表明当前快照读取完整。
                 return items
             if next_cursor in seen_cursors:
-                raise WecomCliProtocolError(
-                    f"wecom-cli {resource} list 返回了循环分页游标"
-                )
+                raise WecomCliProtocolError(f"wecom-cli {resource} list 返回了循环分页游标")
             # 记录已消费游标，防止外部服务异常导致无限分页循环。
             seen_cursors.add(next_cursor)
             cursor = next_cursor
@@ -555,8 +673,15 @@ class WecomCliSmartTableAdapter:
                 external_error_code = None
                 external_error_type = None
                 http_status = None
+                rejected_field_candidates: tuple[str, ...] = ()
             else:
-                error_code, external_error_code, external_error_type, http_status = parsed_error
+                (
+                    error_code,
+                    external_error_code,
+                    external_error_type,
+                    http_status,
+                    rejected_field_candidates,
+                ) = parsed_error
             logger.error(
                 "wecom_cli_process_failed error_code=%s",
                 error_code,
@@ -566,6 +691,7 @@ class WecomCliSmartTableAdapter:
                     "external_error_code": external_error_code,
                     "external_error_type": external_error_type,
                     "http_status": http_status,
+                    "remote_rejected_field_candidates": list(rejected_field_candidates),
                 },
             )
             raise WecomCliProcessError(
@@ -574,6 +700,7 @@ class WecomCliSmartTableAdapter:
                 external_error_code=external_error_code,
                 external_error_type=external_error_type,
                 http_status=http_status,
+                rejected_field_candidates=rejected_field_candidates,
             )
         try:
             parsed: Any = json.loads(completed.stdout)
@@ -582,16 +709,16 @@ class WecomCliSmartTableAdapter:
             raise WecomCliProtocolError("wecom-cli 未返回 JSON 对象") from error
         return self._as_mapping(parsed, "CLI 响应")
 
-    @staticmethod
     def _structured_process_error(
-        stdout: str,
-    ) -> tuple[str, int | None, str | None, int | None] | None:
+        self, stdout: str
+    ) -> tuple[str, int | None, str | None, int | None, tuple[str, ...]] | None:
         """从非零退出 stdout 提取受控错误码、错误类型和 HTTP 状态。
 
         参数：stdout 为 CLI 输出，仅在内存中解析。
         返回值：内部分类及安全结构化诊断；不是 JSON 对象时返回 None。
         异常：无；非法字段和非白名单文本会被忽略。
-        副作用：无，不记录或返回任何远端消息、响应体或客户字段。
+        副作用：仅对 640027 在内存中按已缓存 schema 精确筛选字段标题，返回规范字段名；
+        不记录或返回其他远端消息、响应体或客户字段。
         """
         try:
             parsed: object = json.loads(stdout)
@@ -600,12 +727,10 @@ class WecomCliSmartTableAdapter:
         if not isinstance(parsed, Mapping):
             return None
 
-        # 只读取结构化 schema 中明示的错误字段，绝不触碰 errmsg、message、body 等正文。
+        # 先提取结构化白名单字段；只有 640027 后续会在内存中精确筛选 schema 标题。
         nested_error = parsed.get("error")
         error = nested_error if isinstance(nested_error, Mapping) else {}
-        external_error_code = WecomCliSmartTableAdapter._safe_integer(
-            parsed.get("errcode")
-        )
+        external_error_code = WecomCliSmartTableAdapter._safe_integer(parsed.get("errcode"))
         if external_error_code is None:
             external_error_code = WecomCliSmartTableAdapter._safe_integer(error.get("code"))
 
@@ -628,7 +753,30 @@ class WecomCliSmartTableAdapter:
         error_code = WecomCliSmartTableAdapter._structured_error_category(
             external_error_code, external_error_type, http_status
         )
-        return error_code, external_error_code, external_error_type, http_status
+        # 仅对远端参数错误在内存中匹配 schema 标题，绝不保留或记录 errmsg 原文。
+        rejected_field_candidates: list[str] = []
+        if external_error_code == 640027 and self._schema is not None:
+            raw_message = parsed.get("errmsg")
+            if not isinstance(raw_message, str):
+                raw_message = error.get("message", error.get("errmsg"))
+            if isinstance(raw_message, str):
+                for field in self._schema.fields:
+                    title = field.name.removeprefix("*")
+                    exact_title = (
+                        re.search(rf"(?<!\w){re.escape(title)}(?!\w)", raw_message)
+                        if title
+                        else None
+                    )
+                    if exact_title:
+                        if title not in rejected_field_candidates:
+                            rejected_field_candidates.append(title)
+        return (
+            error_code,
+            external_error_code,
+            external_error_type,
+            http_status,
+            tuple(rejected_field_candidates),
+        )
 
     @staticmethod
     def _safe_integer(value: object) -> int | None:
@@ -829,9 +977,8 @@ class WecomCliSmartTableAdapter:
                 raise WecomCliProtocolError(f"智能表格未配置字段：{canonical_name}")
             # 地理位置必须包含企业微信地图对象；普通地址字符串不能伪造地图标识。
             # 无法构造地图对象时跳过该字段，留给人工补充。
-            if (
-                field.field_type is SmartTableFieldType.LOCATION
-                and not self._is_writable_location(value)
+            if field.field_type is SmartTableFieldType.LOCATION and not self._is_writable_location(
+                value
             ):
                 logger.warning("wecom_cli_location_value_skipped")
                 continue
@@ -951,9 +1098,7 @@ class WecomCliSmartTableAdapter:
         return SmartTableRecord(record_id=record_id, fields=normalized, member_names=member_names)
 
     @staticmethod
-    def _member_display_name(
-        field: SmartTableField | None, value: object
-    ) -> str | None:
+    def _member_display_name(field: SmartTableField | None, value: object) -> str | None:
         """提取企业微信成员单元格中的可读姓名，不把姓名替代 userId。
 
         参数：field 为真实字段定义；value 为成员字段原始值。
@@ -963,11 +1108,7 @@ class WecomCliSmartTableAdapter:
         """
         if field is None or field.field_type is not SmartTableFieldType.MEMBER:
             return None
-        if (
-            not isinstance(value, list)
-            or len(value) != 1
-            or not isinstance(value[0], Mapping)
-        ):
+        if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], Mapping):
             return None
         name = value[0].get("userName")
         if not isinstance(name, str):

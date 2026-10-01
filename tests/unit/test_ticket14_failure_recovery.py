@@ -21,6 +21,7 @@ from app.leads.models import (
     LeadFieldProvenance,
     LeadMessageResolution,
     MessageRetryAttempt,
+    SmartTableSync,
 )
 from app.leads.service import (
     FirstTextLeadWorkspaceService,
@@ -38,6 +39,7 @@ from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.models import SmartTableRecord
 from app.smart_table.registry import build_required_smart_table_schema
 from app.smart_table.wecom_cli import (
+    WecomCliProcessError,
     WecomCliProtocolError,
     WecomCliTransportError,
 )
@@ -113,9 +115,7 @@ def session_factory() -> Generator[sessionmaker[Session], None, None]:
         engine.dispose()
 
 
-def persist_messages(
-    session_factory: sessionmaker[Session], texts: list[str]
-) -> list[int]:
+def persist_messages(session_factory: sessionmaker[Session], texts: list[str]) -> list[int]:
     """持久化同一销售按 sequence 排列的消息和 Outbox 事件。
 
     参数：session_factory 为测试事务工厂；texts 为按接收顺序排列的消息文本。
@@ -148,16 +148,12 @@ def persist_messages(
     return event_ids
 
 
-def append_messages(
-    session_factory: sessionmaker[Session], texts: list[str]
-) -> list[int]:
+def append_messages(session_factory: sessionmaker[Session], texts: list[str]) -> list[int]:
     """在已创建的首条消息之后追加连续 sequence，避免首条成功消费自动递归处理后续消息。"""
     with session_factory.begin() as session:
         last_sequence = (
             session.scalar(
-                select(IncomingMessage.sequence)
-                .order_by(IncomingMessage.sequence.desc())
-                .limit(1)
+                select(IncomingMessage.sequence).order_by(IncomingMessage.sequence.desc()).limit(1)
             )
             or 0
         )
@@ -266,8 +262,30 @@ def test_retry_failed_message_is_protected_supplement_not_history_replay(
 
     with session_factory() as session:
         event_before_retry = session.get(OutboxEvent, event_ids[1])
+        lead_before_retry = session.scalar(
+            select(Lead).where(Lead.source_message_id == "message-1")
+        )
     assert event_before_retry is not None, "failed message event missing"
     assert event_before_retry.status == "failed_pending_review", event_before_retry.status
+    assert lead_before_retry is not None
+    # 模拟旧版本的历史成功尝试，但原消息事件仍停留在失败检查点。
+    with session_factory.begin() as session:
+        sync = session.scalar(
+            select(SmartTableSync).where(SmartTableSync.lead_id == lead_before_retry.id)
+        )
+        assert sync is not None
+        session.add(
+            MessageRetryAttempt(
+                message_id="message-2",
+                segment_index=0,
+                lead_id=lead_before_retry.id,
+                operator_user_id="sales-1",
+                attempt_number=1,
+                status="succeeded",
+                updated_fields=["联系人"],
+                protected_fields=[],
+            )
+        )
     calls_before_retry = len(update_calls)
     result = service.retry_failed_message("message-2")
     repeated = service.retry_failed_message("message-2")
@@ -278,6 +296,9 @@ def test_retry_failed_message_is_protected_supplement_not_history_replay(
     with session_factory() as session:
         lead = session.scalar(select(Lead).where(Lead.source_message_id == "message-1"))
         failed_event = session.get(OutboxEvent, event_ids[1])
+        sync = session.scalar(
+            select(SmartTableSync).where(SmartTableSync.lead_id == lead_before_retry.id)
+        )
         later_events = session.scalars(
             select(OutboxEvent).where(OutboxEvent.sequence.in_((3, 4)))
         ).all()
@@ -286,9 +307,10 @@ def test_retry_failed_message_is_protected_supplement_not_history_replay(
     assert lead.field_values["手机"] == "13800138000"
     assert lead.field_values["工艺"] == ["码垛"]
     assert lead.field_values["联系人"] == "失败联系人"
-    assert failed_event is not None and failed_event.status == "failed_pending_review"
+    assert failed_event is not None and failed_event.status == "succeeded"
+    assert sync is not None and sync.status == "succeeded"
     assert all(event.status == "succeeded" for event in later_events)
-    assert len(attempts) == 1 and attempts[0].status == "succeeded"
+    assert len(attempts) == 2 and all(attempt.status == "succeeded" for attempt in attempts)
     # 第二次人工点击只命中同一 attempt；retry 不会再次调用 N+1/N+2 的历史消费路径。
     assert len(update_calls) == calls_before_retry + 1
     assert update_calls[-1] == {"联系人": "失败联系人"}
@@ -336,6 +358,209 @@ def test_retry_failed_message_keeps_sales_edit_protected(
     assert "联系人" not in result.updated_fields
     record = adapter.get_record(record_id)
     assert record is not None and record.fields["联系人"] == "销售确认"
+
+
+def test_inconsistent_legacy_success_restores_same_source_plan_from_provenance(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证旧同步假成功只按原计划和同来源字段事实恢复同一远端行。"""
+    event_ids = persist_messages(session_factory, ["客户：客户恢复；工艺：装配"])
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+    service.consume(event_ids[0])
+
+    with session_factory.begin() as session:
+        event = session.get(OutboxEvent, event_ids[0])
+        assert event is not None
+        lead = session.scalar(select(Lead).where(Lead.source_message_id == event.message_id))
+        assert lead is not None and lead.smart_table_record_id is not None
+        sync = session.scalar(select(SmartTableSync).where(SmartTableSync.lead_id == lead.id))
+        assert sync is not None
+        # 模拟历史 ACK 假成功：同步仍 retrying，但 latest retry attempt 已被误标 succeeded。
+        event.status = "failed_pending_review"
+        event.failure_category = "transient"
+        sync.status = "retrying"
+        source_message_id = event.message_id
+        session.get(IncomingMessage, source_message_id).normalized_text = "普通自由文本补充"
+        # 测试显式建立该失败来源的字段事实，模拟 T08 结果已落入后台 provenance。
+        session.add(
+            LeadFieldProvenance(
+                lead_id=lead.id,
+                source_message_id=source_message_id,
+                field_name="工艺",
+                value='["装配"]',
+                last_ai_synced_value='["装配"]',
+            )
+        )
+        session.add(
+            MessageRetryAttempt(
+                message_id=source_message_id,
+                segment_index=0,
+                lead_id=lead.id,
+                operator_user_id="sales-1",
+                attempt_number=1,
+                status="succeeded",
+                updated_fields=["工艺"],
+                protected_fields=[],
+            )
+        )
+        record_id = lead.smart_table_record_id
+
+    # 只清空既有测试行的原计划字段，不创建或删除记录。
+    adapter.update_record(record_id, {"工艺": None})
+    update_calls: list[dict[str, object]] = []
+    original_update = adapter.update_record
+
+    def capture_update(target_id: str, fields: dict[str, object]) -> SmartTableRecord:
+        """记录远端补丁字段名和值形状，不触碰任何外部客户数据。"""
+        update_calls.append(dict(fields))
+        return original_update(target_id, fields)
+
+    monkeypatch.setattr(adapter, "update_record", capture_update)
+    result = service.retry_failed_message(source_message_id)
+
+    assert result.status is ProtectedSupplementStatus.SUCCEEDED
+    assert update_calls == [{"工艺": ["装配"]}]
+    record = adapter.get_record(record_id)
+    assert record is not None and record.fields["工艺"] == ["装配"]
+    with session_factory() as session:
+        event = session.get(OutboxEvent, event_ids[0])
+        lead = session.scalar(select(Lead).where(Lead.source_message_id == source_message_id))
+        sync = session.scalar(select(SmartTableSync).where(SmartTableSync.lead_id == lead.id))
+        assert event is not None and event.status == "succeeded"
+        assert lead is not None and lead.smart_table_record_id == record_id
+        assert sync is not None and sync.status == "succeeded"
+
+
+def test_protected_recovery_never_recreates_a_missing_remote_row(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证历史消息恢复遇到远端行缺失时只失败待审，不重建记录。
+
+    参数：session_factory 提供隔离数据库；monkeypatch 隐藏现有远端行。
+    返回值：无。异常：断言失败时由 pytest 报告。
+    副作用：执行一次同线索受保护重试，并确认行数与绑定标识不变。
+    """
+    event_ids = persist_messages(session_factory, ["客户：客户丙；工艺：装配"])
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+    service.consume(event_ids[0])
+    event_ids.extend(append_messages(session_factory, ["客户：客户丙；联系人：补充联系人"]))
+    lead = None
+    with session_factory() as session:
+        lead = session.scalar(select(Lead).where(Lead.source_message_id == "message-1"))
+    assert lead is not None and lead.smart_table_record_id is not None
+    original_record_id = lead.smart_table_record_id
+
+    def fail_update(*_args: object, **_kwargs: object) -> object:
+        """将补充消息固定为永久失败检查点。"""
+        raise WecomCliProtocolError("controlled parameter rejection")
+
+    monkeypatch.setattr(adapter, "update_record", fail_update)
+    service.consume(event_ids[1])
+    create_calls: list[object] = []
+    original_create = adapter.create_record
+
+    def track_create(*args: object, **kwargs: object) -> object:
+        """记录恢复期间任何可能的行重建调用。"""
+        create_calls.append(args)
+        return original_create(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(adapter, "create_record", track_create)
+    monkeypatch.setattr(adapter, "get_record", lambda _record_id: None)
+
+    result = service.retry_failed_message("message-2")
+
+    assert result.status is ProtectedSupplementStatus.FAILED_PENDING_REVIEW
+    assert create_calls == []
+    assert len(adapter.get_records()) == 1
+    with session_factory() as session:
+        current_lead = session.scalar(select(Lead).where(Lead.source_message_id == "message-1"))
+        assert current_lead is not None
+        sync = session.scalar(
+            select(SmartTableSync).where(SmartTableSync.lead_id == current_lead.id)
+        )
+        event = session.get(OutboxEvent, event_ids[1])
+    assert current_lead is not None and current_lead.smart_table_record_id == original_record_id
+    # 同步事实对应 message-1；message-2 的受保护补充失败不改写首条同步状态。
+    assert sync is not None and sync.status == "succeeded"
+    assert event is not None and event.status == "failed_pending_review"
+
+
+def test_remote_640027_is_terminal_and_persists_only_safe_field_names(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 640027 进入永久人工检查点且受控审计只保留 schema 字段名。
+
+    参数：session_factory 提供隔离数据库；monkeypatch 注入受控远端错误。
+    返回值：无。异常：业务失败由恢复服务归档，不向测试调用者传播。
+    副作用：在同一 Lead/Smart Table 记录上执行失败与后续受控恢复，不提交 CRM。
+    """
+    event_ids = persist_messages(session_factory, ["客户：客户丁；工艺：装配"])
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    original_update = adapter.update_record
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+    update_calls = 0
+
+    def reject_parameter(*_args: object, **_kwargs: object) -> object:
+        """模拟不可重试的远端参数错误，拒绝正文只存在于模拟调用栈。"""
+        nonlocal update_calls
+        update_calls += 1
+        raise WecomCliProcessError(
+            "wecom-cli 退出失败",
+            error_code="remote_business_error",
+            external_error_code=640027,
+            rejected_field_candidates=("手机",),
+        )
+
+    monkeypatch.setattr(adapter, "update_record", reject_parameter)
+    service.consume(event_ids[0])
+
+    with session_factory() as session:
+        event = session.get(OutboxEvent, event_ids[0])
+        lead = session.scalar(select(Lead).where(Lead.source_message_id == "message-1"))
+        assert lead is not None
+        original_record_id = lead.smart_table_record_id
+        sync = session.scalar(select(SmartTableSync).where(SmartTableSync.lead_id == lead.id))
+    assert event is not None and event.status == "failed_pending_review"
+    assert event.failure_category == "permanent"
+    assert sync is not None and sync.status == "failed_pending_review"
+    assert update_calls == 1
+
+    service.retry_failed_message("message-1")
+
+    with session_factory() as session:
+        audit = session.scalar(
+            select(BusinessAuditEvent).where(
+                BusinessAuditEvent.message_id == "message-1",
+                BusinessAuditEvent.event_type == "lead_message_protected_retry_failed",
+            )
+        )
+        event = session.get(OutboxEvent, event_ids[0])
+        lead = session.scalar(select(Lead).where(Lead.source_message_id == "message-1"))
+        assert lead is not None
+        sync = session.scalar(select(SmartTableSync).where(SmartTableSync.lead_id == lead.id))
+    assert update_calls == 2
+    assert audit is not None
+    assert audit.details["rejected_field_candidates"] == ["手机"]
+    assert event is not None and event.status == "failed_pending_review"
+    assert sync is not None and sync.status == "failed_pending_review"
+
+    monkeypatch.setattr(adapter, "update_record", original_update)
+    recovered = service.retry_failed_message("message-1")
+
+    with session_factory() as session:
+        lead_count = len(session.scalars(select(Lead)).all())
+        event = session.get(OutboxEvent, event_ids[0])
+        lead = session.scalar(select(Lead).where(Lead.source_message_id == "message-1"))
+        assert lead is not None
+        sync = session.scalar(select(SmartTableSync).where(SmartTableSync.lead_id == lead.id))
+    assert recovered.status is ProtectedSupplementStatus.SUCCEEDED
+    assert lead_count == 1
+    assert lead.smart_table_record_id == original_record_id
+    assert len(adapter.get_records()) == 1
+    assert event is not None and event.status == "succeeded"
+    assert sync is not None and sync.status == "succeeded"
 
 
 def test_retry_failed_message_targets_the_failed_segment_only(
@@ -417,9 +642,7 @@ def test_retry_failed_message_targets_the_failed_segment_only(
     }
     assert adapter.get_record(record_b.record_id).fields["联系人"] == "乙失败补充"  # type: ignore[union-attr]
     with session_factory() as session:
-        lead_a_after = session.scalar(
-            select(Lead).where(Lead.source_segment_index == 0)
-        )
+        lead_a_after = session.scalar(select(Lead).where(Lead.source_segment_index == 0))
     assert lead_a_after is not None
     assert "联系人" not in lead_a_after.field_values
 
@@ -477,12 +700,16 @@ def test_retry_does_not_replace_current_nonempty_ai_value(
     assert "联系人" not in current_record.fields.get("AI待确认", [])
     with session_factory() as session:
         lead = session.scalar(select(Lead).where(Lead.source_message_id == "message-1"))
-        provenance = session.scalar(
-            select(LeadFieldProvenance).where(
-                LeadFieldProvenance.lead_id == lead.id,
-                LeadFieldProvenance.field_name == "联系人",
+        provenance = (
+            session.scalar(
+                select(LeadFieldProvenance).where(
+                    LeadFieldProvenance.lead_id == lead.id,
+                    LeadFieldProvenance.field_name == "联系人",
+                )
             )
-        ) if lead is not None else None
+            if lead is not None
+            else None
+        )
     assert lead is not None and lead.field_values["联系人"] == "后续消息联系人"
     assert provenance is not None and provenance.is_user_confirmed is True
 
