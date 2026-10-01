@@ -523,6 +523,23 @@ class WecomCliSmartTableAdapter:
             if raw is None and field.name.startswith("*"):
                 raw = row.get(field.name.removeprefix("*"))
             canonical_name = field.name.removeprefix("*")
+            if isinstance(raw, str) and field.field_type in {
+                SmartTableFieldType.MEMBER,
+                SmartTableFieldType.SINGLE_SELECT,
+                SmartTableFieldType.MULTI_SELECT,
+                SmartTableFieldType.ATTACHMENT,
+                SmartTableFieldType.LOCATION,
+            }:
+                # records query 将结构化单元格序列化在 string 列中，先恢复其 JSON 结构。
+                try:
+                    raw = json.loads(raw)
+                except json.JSONDecodeError:
+                    # 部分 CLI 响应直接返回单元格文本，保留给下方字段类型解析。
+                    pass
+            if field.field_type is SmartTableFieldType.MEMBER and raw in (None, []):
+                # 查询接口对未设置成员字段返回 null/空列表；不应让无关字段阻断整行读取。
+                normalized[canonical_name] = None
+                continue
             if field.field_type is SmartTableFieldType.MULTI_SELECT and raw is None:
                 # records query 对未填多选返回 null；领域层统一使用空列表表示未选择。
                 raw = []

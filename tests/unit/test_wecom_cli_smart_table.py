@@ -1298,3 +1298,72 @@ def test_cli_process_exit_during_add_is_not_retried() -> None:
             actor=SmartTableActor.ROBOT,
         )
     assert len(fake_cli.calls) == 2
+
+
+def test_query_record_decodes_select_cells_and_accepts_empty_member_cells() -> None:
+    """验证 SQL 查询返回的 JSON 单选值会规范化，空成员列不会阻断整行读取。"""
+    schema = SmartTableSchema(
+        fields=(
+            SmartTableField(
+                "international",
+                "是否为国际客户",
+                SmartTableFieldType.SINGLE_SELECT,
+                (SmartTableOption("domestic-id", "国内"),),
+            ),
+            SmartTableField("lead-name", "线索名称", SmartTableFieldType.TEXT),
+            SmartTableField("creator", "创建人", SmartTableFieldType.MEMBER),
+            SmartTableField("owner", "负责人", SmartTableFieldType.MEMBER),
+            SmartTableField(
+                "submission-status",
+                "提交状态",
+                SmartTableFieldType.SINGLE_SELECT,
+                (SmartTableOption("pending-id", "未提交"),),
+            ),
+        )
+    )
+    row = {
+        "RECORD_ID": "record-1",
+        "是否为国际客户": '[{"id":"domestic-id","text":"国内"}]',
+        "线索名称": "样例公司",
+        "创建人": None,
+        "负责人": None,
+        "提交状态": '[{"id":"pending-id","text":"未提交"}]',
+    }
+    fake_cli = FakeCli([{"errcode": 0, "values": [json.dumps({"rows": [row]})]}])
+    adapter = _adapter(fake_cli, sheet_title="CRM线索")
+    adapter._schema = schema
+
+    record = adapter.get_records()[0]
+
+    assert record.fields == {
+        "是否为国际客户": "国内",
+        "线索名称": "样例公司",
+        "创建人": None,
+        "负责人": None,
+        "提交状态": "未提交",
+    }
+
+
+def test_query_record_decodes_json_stringified_member_and_multi_select_cells() -> None:
+    """验证 SQL 查询中的成员与多选 JSON 字符串会还原为领域值。"""
+    schema = SmartTableSchema(
+        fields=(
+            SmartTableField("owner", "负责人", SmartTableFieldType.MEMBER),
+            SmartTableField(
+                "confirmation",
+                "AI待确认",
+                SmartTableFieldType.MULTI_SELECT,
+                (SmartTableOption("contact-option", "联系人"),),
+            ),
+        )
+    )
+    row = {
+        "RECORD_ID": "record-1",
+        "负责人": json.dumps([{"id": "sales-1", "name": "测试销售"}], ensure_ascii=False),
+        "AI待确认": json.dumps([{"id": "contact-option", "text": "联系人"}], ensure_ascii=False),
+    }
+
+    record = _adapter(FakeCli([]))._parse_query_record(row, schema)
+
+    assert record.fields == {"负责人": "sales-1", "AI待确认": ["联系人"]}
+    assert record.member_names == {"负责人": "测试销售"}
