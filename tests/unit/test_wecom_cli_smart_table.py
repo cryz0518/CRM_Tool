@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from collections.abc import Mapping, Sequence
 
 import pytest
 
+from app.core.logging import JsonFormatter
 from app.smart_table.adapter import (
     SmartTableActor,
     SmartTableAdapterConfigurationError,
     SmartTablePermissionError,
 )
-from app.smart_table.models import SmartTableField, SmartTableFieldType
+from app.smart_table.models import (
+    SmartTableField,
+    SmartTableFieldType,
+    SmartTableOption,
+    SmartTableSchema,
+)
 from app.smart_table.wecom_cli import (
     WecomCliProcessError,
     WecomCliSmartTableAdapter,
@@ -80,6 +87,11 @@ def _payload(arguments: Sequence[str]) -> dict[str, object]:
     value = json.loads(arguments[arguments.index("--json") + 1])
     assert isinstance(value, dict)
     return value
+
+
+def _wire_value(value: object) -> str:
+    """按 wecom-cli 1.3.4 values map 契约序列化单元格值。"""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def _field_response() -> Mapping[str, object]:
@@ -172,14 +184,14 @@ def test_canonical_fields_and_pending_options_are_mapped_to_real_schema_names() 
     assert create_payload["records"] == [
         {
             "values": {
-                "*业务线": "协作机器人",
-                "*联系人": "张三",
-                "*手机": "13800138000",
-                "*线索名称": "长广溪智造",
-                "客户行业": "机械加工",
-                "AI待确认": [{"id": "pending-business-line", "text": "*业务线"}],
-                "创建人": [{"userId": "sales-1"}],
-                "负责人": [{"userId": "sales-1"}],
+                "*业务线": _wire_value("协作机器人"),
+                "*联系人": _wire_value("张三"),
+                "*手机": _wire_value("13800138000"),
+                "*线索名称": _wire_value("长广溪智造"),
+                "客户行业": _wire_value("机械加工"),
+                "AI待确认": _wire_value([{"id": "pending-business-line", "text": "*业务线"}]),
+                "创建人": _wire_value([{"userId": "sales-1"}]),
+                "负责人": _wire_value([{"userId": "sales-1"}]),
             }
         }
     ]
@@ -232,7 +244,12 @@ def test_record_add_normalizes_phone_and_skips_unrepresentable_location() -> Non
 
     payload = _payload(fake_cli.calls[1])
     assert payload["records"] == [
-        {"values": {"电话": "051083480979917", "负责人": [{"userId": "sales-1"}]}}
+        {
+            "values": {
+                "电话": _wire_value("051083480979917"),
+                "负责人": _wire_value([{"userId": "sales-1"}]),
+            }
+        }
     ]
 
 
@@ -570,15 +587,75 @@ def test_records_are_paginated_and_robot_writes_only_given_field_patch() -> None
     assert create_payload["records"] == [
         {
             "values": {
-                "创建人": [{"userId": "sales-user"}],
-                "负责人": [{"userId": "sales-user"}],
-                "*线索名称": "受控测试",
+                "创建人": _wire_value([{"userId": "sales-user"}]),
+                "负责人": _wire_value([{"userId": "sales-user"}]),
+                "*线索名称": _wire_value("受控测试"),
             }
         }
     ]
     update_payload = _payload(fake_cli.calls[5])
-    assert update_payload["records"] == [{"record_id": "record-3", "values": {"工艺": "装配"}}]
+    assert update_payload["records"] == [
+        {"record_id": "record-3", "values": {"工艺": _wire_value("装配")}}
+    ]
     assert updated.fields == {"工艺": "装配"}
+
+
+def test_write_cells_match_wecom_cli_134_json_string_values_contract() -> None:
+    """验证 1.3.4 的 values map 每个字段值都是 JSON 序列化字符串。"""
+    schema = SmartTableSchema(
+        fields=(
+            SmartTableField("name", "线索名称", SmartTableFieldType.TEXT),
+            SmartTableField("remark", "备注", SmartTableFieldType.LONG_TEXT),
+            SmartTableField("phone", "手机", SmartTableFieldType.PHONE_NUMBER),
+            SmartTableField("email", "邮箱", SmartTableFieldType.EMAIL),
+            SmartTableField("date", "下次联系时间", SmartTableFieldType.DATE),
+            SmartTableField(
+                "line",
+                "业务线",
+                SmartTableFieldType.SINGLE_SELECT,
+                (SmartTableOption("line-id", "协作机器人"),),
+            ),
+            SmartTableField(
+                "process",
+                "工艺",
+                SmartTableFieldType.MULTI_SELECT,
+                (SmartTableOption("process-id", "装配"),),
+            ),
+            SmartTableField("owner", "负责人", SmartTableFieldType.MEMBER),
+            SmartTableField(
+                "pending",
+                "AI待确认",
+                SmartTableFieldType.MULTI_SELECT,
+                (SmartTableOption("pending-id", "线索名称"),),
+            ),
+        )
+    )
+    fields = {
+        "线索名称": "公司样例",
+        "备注": "备注样例",
+        "手机": "138 0013 8000",
+        "邮箱": "sales@example.com",
+        "下次联系时间": "2026-10-02T09:00:00+08:00",
+        "业务线": "协作机器人",
+        "工艺": ["装配"],
+        "负责人": "sales-user",
+        "AI待确认": ["线索名称"],
+    }
+
+    encoded = _adapter(FakeCli([]))._to_cli_fields(fields, schema)
+
+    assert all(isinstance(value, str) for value in encoded.values())
+    assert {name: json.loads(value) for name, value in encoded.items()} == {
+        "线索名称": "公司样例",
+        "备注": "备注样例",
+        "手机": "13800138000",
+        "邮箱": "sales@example.com",
+        "下次联系时间": "2026-10-02T09:00:00+08:00",
+        "业务线": [{"id": "line-id", "text": "协作机器人"}],
+        "工艺": [{"id": "process-id", "text": "装配"}],
+        "负责人": [{"userId": "sales-user"}],
+        "AI待确认": [{"id": "pending-id", "text": "线索名称"}],
+    }
 
 
 def test_configured_sheet_title_uses_full_query_and_parses_member_rows() -> None:
@@ -687,11 +764,16 @@ def test_subprocess_timeout_is_retried_once() -> None:
     assert len(fake_cli.calls) == 2
 
 
-def test_idempotent_cli_process_exit_is_retried() -> None:
-    """验证 records list/update 的 CLI 进程异常会有限重试。"""
+def test_idempotent_cli_network_process_error_is_retried() -> None:
+    """验证明确网络错误的幂等读取会有限重试。"""
     fake_cli = FakeCli(
         [
-            WecomCliProcessError("wecom-cli 退出失败，退出码：1"),
+            WecomCliProcessError(
+                "wecom-cli 进程调用失败：network_error",
+                error_code="network_error",
+                external_error_code=893101,
+                external_error_type="NetworkError",
+            ),
             {"errcode": 0, "fields": []},
         ]
     )
@@ -716,16 +798,85 @@ def test_permanent_cli_process_error_is_not_retried() -> None:
 
 def test_subprocess_failure_keeps_only_controlled_error_code(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """验证子进程 stderr 只转换为受控分类，不进入异常正文。"""
+    """验证 stdout 结构化权限错误只保留白名单元数据。"""
 
     def failed_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
         """返回包含敏感片段的模拟 CLI 失败结果。"""
         return subprocess.CompletedProcess(
             args=["wecom-cli"],
             returncode=1,
-            stdout="",
-            stderr="permission denied for customer@example.com token=secret-value",
+            stdout=(
+                '{"errcode":851003,"errmsg":"private response text",'
+                '"body":"private body","docid":"private-doc"}'
+            ),
+            stderr="private stderr token=secret-value",
+        )
+
+    monkeypatch.setattr(subprocess, "run", failed_run)
+    caplog.set_level(logging.ERROR)
+
+    with pytest.raises(WecomCliProcessError) as error:
+        _adapter(FakeCli([]))._run_subprocess(("wecom-cli", "--json", "{}"))
+
+    assert error.value.error_code == "permission_denied"
+    assert error.value.external_error_code == 851003
+    assert error.value.external_error_type is None
+    assert "private response text" not in str(error.value)
+    assert "private body" not in caplog.text
+    assert "private-doc" not in caplog.text
+    assert "secret-value" not in caplog.text
+    assert caplog.records[-1].external_error_code == 851003
+    formatted_log = JsonFormatter().format(caplog.records[-1])
+    assert '"external_error_code": 851003' in formatted_log
+    assert "private response text" not in formatted_log
+
+
+def test_subprocess_network_error_parses_only_safe_stdout_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """验证嵌套网络错误映射为暂态类别且不泄露远端正文。"""
+
+    def failed_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        """返回带有敏感正文的结构化模拟网络失败。"""
+        return subprocess.CompletedProcess(
+            args=["wecom-cli"],
+            returncode=1,
+            stdout=(
+                '{"error":{"type":"NetworkError","code":893101,'
+                '"message":"private response","body":"private body"}}'
+            ),
+            stderr="ignored private stderr",
+        )
+
+    monkeypatch.setattr(subprocess, "run", failed_run)
+    caplog.set_level(logging.ERROR)
+
+    with pytest.raises(WecomCliProcessError) as error:
+        _adapter(FakeCli([]))._run_subprocess(("wecom-cli", "--json", "{}"))
+
+    assert error.value.error_code == "network_error"
+    assert error.value.external_error_code == 893101
+    assert error.value.external_error_type == "NetworkError"
+    assert "private response" not in str(error.value)
+    assert "private body" not in caplog.text
+    assert "ignored private stderr" not in caplog.text
+
+
+def test_non_json_stdout_falls_back_to_limited_stderr_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 stdout 非 JSON 时仍使用 stderr 的有限权限分类。"""
+
+    def failed_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        """返回非 JSON stdout 和可识别的受控权限提示。"""
+        return subprocess.CompletedProcess(
+            args=["wecom-cli"],
+            returncode=1,
+            stdout="not-json private payload",
+            stderr="permission denied token=private",
         )
 
     monkeypatch.setattr(subprocess, "run", failed_run)
@@ -734,8 +885,54 @@ def test_subprocess_failure_keeps_only_controlled_error_code(
         _adapter(FakeCli([]))._run_subprocess(("wecom-cli", "--json", "{}"))
 
     assert error.value.error_code == "permission_denied"
-    assert "customer@example.com" not in str(error.value)
-    assert "secret-value" not in str(error.value)
+    assert error.value.external_error_code is None
+    assert "private" not in str(error.value)
+
+
+def test_unclassified_nonzero_exit_is_permanent_and_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证未知 stdout/stderr 只归为 process_exit，不被误判为暂态重试。"""
+
+    subprocess_calls = 0
+
+    def failed_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        """返回没有已知结构或 stderr 分类的进程错误。"""
+        nonlocal subprocess_calls
+        subprocess_calls += 1
+        return subprocess.CompletedProcess(
+            args=["wecom-cli"], returncode=1, stdout="{\"other\":true}", stderr="unclassified"
+        )
+
+    monkeypatch.setattr(subprocess, "run", failed_run)
+    adapter = WecomCliSmartTableAdapter(
+        doc_id="test-doc", sheet_id="test-sheet", retry_count=1
+    )
+
+    with pytest.raises(WecomCliProcessError) as error:
+        adapter.get_schema()
+
+    assert error.value.error_code == "process_exit"
+    assert subprocess_calls == 1
+
+
+def test_http_status_controls_process_error_retry() -> None:
+    """验证只有明确可重试 HTTP 状态允许幂等 CLI 调用重放。"""
+    retryable = FakeCli(
+        [
+            WecomCliProcessError("HTTP error", error_code="http_error", http_status=503),
+            {"errcode": 0, "fields": []},
+        ]
+    )
+    permanent = FakeCli(
+        [WecomCliProcessError("HTTP error", error_code="http_error", http_status=403)]
+    )
+
+    assert _adapter(retryable).get_schema().fields == ()
+    assert len(retryable.calls) == 2
+    with pytest.raises(WecomCliProcessError):
+        _adapter(permanent).get_schema()
+    assert len(permanent.calls) == 1
 
 
 def test_update_declares_field_title_key_type() -> None:

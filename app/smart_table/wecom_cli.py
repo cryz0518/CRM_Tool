@@ -45,8 +45,18 @@ _FIELD_TYPES = {
     "user": SmartTableFieldType.MEMBER,
 }
 _RECENT_WRITE_VISIBILITY_SECONDS = 30.0
-_PERMANENT_PROCESS_ERROR_CODES = frozenset(
-    {"permission_denied", "record_not_found", "invalid_request"}
+_SAFE_PROCESS_ERROR_TYPES = frozenset(
+    {
+        "ApiError",
+        "AuthError",
+        "AuthenticationError",
+        "CryptoError",
+        "HttpError",
+        "NetworkError",
+        "ParseError",
+        "TimeoutError",
+        "TransportConfigError",
+    }
 )
 
 
@@ -65,16 +75,36 @@ class WecomCliProtocolError(WecomCliSmartTableAdapterError, PermanentTaskFailure
 class WecomCliProcessError(WecomCliProtocolError):
     """表示 wecom-cli 子进程非零退出，具体动作由调用层判断是否可重试。"""
 
-    def __init__(self, message: str, *, error_code: str = "process_exit") -> None:
-        """保存不含原始 stderr 的受控进程错误分类。
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = "process_exit",
+        external_error_code: int | None = None,
+        external_error_type: str | None = None,
+        http_status: int | None = None,
+    ) -> None:
+        """保存不含原始输出的受控 CLI 错误诊断字段。
 
-        参数：message 为安全异常摘要；error_code 为有限白名单中的错误分类。
+        参数：message 为安全异常摘要；其余字段为内部错误分类和白名单结构字段。
         返回值：无。
         异常：无。
-        副作用：仅保存异常对象状态，不记录原始 CLI 输出。
+        副作用：仅保存异常对象状态，不记录 stdout、stderr 或远端正文。
         """
         super().__init__(message)
         self.error_code = error_code
+        self.external_error_code = external_error_code
+        self.external_error_type = external_error_type
+        self.http_status = http_status
+
+    @property
+    def retryable(self) -> bool:
+        """仅允许明确网络、超时或可重试 HTTP 状态触发幂等重试。"""
+        return self.error_code in {"network_error", "timeout"} or (
+            self.error_code == "http_error"
+            and self.http_status is not None
+            and (self.http_status in {408, 425, 429} or self.http_status >= 500)
+        )
 
 
 class WecomCliSmartTableAdapter:
@@ -466,7 +496,7 @@ class WecomCliSmartTableAdapter:
             except WecomCliProcessError as error:
                 # records list/update 是幂等操作，进程异常可以安全重放；records add
                 # 可能已经在服务端成功，不能因客户端退出异常再次创建重复记录。
-                if action == "add" or error.error_code in _PERMANENT_PROCESS_ERROR_CODES:
+                if action == "add" or not error.retryable:
                     raise
                 if attempt == self._retry_count:
                     raise WecomCliTransportError(
@@ -516,19 +546,32 @@ class WecomCliSmartTableAdapter:
             timeout=self._timeout_seconds,
         )
         if completed.returncode != 0:
-            # 只把 stderr 映射为受控错误码，既保留排障方向又不把外部正文写入日志。
-            error_code = self._process_error_code(completed.stderr)
+            # CLI 1.3.x 把结构化错误放在 stdout；只有空 stdout 或非法 JSON 才检查 stderr。
+            parsed_error = self._structured_process_error(completed.stdout)
+            if parsed_error is None:
+                error_code = self._process_error_code(completed.stderr)
+                external_error_code = None
+                external_error_type = None
+                http_status = None
+            else:
+                error_code, external_error_code, external_error_type, http_status = parsed_error
             logger.error(
                 "wecom_cli_process_failed error_code=%s",
                 error_code,
                 extra={
                     "returncode": completed.returncode,
                     "error_code": error_code,
+                    "external_error_code": external_error_code,
+                    "external_error_type": external_error_type,
+                    "http_status": http_status,
                 },
             )
             raise WecomCliProcessError(
                 f"wecom-cli 退出失败，退出码：{completed.returncode}",
                 error_code=error_code,
+                external_error_code=external_error_code,
+                external_error_type=external_error_type,
+                http_status=http_status,
             )
         try:
             parsed: Any = json.loads(completed.stdout)
@@ -536,6 +579,108 @@ class WecomCliSmartTableAdapter:
             # CLI 成功退出但协议异常时，拒绝将非 JSON 文本当作业务数据继续处理。
             raise WecomCliProtocolError("wecom-cli 未返回 JSON 对象") from error
         return self._as_mapping(parsed, "CLI 响应")
+
+    @staticmethod
+    def _structured_process_error(
+        stdout: str,
+    ) -> tuple[str, int | None, str | None, int | None] | None:
+        """从非零退出 stdout 提取受控错误码、错误类型和 HTTP 状态。
+
+        参数：stdout 为 CLI 输出，仅在内存中解析。
+        返回值：内部分类及安全结构化诊断；不是 JSON 对象时返回 None。
+        异常：无；非法字段和非白名单文本会被忽略。
+        副作用：无，不记录或返回任何远端消息、响应体或客户字段。
+        """
+        try:
+            parsed: object = json.loads(stdout)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(parsed, Mapping):
+            return None
+
+        # 只读取结构化 schema 中明示的错误字段，绝不触碰 errmsg、message、body 等正文。
+        nested_error = parsed.get("error")
+        error = nested_error if isinstance(nested_error, Mapping) else {}
+        external_error_code = WecomCliSmartTableAdapter._safe_integer(
+            parsed.get("errcode")
+        )
+        if external_error_code is None:
+            external_error_code = WecomCliSmartTableAdapter._safe_integer(error.get("code"))
+
+        raw_type = error.get("type")
+        external_error_type = (
+            raw_type
+            if isinstance(raw_type, str) and raw_type in _SAFE_PROCESS_ERROR_TYPES
+            else None
+        )
+        http_status = None
+        for source in (error, parsed):
+            for key in ("http_status", "httpStatus", "status_code", "statusCode", "status"):
+                candidate = WecomCliSmartTableAdapter._safe_integer(source.get(key))
+                if candidate is not None and 100 <= candidate <= 599:
+                    http_status = candidate
+                    break
+            if http_status is not None:
+                break
+
+        error_code = WecomCliSmartTableAdapter._structured_error_category(
+            external_error_code, external_error_type, http_status
+        )
+        return error_code, external_error_code, external_error_type, http_status
+
+    @staticmethod
+    def _safe_integer(value: object) -> int | None:
+        """只接纳非布尔整数或纯数字文本，拒绝任意外部描述。"""
+        if type(value) is int:
+            return value
+        if isinstance(value, str) and value.isdecimal():
+            try:
+                return int(value)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _structured_error_category(
+        error_code: int | None,
+        error_type: str | None,
+        http_status: int | None,
+    ) -> str:
+        """把已筛选的 CLI 错误码映射为有限内部类别。"""
+        code_categories = {
+            851003: "permission_denied",
+            853004: "authentication",
+            893003: "local_io_error",
+            893101: "network_error",
+            893102: "http_error",
+            893103: "protocol_parse",
+            893106: "transport_config",
+            893201: "authentication",
+            893203: "crypto_error",
+            893999: "other",
+        }
+        if error_code in code_categories:
+            return code_categories[error_code]
+        if error_code is not None and error_code > 0:
+            # 893xxx 是 CLI 自身分类，其余正数按远端业务码 fail closed。
+            return "other" if 893000 <= error_code <= 893999 else "remote_business_error"
+        if error_type == "NetworkError":
+            return "network_error"
+        if error_type == "TimeoutError":
+            return "timeout"
+        if error_type == "HttpError" or http_status is not None:
+            return "http_error"
+        if error_type == "ParseError":
+            return "protocol_parse"
+        if error_type in {"AuthError", "AuthenticationError"}:
+            return "authentication"
+        if error_type == "TransportConfigError":
+            return "transport_config"
+        if error_type == "CryptoError":
+            return "crypto_error"
+        if error_type == "ApiError":
+            return "remote_business_error"
+        return "process_exit"
 
     @staticmethod
     def _process_error_code(stderr: str) -> str:
@@ -667,15 +812,15 @@ class WecomCliSmartTableAdapter:
 
     def _to_cli_fields(
         self, fields: Mapping[str, object], schema: SmartTableSchema
-    ) -> dict[str, object]:
-        """把业务规范字段和值转换为真实字段标题及 CLI 原生值。
+    ) -> dict[str, str]:
+        """把业务字段转换为标题键及 CLI 1.3.x 要求的 JSON 值字符串。
 
         参数：fields 为业务层字段补丁；schema 为当前真实字段快照。
-        返回：可直接传给 wecom-cli 的字段标题和值。
+        返回：键为真实字段标题、值为单元格 JSON 序列化文本的映射。
         异常：字段未配置、成员身份或 AI待确认选项不合法时抛出异常。
         副作用：无。
         """
-        converted: dict[str, object] = {}
+        converted: dict[str, str] = {}
         for canonical_name, value in fields.items():
             field = schema.get_field(canonical_name)
             if field is None:
@@ -714,28 +859,29 @@ class WecomCliSmartTableAdapter:
 
     def _to_cli_value(
         self, canonical_name: str, field: SmartTableField, value: object
-    ) -> object:
-        """按字段类型转换成员和 AI待确认的 CLI 值，其余字段保持既有契约。
+    ) -> str:
+        """先按字段类型构造 CellValue，再序列化为 CLI map 中的字符串。
 
         参数：canonical_name 为业务规范字段名；field 为真实字段定义；value 为业务层值。
-        返回：匹配 CLI 字段类型的原生值。
+        返回：CLI 1.3.x `values` map 所需的 JSON 序列化值。
         异常：成员身份或 AI待确认选项格式不合法时抛出异常。
         副作用：无。
         """
+        cli_value = value
         if field.field_type is SmartTableFieldType.MEMBER:
             if not isinstance(value, str) or not value:
                 raise ValueError(f"MEMBER 字段必须传入非空 sales_user_id：{canonical_name}")
             # CLI 的 CellUserValue 写入格式为数组；业务层只保留企业微信销售身份字符串。
-            return [{"userId": value}]
-        if field.field_type is SmartTableFieldType.PHONE_NUMBER:
-            if isinstance(value, str):
-                # 企微电话列接受标准字符串；去除常见空格、短横线和括号，保留号码本身及国际区号加号。
-                return re.sub(r"[\s()\-]+", "", value.strip())
-            return value
-        if field.field_type in {
+            cli_value = [{"userId": value}]
+        elif field.field_type is SmartTableFieldType.PHONE_NUMBER and isinstance(value, str):
+            # 企微电话列接受标准字符串；去除常见空格、短横线和括号，保留号码及国际区号加号。
+            cli_value = re.sub(r"[\s()\-]+", "", value.strip())
+        elif canonical_name == "AI待确认" or field.field_type in {
             SmartTableFieldType.SINGLE_SELECT,
             SmartTableFieldType.MULTI_SELECT,
         }:
+            if canonical_name == "AI待确认" and not isinstance(value, list):
+                raise ValueError("AI待确认必须传入规范字段名列表")
             # CRM 线索表的单选/多选写入都必须使用管理员已配置的 option ID。
             raw_values = value if isinstance(value, list) else [value]
             values: list[str] = []
@@ -745,32 +891,19 @@ class WecomCliSmartTableAdapter:
                 values.append(item)
             if not field.options:
                 # 兼容旧测试替身缺少 options 的响应；真实表结构 readiness 会拒绝缺少选项。
-                return value
-            options = {option.name.removeprefix("*"): option for option in field.options}
-            try:
-                return [
-                    {"id": options[item].option_id, "text": options[item].name}
-                    for item in values
-                ]
-            except KeyError as error:
-                raise ValueError(f"选择字段缺少选项：{canonical_name}={error.args[0]}") from error
-        if canonical_name == "AI待确认":
-            if not isinstance(value, list):
-                raise ValueError("AI待确认必须传入规范字段名列表")
-            names: list[str] = []
-            for name in value:
-                if not isinstance(name, str):
-                    raise ValueError("AI待确认必须传入规范字段名列表")
-                names.append(name)
-            # 管理员可为业务字段选项增加必填前缀；写入必须使用 schema 中真实 option ID。
-            options = {option.name.removeprefix("*"): option for option in field.options}
-            try:
-                return [
-                    {"id": options[name].option_id, "text": options[name].name} for name in names
-                ]
-            except KeyError as error:
-                raise ValueError(f"AI待确认缺少字段选项：{error.args[0]}") from error
-        return value
+                cli_value = value
+            else:
+                options = {option.name.removeprefix("*"): option for option in field.options}
+                try:
+                    cli_value = [
+                        {"id": options[item].option_id, "text": options[item].name}
+                        for item in values
+                    ]
+                except KeyError as error:
+                    raise ValueError(
+                        f"选择字段缺少选项：{canonical_name}={error.args[0]}"
+                    ) from error
+        return json.dumps(cli_value, ensure_ascii=False, separators=(",", ":"))
 
     def _parse_record(
         self, item: Mapping[str, object], schema: SmartTableSchema
