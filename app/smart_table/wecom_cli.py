@@ -9,7 +9,9 @@ import shutil
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 from app.core.failures import PermanentTaskFailure, RetryableTaskFailure
 from app.smart_table.adapter import (
@@ -868,7 +870,19 @@ class WecomCliSmartTableAdapter:
         副作用：无。
         """
         cli_value = value
-        if field.field_type is SmartTableFieldType.MEMBER:
+        if field.field_type is SmartTableFieldType.DATE:
+            if not isinstance(value, str):
+                raise ValueError("DATE 字段必须传入 ISO 日期或日期时间字符串")
+            try:
+                # wecom-cli 1.3.4 的 date_time 写入契约要求东八区年月日时分秒。
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as error:
+                raise ValueError("DATE 字段格式不符合 CLI 1.3.4 契约") from error
+            shanghai = ZoneInfo("Asia/Shanghai")
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=shanghai)
+            cli_value = parsed.astimezone(shanghai).strftime("%Y-%m-%d %H:%M:%S")
+        elif field.field_type is SmartTableFieldType.MEMBER:
             if not isinstance(value, str) or not value:
                 raise ValueError(f"MEMBER 字段必须传入非空 sales_user_id：{canonical_name}")
             # CLI 的 CellUserValue 写入格式为数组；业务层只保留企业微信销售身份字符串。

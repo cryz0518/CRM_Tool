@@ -635,7 +635,7 @@ def test_write_cells_match_wecom_cli_134_json_string_values_contract() -> None:
         "备注": "备注样例",
         "手机": "138 0013 8000",
         "邮箱": "sales@example.com",
-        "下次联系时间": "2026-10-02T09:00:00+08:00",
+        "下次联系时间": "2026-10-02T01:00:00Z",
         "业务线": "协作机器人",
         "工艺": ["装配"],
         "负责人": "sales-user",
@@ -650,12 +650,16 @@ def test_write_cells_match_wecom_cli_134_json_string_values_contract() -> None:
         "备注": "备注样例",
         "手机": "13800138000",
         "邮箱": "sales@example.com",
-        "下次联系时间": "2026-10-02T09:00:00+08:00",
+        "下次联系时间": "2026-10-02 09:00:00",
         "业务线": [{"id": "line-id", "text": "协作机器人"}],
         "工艺": [{"id": "process-id", "text": "装配"}],
         "负责人": [{"userId": "sales-user"}],
         "AI待确认": [{"id": "pending-id", "text": "线索名称"}],
     }
+    date_only = _adapter(FakeCli([]))._to_cli_fields(
+        {"下次联系时间": "2026-10-03"}, schema
+    )
+    assert json.loads(date_only["下次联系时间"]) == "2026-10-03 00:00:00"
 
 
 def test_configured_sheet_title_uses_full_query_and_parses_member_rows() -> None:
