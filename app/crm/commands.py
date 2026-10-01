@@ -6,6 +6,8 @@ import hashlib
 import logging
 import re
 from collections.abc import Mapping
+from datetime import UTC
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -89,6 +91,31 @@ _PREVIEW_FIELD_NAMES = (
     "负责人",
     "提交状态",
 )
+
+
+def _company_submission_display_text(fields: Mapping[str, object], lead: Lead) -> str:
+    """从发卡时 Smart Table 快照生成公司、联系人和日期的结果展示名。
+
+    参数：fields 为同次表格读取的记录字段；lead 提供服务端创建日期。
+    返回值：按公司、联系人、上海时区日期组成的安全展示字符串。
+    异常：无。
+    副作用：无，不访问表格或修改线索。
+    """
+    company_name = fields.get("线索名称") or lead.standard_company_name
+    contact_name = fields.get("联系人")
+    created_at = lead.created_at
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    created_text = created_at.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y年%m月%d日")
+    return "｜".join(
+        part
+        for part in (
+            company_name.strip() if isinstance(company_name, str) else "",
+            contact_name.strip() if isinstance(contact_name, str) else "",
+            created_text,
+        )
+        if part
+    )
 
 
 def parse_company_submission_request(text: str) -> str | None:
@@ -489,6 +516,7 @@ def prepare_company_submission_preview(
             {
                 "lead_id": lead.id,
                 "company_name": f"{record.fields.get('线索名称') or company_name}（候选{index}）",
+                "display_text": _company_submission_display_text(record.fields, lead),
             }
             for index, (record, lead) in enumerate(eligible, start=1)
         )
@@ -527,6 +555,7 @@ def prepare_company_submission_preview(
             lead_id=lead.id,
             request_message_id=command.request_message_id,
             company_name=str(record.fields.get("线索名称") or company_name),
+            display_text=_company_submission_display_text(record.fields, lead),
             field_values=display_fields,
         )
     except CardCapabilityUnavailable:

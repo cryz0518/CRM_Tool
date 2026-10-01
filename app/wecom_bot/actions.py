@@ -193,6 +193,39 @@ class FrozenCardUpdate:
 
 
 @dataclass(frozen=True)
+class FrozenButtonCardUpdate:
+    """保存单条指定线索按钮卡完成态需要的服务端关联值。
+
+    参数：task_id 和 action_key 均来自已持久化的服务端动作。
+    返回值：无。
+    异常：无。
+    副作用：无，仅承载不可变更新快照。
+    """
+
+    task_id: str
+    action_key: str
+
+    def as_payload(self) -> dict[str, object]:
+        """构造同类型 button_interaction 完成卡片更新体。
+
+        参数：无。
+        返回值：只含原动作关联值和固定完成态文案的安全卡片更新体。
+        异常：无。
+        副作用：无，不访问客户端字段或外部服务。
+        """
+        return {
+            "card_type": CARD_TYPE_BUTTON_INTERACTION,
+            "task_id": self.task_id,
+            "main_title": {
+                "title": "确认提交线索",
+                "desc": "已受理，后台正在提交，请勿重复操作",
+            },
+            "button_list": [{"text": "确认", "style": 1, "key": self.action_key}],
+            "replace_text": "已确认提交",
+        }
+
+
+@dataclass(frozen=True)
 class CallbackClaimResult:
     """描述一次 callback delivery 的认领结果及可安全返回的摘要。"""
 
@@ -201,7 +234,7 @@ class CallbackClaimResult:
     action_id: str | None
     summary: str
     should_update_card: bool
-    frozen_card_update: FrozenCardUpdate | None = None
+    frozen_card_update: FrozenCardUpdate | FrozenButtonCardUpdate | None = None
 
     def response_card(self) -> dict[str, object]:
         """构造一次 callback response 使用的最小状态卡片。
@@ -212,7 +245,7 @@ class CallbackClaimResult:
         副作用：无。
         """
 
-        # 批量首个合法选择使用 claim 时从服务端冻结候选生成的同类型更新卡。
+        # 首次合法提交类 callback 使用 claim 时从服务端事实构造同类型冻结更新卡。
         if self.code == "claimed" and self.frozen_card_update is not None:
             return self.frozen_card_update.as_payload()
         # 非批量交互沿用现有状态回执；task_id 只回显服务端已解析的 opaque correlation。
@@ -680,7 +713,7 @@ class WecomActionService:
                     False,
                 )
 
-            frozen_card_update: FrozenCardUpdate | None = None
+            frozen_card_update: FrozenCardUpdate | FrozenButtonCardUpdate | None = None
             if action.action_type in {
                 ACTION_TYPE_CRM_FIELD_CONFIRMATION,
                 ACTION_TYPE_CRM_COMPANY_CONFIRMATION,
@@ -732,6 +765,32 @@ class WecomActionService:
                             "owner_mismatch",
                             "当前账号已不是智能表格负责人",
                         )
+                if action.action_type == ACTION_TYPE_CRM_COMPANY_CONFIRMATION:
+                    if candidate_leads is None:
+                        # 唯一匹配卡只回显服务端 task/action key，不携带客户展示字段。
+                        if action.expected_action_key != CARD_EVENT_KEY_CRM_COMPANY_CONFIRM:
+                            return self._deny_action(
+                                action,
+                                delivery,
+                                "invalid_action_context",
+                                "确认卡内容已失效，请重新发起",
+                            )
+                        frozen_card_update = FrozenButtonCardUpdate(
+                            task_id=action.task_id,
+                            action_key=action.expected_action_key,
+                        )
+                    else:
+                        # 多候选公司卡复用投票卡冻结结构，选项只来自服务端候选 context。
+                        frozen_card_update = _freeze_vote_card_update(
+                            action, callback.selected_option_ids
+                        )
+                    if frozen_card_update is None:
+                        return self._deny_action(
+                            action,
+                            delivery,
+                            "invalid_action_context",
+                            "候选卡内容已失效，请重新发起",
+                        )
 
             if action.action_type == ACTION_TYPE_CRM_BATCH_SUBMISSION:
                 # claim 只校验 option ID 属于服务端冻结候选；worker 逐条重验 owner、
@@ -761,7 +820,7 @@ class WecomActionService:
                         "selection_mismatch",
                         "请至少选择一条有效线索",
                     )
-                frozen_card_update = _freeze_batch_card_update(
+                frozen_card_update = _freeze_vote_card_update(
                     action, callback.selected_option_ids
                 )
                 if frozen_card_update is None:
@@ -1347,10 +1406,12 @@ class WecomActionService:
         request_message_id: str,
         company_name: str,
         field_values: Mapping[str, object],
+        display_text: str | None = None,
     ) -> WecomAction:
         """发行单条公司线索的全字段提交确认卡。
 
-        参数：lead_id 为服务端线索标识；field_values 为本次查表得到的展示快照。
+        参数：lead_id 为服务端线索标识；field_values 为本次查表得到的展示快照；
+        display_text 为由该快照生成的安全冻结展示名。
         返回值：已持久化的服务端动作。
         异常：卡片能力、权限或展示值不合法时抛出异常。
         副作用：只写入确认动作和待发送卡片，不调用 CRM。
@@ -1362,7 +1423,10 @@ class WecomActionService:
             target_type="lead",
             target_id=lead_id,
             expected_action_key=CARD_EVENT_KEY_CRM_COMPANY_CONFIRM,
-            context={"request_message_id": request_message_id},
+            context={
+                "request_message_id": request_message_id,
+                **({"display_text": display_text} if display_text is not None else {}),
+            },
             title="确认提交线索",
             description=f"请核对“{_redact_text(company_name, 96)}”的全部字段后确认提交",
             source_message_id=request_message_id,
@@ -1391,6 +1455,10 @@ class WecomActionService:
         target_id = hashlib.sha256(
             f"crm-company-candidates:{request_message_id}:{company_name}".encode()
         ).hexdigest()
+        description = (
+            f"公司名称“{_redact_text(company_name, 96)}”存在多个"
+            f"{'包含匹配' if contains_match else '精确'}候选，请选择一条"
+        )
         return self.issue_action(
             actor_user_id=actor_user_id,
             action_type=ACTION_TYPE_CRM_COMPANY_CONFIRMATION,
@@ -1400,12 +1468,10 @@ class WecomActionService:
             context={
                 "request_message_id": request_message_id,
                 "candidate_leads": [dict(item) for item in candidates],
+                "card_description": description,
             },
             title="选择要提交的线索",
-            description=(
-                f"公司名称“{_redact_text(company_name, 96)}”存在多个"
-                f"{'包含匹配' if contains_match else '精确'}候选，请选择一条"
-            ),
+            description=description,
             source_message_id=request_message_id,
         )
 
@@ -1737,10 +1803,10 @@ def build_action_card(
     return payload
 
 
-def _freeze_batch_card_update(
+def _freeze_vote_card_update(
     action: WecomAction, selected_option_ids: tuple[str, ...]
 ) -> FrozenCardUpdate | None:
-    """从持久化 action context 构造不可变、同类型批量卡片更新。
+    """从持久化 action context 构造不可变、同类型投票卡更新。
 
     参数：action 为锁定的服务端动作；selected_option_ids 为已通过范围校验的 option ID。
     返回值：仅含冻结候选及选中状态的安全更新结构；context 不完整时返回 None。
@@ -1749,24 +1815,41 @@ def _freeze_batch_card_update(
     """
     context = action.context
     candidates = context.get("candidate_leads")
-    command_text = context.get("command_text")
-    page = context.get("page")
-    page_count = context.get("page_count")
-    if (
-        not isinstance(candidates, list)
-        or not candidates
-        or command_text
-        not in {"帮我提交放弃提交的线索", "提交今天的线索", "提交我所有线索"}
-        or type(page) is not int
-        or type(page_count) is not int
-        or page < 1
-        or page_count < page
-        or action.expected_action_key != CARD_EVENT_KEY_CRM_BATCH_SUBMISSION
+    if not isinstance(candidates, list) or not candidates:
+        return None
+    if action.action_type == ACTION_TYPE_CRM_BATCH_SUBMISSION:
+        command_text = context.get("command_text")
+        page = context.get("page")
+        page_count = context.get("page_count")
+        if (
+            command_text
+            not in {"帮我提交放弃提交的线索", "提交今天的线索", "提交我所有线索"}
+            or type(page) is not int
+            or type(page_count) is not int
+            or page < 1
+            or page_count < page
+            or action.expected_action_key != CARD_EVENT_KEY_CRM_BATCH_SUBMISSION
+        ):
+            return None
+        # 批量更新沿用发行时的页标题和多选卡文案。
+        title, description = _batch_submission_card_copy(command_text, page, page_count)
+    elif (
+        action.action_type == ACTION_TYPE_CRM_COMPANY_CONFIRMATION
+        and action.target_type == "crm_company_candidates"
+        and action.expected_action_key == CARD_EVENT_KEY_CRM_COMPANY_CONFIRM
     ):
+        # 复用发卡时保存的安全描述，避免更新时改写原候选卡内容。
+        title = "选择要提交的线索"
+        card_description = context.get("card_description")
+        description = (
+            card_description
+            if isinstance(card_description, str)
+            else "已受理，后台正在提交，请勿重复操作"
+        )
+    else:
         return None
 
-    # 复用发行时卡片 builder 的同一套展示规则，避免更新时重排或改写候选标签。
-    title, description = _batch_submission_card_copy(command_text, page, page_count)
+    # 复用发行时卡片 builder 的选项规则，避免更新时重排或改写冻结候选标签。
     original_card = build_action_card(
         task_id=action.task_id,
         event_key=action.expected_action_key,
@@ -1856,6 +1939,8 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
         "field_values",
         "command_text",
         "request_message_id",
+        "card_description",
+        "display_text",
         "message_id",
         "segment_index",
         "reason",
@@ -2486,7 +2571,24 @@ class DeterministicWecomActionExecutor:
                 request_message_id=request_message_id,
                 duplicates=result.duplicate_confirmations,
             )
-        return "crm_company_submission_completed", format_submission_reply(result)
+        # 唯一候选与多候选都只采用发卡时持久化的服务端标签，不读取 callback 展示字段。
+        labels: dict[str, str] = {}
+        display_text = action.context.get("display_text")
+        if isinstance(display_text, str) and display_text:
+            labels[target_lead_id] = display_text
+        candidates = action.context.get("candidate_leads")
+        if isinstance(candidates, list):
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                lead_id = candidate.get("lead_id")
+                label = candidate.get("display_text")
+                if isinstance(lead_id, str) and isinstance(label, str) and label:
+                    labels[lead_id] = label
+        return (
+            "crm_company_submission_completed",
+            format_submission_reply(result, lead_labels=labels, selected_count=1),
+        )
 
     def _discard_lead(self, action: ActionSnapshot) -> tuple[str, str]:
         """重新读取当前线索状态后复用既有 LeadDiscardService。

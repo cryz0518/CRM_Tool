@@ -1229,6 +1229,10 @@ def test_company_preview_exactly_matches_table_and_does_not_call_crm(
     with session_factory() as session:
         action = session.scalar(select(WecomAction))
         assert action is not None and action.target_id == "preview-lead"
+        display_text = action.context.get("display_text")
+        assert isinstance(display_text, str)
+        assert display_text.startswith("上海世界纵横智能科技有限公司｜王工｜")
+        assert len(display_text.split("｜")) == 3
         preview = session.scalar(
             select(NotificationRecord).where(
                 NotificationRecord.notification_type == "wecom_action_preview"
@@ -1257,7 +1261,19 @@ def test_company_preview_contains_match_still_requires_confirmation_card(
     monkeypatch.setattr(crm_commands, "get_settings", lambda: settings)
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     record = adapter.create_record(
-        {"负责人": "sales-1", "线索名称": "上海世界纵横智能科技有限公司"},
+        {
+            "负责人": "sales-1",
+            "线索名称": "上海世界纵横智能科技有限公司",
+            "联系人": "王工",
+        },
+        actor=SmartTableActor.ROBOT,
+    )
+    second_record = adapter.create_record(
+        {
+            "负责人": "sales-1",
+            "线索名称": "上海世界纵横智能科技有限公司",
+            "联系人": "李工",
+        },
         actor=SmartTableActor.ROBOT,
     )
     with session_factory.begin() as session:
@@ -1281,6 +1297,18 @@ def test_company_preview_contains_match_still_requires_confirmation_card(
                 field_values={"线索名称": record.fields["线索名称"]},
             )
         )
+        session.add(
+            Lead(
+                id="contains-preview-lead-2",
+                source_message_id="contains-preview-message",
+                source_segment_index=1,
+                original_capturing_sales_user_id="sales-1",
+                smart_table_owner_user_id="sales-1",
+                smart_table_record_id=second_record.record_id,
+                lifecycle_state="pending_create",
+                field_values={"线索名称": second_record.fields["线索名称"]},
+            )
+        )
 
     reply = prepare_company_submission_preview(
         session_factory,
@@ -1289,10 +1317,19 @@ def test_company_preview_contains_match_still_requires_confirmation_card(
         "世界纵横",
     )
 
-    assert "名称包含关系" in reply
+    assert "找到 2 条同名线索" in reply
     with session_factory() as session:
         action = session.scalar(select(WecomAction))
-        assert action is not None and action.target_id == "contains-preview-lead"
+        assert action is not None and action.target_type == "crm_company_candidates"
+        candidates = action.context.get("candidate_leads")
+        assert isinstance(candidates, list) and len(candidates) == 2
+        assert {candidate["lead_id"] for candidate in candidates} == {
+            "contains-preview-lead",
+            "contains-preview-lead-2",
+        }
+        assert {
+            candidate["display_text"].split("｜")[1] for candidate in candidates
+        } == {"王工", "李工"}
 
 
 @pytest.mark.parametrize(

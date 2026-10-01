@@ -49,6 +49,7 @@ from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.registry import build_required_smart_table_schema
 from app.wecom_bot.actions import (
     CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
+    CARD_EVENT_KEY_CRM_COMPANY_CONFIRM,
     CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE,
     CARD_EVENT_KEY_CRM_FIELD_CONFIRM,
     CARD_EVENT_KEY_DISCARD_CONFIRM,
@@ -1031,10 +1032,28 @@ def test_today_callback_claim_executor_submits_only_selected_lead(
     assert replay.code == "action_processing"
     assert claim.should_update_card is True
     assert replay.should_update_card is False
+    assert action.action_type == "crm_batch_submission"
     card = claim.response_card()
     assert card["card_type"] == "vote_interaction"
-    assert card["checkbox"]["disable"] is True  # type: ignore[index]
+    checkbox = card["checkbox"]
+    assert checkbox["mode"] == 1  # type: ignore[index]
+    assert checkbox["disable"] is True  # type: ignore[index]
+    assert checkbox["option_list"] == [  # type: ignore[index]
+        {
+            "id": lead_ids[0],
+            "text": "1. TODAY测试公司-0",
+            "is_checked": True,
+        },
+        {
+            "id": lead_ids[1],
+            "text": "2. TODAY测试公司-1",
+            "is_checked": False,
+        },
+    ]
+    assert card["replace_text"] == "已确认选择"
     assert execution.executed is True
+    replay_execution = action_service.execute_action(action.id, executor)
+    assert replay_execution.executed is False
     assert crm.search_calls == 1 and crm.calls == 1 and crm.update_calls == 0
     assert [payload["name"] for payload in crm.payloads] == ["TODAY测试公司-0"]
     with session_factory() as session:
@@ -1519,6 +1538,326 @@ def test_batch_callback_freezes_original_vote_card_and_ignores_client_names(
             )
         )
         assert delivery is not None and delivery.transport_status == "succeeded"
+
+
+def test_unique_company_callback_freezes_button_card_once(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证唯一指定线索确认卡更新与 replay 幂等。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：卡片结构、回放次数或 Outbox 数量不符时断言失败。
+    副作用：只写入测试数据库并调用本地模拟更新函数。
+    """
+    _authorize(session_factory)
+    service = _service(session_factory)
+    action = service.issue_company_submission_confirmation_action(
+        actor_user_id="sales-a",
+        lead_id="lead-company-freeze",
+        request_message_id="message-company-freeze",
+        company_name="冻结公司",
+        field_values={"线索名称": "冻结公司"},
+    )
+    with session_factory.begin() as session:
+        session.add(
+            Lead(
+                id="lead-company-freeze",
+                original_capturing_sales_user_id="sales-a",
+                smart_table_owner_user_id="sales-a",
+                lifecycle_state="pending_create",
+                field_values={},
+            )
+        )
+    frame = _frame_for_action(action, msgid="provider-company-freeze")
+    card_event = frame["body"]["event"]["template_card_event"]  # type: ignore[index]
+    card_event["company_name"] = "客户端注入名称"
+    updates: list[dict[str, object]] = []
+
+    async def update_card(
+        callback_frame: Mapping[str, object], card: dict[str, object]
+    ) -> dict[str, int]:
+        """记录并确认原 callback 对应的卡片更新。
+
+        参数：callback_frame 为原始帧；card 为待更新卡片。
+        返回值：模拟企业微信成功 ACK。
+        异常：frame 非原对象时断言失败。
+        副作用：追加一条更新到测试列表。
+        """
+        assert callback_frame is frame
+        updates.append(card)
+        return {"errcode": 0}
+
+    handler = WecomTemplateCardCallbackHandler(service)
+    asyncio.run(handler.handle(frame, update_card))
+    asyncio.run(
+        handler.handle(
+            _frame_for_action(action, msgid="provider-company-freeze-replay"), update_card
+        )
+    )
+
+    assert len(updates) == 1
+    assert updates[0] == {
+        "card_type": "button_interaction",
+        "task_id": action.task_id,
+        "main_title": {
+            "title": "确认提交线索",
+            "desc": "已受理，后台正在提交，请勿重复操作",
+        },
+        "button_list": [
+            {"text": "确认", "style": 1, "key": CARD_EVENT_KEY_CRM_COMPANY_CONFIRM}
+        ],
+        "replace_text": "已确认提交",
+    }
+    assert "客户端注入名称" not in json.dumps(updates[0], ensure_ascii=False)
+    with session_factory() as session:
+        assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
+
+
+def test_company_candidate_callback_freezes_single_vote_selection_once(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证指定公司多候选卡冻结选择状态和提交入口。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：卡片结构、回放次数或 Outbox 数量不符时断言失败。
+    副作用：只写入测试数据库并调用本地模拟更新函数。
+    """
+    _authorize(session_factory)
+    service = _service(session_factory)
+    action = service.issue_company_candidate_confirmation_action(
+        actor_user_id="sales-a",
+        request_message_id="message-company-candidates",
+        company_name="同名公司",
+        candidates=(
+            {
+                "lead_id": "lead-company-a",
+                "company_name": "同名公司（候选1）",
+                "display_text": "同名公司｜张总｜2026年10月01日",
+            },
+            {
+                "lead_id": "lead-company-b",
+                "company_name": "同名公司（候选2）",
+                "display_text": "同名公司｜李工｜2026年09月30日",
+            },
+        ),
+    )
+    with session_factory.begin() as session:
+        session.add_all(
+            [
+                Lead(
+                    id=lead_id,
+                    original_capturing_sales_user_id="sales-a",
+                    smart_table_owner_user_id="sales-a",
+                    lifecycle_state="pending_create",
+                    field_values={},
+                )
+                for lead_id in ("lead-company-a", "lead-company-b")
+            ]
+        )
+    frame = _batch_frame_for_action(
+        action, ("lead-company-b",), msgid="provider-company-candidates"
+    )
+    card_event = frame["body"]["event"]["template_card_event"]  # type: ignore[index]
+    card_event["company_name"] = "客户端注入名称"
+    updates: list[dict[str, object]] = []
+
+    async def update_card(
+        callback_frame: Mapping[str, object], card: dict[str, object]
+    ) -> dict[str, int]:
+        """记录指定公司候选卡更新并返回 ACK 成功。
+
+        参数：callback_frame 为 callback 帧；card 为候选状态更新体。
+        返回值：模拟企业微信成功 ACK。
+        异常：frame 非本测试原对象时断言失败。
+        副作用：追加一条更新到测试列表。
+        """
+        assert callback_frame is frame
+        updates.append(card)
+        return {"errcode": 0}
+
+    handler = WecomTemplateCardCallbackHandler(service)
+    asyncio.run(handler.handle(frame, update_card))
+    asyncio.run(
+        handler.handle(
+            _batch_frame_for_action(
+                action, ("lead-company-b",), msgid="provider-company-candidates-replay"
+            ),
+            update_card,
+        )
+    )
+
+    assert len(updates) == 1
+    assert updates[0]["card_type"] == "vote_interaction"
+    assert updates[0]["task_id"] == action.task_id
+    assert updates[0]["main_title"] == {
+        "title": "选择要提交的线索",
+        "desc": "公司名称“同名公司”存在多个精确候选，请选择一条",
+    }
+    assert updates[0]["checkbox"] == {
+        "question_key": "crm_submission_candidates",
+        "mode": 0,
+        "option_list": [
+            {"id": "lead-company-a", "text": "1. 同名公司（候选1）", "is_checked": False},
+            {"id": "lead-company-b", "text": "2. 同名公司（候选2）", "is_checked": True},
+        ],
+        "disable": True,
+    }
+    assert updates[0]["submit_button"] == {
+        "text": "确认选择",
+        "key": CARD_EVENT_KEY_CRM_COMPANY_CONFIRM,
+    }
+    assert updates[0]["replace_text"] == "已确认选择"
+    assert "客户端注入名称" not in json.dumps(updates[0], ensure_ascii=False)
+    with session_factory() as session:
+        assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
+
+
+def test_company_submission_result_uses_frozen_label_and_safe_reason(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证唯一指定提交结果使用发行时标签和受控重复原因。
+
+    参数：数据库、临时员工目录和 monkeypatch fixture 用于隔离提交依赖。
+    返回值：无。
+    异常：结果、敏感信息或外部调用次数不符时断言失败。
+    副作用：只写入测试数据库、临时 CSV 和模拟 CRM。
+    """
+    import app.crm.service as crm_service
+
+    employee_path = tmp_path / "employee.csv"
+    employee_path.write_text("id,name,nickname\ncrm-sales-a,测试销售,测试\n", encoding="utf-8")
+    settings = get_settings().model_copy(update={"employee_directory_path": str(employee_path)})
+    monkeypatch.setattr(crm_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(crm_service, "_TEST_EMPLOYEE_DIRECTORY_PATH", employee_path, raising=False)
+
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_ids = _seed_today_submission_leads(session_factory, adapter)
+    lead_id = lead_ids[0]
+    frozen_label = "服务端快照公司｜张总｜2026年10月01日"
+    action_service = _service(session_factory)
+    action = action_service.issue_company_submission_confirmation_action(
+        actor_user_id="sales-a",
+        lead_id=lead_id,
+        request_message_id="company-safe-result",
+        company_name="服务端快照公司",
+        display_text=frozen_label,
+        field_values={"线索名称": "服务端快照公司"},
+    )
+    frame = _frame_for_action(action, msgid="company-safe-result-provider")
+    frame["body"]["event"]["template_card_event"]["company_name"] = "客户端注入名称"  # type: ignore[index]
+    claim = action_service.claim_callback(frame)
+    replay = action_service.claim_callback(
+        _frame_for_action(action, msgid="company-safe-result-replay")
+    )
+
+    class DuplicateTargetCRM(MockCRMAdapter):
+        """模拟重复目标没有可操作 CRM Lead ID 的受控结果。"""
+
+        def search_by_company_name(
+            self, payload: Mapping[str, object] | str
+        ) -> tuple[CRMSearchResult, ...]:
+            """阻止测试走 create，并返回安全 duplicate 分类。"""
+            del payload
+            self.search_calls += 1
+            raise SopCRMError(
+                "PRIVATE RAW SOP MESSAGE",
+                category="duplicate_target_unavailable",
+                sub_code="duplicate_detected_without_lead_id",
+                duplicate_entity_type="lead",
+            )
+
+    crm = DuplicateTargetCRM()
+    executor = DeterministicWecomActionExecutor(
+        session_factory, adapter, crm, action_service
+    )
+    execution = action_service.execute_action(action.id, executor)
+    replay_execution = action_service.execute_action(action.id, executor)
+
+    assert claim.code == "claimed"
+    assert replay.code == "action_processing"
+    assert execution.executed is True
+    assert replay_execution.executed is False
+    assert "CRM 提交结果（已选择 1 条）" in execution.summary
+    assert f"{frozen_label}：CRM 检测到重复线索" in execution.summary
+    assert "客户端注入名称" not in execution.summary
+    assert "PRIVATE RAW SOP MESSAGE" not in execution.summary
+    assert crm.search_calls == 1 and crm.calls == 0
+    with session_factory() as session:
+        assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
+
+
+def test_company_candidate_submission_executes_only_selected_lead_and_uses_frozen_label(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证指定公司多候选仅提交已选 Lead 并使用冻结标签。
+
+    参数：数据库、临时员工目录和 monkeypatch fixture 用于隔离提交依赖。
+    返回值：无。
+    异常：结果、CRM 调用次数或 Outbox 数量不符时断言失败。
+    副作用：只写入测试数据库、临时 CSV 和模拟 CRM。
+    """
+    import app.crm.service as crm_service
+
+    employee_path = tmp_path / "employee.csv"
+    employee_path.write_text("id,name,nickname\ncrm-sales-a,测试销售,测试\n", encoding="utf-8")
+    settings = get_settings().model_copy(update={"employee_directory_path": str(employee_path)})
+    monkeypatch.setattr(crm_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(crm_service, "_TEST_EMPLOYEE_DIRECTORY_PATH", employee_path, raising=False)
+
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_ids = _seed_today_submission_leads(session_factory, adapter)
+    labels = (
+        "同名公司｜张总｜2026年10月01日",
+        "同名公司｜李工｜2026年09月30日",
+    )
+    action_service = _service(session_factory)
+    action = action_service.issue_company_candidate_confirmation_action(
+        actor_user_id="sales-a",
+        request_message_id="company-candidate-result",
+        company_name="同名公司",
+        candidates=tuple(
+            {
+                "lead_id": lead_id,
+                "company_name": f"同名公司（候选{index}）",
+                "display_text": labels[index - 1],
+            }
+            for index, lead_id in enumerate(lead_ids, start=1)
+        ),
+    )
+    frame = _batch_frame_for_action(
+        action, (lead_ids[1],), msgid="company-candidate-result-provider"
+    )
+    frame["body"]["event"]["template_card_event"]["company_name"] = "客户端注入名称"  # type: ignore[index]
+    claim = action_service.claim_callback(frame)
+    replay = action_service.claim_callback(
+        _batch_frame_for_action(
+            action, (lead_ids[1],), msgid="company-candidate-result-replay"
+        )
+    )
+    crm = MockCRMAdapter()
+    executor = DeterministicWecomActionExecutor(
+        session_factory, adapter, crm, action_service
+    )
+    execution = action_service.execute_action(action.id, executor)
+    replay_execution = action_service.execute_action(action.id, executor)
+
+    assert claim.code == "claimed"
+    assert replay.code == "action_processing"
+    assert execution.executed is True
+    assert replay_execution.executed is False
+    assert "CRM 提交结果（已选择 1 条）" in execution.summary
+    assert f"{labels[1]}" in execution.summary
+    assert "客户端注入名称" not in execution.summary
+    assert crm.search_calls == 1 and crm.calls == 1 and crm.update_calls == 0
+    assert [payload["name"] for payload in crm.payloads] == ["TODAY测试公司-1"]
+    with session_factory() as session:
+        assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
 
 
 def test_final_notification_retry_does_not_repeat_domain_action(
