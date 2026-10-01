@@ -116,18 +116,20 @@ services:
     build: .
     environment: *application_environment
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
-    # 真实 Adapter 只读挂载本机 CLI 凭据；镜像、代码仓库和容器环境变量均不保存密钥。
-    volumes: &application_volumes
-      - type: bind
-        source: ${WECOM_CLI_CREDENTIALS_PATH:-./.wecom-cli-credentials}
-        target: /home/appuser/.config/wecom
-        read_only: true
-      # 员工目录只读注入容器，供提交边界解析 CRM headerId；不写入镜像或数据库。
-      - type: bind
+    volumes:
+      # 普通应用数据卷：员工目录只读，媒体数据由接入与处理流程共用。
+      - &employee_directory_volume
+        type: bind
         source: ${EMPLOYEE_DIRECTORY_HOST_PATH:-./employee.csv}
         target: /app/employee.csv
         read_only: true
-      - media_data:/var/lib/crm-lead/media
+      - &media_data_volume media_data:/var/lib/crm-lead/media
+      # wecom-cli 静默刷新必须能持久化新凭据；只提供给 app/worker，不进入镜像、Git 或环境变量。
+      - &wecom_cli_credentials_volume
+        type: bind
+        source: ${WECOM_CLI_CREDENTIALS_PATH:-./.wecom-cli-credentials}
+        target: /home/appuser/.config/wecom
+        read_only: false
     ports:
       - "${APP_PORT:-8000}:8000"
     depends_on:
@@ -147,8 +149,11 @@ services:
     build: .
     environment: *application_environment
     command: ["celery", "-A", "workers.celery_app:celery_app", "worker", "--loglevel=INFO", "--hostname=worker@%h"]
-    # Worker 与应用共用同一只读凭据挂载，确保后台同步走真实 CLI 时也可授权。
-    volumes: *application_volumes
+    # Worker 与应用共用同一可写凭据目录，确保静默刷新后读取同一份凭据。
+    volumes:
+      - *employee_directory_volume
+      - *media_data_volume
+      - *wecom_cli_credentials_volume
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -185,7 +190,9 @@ services:
       WECOM_BOT_SECRET: "${WECOM_BOT_SECRET:-}"
       WECOM_CARD_CALLBACK_ENABLED: "${WECOM_CARD_CALLBACK_ENABLED:-false}"
     command: ["python", "-m", "app.wecom_bot.runner"]
-    volumes: *application_volumes
+    # Bot 只需媒体持久卷；不调用 wecom-cli，也不读取员工目录。
+    volumes:
+      - *media_data_volume
     depends_on:
       migrate:
         condition: service_completed_successfully
