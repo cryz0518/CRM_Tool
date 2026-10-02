@@ -1165,6 +1165,131 @@ def test_free_text_company_hint_prevents_context_cross_lead_and_keeps_tyc_pendin
     assert second_record.fields["AI待确认"] == ["线索名称"]
 
 
+def test_new_company_update_intent_starts_new_lead_and_follow_up_uses_new_context(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证未命中历史的新公司不会被 UPDATE_LEAD 错误归入当前线索。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：新公司覆盖旧线索、补充消息创建第三条线索或表格记录数量错误时由 pytest 报告。
+    副作用：模拟三条连续销售消息，并写入测试用智能表格记录与归属事实。
+    """
+    first_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-routing-company-a",
+        sales_user_id="sales-1",
+        text="公司A的张经理，需要协作机器人方案",
+    )
+    gateway = AIGateway(
+        MockLLMProvider(
+            [
+                json.dumps(
+                    {
+                        "intent": "NEW_LEAD",
+                        "customer_reference": {},
+                        "crm_fields": {"线索名称": "公司A", "联系人": "张经理"},
+                        "enrichment": {},
+                        "confidence_by_field": {"线索名称": 0.99, "联系人": 0.95},
+                        "conflicts": [],
+                        "warnings": [],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "intent": "UPDATE_LEAD",
+                        "customer_reference": {},
+                        "crm_fields": {
+                            "线索名称": "公司B",
+                            "联系人": "董经理",
+                            "工艺": "视觉检测",
+                        },
+                        "enrichment": {},
+                        "confidence_by_field": {
+                            "线索名称": 0.99,
+                            "联系人": 0.95,
+                            "工艺": 0.95,
+                        },
+                        "conflicts": [],
+                        "warnings": [],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "intent": "UPDATE_LEAD",
+                        "customer_reference": {},
+                        "crm_fields": {"手机": "13800000000"},
+                        "enrichment": {"预算": "预算38万", "线索来源": "电缆行业展会"},
+                        "confidence_by_field": {"手机": 0.99},
+                        "conflicts": [],
+                        "warnings": [],
+                    }
+                ),
+            ]
+        )
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter, ai_gateway=gateway)
+
+    # 先消费首条消息，避免同销售顺序消费器自动推进尚未建立的后续消息。
+    first = service.consume(first_event_id)
+
+    second_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-routing-company-b",
+        sales_user_id="sales-1",
+        text="公司B的董经理，电缆表面绝缘层瑕疵视觉检测",
+    )
+    second = service.consume(second_event_id)
+
+    third_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-routing-company-b-follow-up",
+        sales_user_id="sales-1",
+        text="预算38万，测试手机号，电缆行业展会，预计今年底",
+    )
+    third = service.consume(third_event_id)
+
+    assert first.status is LeadProcessingStatus.CREATED
+    assert second.status is LeadProcessingStatus.CREATED
+    assert third.status is LeadProcessingStatus.UPDATED
+    assert first.lead_id is not None
+    assert second.lead_id is not None
+    assert third.lead_id == second.lead_id
+    assert first.lead_id != second.lead_id
+    assert first.smart_table_record_id != second.smart_table_record_id
+
+    with session_factory() as session:
+        # 数据库中应只有两条线索，且 A 的公司字段不能被 B 的新公司覆盖。
+        leads = session.scalars(select(Lead).order_by(Lead.created_at)).all()
+        assert len(leads) == 2
+        assert {lead.field_values.get("线索名称") for lead in leads} == {"公司A", "公司B"}
+        resolutions = {
+            resolution.message_id: resolution.lead_id
+            for resolution in session.scalars(
+                select(LeadMessageResolution).where(
+                    LeadMessageResolution.message_id.in_(
+                        (
+                            "message-routing-company-a",
+                            "message-routing-company-b",
+                            "message-routing-company-b-follow-up",
+                        )
+                    )
+                )
+            )
+        }
+        assert resolutions == {
+            "message-routing-company-a": first.lead_id,
+            "message-routing-company-b": second.lead_id,
+            "message-routing-company-b-follow-up": second.lead_id,
+        }
+
+    # 两条 Lead 必须对应两条独立审核记录，补充消息不能新建第三条记录。
+    records = adapter.get_records()
+    assert len(records) == 2
+    assert {record.fields["线索名称"] for record in records} == {"公司A", "公司B"}
+
+
 def test_free_form_company_contact_phone_message_is_not_unassigned(
     session_factory: sessionmaker[Session],
 ) -> None:

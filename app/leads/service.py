@@ -1669,6 +1669,8 @@ class FirstTextLeadWorkspaceService:
             return None, LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
 
         fields = patch.fields
+        # 正式公司名是确定性的新线索边界；不能由模型的 UPDATE_LEAD 意图覆盖。
+        incoming_company_name = str(fields.get("线索名称") or "").strip()
         ai_identity_fields = {
             field_name: value
             for field_name, value in fields.items()
@@ -1687,9 +1689,9 @@ class FirstTextLeadWorkspaceService:
             active_context_lead is not None
             and not explicit_new_lead_signal
             and (
-                patch.analysis.intent == "UPDATE_LEAD"
-                or weak_context_fragment
+                weak_context_fragment
                 or media_context_continuation
+                or (not incoming_company_name and patch.analysis.intent == "UPDATE_LEAD")
             )
         ):
             # 名片/OCR 等新身份候选未命中旧表格时，以 AI 关系判断、媒体连续性或
@@ -1707,6 +1709,20 @@ class FirstTextLeadWorkspaceService:
                 logger.info("ai_context_continuation_selected", extra={"reason": "ai_update"})
         elif ai_identity_fields:
             # 有明确 AI 身份且没有可靠历史命中时，继续按新线索处理，避免把不同客户串入当前线索。
+            if (
+                active_context_lead is not None
+                and incoming_company_name
+                and not weak_context_fragment
+                and not media_context_continuation
+                and not explicit_new_lead_signal
+            ):
+                # 仅记录受控事实，不把公司名称或其他客户内容写入容器日志。
+                self._record_audit(
+                    session,
+                    event,
+                    "ai_company_identity_overrode_active_context",
+                    {"active_context_present": True, "new_company_identity_present": True},
+                )
             context_lead = None
         # 弱片段可能在上一步移除了模型伪造的身份字段，后续逻辑必须使用清理后的补丁。
         fields = patch.fields
