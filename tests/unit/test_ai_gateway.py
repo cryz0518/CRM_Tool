@@ -129,6 +129,19 @@ def test_gateway_classifies_submission_intent_without_crm_side_effect() -> None:
     assert "意图分类" in provider.requests[0].messages[0]["content"]
 
 
+def test_gateway_classifies_incomplete_resubmission_without_client_targets() -> None:
+    """验证意图模型只输出待完善重提类别，不承担线索或动作身份解析。"""
+    provider = MockLLMProvider(
+        responses=['{"intent":"SUBMIT_RETRY_INCOMPLETE","company_name":null}']
+    )
+
+    intent = AIGateway(provider).classify_submission_intent("重新提交")
+
+    assert intent.intent == "SUBMIT_RETRY_INCOMPLETE"
+    assert intent.company_name is None
+    assert "SUBMIT_RETRY_INCOMPLETE" in provider.requests[0].messages[0]["content"]
+
+
 def test_gateway_keeps_lead_capture_as_typed_intent() -> None:
     """验证包含提交方案字样的普通客户消息仍返回 LEAD_CAPTURE。"""
     provider = MockLLMProvider(responses=['{"intent":"LEAD_CAPTURE","company_name":null}'])

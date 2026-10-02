@@ -57,6 +57,7 @@ from app.wecom_bot.actions import (
     CallbackParseError,
     DeterministicWecomActionExecutor,
     InvalidActionTransition,
+    StaleActionClaim,
     TemplateCardCallbackParser,
     WecomActionService,
     WecomActionStatus,
@@ -674,6 +675,15 @@ def test_company_submission_request_is_strict_and_returns_exact_company_name() -
     assert parse_company_submission_request("请帮我提交上海世界纵横智能科技有限公司。") is None
 
 
+def test_incomplete_retry_routing_keeps_abandoned_priority_and_guards() -> None:
+    """验证待完善重提不抢占放弃/更新命令，疑问和否定不授权提交。"""
+    assert parse_crm_submission_command("重新提交") is None
+    assert parse_crm_submission_command("重新提交放弃提交的线索") == "帮我提交放弃提交的线索"
+    assert parse_crm_submission_command("提交我的更新") == "提交我的更新"
+    assert not is_explicit_submission_request("这些待完善线索可以重新提交吗？")
+    assert not is_explicit_submission_request("先不要重新提交")
+
+
 def test_company_submission_confirmation_card_contains_preview_fields(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -786,6 +796,7 @@ def test_batch_markdown_and_checkbox_share_frozen_page_order() -> None:
             "company_name": "候选一",
             "display_text": "候选一｜王工｜2026-09-30",
             "field_values": {"业务线": "协作机器人", "联系人": "王工", "AI待确认": ["职务"]},
+            "missing_fields": ["职务"],
         },
         {
             "lead_id": "lead-b",
@@ -811,6 +822,8 @@ def test_batch_markdown_and_checkbox_share_frozen_page_order() -> None:
     assert "【1】候选一｜王工｜2026-09-30" in markdown[0]
     assert "【2】候选二｜李工｜2026-09-30" in markdown[0]
     assert "- AI待确认：[\"职务\"]" in markdown[0]
+    assert "- 状态：待完善" in markdown[0]
+    assert "- 缺少：职务" in markdown[0]
     options = card["checkbox"]["option_list"]  # type: ignore[index]
     assert [option["id"] for option in options] == ["lead-a", "lead-b"]  # type: ignore[index]
     assert [option["text"] for option in options] == ["1. 候选一", "2. 候选二"]  # type: ignore[index]
@@ -1138,6 +1151,157 @@ def test_today_callback_defers_temporary_lifecycle_to_worker_revalidation(
     assert result.code == "claimed"
     with session_factory() as session:
         assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
+
+
+def test_incomplete_submission_results_are_fenced_and_persisted_on_action(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证批量动作只持久化安全逐条结果，且使用当前 claim token fencing。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_ids = _seed_today_submission_leads(session_factory, adapter, count=1)
+    record = next(iter(adapter.get_records()))
+    adapter.update_record(record.record_id, {"业务线": ""})
+    action_service = _service(session_factory)
+    action = _issue_today_action(action_service, lead_ids, message_id="fenced-incomplete-results")
+    claim = action_service.claim_callback(
+        _batch_frame_for_action(action, lead_ids, msgid="fenced-incomplete-provider")
+    )
+    crm = MockCRMAdapter()
+    executor = DeterministicWecomActionExecutor(session_factory, adapter, crm, action_service)
+
+    execution = action_service.execute_action(action.id, executor)
+
+    assert claim.code == "claimed"
+    assert execution.executed is True
+    assert crm.search_calls == 0 and crm.calls == 0
+    with session_factory() as session:
+        saved = session.get(WecomAction, action.id)
+        outbox = session.scalar(
+            select(WecomActionOutbox).where(WecomActionOutbox.action_id == action.id)
+        )
+    assert saved is not None and saved.status == "succeeded"
+    assert saved.context["selected_lead_ids"] == [lead_ids[0]]
+    assert saved.context["submission_results"] == [
+        {
+            "lead_id": lead_ids[0],
+            "status": "incomplete",
+            "reason_code": "missing_required_fields",
+            "missing_fields": ["业务线"],
+        }
+    ]
+    assert saved.context["incomplete_selected_lead_ids"] == [lead_ids[0]]
+    assert outbox is not None and outbox.status == "succeeded"
+    with pytest.raises(StaleActionClaim):
+        action_service.record_submission_results(
+            action.id,
+            "stale-worker-token",
+            (
+                {
+                    "lead_id": lead_ids[0],
+                    "status": "created",
+                    "reason_code": None,
+                    "missing_fields": (),
+                },
+            ),
+        )
+    with session_factory() as session:
+        saved_after_stale_write = session.get(WecomAction, action.id)
+    assert saved_after_stale_write is not None
+    assert saved_after_stale_write.context["submission_results"] == saved.context[
+        "submission_results"
+    ]
+
+
+def test_unique_company_temporary_incomplete_is_confirmable_and_result_persisted(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证唯一指定线索的不完整 temporary 可确认，动作成功但 CRM 零调用。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_ids = _seed_today_submission_leads(session_factory, adapter, count=1)
+    record = next(iter(adapter.get_records()))
+    adapter.update_record(record.record_id, {"职务": ""})
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_ids[0])
+        assert lead is not None
+        lead.lifecycle_state = "temporary"
+    action_service = _service(session_factory)
+    action = action_service.issue_company_submission_confirmation_action(
+        actor_user_id="sales-a",
+        lead_id=lead_ids[0],
+        request_message_id="single-incomplete-request",
+        company_name="TODAY测试公司-0",
+        display_text="TODAY测试公司-0｜王工｜日期",
+        field_values={"线索名称": "TODAY测试公司-0"},
+    )
+    claim = action_service.claim_callback(
+        _frame_for_action(action, msgid="single-incomplete-provider")
+    )
+    crm = MockCRMAdapter()
+    executor = DeterministicWecomActionExecutor(session_factory, adapter, crm, action_service)
+
+    execution = action_service.execute_action(action.id, executor)
+
+    assert claim.code == "claimed"
+    assert execution.executed is True
+    assert "缺少「职务」" in execution.summary
+    assert crm.search_calls == 0 and crm.calls == 0
+    with session_factory() as session:
+        saved = session.get(WecomAction, action.id)
+    assert saved is not None and saved.status == "succeeded"
+    assert saved.context["selected_lead_ids"] == [lead_ids[0]]
+    assert saved.context["submission_results"][0]["status"] == "incomplete"
+
+
+def test_multiple_company_candidates_keep_incomplete_temporary_selectable(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证指定线索多候选仍能选择不完整 temporary，且未选项不进入结果。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_ids = _seed_today_submission_leads(session_factory, adapter, count=2)
+    records = adapter.get_records()
+    adapter.update_record(records[0].record_id, {"沟通方式": ""})
+    with session_factory.begin() as session:
+        for lead_id in lead_ids:
+            lead = session.get(Lead, lead_id)
+            assert lead is not None
+            lead.lifecycle_state = "temporary"
+    action_service = _service(session_factory)
+    action = action_service.issue_company_candidate_confirmation_action(
+        actor_user_id="sales-a",
+        request_message_id="multi-single-incomplete-request",
+        company_name="TODAY测试公司",
+        candidates=(
+            {
+                "lead_id": lead_ids[0],
+                "company_name": "候选公司一",
+                "display_text": "候选公司一｜王工",
+            },
+            {
+                "lead_id": lead_ids[1],
+                "company_name": "候选公司二",
+                "display_text": "候选公司二｜王工",
+            },
+        ),
+    )
+    claim = action_service.claim_callback(
+        _batch_frame_for_action(
+            action, (lead_ids[0],), msgid="multi-single-incomplete-provider"
+        )
+    )
+    crm = MockCRMAdapter()
+    executor = DeterministicWecomActionExecutor(session_factory, adapter, crm, action_service)
+
+    execution = action_service.execute_action(action.id, executor)
+
+    assert claim.code == "claimed"
+    assert execution.executed is True
+    assert "缺少「沟通方式」" in execution.summary
+    assert crm.search_calls == 0 and crm.calls == 0
+    with session_factory() as session:
+        saved = session.get(WecomAction, action.id)
+    assert saved is not None
+    assert saved.context["selected_lead_ids"] == [lead_ids[0]]
+    assert [item["lead_id"] for item in saved.context["submission_results"]] == [lead_ids[0]]
 
 
 def test_today_callback_defers_owner_transfer_to_worker_revalidation(

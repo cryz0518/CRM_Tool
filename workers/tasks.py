@@ -305,6 +305,7 @@ def _submission_command_text(intent: SubmissionIntent) -> str | None:
         "SUBMIT_ALL": "提交我所有线索",
         "SUBMIT_ABANDONED": "帮我提交放弃提交的线索",
         "SUBMIT_UPDATES": "提交我的更新",
+        "SUBMIT_RETRY_INCOMPLETE": "重新提交待完善的线索",
     }
     if intent.intent in command_by_intent:
         return command_by_intent[intent.intent]

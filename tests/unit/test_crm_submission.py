@@ -924,6 +924,302 @@ def test_targeted_temporary_lead_reports_missing_required_fields_before_crm(
     assert lead is not None and lead.lifecycle_state == "temporary"
 
 
+def test_incomplete_retry_reloads_table_and_never_recreates_successful_lead(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证待完善重提每次重读表格，已成功线索不会被再次提交。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    record = next(iter(adapter.get_records()))
+    adapter.update_record(record.record_id, {"职务": ""})
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.lifecycle_state = "temporary"
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+
+    first = service.submit_incomplete_retry(
+        SubmissionCommand("重新提交待完善的线索", "sales-1", "retry-incomplete-1"),
+        (lead_id,),
+    )
+
+    assert len(first.items) == 1
+    assert first.items[0].status is SubmissionItemStatus.INCOMPLETE
+    assert first.items[0].missing_fields == ("职务",)
+    assert crm.search_calls == 0 and crm.calls == 0
+    adapter.update_record(record.record_id, {"职务": "项目经理"})
+
+    second = service.submit_incomplete_retry(
+        SubmissionCommand("重新提交待完善的线索", "sales-1", "retry-incomplete-2"),
+        (lead_id,),
+    )
+    third = service.submit_incomplete_retry(
+        SubmissionCommand("重新提交待完善的线索", "sales-1", "retry-incomplete-3"),
+        (lead_id,),
+    )
+
+    assert second.succeeded == 1
+    assert crm.search_calls == 1 and crm.calls == 1
+    assert len(third.items) == 1
+    assert third.items[0].status is SubmissionItemStatus.NOT_SUBMITTED
+    assert third.items[0].reason_code == "already_submitted"
+    assert crm.search_calls == 1 and crm.calls == 1
+
+
+def test_incomplete_retry_fails_closed_after_owner_or_table_status_change(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 owner 转移或 Smart Table 已非未提交时均不进入 CRM。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    record = next(iter(adapter.get_records()))
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.lifecycle_state = "temporary"
+        lead.smart_table_owner_user_id = "sales-2"
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+
+    owner_changed = service.submit_incomplete_retry(
+        SubmissionCommand("重新提交待完善的线索", "sales-1", "retry-owner-changed"),
+        (lead_id,),
+    )
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.smart_table_owner_user_id = "sales-1"
+    adapter.update_record(record.record_id, {"提交状态": "已提交"})
+    status_changed = service.submit_incomplete_retry(
+        SubmissionCommand("重新提交待完善的线索", "sales-1", "retry-status-changed"),
+        (lead_id,),
+    )
+
+    assert owner_changed.items[0].status is SubmissionItemStatus.NOT_SUBMITTED
+    assert owner_changed.items[0].reason_code == "candidate_state_changed"
+    assert status_changed.items[0].status is SubmissionItemStatus.NOT_SUBMITTED
+    assert status_changed.items[0].reason_code == "candidate_state_changed"
+    assert crm.search_calls == 0 and crm.calls == 0
+
+
+def test_retry_command_aggregates_incomplete_results_from_all_pages(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证重提按原 request_message_id 聚合多页选择且使用当前表格缺项。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    first_lead_id = _lead(session_factory, adapter)
+    first_record = next(iter(adapter.get_records()))
+    adapter.update_record(first_record.record_id, {"职务": ""})
+    second_record = adapter.create_record(
+        {
+            "负责人": "sales-1",
+            "线索名称": "第二条测试公司",
+            "业务线": "",
+            "线索来源": "展会",
+            "联系人": "李工",
+            "职务": "经理",
+            "沟通方式": "微信",
+            "手机": "13800000001",
+            "客户行业": "其他",
+            "备注": "已确认测试需求，销售后续跟进。",
+            "提交状态": "未提交",
+        },
+        actor=SmartTableActor.ROBOT,
+    )
+    with session_factory.begin() as session:
+        first_lead = session.get(Lead, first_lead_id)
+        assert first_lead is not None
+        first_lead.lifecycle_state = "temporary"
+        second_message = IncomingMessage(
+            message_id="retry-page-source-2",
+            sales_user_id="sales-1",
+            sequence=2,
+            raw_payload={},
+        )
+        second_lead = Lead(
+            source_message_id=second_message.message_id,
+            original_capturing_sales_user_id="sales-1",
+            smart_table_owner_user_id="sales-1",
+            smart_table_record_id=second_record.record_id,
+            lifecycle_state="temporary",
+            standard_company_name="第二条测试公司",
+            field_values=dict(second_record.fields),
+        )
+        session.add_all([second_message, second_lead])
+        session.flush()
+        second_lead_id = second_lead.id
+        session.add_all(
+            [
+                WecomAction(
+                    task_id="retry-page-1",
+                    action_type="crm_batch_submission",
+                    bound_actor_wecom_user_id="sales-1",
+                    target_type="crm_batch_submission",
+                    target_id="page-1",
+                    expected_action_key="crm.batch_submission.confirm",
+                    status="succeeded",
+                    expires_at=utc_now() + timedelta(minutes=5),
+                    context={
+                        "request_message_id": "original-paged-request",
+                        "candidate_leads": [
+                            {
+                                "lead_id": first_lead_id,
+                                "company_name": "第一条测试公司",
+                                "display_text": "第一条测试公司｜王工",
+                            }
+                        ],
+                        "selected_lead_ids": [first_lead_id],
+                        "submission_results": [
+                            {
+                                "lead_id": first_lead_id,
+                                "status": "incomplete",
+                                "reason_code": "missing_required_fields",
+                                "missing_fields": ["旧字段快照不可复用"],
+                            }
+                        ],
+                    },
+                ),
+                WecomAction(
+                    task_id="retry-page-2",
+                    action_type="crm_batch_submission",
+                    bound_actor_wecom_user_id="sales-1",
+                    target_type="crm_batch_submission",
+                    target_id="page-2",
+                    expected_action_key="crm.batch_submission.confirm",
+                    status="succeeded",
+                    expires_at=utc_now() + timedelta(minutes=5),
+                    context={
+                        "request_message_id": "original-paged-request",
+                        "candidate_leads": [
+                            {
+                                "lead_id": second_lead_id,
+                                "company_name": "第二条测试公司",
+                                "display_text": "第二条测试公司｜李工",
+                            }
+                        ],
+                        "selected_lead_ids": [second_lead_id],
+                        "submission_results": [
+                            {
+                                "lead_id": second_lead_id,
+                                "status": "incomplete",
+                                "reason_code": "missing_required_fields",
+                                "missing_fields": ["另一个旧字段"],
+                            }
+                        ],
+                    },
+                ),
+            ]
+        )
+        retry_message = IncomingMessage(
+            message_id="retry-current-request",
+            sales_user_id="sales-1",
+            sequence=3,
+            raw_payload={},
+            normalized_text="重新提交",
+        )
+        session.add(retry_message)
+        session.flush()
+        retry_event = OutboxEvent(
+            message_id=retry_message.message_id,
+            sales_user_id="sales-1",
+            sequence=3,
+            event_type="crm_submission_intent",
+            status="processing",
+        )
+        session.add(retry_event)
+        session.flush()
+        retry_event_id = retry_event.id
+
+    crm = MockCRMAdapter()
+    reply = consume_submission_command(
+        session_factory,
+        adapter,
+        crm,
+        retry_event_id,
+        command_text="重新提交待完善的线索",
+    )
+
+    assert "重新提交结果（共 2 条）" in reply
+    assert "第一条测试公司｜王工：缺少「职务」" in reply
+    assert "第二条测试公司｜李工：缺少「业务线」" in reply
+    assert "旧字段快照不可复用" not in reply
+    assert crm.search_calls == 0 and crm.calls == 0
+    with session_factory() as session:
+        prior_actions = session.scalars(
+            select(WecomAction).where(
+                WecomAction.target_id.in_(("page-1", "page-2"))
+            )
+        ).all()
+        retry_notification = session.scalar(
+            select(NotificationRecord).where(
+                NotificationRecord.source_message_id == "retry-current-request",
+                NotificationRecord.notification_type == "crm_submission_retry_summary",
+            )
+        )
+    assert all(
+        any(
+            result["status"] == "incomplete"
+            for result in action.context["submission_results"]
+        )
+        for action in prior_actions
+    )
+    assert retry_notification is not None and retry_notification.content == reply
+
+
+def test_retry_command_without_prior_incomplete_selection_is_safe_noop(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证没有历史待完善选择时给出安全提示且 CRM 零调用。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    with session_factory.begin() as session:
+        session.add(
+            SalesAuthorization(
+                wecom_user_id="sales-1", is_authorized=True, is_active=True
+            )
+        )
+        message = IncomingMessage(
+            message_id="retry-no-history-request",
+            sales_user_id="sales-1",
+            sequence=1,
+            raw_payload={},
+            normalized_text="重新提交",
+        )
+        session.add(message)
+        session.flush()
+        event = OutboxEvent(
+            message_id=message.message_id,
+            sales_user_id="sales-1",
+            sequence=1,
+            event_type="crm_submission_intent",
+            status="processing",
+        )
+        session.add(event)
+        session.flush()
+        event_id = event.id
+    crm = MockCRMAdapter()
+
+    reply = consume_submission_command(
+        session_factory,
+        adapter,
+        crm,
+        event_id,
+        command_text="重新提交待完善的线索",
+    )
+
+    assert reply == "当前没有上次已选择且待完善的线索需要重新提交。"
+    assert crm.search_calls == 0 and crm.calls == 0
+    with session_factory() as session:
+        event = session.get(OutboxEvent, event_id)
+        notification = session.scalar(
+            select(NotificationRecord).where(
+                NotificationRecord.source_message_id == "retry-no-history-request"
+            )
+        )
+    assert event is not None and event.status == "succeeded"
+    assert notification is not None and notification.content == reply
+
+
 def test_complete_temporary_duplicate_stop_promotes_and_allows_abandoned_resubmit(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -1043,14 +1339,14 @@ def test_complete_temporary_duplicate_continue_updates_existing_crm_identity(
     assert sync is not None and sync.crm_lead_id == "crm-A" and sync.status == "succeeded"
 
 
-def test_today_submission_rejects_temporary_lead_at_card_and_callback(
+def test_today_submission_shows_incomplete_temporary_and_defers_validation_to_callback(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证“今天”只允许当日 pending_create，回调不能把 temporary 重新放行。"""
+    """验证不完整 temporary 可进入 TODAY 候选，确认时返回缺项且不调用 CRM。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter)
     record = next(iter(adapter.get_records()))
-    adapter.update_record(record.record_id, {"客户行业": ""})
+    adapter.update_record(record.record_id, {"业务线": "", "职务": ""})
     with session_factory.begin() as session:
         lead = session.get(Lead, lead_id)
         assert lead is not None
@@ -1059,12 +1355,119 @@ def test_today_submission_rejects_temporary_lead_at_card_and_callback(
     service = CrmSubmissionService(session_factory, adapter, crm)
 
     candidates = service.list_submission_candidates("提交今天的线索", "sales-1")
-    assert candidates == ()
+    assert tuple(candidate.lead_id for candidate in candidates) == (lead_id,)
+    result = service.submit_selected(
+        SubmissionCommand("提交今天的线索", "sales-1", "today-incomplete-temporary"),
+        (lead_id,),
+    )
+
+    assert len(result.items) == 1
+    assert result.items[0].status is SubmissionItemStatus.INCOMPLETE
+    assert result.items[0].reason_code == "missing_required_fields"
+    assert result.items[0].missing_fields == ("业务线", "职务")
+    assert result.incomplete == 1
     assert crm.search_calls == 0
     assert crm.calls == 0
     with session_factory() as session:
         lead = session.get(Lead, lead_id)
     assert lead is not None and lead.lifecycle_state == "temporary"
+
+
+def test_all_submission_shows_incomplete_temporary_candidate(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 ALL 与 TODAY 一致，不以 CRM 必填完整度决定 temporary 是否展示。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    record = next(iter(adapter.get_records()))
+    adapter.update_record(record.record_id, {"沟通方式": ""})
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.lifecycle_state = "temporary"
+
+    candidates = CrmSubmissionService(
+        session_factory, adapter, MockCRMAdapter()
+    ).list_submission_candidates("提交我所有线索", "sales-1")
+
+    assert tuple(candidate.lead_id for candidate in candidates) == (lead_id,)
+
+
+def test_today_three_candidates_process_complete_and_incomplete_independently(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 TODAY 三条均可选择，完整项提交而两条不完整项各自零 CRM 调用。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    complete_id = _lead(session_factory, adapter)
+    leads: list[tuple[str, str]] = []
+    with session_factory.begin() as session:
+        for index, missing in enumerate((("业务线", "职务"), ("沟通方式",)), start=1):
+            record = adapter.create_record(
+                {
+                    "负责人": "sales-1",
+                    "线索名称": f"临时测试公司-{index}",
+                    "业务线": "协作机器人",
+                    "线索来源": "展会",
+                    "联系人": f"测试联系人-{index}",
+                    "职务": "经理",
+                    "沟通方式": "微信",
+                    "手机": f"1380000000{index}",
+                    "客户行业": "其他",
+                    "备注": "已确认自动化需求，销售需继续跟进。",
+                    "提交状态": "未提交",
+                },
+                actor=SmartTableActor.ROBOT,
+            )
+            adapter.update_record(record.record_id, {field: "" for field in missing})
+            message_id = f"today-temporary-source-{index}"
+            session.add(
+                IncomingMessage(
+                    message_id=message_id,
+                    sales_user_id="sales-1",
+                    sequence=index + 1,
+                    raw_payload={},
+                )
+            )
+            lead = Lead(
+                source_message_id=message_id,
+                original_capturing_sales_user_id="sales-1",
+                smart_table_owner_user_id="sales-1",
+                smart_table_record_id=record.record_id,
+                lifecycle_state="temporary",
+                standard_company_name=f"临时测试公司-{index}",
+                field_values=dict(record.fields),
+            )
+            session.add(lead)
+            session.flush()
+            leads.append((lead.id, record.record_id))
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+
+    candidates = service.list_submission_candidates("提交今天的线索", "sales-1")
+    result = service.submit_selected(
+        SubmissionCommand("提交今天的线索", "sales-1", "today-three-mixed"),
+        tuple(candidate.lead_id for candidate in candidates),
+    )
+
+    assert {candidate.lead_id for candidate in candidates} == {
+        complete_id,
+        leads[0][0],
+        leads[1][0],
+    }
+    assert {candidate.lead_id: candidate.missing_fields for candidate in candidates} == {
+        complete_id: (),
+        leads[0][0]: ("业务线", "职务"),
+        leads[1][0]: ("沟通方式",),
+    }
+    assert len(result.items) == 3
+    statuses = {item.lead_id: item.status for item in result.items}
+    assert statuses[complete_id] is SubmissionItemStatus.CREATED
+    assert statuses[leads[0][0]] is SubmissionItemStatus.INCOMPLETE
+    assert statuses[leads[1][0]] is SubmissionItemStatus.INCOMPLETE
+    missing = {item.lead_id: item.missing_fields for item in result.items}
+    assert missing[leads[0][0]] == ("业务线", "职务")
+    assert missing[leads[1][0]] == ("沟通方式",)
+    assert crm.search_calls == 1 and crm.calls == 1
 
 
 def test_today_submission_promotes_temporary_lead_from_complete_table_snapshot(
@@ -1173,6 +1576,7 @@ def test_company_preview_exactly_matches_table_and_does_not_call_crm(
             "沟通方式": "见面拜访",
             "手机": "13800000000",
             "备注": "已确认需求",
+            "提交状态": "未提交",
         },
         actor=SmartTableActor.ROBOT,
     )
@@ -1265,6 +1669,7 @@ def test_company_preview_contains_match_still_requires_confirmation_card(
             "负责人": "sales-1",
             "线索名称": "上海世界纵横智能科技有限公司",
             "联系人": "王工",
+                "提交状态": "未提交",
         },
         actor=SmartTableActor.ROBOT,
     )
@@ -1273,6 +1678,7 @@ def test_company_preview_contains_match_still_requires_confirmation_card(
             "负责人": "sales-1",
             "线索名称": "上海世界纵横智能科技有限公司",
             "联系人": "李工",
+                "提交状态": "未提交",
         },
         actor=SmartTableActor.ROBOT,
     )
@@ -1427,7 +1833,7 @@ def test_batch_submission_sends_full_snapshot_markdown_before_short_selection_ca
                     "业务线": "协作机器人",
                     "线索来源": "展会",
                     "联系人": f"联系人-{index}",
-                    "职务": "技术经理",
+                    "职务": "技术经理" if index == 0 else "",
                     "沟通方式": "微信",
                     "手机": f"1380000000{index}",
                     "客户行业": "机械加工",
@@ -1478,6 +1884,8 @@ def test_batch_submission_sends_full_snapshot_markdown_before_short_selection_ca
     options = card.payload["template_card"]["checkbox"]["option_list"]  # type: ignore[index]
     assert "**待提交线索明细（第 1/1 页）**" in markdown
     assert "- 客户行业：机械加工" in markdown
+    assert "- 状态：待完善" in markdown
+    assert "- 缺少：职务" in markdown
     assert "- AI待确认：[\"职务\"]" in markdown
     assert [option["id"] for option in options] == [
         "batch-detail-lead-0",
@@ -1507,6 +1915,7 @@ def test_company_preview_links_existing_owner_record_into_local_lead(
             "线索名称": "已有表格线索",
             "业务线": "协作机器人",
             "手机": "13800000000",
+            "提交状态": "未提交",
         },
         actor=SmartTableActor.ROBOT,
     )
@@ -1558,7 +1967,7 @@ def test_company_preview_keeps_temporary_owner_record_available(
     monkeypatch.setattr(crm_commands, "get_settings", lambda: settings)
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     record = adapter.create_record(
-        {"负责人": "sales-1", "线索名称": "临时状态线索"},
+        {"负责人": "sales-1", "线索名称": "临时状态线索", "提交状态": "未提交"},
         actor=SmartTableActor.ROBOT,
     )
     with session_factory.begin() as session:

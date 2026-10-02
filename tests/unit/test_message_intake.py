@@ -106,6 +106,46 @@ def test_submission_like_natural_language_enters_async_intent_classification(
     assert event.event_type == "crm_submission_intent"
 
 
+def test_plain_resubmit_enters_intent_router_and_abandoned_phrase_keeps_priority(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证“重新提交”进入意图路由，放弃提交专用表达仍走确定性快路径。"""
+    authorize_salesperson(session_factory, "sales-1")
+    intake = MessageIntakeService(session_factory)
+    intake.receive(
+        IncomingMessageCommand(
+            message_id="message-retry-intent",
+            sales_user_id="sales-1",
+            raw_payload={"text": "重新提交"},
+            normalized_text="重新提交",
+        )
+    )
+    intake.receive(
+        IncomingMessageCommand(
+            message_id="message-abandoned-fast-path",
+            sales_user_id="sales-1",
+            raw_payload={"text": "重新提交放弃提交的线索"},
+            normalized_text="重新提交放弃提交的线索",
+        )
+    )
+
+    with session_factory() as session:
+        retry = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.message_id == "message-retry-intent")
+        )
+        abandoned = session.scalar(
+            select(OutboxEvent).where(
+                OutboxEvent.message_id == "message-abandoned-fast-path"
+            )
+        )
+
+    assert retry is not None and retry.event_type == "crm_submission_intent"
+    assert abandoned is not None and abandoned.event_type == "crm_submission_command"
+    assert tasks._submission_command_text(
+        SubmissionIntent(intent="SUBMIT_RETRY_INCOMPLETE")
+    ) == "重新提交待完善的线索"
+
+
 def test_ordinary_text_skips_submission_intent_classifier_and_enters_lead_pipeline(
     session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -157,6 +197,8 @@ def test_ordinary_text_skips_submission_intent_classifier_and_enters_lead_pipeli
         ("不要提交今天的线索", "SUBMIT_TODAY"),
         ("不用提交所有线索", "SUBMIT_ALL"),
         ("先别提交遨博这条线索", "SUBMIT_SINGLE"),
+        ("先不要重新提交", "SUBMIT_RETRY_INCOMPLETE"),
+        ("这些待完善线索可以重新提交吗？", "SUBMIT_RETRY_INCOMPLETE"),
     ],
 )
 def test_negative_submission_intent_never_enters_submission_workflow(

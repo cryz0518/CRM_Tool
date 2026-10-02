@@ -52,6 +52,7 @@ class SubmissionIntent(BaseModel):
         "SUBMIT_SINGLE",
         "SUBMIT_ABANDONED",
         "SUBMIT_UPDATES",
+        "SUBMIT_RETRY_INCOMPLETE",
         "UNKNOWN",
     ]
     company_name: str | None = None

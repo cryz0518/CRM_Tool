@@ -1078,6 +1078,105 @@ class WecomActionService:
                 extra={"action_id": action.id, "event": "action_claimed"},
             )
 
+    def record_submission_results(
+        self,
+        action_id: str,
+        claim_token: str,
+        items: Sequence[Mapping[str, object]],
+    ) -> None:
+        """以当前 action claim fencing 保存所选线索的安全逐条提交结果。
+
+        参数：action_id 和 claim_token 定位当前 Worker；items 仅包含 lead_id、status、
+        reason_code、missing_fields。
+        返回值：无。
+        异常：claim 已失效、结果与冻结选择不一致或结果字段不受控时抛出异常。
+        副作用：仅更新 action.context 的结果摘要，不保存客户字段、payload 或异常正文。
+        """
+        allowed_statuses = {
+            "created", "updated", "unchanged", "incomplete", "duplicate_confirmation",
+            "mapping_missing", "processing", "retrying", "failed_pending_review",
+            "company_identity_review", "not_submitted",
+        }
+        allowed_reasons = {
+            "missing_required_fields", "duplicate_confirmation_required",
+            "crm_user_mapping_missing", "sync_processing", "crm_create_retrying",
+            "crm_create_failed_pending_review", "candidate_state_changed", "already_submitted",
+            "duplicate_target_unavailable", "company_identity_conflict",
+            "company_identity_reserved", "crm_duplicate_search_retrying",
+            "crm_duplicate_search_failed", "crm_update_incomplete", "crm_update_retrying",
+            "crm_update_failed_pending_review", "company_identity_change_pending_review",
+        }
+        if not items or len(items) > 20:
+            raise ValueError("逐条提交结果数量非法")
+        safe_items: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for item in items:
+            lead_id = item.get("lead_id")
+            status = item.get("status")
+            reason_code = item.get("reason_code")
+            missing_fields = item.get("missing_fields")
+            if (
+                set(item) != {"lead_id", "status", "reason_code", "missing_fields"}
+                or not isinstance(lead_id, str)
+                or _ID_PATTERN.fullmatch(lead_id) is None
+                or lead_id in seen
+                or not isinstance(status, str)
+                or status not in allowed_statuses
+                or (
+                    reason_code is not None
+                    and (
+                        not isinstance(reason_code, str)
+                        or reason_code not in allowed_reasons
+                    )
+                )
+                or not isinstance(missing_fields, (list, tuple))
+                or len(missing_fields) > 32
+                or any(
+                    not isinstance(field, str)
+                    or not 0 < len(field) <= 64
+                    or "\n" in field
+                    or "\r" in field
+                    for field in missing_fields
+                )
+            ):
+                raise ValueError("逐条提交结果包含非法字段")
+            seen.add(lead_id)
+            safe_items.append(
+                {
+                    "lead_id": lead_id,
+                    "status": status,
+                    "reason_code": reason_code,
+                    "missing_fields": list(missing_fields),
+                }
+            )
+
+        with self._session_factory.begin() as session:
+            action, outbox = self._lock_action_and_outbox(session, action_id)
+            self._assert_locked_claim(action, outbox, claim_token)
+            if action.action_type == ACTION_TYPE_CRM_BATCH_SUBMISSION:
+                selected = action.context.get("selected_lead_ids")
+            elif action.action_type == ACTION_TYPE_CRM_COMPANY_CONFIRMATION:
+                selected = [action.context.get("selected_lead_id", action.target_id)]
+            else:
+                raise ValueError("该 action 类型不保存 CRM 逐条结果")
+            if (
+                not isinstance(selected, list)
+                or not all(isinstance(lead_id, str) for lead_id in selected)
+                or len(selected) != len(safe_items)
+                or set(selected) != seen
+            ):
+                raise ValueError("逐条结果与服务端冻结选择不一致")
+            action.context = {
+                **action.context,
+                "selected_lead_ids": list(selected),
+                "submission_results": safe_items,
+                "incomplete_selected_lead_ids": [
+                    item["lead_id"]
+                    for item in safe_items
+                    if item["status"] == "incomplete"
+                ],
+            }
+
     def mark_remote_effect_succeeded(
         self,
         action_id: str,
@@ -2180,14 +2279,21 @@ def build_batch_submission_markdown(
                 f"- {_escape_markdown(field_name)}："
                 f"{_escape_markdown(_preview_card_value(value))}"
             )
-        blocks.append(
-            "\n".join(
-                [
-                    f"【{index}】{_escape_markdown(label)}",
-                    *field_lines,
-                ]
+        missing_fields = candidate_data.get("missing_fields")
+        candidate_lines = [f"【{index}】{_escape_markdown(label)}"]
+        if (
+            isinstance(missing_fields, (list, tuple))
+            and missing_fields
+            and all(isinstance(field, str) for field in missing_fields)
+        ):
+            candidate_lines.extend(
+                (
+                    "- 状态：待完善",
+                    "- 缺少：" + _escape_markdown("、".join(missing_fields)),
+                )
             )
-        )
+        candidate_lines.extend(field_lines)
+        blocks.append("\n".join(candidate_lines))
 
     header = f"**待提交线索明细（第 {page}/{page_count} 页）**"
     chunks: list[str] = []
@@ -2514,6 +2620,20 @@ class DeterministicWecomActionExecutor:
             SubmissionCommand(command_text, action.bound_actor_wecom_user_id, request_message_id),
             tuple(selected),
         )
+        if self._action_service is not None:
+            self._action_service.record_submission_results(
+                action.id,
+                action.claim_token,
+                tuple(
+                    {
+                        "lead_id": item.lead_id,
+                        "status": getattr(item.status, "value", str(item.status)),
+                        "reason_code": item.reason_code,
+                        "missing_fields": item.missing_fields,
+                    }
+                    for item in result.items
+                ),
+            )
         if result.duplicate_confirmations and self._action_service is not None:
             self._action_service.issue_duplicate_confirmation_action(
                 actor_user_id=action.bound_actor_wecom_user_id,
@@ -2565,6 +2685,20 @@ class DeterministicWecomActionExecutor:
                 target_lead_id=target_lead_id,
             )
         )
+        if self._action_service is not None:
+            self._action_service.record_submission_results(
+                action.id,
+                action.claim_token,
+                tuple(
+                    {
+                        "lead_id": item.lead_id,
+                        "status": getattr(item.status, "value", str(item.status)),
+                        "reason_code": item.reason_code,
+                        "missing_fields": item.missing_fields,
+                    }
+                    for item in result.items
+                ),
+            )
         if result.duplicate_confirmations and self._action_service is not None:
             self._action_service.issue_duplicate_confirmation_action(
                 actor_user_id=action.bound_actor_wecom_user_id,

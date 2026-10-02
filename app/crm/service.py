@@ -38,6 +38,7 @@ _TODAY_COMMAND = "提交今天的线索"
 _ALL_COMMAND = "提交我所有线索"
 _ABANDONED_COMMAND = "帮我提交放弃提交的线索"
 _UPDATES_COMMAND = "提交我的更新"
+_RETRY_INCOMPLETE_COMMAND = "重新提交待完善的线索"
 _BUSINESS_COMPLETENESS_FIELDS = (
     "业务线",
     "线索名称",
@@ -148,6 +149,7 @@ class SubmissionCandidate:
     company_name: str
     display_text: str | None = None
     snapshot_fields: tuple[tuple[str, object], ...] = ()
+    missing_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -465,14 +467,81 @@ class CrmSubmissionService:
                 ]
 
         if target_missing:
-            return SubmissionBatchResult(
-                incomplete=1,
-                incomplete_lead_ids=(command.target_lead_id or "",),
+            return _append_create_result(
+                SubmissionBatchResult(),
+                command.target_lead_id or "",
+                _create_outcome("not_submitted", reason_code="candidate_state_changed"),
             )
         result = SubmissionBatchResult()
         for lead_id in candidate_ids:
             # 每条独立执行；任何一条失败都不得影响后续候选。
             outcome = self._submit_create(lead_id, command)
+            result = _append_create_result(result, lead_id, outcome)
+        return result
+
+    def submit_incomplete_retry(
+        self, command: SubmissionCommand, selected_lead_ids: tuple[str, ...]
+    ) -> SubmissionBatchResult:
+        """重读并重提当前销售最近一次已选择但当时不完整的服务端目标。
+
+        参数：command 为本次重提消息事实；selected_lead_ids 来自服务端历史 action 结果。
+        返回值：每个历史目标各有一条当前状态结果。
+        异常：命令不匹配或销售未授权时抛出 ValueError；外部依赖错误按既有服务边界处理。
+        副作用：只对重新验证仍有效且当前完整的目标复用首次创建流程。
+        """
+        if command.text != _RETRY_INCOMPLETE_COMMAND:
+            raise ValueError("不支持待完善线索重提命令")
+        selected = tuple(dict.fromkeys(selected_lead_ids))
+        with self._session_factory() as session:
+            authorization = session.get(SalesAuthorization, command.sales_user_id)
+            if (
+                authorization is None
+                or not authorization.is_authorized
+                or not authorization.is_active
+            ):
+                raise ValueError("提交销售未授权")
+            # 一次读取用于前置 fail-closed；真正创建前仍会在 _submit_create 重读 Final Snapshot。
+            smart_table_snapshot = {
+                record.record_id: record for record in self._smart_table_adapter.get_records()
+            }
+            eligible: set[str] = set()
+            reasons: dict[str, str] = {}
+            for lead_id in selected:
+                lead = session.get(Lead, lead_id)
+                if lead is None or lead.smart_table_owner_user_id != command.sales_user_id:
+                    reasons[lead_id] = "candidate_state_changed"
+                    continue
+                sync = latest_crm_create_sync(session, lead_id)
+                if sync is not None and sync.status in {"succeeded", "abandoned"}:
+                    reasons[lead_id] = "already_submitted"
+                    continue
+                if lead.lifecycle_state not in {"temporary", "pending_create"}:
+                    reasons[lead_id] = "candidate_state_changed"
+                    continue
+                if not self._is_unsubmitted_smart_table_record(
+                    lead, snapshot=smart_table_snapshot
+                ):
+                    reasons[lead_id] = "candidate_state_changed"
+                    continue
+                eligible.add(lead_id)
+
+        result = SubmissionBatchResult()
+        for lead_id in selected:
+            if lead_id in eligible:
+                outcome = self._submit_create(
+                    lead_id,
+                    SubmissionCommand(
+                        "提交指定线索",
+                        command.sales_user_id,
+                        command.request_message_id,
+                        target_lead_id=lead_id,
+                    ),
+                )
+            else:
+                outcome = _create_outcome(
+                    "not_submitted",
+                    reason_code=reasons.get(lead_id, "candidate_state_changed"),
+                )
             result = _append_create_result(result, lead_id, outcome)
         return result
 
@@ -518,7 +587,7 @@ class CrmSubmissionService:
                     ):
                         continue
                 elif command_text == _TODAY_COMMAND:
-                    # 今日候选可包括后台 temporary，但只以当前表格完整快照确认其提交资格。
+                    # 候选资格只看所有权、日期、生命周期与实时未提交状态；字段完整性留给最终提交。
                     if (
                         lead.lifecycle_state not in {"pending_create", "temporary"}
                         or not self._is_today_owned_candidate(lead, sales_user_id)
@@ -530,10 +599,6 @@ class CrmSubmissionService:
                         lead, snapshot=smart_table_snapshot
                     ):
                         continue
-                    if lead.lifecycle_state == "temporary":
-                        record = smart_table_snapshot.get(lead.smart_table_record_id or "")
-                        if record is None or self._missing_crm_minimum(dict(record.fields)):
-                            continue
                 else:
                     # 只有待创建和仍在补全的草稿能进入卡片；已同步、废弃或失败终态保持冻结。
                     if lead.lifecycle_state not in {"pending_create", "temporary"}:
@@ -573,6 +638,7 @@ class CrmSubmissionService:
                             company_name.strip(),
                             display_text,
                             tuple(display_snapshot.items()),
+                            self._missing_crm_minimum(dict(snapshot_fields)),
                         )
                     )
             return tuple(candidates)
@@ -618,7 +684,7 @@ class CrmSubmissionService:
                     ):
                         valid_ids.add(lead_id)
                 elif command.text == _TODAY_COMMAND:
-                    # frozen candidate 的 temporary 状态必须靠当前完整表格快照重新确认。
+                    # frozen candidate 只重验候选状态；必填字段仍由 _submit_create 的最终快照校验。
                     if (
                         lead.smart_table_owner_user_id == command.sales_user_id
                         and lead.lifecycle_state in {"pending_create", "temporary"}
@@ -626,16 +692,6 @@ class CrmSubmissionService:
                         and (sync is None or sync.status not in {"succeeded", "abandoned"})
                         and self._is_unsubmitted_smart_table_record(
                             lead, snapshot=smart_table_snapshot
-                        )
-                        and (
-                            lead.lifecycle_state != "temporary"
-                            or not self._missing_crm_minimum(
-                                dict(
-                                    smart_table_snapshot[
-                                        lead.smart_table_record_id or ""
-                                    ].fields
-                                )
-                            )
                         )
                     ):
                         valid_ids.add(lead_id)
@@ -857,7 +913,7 @@ class CrmSubmissionService:
             existing = latest_crm_create_sync(session, lead_id)
             if existing is not None:
                 if existing.status == "succeeded":
-                    return _create_outcome("not_submitted")
+                    return _create_outcome("not_submitted", reason_code="already_submitted")
                 if existing.status == "awaiting_duplicate_confirmation":
                     duplicate = self._duplicate_from_sync(lead, existing)
                     return _create_outcome(
@@ -1080,7 +1136,9 @@ class CrmSubmissionService:
                 existing = latest_crm_create_sync(session, lead_id, for_update=True)
                 if existing is not None:
                     if existing.status == "succeeded":
-                        return _create_outcome("incomplete")
+                        return _create_outcome(
+                            "not_submitted", reason_code="already_submitted"
+                        )
                     if existing.status == "awaiting_duplicate_confirmation":
                         duplicate = self._duplicate_from_sync(lead, existing)
                         return _create_outcome(
