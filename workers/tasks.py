@@ -26,6 +26,7 @@ from app.crm.commands import (
     parse_company_submission_request,
 )
 from app.crm.dependencies import get_crm_adapter
+from app.leads.models import Lead, LeadMessageResolution
 from app.leads.review import LeadReviewService
 from app.leads.service import COMPLETED_CHECKPOINT_STATUSES, FirstTextLeadWorkspaceService
 from app.media.dependencies import get_media_attachment_service, get_media_storage_provider
@@ -175,6 +176,60 @@ def _finish_audit_mirror(
             outbox.failure_code = type(error).__name__[:64]
 
 
+def _resolve_audit_lead_id(session: Session, event: BusinessAuditEvent) -> str | None:
+    """按当前数据库中的确定性事实解析审计事件所属 Lead.id。
+
+    参数：session 为当前审计镜像读取会话；event 为待镜像的业务审计事件。
+    返回值：唯一确定的 Lead.id；无法确定或多线索冲突时返回 None。
+    异常：数据库查询异常向 Worker 传播。
+    副作用：仅读取数据库，不修改审计事件、线索或归属关系。
+    """
+    details = event.details if isinstance(event.details, dict) else {}
+    detail_lead_id = details.get("lead_id")
+    if isinstance(detail_lead_id, str) and detail_lead_id.strip():
+        # 历史审计事实中的 lead_id 是最高优先级的确定性归属来源。
+        return detail_lead_id.strip()
+
+    smart_table_record_id = details.get("smart_table_record_id")
+    if isinstance(smart_table_record_id, str) and smart_table_record_id.strip():
+        record_lead_ids = list(
+            session.scalars(
+                select(Lead.id).where(Lead.smart_table_record_id == smart_table_record_id)
+            )
+        )
+        if len(record_lead_ids) == 1:
+            # 只有表格记录唯一对应一个 Lead 时才采用该归属。
+            return record_lead_ids[0]
+        if len(record_lead_ids) > 1:
+            # 数据异常导致多条匹配时不得任选一条继续镜像。
+            return None
+
+    resolution_lead_ids = {
+        lead_id
+        for lead_id in session.scalars(
+            select(LeadMessageResolution.lead_id).where(
+                LeadMessageResolution.message_id == event.message_id,
+                LeadMessageResolution.lead_id.is_not(None),
+            )
+        )
+        if isinstance(lead_id, str) and lead_id.strip()
+    }
+    if len(resolution_lead_ids) == 1:
+        # 同消息多个 segment 指向同一 Lead 时，去重后仍可安全确定归属。
+        return next(iter(resolution_lead_ids))
+    if len(resolution_lead_ids) > 1:
+        # 多 segment 指向不同 Lead 属于 ambiguity，不能猜测第一条。
+        return None
+
+    source_lead_ids = list(
+        session.scalars(select(Lead.id).where(Lead.source_message_id == event.message_id))
+    )
+    if len(source_lead_ids) == 1:
+        # 仅保留历史 source_message_id fallback，且要求唯一匹配。
+        return source_lead_ids[0]
+    return None
+
+
 @celery_app.task(name="workers.consume_audit_mirror_outbox")  # type: ignore[untyped-decorator]
 def consume_audit_mirror_outbox(outbox_id: int) -> str:
     """消费一条审计镜像 Outbox，并用 claim fencing 与稳定镜像键控制重试。
@@ -206,6 +261,9 @@ def consume_audit_mirror_outbox(outbox_id: int) -> str:
                 if message is not None and message.scrubbed_at is None
                 else None
             )
+            resolved_lead_id = (
+                _resolve_audit_lead_id(session, event) if event is not None else None
+            )
         if outbox is None or event is None:
             _finish_audit_mirror(
                 factory,
@@ -220,6 +278,7 @@ def consume_audit_mirror_outbox(outbox_id: int) -> str:
             SmartTableAuditSink(get_smart_table_audit_adapter()).mirror(
                 event,
                 sales_original_message=sales_original_message,
+                resolved_lead_id=resolved_lead_id,
             )
         except Exception as error:
             _finish_audit_mirror(

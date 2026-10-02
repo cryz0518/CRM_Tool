@@ -10,6 +10,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.leads.models import Lead, LeadMessageResolution
 from app.messaging.models import (
     AuditMirrorOutbox,
     Base,
@@ -126,6 +127,74 @@ def _run_worker_with_adapter(
     return tasks.consume_audit_mirror_outbox.run(outbox_id)
 
 
+def _persist_lead_audit_case(
+    factory: sessionmaker[Session],
+    *,
+    events: tuple[tuple[str, dict[str, object]], ...],
+    leads: tuple[tuple[str, str | None, str | None], ...] = (),
+    resolutions: tuple[tuple[str, int, str | None], ...] = (),
+) -> list[int]:
+    """持久化审计事件、线索及分段归属事实，并返回镜像任务 ID。"""
+    message_ids = list(dict.fromkeys(message_id for message_id, _ in events))
+    for message_id, _, _ in resolutions:
+        if message_id not in message_ids:
+            message_ids.append(message_id)
+    for _, source_message_id, _ in leads:
+        if source_message_id is not None and source_message_id not in message_ids:
+            message_ids.append(source_message_id)
+
+    with factory.begin() as session:
+        session.add(
+            SalesAuthorization(
+                wecom_user_id="sales-1",
+                is_authorized=False,
+                is_active=True,
+            )
+        )
+        for sequence, message_id in enumerate(message_ids, start=1):
+            session.add(
+                IncomingMessage(
+                    message_id=message_id,
+                    sales_user_id="sales-1",
+                    sequence=sequence,
+                    raw_payload={},
+                    normalized_text=None,
+                )
+            )
+        for lead_id, source_message_id, smart_table_record_id in leads:
+            session.add(
+                Lead(
+                    id=lead_id,
+                    source_message_id=source_message_id,
+                    original_capturing_sales_user_id="sales-1",
+                    smart_table_owner_user_id="sales-1",
+                    smart_table_record_id=smart_table_record_id,
+                    field_values={},
+                    enrichment_values={},
+                )
+            )
+        for message_id, segment_index, lead_id in resolutions:
+            session.add(
+                LeadMessageResolution(
+                    message_id=message_id,
+                    segment_index=segment_index,
+                    lead_id=lead_id,
+                    status="assigned" if lead_id is not None else "unassigned",
+                )
+            )
+        for message_id, details in events:
+            session.add(
+                BusinessAuditEvent(
+                    message_id=message_id,
+                    sales_user_id="sales-1",
+                    event_type=f"audit_{message_id}",
+                    details=details,
+                )
+            )
+    with factory() as session:
+        return list(session.scalars(select(AuditMirrorOutbox.id).order_by(AuditMirrorOutbox.id)))
+
+
 def test_business_audit_event_creates_one_unique_mirror_job(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -148,7 +217,7 @@ def test_audit_mirror_retry_is_idempotent_and_drops_sensitive_details(
     with session_factory() as session:
         event = session.scalar(select(BusinessAuditEvent))
         assert event is not None
-        first = SmartTableAuditSink(adapter).mirror(event)
+        first = SmartTableAuditSink(adapter).mirror(event, resolved_lead_id="lead-1")
     with session_factory.begin() as update_session:
         outbox = update_session.get(AuditMirrorOutbox, outbox_id)
         assert outbox is not None
@@ -156,16 +225,162 @@ def test_audit_mirror_retry_is_idempotent_and_drops_sensitive_details(
     with session_factory() as session:
         event = session.scalar(select(BusinessAuditEvent))
         assert event is not None
-        second = SmartTableAuditSink(adapter).mirror(event)
+        second = SmartTableAuditSink(adapter).mirror(event, resolved_lead_id="lead-1")
 
     assert first.record_id == second.record_id
     assert len(adapter.get_records()) == 1
     fields = adapter.get_records()[0].fields
-    assert fields["lead_id"] == "lead-1"
-    assert fields["missing_fields"] == "业务线"
+    assert fields["线索归属ID"] == "lead-1"
+    assert fields["缺失字段"] == "业务线"
+    assert "lead_id" not in fields
+    assert "status" not in fields
+    assert "missing_fields" not in fields
     assert "phone" not in fields
     assert "email" not in fields
     assert "raw_response" not in fields
+
+
+def test_audit_mirror_maps_internal_details_to_chinese_fields(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证内部英文 details 只以中文字段名输出到管理员表格。"""
+    outbox_id = _persist_lead_audit_case(
+        session_factory,
+        events=(("message-1", {"lead_id": "lead-1", "status": "succeeded"}),),
+    )[0]
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+
+    assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "succeeded"
+    fields = adapter.get_records()[0].fields
+    assert fields["线索归属ID"] == "lead-1"
+    assert fields["处理状态"] == "succeeded"
+    assert "lead_id" not in fields
+    assert "status" not in fields
+
+
+def test_audit_mirror_resolves_lead_from_message_resolutions(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证没有 details lead_id 时使用唯一消息归属事实。"""
+    outbox_id = _persist_lead_audit_case(
+        session_factory,
+        events=(("message-1", {}),),
+        leads=(("lead-1", None, None),),
+        resolutions=(("message-1", 0, "lead-1"),),
+    )[0]
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+
+    assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "succeeded"
+    assert adapter.get_records()[0].fields["线索归属ID"] == "lead-1"
+
+
+def test_audit_mirror_keeps_same_lead_id_for_different_messages(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证同一线索的多条消息最终显示相同的 Lead.id。"""
+    outbox_ids = _persist_lead_audit_case(
+        session_factory,
+        events=(("message-1", {}), ("message-2", {})),
+        leads=(("lead-1", None, None),),
+        resolutions=(
+            ("message-1", 0, "lead-1"),
+            ("message-2", 0, "lead-1"),
+        ),
+    )
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+
+    for outbox_id in outbox_ids:
+        assert (
+            _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter)
+            == "succeeded"
+        )
+    assert [record.fields["线索归属ID"] for record in adapter.get_records()] == [
+        "lead-1",
+        "lead-1",
+    ]
+
+
+def test_audit_mirror_deduplicates_same_lead_across_message_segments(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证同消息多个 segment 指向同一 Lead 时仍可确定归属。"""
+    outbox_id = _persist_lead_audit_case(
+        session_factory,
+        events=(("message-1", {}),),
+        leads=(("lead-1", None, None),),
+        resolutions=(
+            ("message-1", 0, "lead-1"),
+            ("message-1", 1, "lead-1"),
+        ),
+    )[0]
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+
+    assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "succeeded"
+    assert adapter.get_records()[0].fields["线索归属ID"] == "lead-1"
+
+
+def test_audit_mirror_leaves_ambiguous_segment_resolution_empty(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证同消息 segment 指向多个 Lead 时不任选其一。"""
+    outbox_id = _persist_lead_audit_case(
+        session_factory,
+        events=(("message-1", {}),),
+        leads=(("lead-1", None, None), ("lead-2", None, None)),
+        resolutions=(
+            ("message-1", 0, "lead-1"),
+            ("message-1", 1, "lead-2"),
+        ),
+    )[0]
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+
+    assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "succeeded"
+    assert "线索归属ID" not in adapter.get_records()[0].fields
+
+
+def test_audit_mirror_details_lead_id_has_priority_over_lookup(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 details.lead_id 优先于消息归属查询结果。"""
+    outbox_id = _persist_lead_audit_case(
+        session_factory,
+        events=(("message-1", {"lead_id": "lead-1"}),),
+        leads=(("lead-1", None, None), ("lead-2", None, None)),
+        resolutions=(("message-1", 0, "lead-2"),),
+    )[0]
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+
+    assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "succeeded"
+    assert adapter.get_records()[0].fields["线索归属ID"] == "lead-1"
+
+
+def test_audit_mirror_resolves_lead_from_smart_table_record_id(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 details.smart_table_record_id 唯一匹配时解析对应 Lead.id。"""
+    outbox_id = _persist_lead_audit_case(
+        session_factory,
+        events=(("message-1", {"smart_table_record_id": "record-1"}),),
+        leads=(("lead-1", None, "record-1"),),
+    )[0]
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+
+    assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "succeeded"
+    assert adapter.get_records()[0].fields["线索归属ID"] == "lead-1"
+
+
+def test_audit_mirror_without_lead_facts_leaves_lead_id_empty(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证没有确定归属事实时不猜测线索归属 ID。"""
+    outbox_id = _persist_lead_audit_case(
+        session_factory,
+        events=(("message-1", {}),),
+    )[0]
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+
+    assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "succeeded"
+    assert "线索归属ID" not in adapter.get_records()[0].fields
 
 
 def test_audit_mirror_uses_normalized_text_and_excludes_raw_payload(
