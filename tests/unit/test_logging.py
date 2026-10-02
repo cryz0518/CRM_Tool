@@ -40,3 +40,28 @@ def test_json_log_includes_only_allowlisted_safe_status_fields() -> None:
 
     assert payload["accepted"] is True
     assert "raw_payload" not in payload
+
+
+def test_json_log_includes_only_numeric_callback_timing_fields() -> None:
+    """验证 callback 时序只输出非负整数，不接纳伪装的字符串或布尔值。"""
+    record = logging.LogRecord("test", logging.INFO, __file__, 1, "callback timing", (), None)
+    record.callback_claim_duration_ms = 12
+    record.card_update_duration_ms = 34
+    record.remaining_deadline_ms = 56
+    record.callback_total_duration_ms = 78
+    record.req_id = "must-not-log"
+    record.task_id = "must-not-log"
+
+    payload = json.loads(JsonFormatter().format(record))
+
+    assert payload["callback_claim_duration_ms"] == 12
+    assert payload["card_update_duration_ms"] == 34
+    assert payload["remaining_deadline_ms"] == 56
+    assert payload["callback_total_duration_ms"] == 78
+    assert "req_id" not in payload and "task_id" not in payload
+
+    record.callback_claim_duration_ms = "customer-data"
+    record.card_update_duration_ms = True
+    payload = json.loads(JsonFormatter().format(record))
+    assert "callback_claim_duration_ms" not in payload
+    assert "card_update_duration_ms" not in payload

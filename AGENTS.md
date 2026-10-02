@@ -705,7 +705,7 @@ validate_payload()
 
 CRM（客户关系管理系统）提交前必须通过 `CRMUserMapper（CRM用户映射器）` 查找提交销售的 CRM 用户映射。映射缺失时不调用 CRM（客户关系管理系统）接口，线索保持 `pending_create（待创建）` 或 `pending_update（待更新）`，同步记录写入不可重试的 `validation_failed / mapping_missing（校验失败/映射缺失）`；禁止借用管理员、公共账户、同名用户或其他销售身份。Operations Console（运维控制台）必须展示映射异常及受影响线索。
 
-明确冻结的精确提交命令可以由 deterministic parser（确定性解析器）直接进入对应安全工作流；其它自由文本由 AI Intent Router（意图路由器）输出结构化工作流意图：`LEAD_CAPTURE`、`SUBMIT_TODAY`、`SUBMIT_ALL`、`SUBMIT_SINGLE`、`SUBMIT_ABANDONED`、`SUBMIT_UPDATES` 或 `UNKNOWN`。无论来自精确命令还是 AI 路由，目标线索、候选 ID、负责人、CRM Payload（提交载荷）和卡片选择均由服务端确定性解析、重读和校验。提交意图还必须通过保守的执行证据检查，疑问、否定或取消表达不得触发 CRM 写操作；`LEAD_CAPTURE` 回到正常线索抽取流程，`UNKNOWN` 只返回澄清提示。
+精确提交命令由 deterministic parser（确定性解析器）直接进入安全工作流；submission-like 自由文本由 AI Intent Router（意图路由器）分类为结构化工作流意图，例如“请把我所有能提交的线索都提交一下”应识别为 `SUBMIT_ALL`；普通客户信息和补充消息直接进入 Lead pipeline。Router 只选择工作流，不决定目标线索、权限或 CRM 参数；这些仍由服务端确定性解析、重读和校验。提交意图还必须通过保守的执行证据检查，疑问、否定或取消表达不得触发 CRM 写操作。
 
 批量提交仍必须经过服务端持久化候选动作、销售卡片选择、回调重校验和 `submit_selected()`；AI待确认 本身不阻塞提交。销售显式确认仍可作为 User Confirmation Event（人工确认事件）审计，但不是进入 CRM 的前置条件。
 

@@ -165,6 +165,13 @@ class AdminLeadCreationService:
             )
         except Exception as exc:
             summary = self._safe_summary(exc)
+            remote_record_id = getattr(exc, "remote_record_id", None)
+            if isinstance(remote_record_id, str) and remote_record_id:
+                # 已返回的远端 ID 必须进入 frozen recovery，禁止后续请求再新增一行。
+                with self._session_factory.begin() as session:
+                    lead = session.get(Lead, lead_id)
+                    if lead is not None:
+                        lead.smart_table_record_id = remote_record_id
             logger.error(
                 "admin_lead_creation_remote_unknown",
                 extra={
@@ -180,10 +187,25 @@ class AdminLeadCreationService:
                 "unknown",
                 "pending_recovery",
                 summary,
-                failure_code="remote_create_unknown",
+                failure_code=(
+                    "remote_record_unverified"
+                    if isinstance(remote_record_id, str) and remote_record_id
+                    else "remote_create_unknown"
+                ),
+                smart_table_record_id=(
+                    remote_record_id if isinstance(remote_record_id, str) else None
+                ),
             )
             return AdminLeadCreationResult(
-                operation_id, lead_id, "pending_recovery", "remote_create_unknown", summary
+                operation_id,
+                lead_id,
+                "pending_recovery",
+                (
+                    "remote_record_unverified"
+                    if isinstance(remote_record_id, str) and remote_record_id
+                    else "remote_create_unknown"
+                ),
+                summary,
             )
 
         try:

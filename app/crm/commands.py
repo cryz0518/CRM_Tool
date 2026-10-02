@@ -5,14 +5,22 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from collections.abc import Mapping
+from datetime import UTC
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.crm.adapter import CRMAdapter
-from app.crm.service import CrmSubmissionService, SubmissionBatchResult, SubmissionCommand
-from app.leads.models import CrmSyncRecord, Lead, new_lead_id
+from app.crm.service import (
+    CrmSubmissionService,
+    SubmissionBatchResult,
+    SubmissionCommand,
+    SubmissionItemResult,
+)
+from app.leads.models import CrmSyncRecord, Lead, latest_crm_create_sync, new_lead_id
 from app.leads.review import LeadReviewService
 from app.messaging.models import (
     BusinessAuditEvent,
@@ -20,12 +28,16 @@ from app.messaging.models import (
     NotificationRecord,
     OutboxEvent,
     SalesAuthorization,
+    WecomAction,
 )
 from app.smart_table.adapter import SmartTableAdapter
 from app.smart_table.models import SmartTableRecord
 from app.wecom_bot.actions import (
+    ACTION_TYPE_CRM_BATCH_SUBMISSION,
+    ACTION_TYPE_CRM_COMPANY_CONFIRMATION,
     CardCapabilityUnavailable,
     WecomActionService,
+    build_batch_submission_markdown,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -45,6 +57,7 @@ _SUBMISSION_COMMAND_ALIASES = {
     "帮我提交放弃的线索": "帮我提交放弃提交的线索",
     "提交放弃的线索": "帮我提交放弃提交的线索",
     "提交放弃提交的线索": "帮我提交放弃提交的线索",
+    "重新提交放弃提交的线索": "帮我提交放弃提交的线索",
     "帮我提交我的更新": "提交我的更新",
     "提交更新": "提交我的更新",
 }
@@ -82,6 +95,31 @@ _PREVIEW_FIELD_NAMES = (
     "负责人",
     "提交状态",
 )
+
+
+def _company_submission_display_text(fields: Mapping[str, object], lead: Lead) -> str:
+    """从发卡时 Smart Table 快照生成公司、联系人和日期的结果展示名。
+
+    参数：fields 为同次表格读取的记录字段；lead 提供服务端创建日期。
+    返回值：按公司、联系人、上海时区日期组成的安全展示字符串。
+    异常：无。
+    副作用：无，不访问表格或修改线索。
+    """
+    company_name = fields.get("线索名称") or lead.standard_company_name
+    contact_name = fields.get("联系人")
+    created_at = lead.created_at
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    created_text = created_at.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y年%m月%d日")
+    return "｜".join(
+        part
+        for part in (
+            company_name.strip() if isinstance(company_name, str) else "",
+            contact_name.strip() if isinstance(contact_name, str) else "",
+            created_text,
+        )
+        if part
+    )
 
 
 def parse_company_submission_request(text: str) -> str | None:
@@ -144,6 +182,8 @@ def looks_like_submission_intent(text: str) -> bool:
             "这家公司",
             "公司",
             "企业",
+            "重新提交",
+            "待完善",
         )
     )
 
@@ -164,7 +204,18 @@ def is_explicit_submission_request(text: str) -> bool:
         return False
     return "提交" in candidate and any(
         marker in candidate
-        for marker in ("线索", "更新", "今天", "所有", "全部", "放弃", "这条", "这家公司")
+        for marker in (
+            "线索",
+            "更新",
+            "今天",
+            "所有",
+            "全部",
+            "放弃",
+            "这条",
+            "这家公司",
+            "重新提交",
+            "待完善",
+        )
     )
 
 
@@ -221,6 +272,57 @@ def consume_submission_command(
                         sales_user_id=command.sales_user_id,
                         source_message_id=command.request_message_id,
                         notification_type="crm_submission_preview",
+                        content=reply,
+                    )
+                )
+        return reply
+    if command.text == "重新提交待完善的线索":
+        try:
+            targets, labels = _latest_incomplete_submission_targets(
+                session_factory, command.sales_user_id
+            )
+            if not targets:
+                reply = "当前没有上次已选择且待完善的线索需要重新提交。"
+            else:
+                if crm_adapter is None:
+                    raise ValueError("CRM 重提命令缺少 CRM Adapter")
+                service = CrmSubmissionService(
+                    session_factory,
+                    smart_table_adapter,
+                    crm_adapter,
+                    robot_submission_confirmation_available=get_settings().wecom_card_callback_ready(),
+                )
+                result = service.submit_incomplete_retry(command, targets)
+                _issue_duplicate_confirmation_card(command, result, session_factory)
+                reply = format_submission_reply(
+                    result, lead_labels=labels, selected_count=len(targets)
+                ).replace(
+                    f"CRM 提交结果（已选择 {len(targets)} 条）",
+                    f"重新提交结果（共 {len(targets)} 条）",
+                    1,
+                )
+        except Exception:
+            return _record_command_failure(session_factory, outbox_event_id, command)
+        with session_factory.begin() as session:
+            event = session.get(OutboxEvent, outbox_event_id)
+            if event is not None:
+                pending = session.scalar(
+                    select(CrmSyncRecord.id)
+                    .where(
+                        CrmSyncRecord.request_message_id == command.request_message_id,
+                        CrmSyncRecord.status.in_(("retrying", "processing")),
+                    )
+                    .limit(1)
+                )
+                event.status = "retrying" if pending is not None else "succeeded"
+            key = notification_key_for_message(command.request_message_id)
+            if session.get(NotificationRecord, key) is None:
+                session.add(
+                    NotificationRecord(
+                        notification_key=key,
+                        sales_user_id=command.sales_user_id,
+                        source_message_id=command.request_message_id,
+                        notification_type="crm_submission_retry_summary",
                         content=reply,
                     )
                 )
@@ -332,6 +434,16 @@ def prepare_batch_submission_selection(
         ]
         for page_number, page in enumerate(pages, start=1):
             # 每一页都由服务端冻结候选 ID；销售只能在对应卡片内选择，不能传任意 offset。
+            page_details = tuple(
+                {
+                    "lead_id": item.lead_id,
+                    "company_name": item.company_name,
+                    "display_text": item.display_text or item.company_name,
+                    "field_values": dict(item.snapshot_fields),
+                    "missing_fields": item.missing_fields,
+                }
+                for item in page
+            )
             action_service.issue_batch_submission_action(
                 actor_user_id=command.sales_user_id,
                 request_message_id=command.request_message_id,
@@ -343,6 +455,11 @@ def prepare_batch_submission_selection(
                         "display_text": item.display_text or item.company_name,
                     }
                     for item in page
+                ),
+                preview_markdown_chunks=build_batch_submission_markdown(
+                    page_details,
+                    page=page_number,
+                    page_count=len(pages),
                 ),
                 page=page_number,
                 page_count=len(pages),
@@ -419,6 +536,10 @@ def prepare_company_submission_preview(
     records, contains_match = _find_company_records(smart_table_adapter, company_name)
     if not records:
         return "未找到该公司名称的线索，请确认智能表格中的线索名称后重试。"
+    # 指定线索候选必须仍是未提交；字段完整性不在预览阶段筛除。
+    records = [record for record in records if record.fields.get("提交状态") == "未提交"]
+    if not records:
+        return "已找到该公司记录，但当前没有可提交的未提交线索。"
 
     record_ids = tuple(record.record_id for record in records)
     lead_ids_by_record: dict[str, str] = {}
@@ -450,12 +571,20 @@ def prepare_company_submission_preview(
     with session_factory() as session:
         leads = list(session.scalars(select(Lead).where(Lead.id.in_(lead_ids_by_record.values()))))
     by_record_id = {lead.smart_table_record_id: lead for lead in leads}
-    eligible = [
-        (record, by_record_id[record.record_id])
-        for record in records
-        if record.record_id in by_record_id
-        and (record.fields.get("负责人") in (None, command.sales_user_id))
-    ]
+    eligible: list[tuple[SmartTableRecord, Lead]] = []
+    with session_factory() as session:
+        for record in records:
+            lead = by_record_id.get(record.record_id)
+            if (
+                lead is None
+                or lead.smart_table_owner_user_id != command.sales_user_id
+                or record.fields.get("负责人") not in (None, command.sales_user_id)
+            ):
+                continue
+            sync = latest_crm_create_sync(session, lead.id)
+            if sync is not None and sync.status in {"succeeded", "abandoned"}:
+                continue
+            eligible.append((record, lead))
     if not eligible:
         return "已找到同名表格记录，但当前账号没有可提交的本人待提交线索。"
 
@@ -468,6 +597,7 @@ def prepare_company_submission_preview(
             {
                 "lead_id": lead.id,
                 "company_name": f"{record.fields.get('线索名称') or company_name}（候选{index}）",
+                "display_text": _company_submission_display_text(record.fields, lead),
             }
             for index, (record, lead) in enumerate(eligible, start=1)
         )
@@ -506,6 +636,7 @@ def prepare_company_submission_preview(
             lead_id=lead.id,
             request_message_id=command.request_message_id,
             company_name=str(record.fields.get("线索名称") or company_name),
+            display_text=_company_submission_display_text(record.fields, lead),
             field_values=display_fields,
         )
     except CardCapabilityUnavailable:
@@ -757,6 +888,7 @@ def _include_persisted_results(
     return SubmissionBatchResult(
         succeeded=statuses.count("succeeded"),
         incomplete=result.incomplete,
+        incomplete_missing_fields=result.incomplete_missing_fields,
         retrying=max(result.retrying, statuses.count("retrying")),
         processing=max(result.processing, statuses.count("processing")),
         failed_pending_review=max(result.failed_pending_review, generic_terminal_failure_count),
@@ -767,7 +899,77 @@ def _include_persisted_results(
         company_identity_review=result.company_identity_review,
         mapping_missing=result.mapping_missing,
         duplicate_confirmations=result.duplicate_confirmations,
+        items=result.items,
+        not_submitted=result.not_submitted,
     )
+
+
+def _latest_incomplete_submission_targets(
+    session_factory: sessionmaker[Session], sales_user_id: str
+) -> tuple[tuple[str, ...], dict[str, str]]:
+    """从最近已完成的提交命令组读取当时被选择且待完善的 Lead。
+
+    参数：session_factory 提供历史动作读取；sales_user_id 限定当前销售本人。
+    返回值：最近一个含不完整结果的命令组目标 ID 及发行时冻结展示标签。
+    异常：数据库读取错误向调用方传播；畸形旧 context 被安全忽略。
+    副作用：只读动作历史，不改写旧 action 或调用外部系统。
+    """
+    action_types = (
+        ACTION_TYPE_CRM_BATCH_SUBMISSION,
+        ACTION_TYPE_CRM_COMPANY_CONFIRMATION,
+    )
+    with session_factory() as session:
+        actions = list(
+            session.scalars(
+                select(WecomAction)
+                .where(
+                    WecomAction.bound_actor_wecom_user_id == sales_user_id,
+                    WecomAction.action_type.in_(action_types),
+                )
+                .order_by(WecomAction.created_at.desc(), WecomAction.id.desc())
+            )
+        )
+    # 查询已按创建时间倒序；字典保留插入顺序，同时把同一 request 的所有卡页聚合。
+    groups: dict[str, list[WecomAction]] = {}
+    for action in actions:
+        request_id = action.context.get("request_message_id")
+        if isinstance(request_id, str) and request_id:
+            groups.setdefault(request_id, []).append(action)
+    for group in groups.values():
+        labels: dict[str, str] = {}
+        incomplete_ids: list[str] = []
+        for action in group:
+            context = action.context
+            display_text = context.get("display_text")
+            if isinstance(display_text, str) and display_text:
+                labels[action.target_id] = display_text
+            candidates = context.get("candidate_leads")
+            if isinstance(candidates, list):
+                for candidate in candidates:
+                    if not isinstance(candidate, dict):
+                        continue
+                    lead_id = candidate.get("lead_id")
+                    label = candidate.get("display_text") or candidate.get("company_name")
+                    if isinstance(lead_id, str) and isinstance(label, str) and label:
+                        labels[lead_id] = label
+            if action.status != "succeeded":
+                continue
+            saved_results = context.get("submission_results")
+            if not isinstance(saved_results, list):
+                continue
+            for item in saved_results:
+                if (
+                    isinstance(item, dict)
+                    and item.get("status") == "incomplete"
+                    and isinstance(item.get("lead_id"), str)
+                    and item["lead_id"] not in incomplete_ids
+                ):
+                    incomplete_ids.append(item["lead_id"])
+        if incomplete_ids:
+            for lead_id in incomplete_ids:
+                labels.setdefault(lead_id, "线索")
+            return tuple(incomplete_ids), labels
+    return (), {}
 
 
 def _record_command_failure(
@@ -817,28 +1019,208 @@ def _record_command_failure(
         return reply
 
 
-def format_submission_reply(result: SubmissionBatchResult) -> str:
-    """将批次结果格式化为计数及必填缺失提示的销售回复。
+def _crm_duplicate_failure_detail(item: SubmissionItemResult) -> str:
+    """把查重受控诊断字段映射为不含远端正文的销售文案。
 
-    参数：result 为 T12 application service 返回的批次汇总。
-    返回值：不包含线索名称、联系方式、payload 或异常堆栈的中文文本。
+    参数：item 为携带服务端白名单失败证据的逐线索结果。
+    返回值：按适配器类别和安全状态码生成的原因说明。
+    异常：无；非法状态码或 HTTP 状态会被忽略。
+    副作用：无，不读取 CRM 响应正文或异常文本。
+    """
+    if item.reason_code == "duplicate_target_unavailable":
+        entity_name = {
+            "lead": "线索",
+            "customer": "客户",
+            "dealer": "经销商",
+        }.get(item.duplicate_entity_type or "", "对象")
+        return f"CRM 检测到重复{entity_name}，但未返回可操作的线索 ID，请人工确认。"
+
+    metadata: list[str] = []
+    if isinstance(item.http_status, int) and not isinstance(item.http_status, bool):
+        if 100 <= item.http_status <= 599:
+            metadata.append(f"HTTP {item.http_status}")
+    code = item.failure_code
+    if code and len(code) <= 64 and all(
+        character.isalnum() or character in "._:-" for character in code
+    ):
+        metadata.append(f"错误码：{code}")
+    suffix = f"（{'，'.join(metadata)}）" if metadata else ""
+    if item.adapter_category == "malformed_response":
+        detail = f"CRM 返回格式异常{suffix}，未获得有效查重结果"
+    elif item.adapter_category in {"business", "business_rejection"}:
+        detail = f"CRM 返回业务错误{suffix}，查重未通过"
+    elif item.adapter_category == "authentication":
+        detail = f"CRM 鉴权失败{suffix}，请联系管理员检查 CRM 接口配置"
+    elif item.adapter_category == "gateway":
+        detail = f"CRM 网关拒绝或处理失败{suffix}"
+    elif item.adapter_category == "transport":
+        detail = f"CRM 网络连接或超时异常{suffix}，本次未完成查重"
+    else:
+        detail = f"CRM 查重失败{suffix}，需要人工处理"
+    if item.reason_code == "crm_duplicate_search_retrying":
+        return f"{detail}；本次未提交，请稍后重新提交"
+    return detail
+
+
+def format_submission_reply(
+    result: SubmissionBatchResult,
+    *,
+    lead_labels: Mapping[str, str] | None = None,
+    selected_count: int | None = None,
+) -> str:
+    """将批次结果格式化为汇总加逐条明细的销售回复。
+
+    参数：result 为确定性提交结果；lead_labels 为服务端冻结的线索展示名称；
+    selected_count 为 callback 已确认的选择数量。
+    返回值：不包含异常正文、凭据或原始 CRM 响应的中文 Markdown 文本。
     异常：无。
     副作用：无。
     """
+
     if result.updates_not_implemented:
         return "提交我的更新将在 T13 实现；本次未调用 CRM。"
-    missing_fields = (
-        f"缺少必填字段：{'、'.join(result.incomplete_missing_fields)}；"
-        if result.incomplete_missing_fields
-        else ""
+    labels = lead_labels or {}
+    chosen = selected_count if selected_count is not None else (len(result.items) or None)
+    title = f"CRM 提交结果（已选择 {chosen} 条）" if chosen is not None else "CRM 提交结果"
+    failed_count = (
+        result.failed_pending_review
+        + result.mapping_missing
+        + result.company_identity_review
     )
-    return (
-        f"CRM 提交结果：创建成功 {result.succeeded} 条；更新成功 {result.updated} 条；"
-        f"无变化 {result.unchanged} 条；"
-        f"公司身份变化待人工审查 {result.company_identity_review} 条；"
-        f"待完善或待明确确认 {result.incomplete} 条；{missing_fields}"
-        f"重复待确认 {len(result.duplicate_confirmations)} 条；"
-        f"CRM 用户映射缺失 {result.mapping_missing} 条；"
-        f"提交处理中 {result.processing} 条；可重试失败 {result.retrying} 条；"
-        f"需人工处理失败 {result.failed_pending_review} 条。"
+    duplicate_retry_count = sum(
+        getattr(item.status, "value", str(item.status)) == "retrying"
+        and item.reason_code == "crm_duplicate_search_retrying"
+        for item in result.items
     )
+    other_retrying_count = max(0, result.retrying - duplicate_retry_count)
+    lines = [
+        title,
+        "",
+        f"✅ 创建成功 {result.succeeded} 条",
+        f"✅ 更新成功 {result.updated} 条",
+        f"✅ 无变化 {result.unchanged} 条",
+        f"⚠️ 待完善 {result.incomplete} 条",
+        f"⏳ 处理中 {result.processing} 条",
+        f"⚪ 未提交 {result.not_submitted} 条",
+        f"⚠️ 查重暂时失败 {duplicate_retry_count} 条",
+        f"🔄 重试中 {other_retrying_count} 条",
+        f"需人工处理 {failed_count} 条",
+        "",
+        (
+            f"汇总：创建 {result.succeeded}｜更新 {result.updated}｜"
+            f"待完善 {result.incomplete}｜处理中 {result.processing}｜"
+            f"未提交 {result.not_submitted}｜失败 {failed_count}"
+        ),
+    ]
+    detail_lines: list[str] = []
+    status_titles = {
+        "created": "✅ 创建成功",
+        "updated": "✅ 更新成功",
+        "unchanged": "✅ 无变化",
+        "incomplete": "⚠️ 待完善",
+        "processing": "⏳ 处理中",
+        "retrying": "🔄 重试中",
+        "duplicate_confirmation": "重复待确认",
+        "mapping_missing": "CRM 用户映射缺失",
+        "company_identity_review": "需人工处理",
+        "failed_pending_review": "需人工处理",
+        "not_submitted": "⚪ 未提交",
+    }
+    reason_text = {
+        "duplicate_confirmation_required": "CRM 已存在同公司线索，请在后续确认卡决定是否覆盖",
+        "crm_user_mapping_missing": "当前负责人无法映射 CRM 用户，请联系管理员",
+        "company_identity_conflict": "公司身份与 CRM 查重结果不一致，需要人工处理",
+        "company_identity_reserved": "已有提交任务正在处理，本次未重复创建",
+        "sync_processing": "已有提交任务正在处理，本次未重复创建",
+        "crm_duplicate_search_retrying": "CRM 查重暂时失败，本次未提交，请稍后重新提交",
+        "crm_duplicate_search_failed": "CRM 查重失败，需要人工处理",
+        "crm_create_retrying": "CRM 创建暂时失败，系统将自动重试",
+        "crm_create_failed_pending_review": "CRM 提交失败，需要人工处理",
+        "crm_update_retrying": "CRM 更新暂时失败，系统将自动重试",
+        "crm_update_failed_pending_review": "CRM 更新失败，需要人工处理",
+        "crm_update_incomplete": "CRM 更新前校验未通过，请检查当前线索信息",
+        "company_identity_change_pending_review": "公司名称发生变化，需要人工处理",
+        "candidate_state_changed": "线索状态已变化，请重新发起提交",
+        "already_submitted": "该线索已完成提交，本次未重复创建",
+    }
+    grouped_statuses = (
+        "created",
+        "updated",
+        "unchanged",
+        "incomplete",
+        "duplicate_confirmation",
+        "mapping_missing",
+        "processing",
+        "retrying",
+        "company_identity_review",
+        "failed_pending_review",
+        "not_submitted",
+    )
+    for status in grouped_statuses:
+        items = [
+            item
+            for item in result.items
+            if getattr(item.status, "value", str(item.status)) == status
+            and item.lead_id in labels
+        ]
+        if not items:
+            continue
+        duplicate_reason = (
+            "crm_duplicate_search_retrying"
+            if status == "retrying"
+            else "crm_duplicate_search_failed"
+        )
+        if status in {"retrying", "failed_pending_review"}:
+            duplicate_items = [item for item in items if item.reason_code == duplicate_reason]
+            unavailable_targets = [
+                item for item in items if item.reason_code == "duplicate_target_unavailable"
+            ]
+            other_items = [
+                item
+                for item in items
+                if item.reason_code not in {duplicate_reason, "duplicate_target_unavailable"}
+            ]
+            groups = []
+            if status == "failed_pending_review" and unavailable_targets:
+                groups.append(("❌ 重复待人工确认", unavailable_targets))
+            if duplicate_items:
+                groups.append(
+                    (
+                        "⚠️ 查重暂时失败" if status == "retrying" else "❌ 查重失败",
+                        duplicate_items,
+                    )
+                )
+            groups.append((status_titles[status], other_items))
+        else:
+            groups = [(status_titles[status], items)]
+        for title_text, group_items in groups:
+            if not group_items:
+                continue
+            detail_lines.append(f"{title_text} {len(group_items)} 条")
+            for item in group_items:
+                label = labels[item.lead_id]
+                if status == "incomplete" and item.missing_fields:
+                    detail_lines.append(f"- {label}：缺少「{'、'.join(item.missing_fields)}」")
+                else:
+                    detail = (
+                        _crm_duplicate_failure_detail(item)
+                        if item.reason_code
+                        in {
+                            "crm_duplicate_search_failed",
+                            "crm_duplicate_search_retrying",
+                            "duplicate_target_unavailable",
+                        }
+                        else reason_text.get(item.reason_code or "", "")
+                    )
+                    detail_lines.append(f"- {label}：{detail}".rstrip("："))
+    if detail_lines:
+        lines.extend(["", "明细：", *detail_lines])
+    elif not result.items and result.incomplete_missing_fields:
+        # 保留旧调用方的兼容汇总；真实批量结果始终走上面的逐条字段来源。
+        lines.extend(
+            [
+                "",
+                f"待完善汇总：缺少必填字段：{'、'.join(result.incomplete_missing_fields)}",
+            ]
+        )
+    return "\n".join(lines)

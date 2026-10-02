@@ -125,8 +125,9 @@ def consume_lead_outbox_event(
                 None if company_request else get_crm_adapter(),
                 outbox_event_id,
             )
-        if _is_submission_intent(factory, outbox_event_id) or _is_text_message(factory, outbox_event_id):
-            # 所有文本消息先经过结构化意图路由；模型只决定工作流类型，不生成 CRM 参数。
+        if _is_submission_intent(factory, outbox_event_id):
+            # 只有已被消息接入层分类为提交意图的事件才进入提交路由；普通线索文本必须
+            # 继续进入原有抽取管线，避免补充手机号等消息被提前结束。
             with factory() as session:
                 event = session.get(OutboxEvent, outbox_event_id)
                 message = session.get(IncomingMessage, event.message_id) if event else None
@@ -291,24 +292,6 @@ def _is_submission_intent(session_factory: sessionmaker[Session], outbox_event_i
         return event.event_type == "crm_submission_intent"
 
 
-def _is_text_message(session_factory: sessionmaker[Session], outbox_event_id: int) -> bool:
-    """判断普通 Outbox 是否带有可供意图模型路由的文本消息。
-
-    参数：session_factory 为数据库会话工厂；outbox_event_id 为待检查事件标识。
-    返回值：事件属于普通文本消息且正文非空时返回 True。
-    异常：事件不存在时抛出 ValueError。
-    副作用：仅读取数据库。
-    """
-    with session_factory() as session:
-        event = session.get(OutboxEvent, outbox_event_id)
-        if event is None:
-            raise ValueError(f"Outbox 事件不存在：{outbox_event_id}")
-        if event.event_type != "message_received":
-            return False
-        message = session.get(IncomingMessage, event.message_id)
-        return message is not None and bool((message.normalized_text or "").strip())
-
-
 def _submission_command_text(intent: SubmissionIntent) -> str | None:
     """把受限提交意图转换为既有内部命令，不接受模型生成的业务参数。
 
@@ -322,6 +305,7 @@ def _submission_command_text(intent: SubmissionIntent) -> str | None:
         "SUBMIT_ALL": "提交我所有线索",
         "SUBMIT_ABANDONED": "帮我提交放弃提交的线索",
         "SUBMIT_UPDATES": "提交我的更新",
+        "SUBMIT_RETRY_INCOMPLETE": "重新提交待完善的线索",
     }
     if intent.intent in command_by_intent:
         return command_by_intent[intent.intent]

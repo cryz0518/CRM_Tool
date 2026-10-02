@@ -3,20 +3,30 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from collections.abc import Mapping, Sequence
 
 import pytest
 
+from app.core.logging import JsonFormatter
 from app.smart_table.adapter import (
     SmartTableActor,
     SmartTableAdapterConfigurationError,
     SmartTablePermissionError,
 )
-from app.smart_table.models import SmartTableField, SmartTableFieldType
+from app.smart_table.models import (
+    SmartTableField,
+    SmartTableFieldType,
+    SmartTableOption,
+    SmartTableRecord,
+    SmartTableSchema,
+)
 from app.smart_table.wecom_cli import (
+    SmartTableWriteVerificationError,
     WecomCliProcessError,
     WecomCliSmartTableAdapter,
+    WecomCliSmartTableAdapterError,
 )
 
 
@@ -96,13 +106,34 @@ def _field_response() -> Mapping[str, object]:
                 "field_id": "business-line",
                 "field_title": "*业务线",
                 "field_type": "single_select",
+                "property_single_select": {
+                    "options": [
+                        {"id": "line-robot", "text": "协作机器人"},
+                        {"id": "line-vehicle", "text": "车载机器人"},
+                    ]
+                },
             },
             {"field_id": "contact", "field_title": "*联系人", "field_type": "text"},
             {"field_id": "phone", "field_title": "*手机", "field_type": "phone_number"},
             {"field_id": "lead-name", "field_title": "*线索名称", "field_type": "text"},
+            {"field_id": "contact-date", "field_title": "下次联系时间", "field_type": "date_time"},
             {"field_id": "remarks", "field_title": "备注", "field_type": "text"},
-            {"field_id": "industry", "field_title": "客户行业", "field_type": "single_select"},
-            {"field_id": "process", "field_title": "工艺", "field_type": "single_select"},
+            {
+                "field_id": "industry",
+                "field_title": "客户行业",
+                "field_type": "single_select",
+                "property_single_select": {
+                    "options": [{"id": "industry-machine", "text": "机械加工"}]
+                },
+            },
+            {
+                "field_id": "process",
+                "field_title": "工艺",
+                "field_type": "single_select",
+                "property_single_select": {
+                    "options": [{"id": "process-assembly", "text": "装配"}]
+                },
+            },
             {
                 "field_id": "pending",
                 "field_title": "AI待确认",
@@ -142,9 +173,25 @@ def test_canonical_fields_and_pending_options_are_mapped_to_real_schema_names() 
                             "*手机": "13800138000",
                             "*线索名称": "长广溪智造",
                             "客户行业": "机械加工",
-                            "AI待确认": [
-                                {"id": "pending-business-line", "text": "*业务线"}
-                            ],
+                            "AI待确认": [{"id": "pending-business-line", "text": "*业务线"}],
+                            "创建人": [{"userId": "sales-1", "userName": "销售一"}],
+                            "负责人": [{"userId": "sales-1", "userName": "销售一"}],
+                        },
+                    }
+                ],
+            },
+            {
+                "errcode": 0,
+                "records": [
+                    {
+                        "record_id": "record-1",
+                        "values": {
+                            "*业务线": "协作机器人",
+                            "*联系人": "张三",
+                            "*手机": "13800138000",
+                            "*线索名称": "长广溪智造",
+                            "客户行业": "机械加工",
+                            "AI待确认": [{"id": "pending-business-line", "text": "*业务线"}],
                             "创建人": [{"userId": "sales-1", "userName": "销售一"}],
                             "负责人": [{"userId": "sales-1", "userName": "销售一"}],
                         },
@@ -172,11 +219,11 @@ def test_canonical_fields_and_pending_options_are_mapped_to_real_schema_names() 
     assert create_payload["records"] == [
         {
             "values": {
-                "*业务线": "协作机器人",
+                "*业务线": [{"id": "line-robot", "text": "协作机器人"}],
                 "*联系人": "张三",
                 "*手机": "13800138000",
                 "*线索名称": "长广溪智造",
-                "客户行业": "机械加工",
+                "客户行业": [{"id": "industry-machine", "text": "机械加工"}],
                 "AI待确认": [{"id": "pending-business-line", "text": "*业务线"}],
                 "创建人": [{"userId": "sales-1"}],
                 "负责人": [{"userId": "sales-1"}],
@@ -218,6 +265,18 @@ def test_record_add_normalizes_phone_and_skips_unrepresentable_location() -> Non
                 ],
             },
             {"errcode": 0, "records": [{"record_id": "record-1", "values": {}}]},
+            {
+                "errcode": 0,
+                "records": [
+                    {
+                        "record_id": "record-1",
+                        "values": {
+                            "电话": "051083480979917",
+                            "负责人": [{"userId": "sales-1"}],
+                        },
+                    }
+                ],
+            },
         ]
     )
 
@@ -232,7 +291,12 @@ def test_record_add_normalizes_phone_and_skips_unrepresentable_location() -> Non
 
     payload = _payload(fake_cli.calls[1])
     assert payload["records"] == [
-        {"values": {"电话": "051083480979917", "负责人": [{"userId": "sales-1"}]}}
+        {
+            "values": {
+                "电话": "051083480979917",
+                "负责人": [{"userId": "sales-1"}],
+            }
+        }
     ]
 
 
@@ -248,6 +312,12 @@ def test_get_record_falls_back_to_recent_create_when_list_is_eventually_consiste
         [
             _field_response(),
             {"errcode": 0, "records": [{"record_id": "record-new", "values": {}}]},
+            {
+                "errcode": 0,
+                "records": [
+                    {"record_id": "record-new", "values": {"负责人": [{"userId": "sales-1"}]}}
+                ],
+            },
             {"errcode": 0, "records": []},
         ]
     )
@@ -279,6 +349,12 @@ def test_recent_create_fallback_keeps_only_fields_sent_for_the_new_record() -> N
                         "record_id": "record-new",
                         "values": {"*联系人": "线索A联系人"},
                     }
+                ],
+            },
+            {
+                "errcode": 0,
+                "records": [
+                    {"record_id": "record-new", "values": {"负责人": [{"userId": "sales-1"}]}}
                 ],
             },
             {"errcode": 0, "records": []},
@@ -519,9 +595,7 @@ def test_schema_reads_pages_and_preserves_real_option_identifiers() -> None:
             },
             {
                 "errcode": 0,
-                "fields": [
-                    {"field_id": "field-2", "field_title": "负责人", "field_type": "user"}
-                ],
+                "fields": [{"field_id": "field-2", "field_title": "负责人", "field_type": "user"}],
             },
         ]
     )
@@ -550,7 +624,21 @@ def test_records_are_paginated_and_robot_writes_only_given_field_patch() -> None
             },
             {"errcode": 0, "records": [{"record_id": "record-2", "values": {"工艺": "装配"}}]},
             {"errcode": 0, "records": [{"record_id": "record-3", "values": {"负责人": member}}]},
+            {
+                "errcode": 0,
+                "records": [
+                    {
+                        "record_id": "record-3",
+                        "values": {
+                            "创建人": member,
+                            "负责人": member,
+                            "*线索名称": "受控测试",
+                        },
+                    }
+                ],
+            },
             {"errcode": 0, "records": [{"record_id": "record-3", "values": {"负责人": member}}]},
+            {"errcode": 0, "records": [{"record_id": "record-3", "values": {"工艺": "装配"}}]},
             {"errcode": 0, "records": [{"record_id": "record-3", "values": {"工艺": "装配"}}]},
         ]
     )
@@ -576,9 +664,160 @@ def test_records_are_paginated_and_robot_writes_only_given_field_patch() -> None
             }
         }
     ]
-    update_payload = _payload(fake_cli.calls[5])
-    assert update_payload["records"] == [{"record_id": "record-3", "values": {"工艺": "装配"}}]
+    update_payload = _payload(fake_cli.calls[6])
+    assert update_payload["records"] == [
+        {
+            "record_id": "record-3",
+            "values": {"工艺": [{"id": "process-assembly", "text": "装配"}]},
+        }
+    ]
     assert updated.fields == {"工艺": "装配"}
+
+
+def test_write_cells_match_wecom_cli_134_native_json_values_contract() -> None:
+    """验证 1.3.4 的 values map 保留原生类型且整个请求只序列化一次。"""
+    schema = SmartTableSchema(
+        fields=(
+            SmartTableField("name", "*线索名称", SmartTableFieldType.TEXT),
+            SmartTableField("remark", "备注", SmartTableFieldType.LONG_TEXT),
+            SmartTableField("phone", "手机", SmartTableFieldType.PHONE_NUMBER),
+            SmartTableField("email", "邮箱", SmartTableFieldType.EMAIL),
+            SmartTableField("date", "下次联系时间", SmartTableFieldType.DATE),
+            SmartTableField(
+                "line",
+                "业务线",
+                SmartTableFieldType.SINGLE_SELECT,
+                (SmartTableOption("line-id", "协作机器人"),),
+            ),
+            SmartTableField(
+                "process",
+                "工艺",
+                SmartTableFieldType.MULTI_SELECT,
+                (SmartTableOption("process-id", "装配"),),
+            ),
+            SmartTableField("owner", "负责人", SmartTableFieldType.MEMBER),
+            SmartTableField(
+                "pending",
+                "AI待确认",
+                SmartTableFieldType.MULTI_SELECT,
+                (SmartTableOption("pending-id", "线索名称"),),
+            ),
+            SmartTableField(
+                "international",
+                "是否为国际客户",
+                SmartTableFieldType.SINGLE_SELECT,
+                (SmartTableOption("domestic-id", "国内"),),
+            ),
+        )
+    )
+    fields = {
+        "线索名称": "公司样例",
+        "备注": "备注样例",
+        "手机": "138 0013 8000",
+        "邮箱": "sales@example.com",
+        "下次联系时间": "2026-10-02T01:00:00Z",
+        "业务线": "协作机器人",
+        "工艺": ["装配"],
+        "负责人": "sales-user",
+        "AI待确认": ["线索名称"],
+        "是否为国际客户": "国内",
+    }
+
+    fake_cli = FakeCli([{"errcode": 0}])
+    adapter = _adapter(fake_cli)
+    values = adapter._to_cli_fields(fields, schema)
+    adapter._call("records", "add", {"records": [{"values": values}]})
+    payload_values = _payload(fake_cli.calls[0])["records"][0]["values"]
+
+    assert type(payload_values["*线索名称"]) is str
+    assert payload_values["*线索名称"] == "公司样例"
+    assert isinstance(payload_values["业务线"], list)
+    assert isinstance(payload_values["负责人"], list)
+    assert isinstance(payload_values["是否为国际客户"], list)
+    assert payload_values == {
+        "*线索名称": "公司样例",
+        "备注": "备注样例",
+        "手机": "13800138000",
+        "邮箱": "sales@example.com",
+        "下次联系时间": "2026-10-02 09:00:00",
+        "业务线": [{"id": "line-id", "text": "协作机器人"}],
+        "工艺": [{"id": "process-id", "text": "装配"}],
+        "负责人": [{"userId": "sales-user"}],
+        "AI待确认": [{"id": "pending-id", "text": "线索名称"}],
+        "是否为国际客户": [{"id": "domestic-id", "text": "国内"}],
+    }
+    date_only = adapter._to_cli_fields({"下次联系时间": "2026-10-03"}, schema)
+    assert date_only["下次联系时间"] == "2026-10-03 00:00:00"
+    # 无法无歧义解析的自然语言日期只跳过该字段，不阻断同一增量补丁。
+    invalid_date = _adapter(FakeCli([]))._to_cli_fields(
+        {"线索名称": "公司样例", "下次联系时间": "下周联系"}, schema
+    )
+    assert invalid_date["*线索名称"] == "公司样例"
+    assert "下次联系时间" not in invalid_date
+
+
+def test_create_ack_requires_uncached_remote_readback_and_keeps_record_id_on_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证新增 ACK 后核实真实远端值，失败时保留首次返回的 record_id 且不重建。"""
+    monkeypatch.setattr("app.smart_table.wecom_cli.time.sleep", lambda _delay: None)
+    fields = {"创建人": "sales-1", "负责人": "sales-1", "线索名称": "QA原生写入"}
+    incorrect_remote_row = {
+        "record_id": "record-created-once",
+        "values": {
+            "创建人": [{"userId": "sales-1"}],
+            "负责人": [{"userId": "sales-1"}],
+            "*线索名称": '"QA原生写入"',
+        },
+    }
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {"errcode": 0, "records": [{"record_id": "record-created-once"}]},
+            *(
+                {"errcode": 0, "records": [incorrect_remote_row]}
+                for _ in range(4)
+            ),
+        ]
+    )
+
+    with pytest.raises(SmartTableWriteVerificationError) as error:
+        _adapter(fake_cli).create_record(fields, actor=SmartTableActor.ROBOT)
+
+    assert error.value.remote_record_id == "record-created-once"
+    assert error.value.missing_or_mismatched_fields == ("线索名称",)
+    assert "QA原生写入" not in str(error.value)
+    assert sum(arguments[2:4] == ("records", "add") for arguments in fake_cli.calls) == 1
+
+
+def test_create_returns_only_after_remote_uncached_values_match() -> None:
+    """验证新增记录只有在远端原始读回值逐字段匹配后才返回成功。"""
+    fields = {"创建人": "sales-1", "负责人": "sales-1", "线索名称": "QA原生写入"}
+    remote_row = {
+        "record_id": "record-created-once",
+        "values": {
+            "创建人": [{"userId": "sales-1", "userName": "QA销售"}],
+            "负责人": [{"userId": "sales-1", "userName": "QA销售"}],
+            "*线索名称": "QA原生写入",
+        },
+    }
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {"errcode": 0, "records": [{"record_id": "record-created-once", "values": {}}]},
+            {"errcode": 0, "records": [remote_row]},
+        ]
+    )
+
+    record = _adapter(fake_cli).create_record(fields, actor=SmartTableActor.ROBOT)
+
+    assert record.record_id == "record-created-once"
+    assert record.fields == {
+        "创建人": "sales-1",
+        "负责人": "sales-1",
+        "线索名称": "QA原生写入",
+    }
+    assert len(fake_cli.calls) == 3
 
 
 def test_configured_sheet_title_uses_full_query_and_parses_member_rows() -> None:
@@ -687,17 +926,532 @@ def test_subprocess_timeout_is_retried_once() -> None:
     assert len(fake_cli.calls) == 2
 
 
-def test_idempotent_cli_process_exit_is_retried() -> None:
-    """验证 records list/update 的 CLI 进程异常会有限重试。"""
+def test_idempotent_cli_network_process_error_is_retried() -> None:
+    """验证明确网络错误的幂等读取会有限重试。"""
     fake_cli = FakeCli(
         [
-            WecomCliProcessError("wecom-cli 退出失败，退出码：1"),
+            WecomCliProcessError(
+                "wecom-cli 进程调用失败：network_error",
+                error_code="network_error",
+                external_error_code=893101,
+                external_error_type="NetworkError",
+            ),
             {"errcode": 0, "fields": []},
         ]
     )
 
     assert _adapter(fake_cli).get_schema().fields == ()
     assert len(fake_cli.calls) == 2
+
+
+def test_permanent_cli_process_error_is_not_retried() -> None:
+    """验证 CLI 明确报告权限或参数错误时不重复提交同一更新。"""
+    fake_cli = FakeCli(
+        [
+            WecomCliProcessError("wecom-cli 退出失败", error_code="permission_denied"),
+            {"errcode": 0, "fields": []},
+        ]
+    )
+
+    with pytest.raises(WecomCliProcessError):
+        _adapter(fake_cli).get_schema()
+    assert len(fake_cli.calls) == 1
+
+
+def test_subprocess_failure_keeps_only_controlled_error_code(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """验证 stdout 结构化权限错误只保留白名单元数据。"""
+
+    def failed_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        """返回包含敏感片段的模拟 CLI 失败结果。"""
+        return subprocess.CompletedProcess(
+            args=["wecom-cli"],
+            returncode=1,
+            stdout=(
+                '{"errcode":851003,"errmsg":"private response text",'
+                '"body":"private body","docid":"private-doc"}'
+            ),
+            stderr="private stderr token=secret-value",
+        )
+
+    monkeypatch.setattr(subprocess, "run", failed_run)
+    caplog.set_level(logging.ERROR)
+
+    with pytest.raises(WecomCliProcessError) as error:
+        _adapter(FakeCli([]))._run_subprocess(("wecom-cli", "--json", "{}"))
+
+    assert error.value.error_code == "permission_denied"
+    assert error.value.external_error_code == 851003
+    assert error.value.external_error_type is None
+    assert "private response text" not in str(error.value)
+    assert "private body" not in caplog.text
+    assert "private-doc" not in caplog.text
+    assert "secret-value" not in caplog.text
+    assert caplog.records[-1].external_error_code == 851003
+    formatted_log = JsonFormatter().format(caplog.records[-1])
+    assert '"external_error_code": 851003' in formatted_log
+    assert "private response text" not in formatted_log
+
+
+def test_subprocess_network_error_parses_only_safe_stdout_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """验证嵌套网络错误映射为暂态类别且不泄露远端正文。"""
+
+    def failed_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        """返回带有敏感正文的结构化模拟网络失败。"""
+        return subprocess.CompletedProcess(
+            args=["wecom-cli"],
+            returncode=1,
+            stdout=(
+                '{"error":{"type":"NetworkError","code":893101,'
+                '"message":"private response","body":"private body"}}'
+            ),
+            stderr="ignored private stderr",
+        )
+
+    monkeypatch.setattr(subprocess, "run", failed_run)
+    caplog.set_level(logging.ERROR)
+
+    with pytest.raises(WecomCliProcessError) as error:
+        _adapter(FakeCli([]))._run_subprocess(("wecom-cli", "--json", "{}"))
+
+    assert error.value.error_code == "network_error"
+    assert error.value.external_error_code == 893101
+    assert error.value.external_error_type == "NetworkError"
+    assert "private response" not in str(error.value)
+    assert "private body" not in caplog.text
+    assert "ignored private stderr" not in caplog.text
+
+
+def test_remote_parameter_error_extracts_only_exact_schema_field_title(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """验证 640027 只输出精确匹配的规范字段名，不传播远端 errmsg。
+
+    参数：monkeypatch 替换子进程回执；caplog 捕获安全错误日志。
+    返回值：无。异常：通过 pytest 捕获受控 CLI 错误对象。
+    副作用：加载模拟 schema 并执行一次模拟非零子进程。
+    """
+    adapter = _adapter(FakeCli([_field_response()]))
+    adapter.get_schema()
+
+    def failed_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        """返回包含字段名和不得外泄数据的模拟远端错误。"""
+        return subprocess.CompletedProcess(
+            args=["wecom-cli"],
+            returncode=1,
+            stdout=(
+                '{"errcode":640027,"errmsg":"invalid 手机 for 客户甲 13800138000 private body"}'
+            ),
+            stderr="private stderr",
+        )
+
+    monkeypatch.setattr(subprocess, "run", failed_run)
+    caplog.set_level(logging.ERROR)
+
+    with pytest.raises(WecomCliProcessError) as captured:
+        adapter._run_subprocess(("wecom-cli", "--json", "{}"))
+
+    error = captured.value
+    assert error.error_code == "remote_business_error"
+    assert error.external_error_code == 640027
+    assert error.retryable is False
+    assert error.rejected_field_candidates == ("手机",)
+    formatted = JsonFormatter().format(caplog.records[-1])
+    assert json.loads(formatted)["remote_rejected_field_candidates"] == ["手机"]
+    for sensitive in ("客户甲", "13800138000", "private body", "private stderr"):
+        assert sensitive not in str(error.__dict__)
+        assert sensitive not in str(error)
+        assert sensitive not in formatted
+
+
+def test_remote_parameter_error_without_exact_title_has_no_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证非精确或未知远端描述不会被模糊映射成业务字段。
+
+    参数：monkeypatch 替换子进程回执。
+    返回值：无。异常：通过 pytest 捕获受控 CLI 错误对象。
+    副作用：加载模拟 schema 并执行一次模拟非零子进程。
+    """
+    adapter = _adapter(FakeCli([_field_response()]))
+    adapter.get_schema()
+
+    def failed_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        """返回不含完整 schema 标题的参数错误。"""
+        return subprocess.CompletedProcess(
+            args=["wecom-cli"],
+            returncode=1,
+            stdout='{"errcode":640027,"errmsg":"手机号号码字段 rejected"}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", failed_run)
+
+    with pytest.raises(WecomCliProcessError) as captured:
+        adapter._run_subprocess(("wecom-cli", "--json", "{}"))
+
+    assert captured.value.rejected_field_candidates == ()
+
+
+def test_non_json_stdout_falls_back_to_limited_stderr_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 stdout 非 JSON 时仍使用 stderr 的有限权限分类。"""
+
+    def failed_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        """返回非 JSON stdout 和可识别的受控权限提示。"""
+        return subprocess.CompletedProcess(
+            args=["wecom-cli"],
+            returncode=1,
+            stdout="not-json private payload",
+            stderr="permission denied token=private",
+        )
+
+    monkeypatch.setattr(subprocess, "run", failed_run)
+
+    with pytest.raises(WecomCliProcessError) as error:
+        _adapter(FakeCli([]))._run_subprocess(("wecom-cli", "--json", "{}"))
+
+    assert error.value.error_code == "permission_denied"
+    assert error.value.external_error_code is None
+    assert "private" not in str(error.value)
+
+
+def test_unclassified_nonzero_exit_is_permanent_and_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证未知 stdout/stderr 只归为 process_exit，不被误判为暂态重试。"""
+
+    subprocess_calls = 0
+
+    def failed_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        """返回没有已知结构或 stderr 分类的进程错误。"""
+        nonlocal subprocess_calls
+        subprocess_calls += 1
+        return subprocess.CompletedProcess(
+            args=["wecom-cli"], returncode=1, stdout='{"other":true}', stderr="unclassified"
+        )
+
+    monkeypatch.setattr(subprocess, "run", failed_run)
+    adapter = WecomCliSmartTableAdapter(doc_id="test-doc", sheet_id="test-sheet", retry_count=1)
+
+    with pytest.raises(WecomCliProcessError) as error:
+        adapter.get_schema()
+
+    assert error.value.error_code == "process_exit"
+    assert subprocess_calls == 1
+
+
+def test_http_status_controls_process_error_retry() -> None:
+    """验证只有明确可重试 HTTP 状态允许幂等 CLI 调用重放。"""
+    retryable = FakeCli(
+        [
+            WecomCliProcessError("HTTP error", error_code="http_error", http_status=503),
+            {"errcode": 0, "fields": []},
+        ]
+    )
+    permanent = FakeCli(
+        [WecomCliProcessError("HTTP error", error_code="http_error", http_status=403)]
+    )
+
+    assert _adapter(retryable).get_schema().fields == ()
+    assert len(retryable.calls) == 2
+    with pytest.raises(WecomCliProcessError):
+        _adapter(permanent).get_schema()
+    assert len(permanent.calls) == 1
+
+
+def test_update_declares_field_title_key_type() -> None:
+    """验证更新请求显式声明使用字段标题，避免 CLI 默认键类型漂移。"""
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {"errcode": 0, "records": [{"record_id": "record-1", "values": {}}]},
+            {"errcode": 0, "records": [{"record_id": "record-1", "values": {}}]},
+            {
+                "errcode": 0,
+                "records": [{"record_id": "record-1", "values": {"备注": "更新后的备注"}}],
+            },
+        ]
+    )
+
+    _adapter(fake_cli).update_record("record-1", {"备注": "更新后的备注"})
+
+    payload = _payload(fake_cli.calls[2])
+    assert payload["key_type"] == "CELL_VALUE_KEY_TYPE_FIELD_TITLE"
+
+
+def test_update_ack_requires_matching_remote_readback() -> None:
+    """验证 update ACK 后的远端 uncached 回读才是字段写入成功证据。
+
+    参数：无。返回值：无。异常：断言失败时由 pytest 报告。
+    副作用：消费模拟 schema、原记录、update ACK 与远端 readback 响应。
+    """
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "values": [
+                    {
+                        "rows": [
+                            {
+                                "RECORD_ID": "record-1",
+                                "备注": "旧值",
+                                "创建人": [{"userId": "sales-1"}],
+                                "负责人": [{"userId": "sales-1"}],
+                            }
+                        ]
+                    }
+                ],
+            },
+            {
+                "errcode": 0,
+                "records": [{"record_id": "record-1", "values": {"备注": "新值"}}],
+            },
+            {
+                "errcode": 0,
+                "values": [
+                    {
+                        "rows": [
+                            {
+                                "RECORD_ID": "record-1",
+                                "备注": "新值",
+                                "创建人": [{"userId": "sales-1"}],
+                                "负责人": [{"userId": "sales-1"}],
+                            }
+                        ]
+                    }
+                ],
+            },
+        ]
+    )
+
+    record = _adapter(fake_cli, sheet_title="CRM线索").update_record("record-1", {"备注": "新值"})
+
+    assert record.fields["备注"] == "新值"
+    assert len(fake_cli.calls) == 4
+
+
+def test_update_waits_for_eventually_consistent_remote_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证有限最终一致性窗口中首次旧值会重读，后续匹配才成功。
+
+    参数：monkeypatch 将退避 sleep 替换为无等待函数。返回值：无。
+    异常：断言失败时由 pytest 报告。
+    副作用：消费两次远端回读，不执行额外写请求。
+    """
+    monkeypatch.setattr("app.smart_table.wecom_cli.time.sleep", lambda _delay: None)
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "values": [
+                    {
+                        "rows": [
+                            {
+                                "RECORD_ID": "record-1",
+                                "备注": "旧值",
+                                "创建人": [{"userId": "sales-1"}],
+                                "负责人": [{"userId": "sales-1"}],
+                            }
+                        ]
+                    }
+                ],
+            },
+            {
+                "errcode": 0,
+                "records": [{"record_id": "record-1", "values": {"备注": "新值"}}],
+            },
+            {
+                "errcode": 0,
+                "values": [
+                    {
+                        "rows": [
+                            {
+                                "RECORD_ID": "record-1",
+                                "备注": "旧值",
+                                "创建人": [{"userId": "sales-1"}],
+                                "负责人": [{"userId": "sales-1"}],
+                            }
+                        ]
+                    }
+                ],
+            },
+            {
+                "errcode": 0,
+                "values": [
+                    {
+                        "rows": [
+                            {
+                                "RECORD_ID": "record-1",
+                                "备注": "新值",
+                                "创建人": [{"userId": "sales-1"}],
+                                "负责人": [{"userId": "sales-1"}],
+                            }
+                        ]
+                    }
+                ],
+            },
+        ]
+    )
+
+    record = _adapter(fake_cli, sheet_title="CRM线索").update_record("record-1", {"备注": "新值"})
+
+    assert record.fields["备注"] == "新值"
+    assert len(fake_cli.calls) == 5
+
+
+def test_update_verification_bypasses_recent_write_cache_and_hides_values() -> None:
+    """验证远端目标缺失时近期写缓存不能伪造成功，异常只暴露规范字段名。
+
+    参数：无。返回值：无。异常：通过 pytest 捕获受控核实异常。
+    副作用：最多执行四次只读远端回查，不重复发送 update。
+    """
+    fake_cli = FakeCli(
+        [_field_response(), *({"errcode": 0, "records": []} for _ in range(4))]
+    )
+    adapter = _adapter(fake_cli)
+    schema = adapter.get_schema()
+    # 人为放入匹配缓存；远端核实仍必须只接受 CLI 回读。
+    adapter._remember_written_record("record-1", {"备注": "敏感目标值"})
+    with pytest.raises(WecomCliSmartTableAdapterError) as error:
+        adapter._verify_remote_write(
+            "record-1", {"备注": "敏感目标值"}, schema, operation="update"
+        )
+
+    assert type(error.value).__name__ == "SmartTableWriteVerificationError"
+    assert error.value.missing_or_mismatched_fields == ("备注",)
+    assert "敏感目标值" not in str(error.value)
+    assert len(fake_cli.calls) == 5
+
+
+def test_remote_verification_normalizes_schema_value_types() -> None:
+    """验证文本、手机号、日期、选择和成员按领域语义回读比较。
+
+    参数：无。返回值：无。异常：断言失败时由 pytest 报告。
+    副作用：只在内存中比较虚构字段，不访问外部服务。
+    """
+    schema = SmartTableSchema(
+        fields=(
+            SmartTableField("remark", "备注", SmartTableFieldType.LONG_TEXT),
+            SmartTableField("phone", "手机", SmartTableFieldType.PHONE_NUMBER),
+            SmartTableField("email", "邮箱", SmartTableFieldType.EMAIL),
+            SmartTableField("date", "下次联系时间", SmartTableFieldType.DATE),
+            SmartTableField(
+                "line",
+                "业务线",
+                SmartTableFieldType.SINGLE_SELECT,
+                (SmartTableOption("line-id", "协作机器人"),),
+            ),
+            SmartTableField(
+                "pending",
+                "AI待确认",
+                SmartTableFieldType.MULTI_SELECT,
+                (SmartTableOption("pending-id", "联系人"),),
+            ),
+            SmartTableField(
+                "process",
+                "工艺",
+                SmartTableFieldType.MULTI_SELECT,
+                (
+                    SmartTableOption("pallet-option", "码垛"),
+                    SmartTableOption("assembly-option", "装配"),
+                ),
+            ),
+            SmartTableField("owner", "负责人", SmartTableFieldType.MEMBER),
+        )
+    )
+    target = {
+        "备注": "安全备注",
+        "手机": "138 0013-8000",
+        "邮箱": "sales@example.invalid",
+        "下次联系时间": "2026-10-02T01:00:00+00:00",
+        "业务线": "协作机器人",
+        "AI待确认": ["联系人"],
+        "工艺": ["码垛", "装配"],
+        "负责人": "sales-1",
+    }
+    remote = SmartTableRecord(
+        record_id="record-1",
+        fields={
+            "备注": "安全备注",
+            "手机": "13800138000",
+            "邮箱": "sales@example.invalid",
+            "下次联系时间": "2026-10-02 09:00:00",
+            "业务线": "协作机器人",
+            "AI待确认": ["联系人"],
+            "工艺": ["码垛", "装配"],
+            "负责人": "sales-1",
+        },
+    )
+
+    mismatches = _adapter(FakeCli([]))._mismatched_write_fields(target, remote, schema)
+
+    assert mismatches == ()
+
+
+def test_remote_verification_rejects_json_quoted_text_instead_of_normalizing_it() -> None:
+    """验证 JSON 字符串外观不能掩盖远端文本多出的双引号。"""
+    schema = SmartTableSchema(
+        fields=(SmartTableField("name", "线索名称", SmartTableFieldType.TEXT),)
+    )
+    remote = SmartTableRecord(record_id="record-1", fields={"线索名称": '"测试公司"'})
+
+    mismatches = _adapter(FakeCli([]))._mismatched_write_fields(
+        {"线索名称": "测试公司"}, remote, schema
+    )
+
+    assert mismatches == ("线索名称",)
+
+
+def test_remote_verification_does_not_require_business_line_or_date_outside_plan() -> None:
+    """验证不在本轮字段计划中的业务线和日期不会成为写入成功门槛。
+
+    参数：无。返回值：无。异常：断言失败时由 pytest 报告。
+    副作用：只在内存中核实计划字段，不访问外部服务。
+    """
+    schema = SmartTableSchema(
+        fields=(
+            SmartTableField("line", "业务线", SmartTableFieldType.SINGLE_SELECT),
+            SmartTableField("date", "下次联系时间", SmartTableFieldType.DATE),
+            SmartTableField("remark", "备注", SmartTableFieldType.TEXT),
+        )
+    )
+    remote = SmartTableRecord(record_id="record-1", fields={"备注": "已写入"})
+
+    mismatches = _adapter(FakeCli([]))._mismatched_write_fields({"备注": "已写入"}, remote, schema)
+
+    assert mismatches == ()
+
+
+def test_no_authority_cli_failure_is_classified_as_permission_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证企业规模权限错误进入受控权限分类，不被当作暂态进程错误。"""
+
+    def failed_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        """返回企业微信明确的权限失败片段。"""
+        return subprocess.CompletedProcess(
+            args=["wecom-cli"],
+            returncode=1,
+            stdout="",
+            stderr="errcode=851003 errmsg=no authority",
+        )
+
+    monkeypatch.setattr(subprocess, "run", failed_run)
+
+    with pytest.raises(WecomCliProcessError) as error:
+        _adapter(FakeCli([]))._run_subprocess(("wecom-cli", "--json", "{}"))
+
+    assert error.value.error_code == "permission_denied"
 
 
 def test_cli_process_exit_during_add_is_not_retried() -> None:
@@ -715,3 +1469,181 @@ def test_cli_process_exit_during_add_is_not_retried() -> None:
             actor=SmartTableActor.ROBOT,
         )
     assert len(fake_cli.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "uncertain_result",
+    [
+        subprocess.TimeoutExpired(cmd="wecom-cli", timeout=1),
+        {"error": {"type": "NetworkError"}},
+        WecomCliProcessError(
+            "wecom-cli 退出失败，退出码：1",
+            error_code="network_error",
+            external_error_code=893101,
+            external_error_type="NetworkError",
+        ),
+    ],
+)
+def test_uncertain_add_result_is_permanent_and_never_replayed(
+    uncertain_result: Mapping[str, object] | BaseException,
+) -> None:
+    """验证 add 超时或网络结果未知时作为永久检查点处理且只发送一次。"""
+    fake_cli = FakeCli([_field_response(), uncertain_result])
+
+    with pytest.raises(WecomCliSmartTableAdapterError, match="新增结果无法确认"):
+        _adapter(fake_cli).create_record(
+            {"负责人": "sales-1"}, actor=SmartTableActor.ROBOT
+        )
+
+    add_calls = [arguments for arguments in fake_cli.calls if arguments[2:4] == ("records", "add")]
+    assert len(add_calls) == 1
+
+
+def test_query_record_accepts_native_sql_select_values_and_empty_members() -> None:
+    """验证 SQL 查询返回原生单选文本，空成员列不会阻断整行读取。"""
+    schema = SmartTableSchema(
+        fields=(
+            SmartTableField(
+                "international",
+                "是否为国际客户",
+                SmartTableFieldType.SINGLE_SELECT,
+                (SmartTableOption("domestic-id", "国内"),),
+            ),
+            SmartTableField("lead-name", "线索名称", SmartTableFieldType.TEXT),
+            SmartTableField("creator", "创建人", SmartTableFieldType.MEMBER),
+            SmartTableField("owner", "负责人", SmartTableFieldType.MEMBER),
+            SmartTableField(
+                "submission-status",
+                "提交状态",
+                SmartTableFieldType.SINGLE_SELECT,
+                (SmartTableOption("pending-id", "未提交"),),
+            ),
+        )
+    )
+    row = {
+        "RECORD_ID": "record-1",
+        "是否为国际客户": "国内",
+        "线索名称": "样例公司",
+        "创建人": None,
+        "负责人": None,
+        "提交状态": "未提交",
+    }
+    fake_cli = FakeCli([{"errcode": 0, "values": [json.dumps({"rows": [row]})]}])
+    adapter = _adapter(fake_cli, sheet_title="CRM线索")
+    adapter._schema = schema
+
+    record = adapter.get_records()[0]
+
+    assert record.fields == {
+        "是否为国际客户": "国内",
+        "线索名称": "样例公司",
+        "创建人": None,
+        "负责人": None,
+        "提交状态": "未提交",
+    }
+
+
+def test_query_record_normalizes_native_member_and_multi_select_cells() -> None:
+    """验证 SQL 查询中的原生成员对象和多选字符串数组会还原为领域值。"""
+    schema = SmartTableSchema(
+        fields=(
+            SmartTableField("owner", "负责人", SmartTableFieldType.MEMBER),
+            SmartTableField(
+                "confirmation",
+                "AI待确认",
+                SmartTableFieldType.MULTI_SELECT,
+                (SmartTableOption("contact-option", "联系人"),),
+            ),
+        )
+    )
+    row = {
+        "RECORD_ID": "record-1",
+        "负责人": [{"id": "sales-1", "name": "测试销售", "corp_name": "测试企业"}],
+        "AI待确认": ["联系人"],
+    }
+
+    record = _adapter(FakeCli([]))._parse_query_record(row, schema)
+
+    assert record.fields == {"负责人": "sales-1", "AI待确认": ["联系人"]}
+    assert record.member_names == {"负责人": "测试销售"}
+
+
+def test_query_record_preserves_json_looking_text_and_native_single_select() -> None:
+    """验证普通文本即使长得像 JSON 也保持原文，单选直接使用查询文本。
+
+    参数：无。
+    返回值：无。
+    异常：断言失败时由 pytest 报告。
+    副作用：仅解析模拟的只读查询行，不访问外部服务。
+    """
+    schema = SmartTableSchema(
+        fields=(
+            SmartTableField("name", "线索名称", SmartTableFieldType.TEXT),
+            SmartTableField(
+                "international",
+                "是否为国际客户",
+                SmartTableFieldType.SINGLE_SELECT,
+            ),
+        )
+    )
+    row = {
+        "RECORD_ID": "record-1",
+        "线索名称": '["这是合法客户文本"]',
+        "是否为国际客户": "国内",
+    }
+
+    record = _adapter(FakeCli([]))._parse_query_record(row, schema)
+
+    assert record.fields == {"线索名称": '["这是合法客户文本"]', "是否为国际客户": "国内"}
+
+
+def test_query_projects_date_as_formatted_text_for_exact_write_verification() -> None:
+    """验证完整查询将 Excel 日期序列格式化为与写入值可直接比较的时间文本。"""
+    response_rows = {"rows": [{"RECORD_ID": "record-1", "下次联系时间": "2026-10-10 10:00:00"}]}
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {"errcode": 0, "values": [json.dumps(response_rows, ensure_ascii=False)]},
+        ]
+    )
+    adapter = _adapter(fake_cli, sheet_title="CRM线索")
+
+    records = adapter.get_records()
+
+    assert records[0].fields["下次联系时间"] == "2026-10-10 10:00:00"
+    sql = fake_cli.calls[1][fake_cli.calls[1].index("--sql") + 1]
+    assert 'DATE_FORMAT(`下次联系时间`, "%Y-%m-%d %H:%i:%s")' in sql
+
+
+def test_query_rejects_non_contract_text_cell_shapes() -> None:
+    """验证 SQL query 不把文本字段数组转换成文本而掩盖远端类型异常。"""
+    schema = SmartTableSchema(
+        fields=(SmartTableField("name", "线索名称", SmartTableFieldType.TEXT),)
+    )
+
+    with pytest.raises(WecomCliSmartTableAdapterError, match="文本或单选字段类型"):
+        _adapter(FakeCli([]))._parse_query_record(
+            {"RECORD_ID": "record-1", "线索名称": ["不是 SQL 文本契约"]}, schema
+        )
+
+
+def test_query_record_normalizes_sql_member_shape() -> None:
+    """验证 SQL 查询返回的人员对象形状可归一化为成员标识和展示名。
+
+    参数：无。
+    返回值：无。
+    异常：断言失败时由 pytest 报告。
+    副作用：仅解析模拟的只读查询行，不访问企业微信。
+    """
+    schema = SmartTableSchema(
+        fields=(SmartTableField("owner", "负责人", SmartTableFieldType.MEMBER),)
+    )
+    row = {
+        "RECORD_ID": "record-1",
+        "负责人": [{"id": "member-1", "name": "测试销售", "corp_name": "测试企业"}],
+    }
+
+    record = _adapter(FakeCli([]))._parse_query_record(row, schema)
+
+    assert record.fields == {"负责人": "member-1"}
+    assert record.member_names == {"负责人": "测试销售"}

@@ -296,10 +296,10 @@ def test_conflict_projection_paginates_all_retry_conflicts_by_source(
     } == {f"task:message_retry:{index + 1}" for index in range(105)}
 
 
-def test_audit_and_config_queries_keep_security_facts_and_mapping_status(
+def test_audit_and_config_queries_keep_security_facts_and_owner_directory_status(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证审计页保留 Break-glass 安全事实，配置页展示授权映射风险。"""
+    """验证审计页保留 Break-glass 安全事实，配置页不把废弃的授权映射当阻塞项。"""
     with session_factory.begin() as session:
         session.add(
             SalesAuthorization(
@@ -338,14 +338,14 @@ def test_audit_and_config_queries_keep_security_facts_and_mapping_status(
     assert audit.data_returned is True
     assert audit.request_context == {"route": "/api/console/break-glass/access"}
     mapping = next(item for item in config.items if item.source == "sales_authorization")
-    assert mapping.status == "not_ready"
-    assert "CRM 映射缺失 1 条" in mapping.issues[0]
+    assert mapping.status == "ok"
+    assert "CRM 提交身份按智能表格负责人目录解析" in mapping.issues[0]
 
 
-def test_sales_authorization_query_exposes_mapping_status_and_affected_leads(
+def test_sales_authorization_query_exposes_owner_scope_without_auth_mapping_blocker(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证目录查询展示授权范围与映射异常关联的待同步线索数。"""
+    """验证目录查询展示授权范围，但不把授权目录 CRM 映射作为提交阻塞。"""
     with session_factory.begin() as session:
         session.add_all(
             [
@@ -389,12 +389,12 @@ def test_sales_authorization_query_exposes_mapping_status_and_affected_leads(
     missing = next(item for item in result.items if item.wecom_user_id == "sales-missing")
     mapped = next(item for item in result.items if item.wecom_user_id == "sales-mapped")
     inactive = next(item for item in result.items if item.wecom_user_id == "sales-inactive")
-    assert missing.crm_mapping_status == "mapping_missing"
-    assert missing.affected_pending_lead_count == 1
-    assert mapped.crm_mapping_status == "mapped"
+    assert missing.crm_mapping_status == "not_required"
+    assert missing.affected_pending_lead_count == 0
+    assert mapped.crm_mapping_status == "not_required"
     assert mapped.affected_pending_lead_count == 0
     assert inactive.crm_mapping_status == "not_required"
 
     query_service = ConsoleQueryService(session_factory, FakeHealthProvider())
     affected = query_service.list_mapping_missing_leads("sales-missing")
-    assert [item.lead_id for item in affected.items] == ["mapping-lead"]
+    assert affected.items == []

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from collections.abc import Mapping
 from datetime import datetime
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -13,6 +15,37 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from app.crm.adapter import CRMCreateResult, CRMSearchResult
+
+DuplicateEntityType = Literal["lead", "customer", "dealer", "unknown"]
+# SOP 文档只提供一条线索类型示例；使用其 SHA-256 精确匹配，源文案不进入代码库。
+_DUPLICATE_ENTITY_MESSAGE_HASHES: dict[str, DuplicateEntityType] = {
+    "3e767f7522343ef3d9328eafd549855a6e1aa55829509bf29dbe75a6e4686da6b8": "lead",
+}
+
+
+def _duplicate_entity_type_for_digest(digest: str) -> DuplicateEntityType:
+    """按 SOP 固定文案的哈希白名单返回重复对象类型。
+
+    参数：digest 为 data.message 的 SHA-256 十六进制摘要。
+    返回值：精确 allowlist 中的 lead/customer/dealer，未登记时返回 unknown。
+    异常：无。
+    副作用：无；摘要和原文均不写入持久化存储。
+    """
+    return _DUPLICATE_ENTITY_MESSAGE_HASHES.get(digest, "unknown")
+
+
+def _classify_duplicate_entity_message(message: object) -> DuplicateEntityType:
+    """只在内存中精确识别 SOP 重复对象文案，不保留或记录原文。
+
+    参数：message 为 SOP data.message 的临时值。
+    返回值：受控对象类型枚举；类型非法、过长或不在白名单时返回 unknown。
+    异常：无；非字符串输入不会被编码或强制转换。
+    副作用：仅对临时字符串计算摘要，不记录、返回或持久化原文。
+    """
+    if not isinstance(message, str) or len(message) > 1024:
+        return "unknown"
+    digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    return _duplicate_entity_type_for_digest(digest)
 
 
 class SopCRMError(RuntimeError):
@@ -26,13 +59,21 @@ class SopCRMError(RuntimeError):
         http_status: int | None = None,
         error_code: str | None = None,
         sub_code: str | None = None,
+        duplicate_entity_type: DuplicateEntityType | None = None,
     ) -> None:
-        """保存脱敏错误分类和协议错误码，供任务层区分失败并支持人工诊断。"""
+        """保存受控 CRM 错误事实，供任务层区分失败并支持人工诊断。
+
+        参数：message 为适配器生成的固定摘要；其余参数为白名单分类、状态码和对象类型。
+        返回值：无。
+        异常：无。
+        副作用：异常仅保留固定摘要和受控元数据，不保存远端响应正文。
+        """
         self.category = category
         self.http_status = http_status
         # 仅保存 Gateway 的非敏感枚举码，不保存 message、签名或业务内容。
         self.error_code = error_code
         self.sub_code = sub_code
+        self.duplicate_entity_type = duplicate_entity_type
         super().__init__(message)
 
 
@@ -81,8 +122,14 @@ class SopCRMAdapter:
         if result == 0:
             return ()
         lead_id = data.get("leadId")
+        # 只接受明确返回的 CRM Lead ID；其他重复对象或缺少 ID 都转人工处理。
         if lead_id is None:
-            raise SopCRMError("CRM duplicate requires manual review")
+            raise SopCRMError(
+                "CRM duplicate target unavailable",
+                category="duplicate_target_unavailable",
+                sub_code="duplicate_detected_without_lead_id",
+                duplicate_entity_type=_classify_duplicate_entity_message(data.get("message")),
+            )
         return (CRMSearchResult(str(lead_id), None, "CRM duplicate"),)
 
     def create_lead(

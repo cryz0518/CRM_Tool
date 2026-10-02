@@ -118,11 +118,13 @@ class LeadReviewService:
         patch: ExtractedLeadPatch,
         *,
         protected_supplement: bool = False,
+        acknowledged_but_unverified_fields: tuple[str, ...] = (),
     ) -> ReviewSyncResult:
         """重读智能表格后同步 T08 的合法字段，并永久保护人工编辑字段。
 
         参数：lead_id 为目标线索；source_message_id 为已持久化 AI 来源消息；patch 为 T08 结果；
-        protected_supplement 表示该补丁来自历史失败消息，只允许补充当前空字段。
+        protected_supplement 表示该补丁来自历史失败消息，只允许补充当前空字段；
+        acknowledged_but_unverified_fields 是旧版 ACK 假成功后需重新核验的原计划字段。
         返回值：实际写入与被保护字段的确定性结果。
         异常：线索、消息或表格记录缺失时抛出 ValueError；适配器错误向调用方传播。
         副作用：可能更新表格、字段来源、人工编辑标记和审计记录。
@@ -142,7 +144,12 @@ class LeadReviewService:
             raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
         current_fields = dict(record.fields)
         plan = self._plan_safe_patch(
-            lead_id, source_message_id, patch, current_fields, protected_supplement
+            lead_id,
+            source_message_id,
+            patch,
+            current_fields,
+            protected_supplement,
+            acknowledged_but_unverified_fields,
         )
 
         # 在外部写入前再读一次表格；并发的后续消息若已提交，必须基于最新状态重算补丁。
@@ -152,7 +159,12 @@ class LeadReviewService:
         if dict(latest_record.fields) != current_fields:
             current_fields = dict(latest_record.fields)
             plan = self._plan_safe_patch(
-                lead_id, source_message_id, patch, current_fields, protected_supplement
+                lead_id,
+                source_message_id,
+                patch,
+                current_fields,
+                protected_supplement,
+                acknowledged_but_unverified_fields,
             )
 
         # 外部写入前再次短暂锁定 Lead；若废弃已提交，不能再把表格或后台事实写成补充结果。
@@ -225,11 +237,13 @@ class LeadReviewService:
         patch: ExtractedLeadPatch,
         current_fields: Mapping[str, object],
         protected_supplement: bool = False,
+        acknowledged_but_unverified_fields: tuple[str, ...] = (),
     ) -> _SafePatchPlan:
         """在短数据库事务中基于当前 Lead 与表格值生成受保护字段补丁。
 
         参数：lead_id 为目标线索；source_message_id 为来源消息；patch 为已校验 AI 补丁；
-        current_fields 为刚从智能表格读取的当前字段；protected_supplement 表示历史失败补充。
+        current_fields 为刚从智能表格读取的当前字段；protected_supplement 表示历史失败补充；
+        acknowledged_but_unverified_fields 只用于识别旧版错误 ACK 后仍为空的原计划字段。
         返回值：包含外部写入补丁、字段保护结果和 Lead 并发比较基线的计划。
         异常：目标不存在、已废弃或来源消息不存在时抛出 ValueError。
         副作用：识别并持久化销售对字段的修改事实，但不调用外部适配器。
@@ -246,7 +260,13 @@ class LeadReviewService:
             # 系统决策也可能只新增审核元数据而不改业务字段，必须先合并本轮待确认声明。
             pending.update(patch.pending_confirmation_fields)
             protected = self._detect_user_edits(
-                session, lead, provenance, current_fields, pending, source_message_id
+                session,
+                lead,
+                provenance,
+                current_fields,
+                pending,
+                source_message_id,
+                acknowledged_but_unverified_fields,
             )
             pending.difference_update(protected)
             fields_to_write: dict[str, object] = {}
@@ -564,6 +584,7 @@ class LeadReviewService:
         current_fields: Mapping[str, object],
         pending: set[str],
         source_message_id: str | None,
+        acknowledged_but_unverified_fields: tuple[str, ...] = (),
     ) -> set[str]:
         """识别与最后 AI 同步值不同的字段并永久标记人工修改和确认。
 
@@ -577,6 +598,13 @@ class LeadReviewService:
         for field_name, source in provenance.items():
             if source.is_user_modified:
                 protected.add(field_name)
+                continue
+            if (
+                field_name in acknowledged_but_unverified_fields
+                and current_fields.get(field_name) in (None, "", [])
+            ):
+                # 旧 adapter 曾把 ACK 当成功；空值不能据此误判为销售编辑。
+                # 真实非空值及人工修改仍由下方既有保护逻辑处理。
                 continue
             if source.last_ai_synced_value is None:
                 continue

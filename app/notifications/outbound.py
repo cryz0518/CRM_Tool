@@ -25,6 +25,7 @@ _SUPPORTED_NOTIFICATION_TYPES = frozenset(
         "crm_submission_summary",
         "crm_submission_preview",
         "crm_submission_intent_unrecognized",
+        "lead_processing_failed",
         "wecom_action_preview",
         "sales_authorization_denied",
         "media_text_input_required",
@@ -64,6 +65,7 @@ class WecomOutboundNotificationSender:
                         ),
                     ),
                 )
+                .order_by(NotificationRecord.created_at, NotificationRecord.notification_key)
             ).all()
         sent = 0
         for notice in notices:

@@ -7,7 +7,7 @@ import logging
 
 import pytest
 
-from app.ai.gateway import AIGateway, BusinessValidationError, FailedStructuredOutputError
+from app.ai.gateway import AIGateway, FailedStructuredOutputError
 from app.ai.models import LLMResponse
 from app.ai.provider import LLMProviderError, MockLLMProvider
 from app.smart_table.registry import (
@@ -58,19 +58,24 @@ def test_gateway_repairs_only_one_malformed_structured_response() -> None:
     assert len(provider.requests) == 2
 
 
-def test_gateway_never_repairs_a_business_invalid_enum_value() -> None:
-    """验证枚举业务校验失败直接拒绝，不能借模型再次改写业务事实。
+def test_gateway_drops_invalid_enum_without_losing_reliable_fields() -> None:
+    """验证非法枚举留待销售补充，但同消息的公司和联系方式仍可使用。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "长广溪智造", "业务线": "未知机器人"},
+                confidence_by_field={"线索名称": 0.95, "业务线": 0.95},
+            )
+        ]
+    )
 
-    参数：无。
-    返回：无。
-    异常：BusinessValidationError 为受控业务校验结论。
-    副作用：Mock Provider 仅收到初始提取请求。
-    """
-    provider = MockLLMProvider(responses=[valid_analysis(crm_fields={"业务线": "未知机器人"})])
+    result = AIGateway(provider).extract_fields(
+        "客户：长广溪智造，手机号：13800138000，业务线：未知机器人"
+    )
 
-    with pytest.raises(BusinessValidationError, match="业务线"):
-        AIGateway(provider).extract_fields("业务线：未知机器人")
-
+    assert result.fields == {"线索名称": "长广溪智造", "手机": "13800138000"}
+    assert result.pending_confirmation_fields == ("业务线",)
+    assert result.low_confidence_candidates == {"业务线": "未知机器人"}
     assert len(provider.requests) == 1
 
 
@@ -124,6 +129,19 @@ def test_gateway_classifies_submission_intent_without_crm_side_effect() -> None:
     assert "意图分类" in provider.requests[0].messages[0]["content"]
 
 
+def test_gateway_classifies_incomplete_resubmission_without_client_targets() -> None:
+    """验证意图模型只输出待完善重提类别，不承担线索或动作身份解析。"""
+    provider = MockLLMProvider(
+        responses=['{"intent":"SUBMIT_RETRY_INCOMPLETE","company_name":null}']
+    )
+
+    intent = AIGateway(provider).classify_submission_intent("重新提交")
+
+    assert intent.intent == "SUBMIT_RETRY_INCOMPLETE"
+    assert intent.company_name is None
+    assert "SUBMIT_RETRY_INCOMPLETE" in provider.requests[0].messages[0]["content"]
+
+
 def test_gateway_keeps_lead_capture_as_typed_intent() -> None:
     """验证包含提交方案字样的普通客户消息仍返回 LEAD_CAPTURE。"""
     provider = MockLLMProvider(responses=['{"intent":"LEAD_CAPTURE","company_name":null}'])
@@ -170,6 +188,38 @@ def test_gateway_recovers_process_from_wants_to_process_wording() -> None:
     )
 
     assert result.fields["工艺"] == "焊接"
+
+
+def test_gateway_recovers_business_line_from_clear_adoption_intent() -> None:
+    """验证模型漏提取时，“想上协作机器人”可按明确采用意图恢复业务线。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "测试企业"},
+                confidence_by_field={"线索名称": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("测试企业的焊接工位想上协作机器人做焊缝检测")
+
+    assert result.fields["业务线"] == "协作机器人"
+
+
+def test_gateway_does_not_infer_business_line_from_company_product_mention() -> None:
+    """验证仅提及公司主营协作机器人，不会被误判为客户业务线。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "测试企业"},
+                confidence_by_field={"线索名称": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("测试企业是协作机器人生产商")
+
+    assert "业务线" not in result.fields
 
 
 def test_gateway_recovers_process_when_model_returns_empty_placeholder() -> None:
@@ -345,27 +395,69 @@ def test_gateway_drops_unverified_communication_candidate_without_blocking_other
     assert result.low_confidence_candidates == {}
 
 
-def test_gateway_rejects_unregistered_communication_method_without_alias_conversion() -> None:
-    """验证未注册沟通描述被严格拒绝，不能静默映射为任一枚举值。
-
-    参数：无。
-    返回：无。
-    异常：BusinessValidationError 为受控业务校验结论。
-    副作用：Mock Provider 仅收到初始提取请求，不触发模型重试或别名转换。
-    """
+def test_gateway_quarantines_unregistered_communication_method_without_other_fallback() -> None:
+    """验证非法沟通方式不阻塞可靠字段，也不会伪造“其他”选项。"""
     provider = MockLLMProvider(
         responses=[
             valid_analysis(
-                crm_fields={"沟通方式": "后续沟通"},
-                confidence_by_field={"沟通方式": 0.95},
+                crm_fields={"线索名称": "长广溪智造", "沟通方式": "后续沟通"},
+                confidence_by_field={"线索名称": 0.95, "沟通方式": 0.95},
             )
         ]
     )
 
-    with pytest.raises(BusinessValidationError, match="枚举值不合法：沟通方式"):
-        AIGateway(provider).extract_fields("后续沟通")
+    result = AIGateway(provider).extract_fields(
+        "客户：长广溪智造，手机号：13800138000，沟通方式：后续沟通"
+    )
 
+    assert result.fields == {"线索名称": "长广溪智造", "手机": "13800138000"}
+    assert result.pending_confirmation_fields == ("沟通方式",)
+    assert result.low_confidence_candidates == {"沟通方式": "后续沟通"}
     assert len(provider.requests) == 1
+
+
+def test_gateway_drops_unregistered_communication_without_field_evidence() -> None:
+    """验证模型臆造的非法枚举不会阻塞同一条消息的可靠字段。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "长广溪智造", "沟通方式": "后续沟通"},
+                confidence_by_field={"线索名称": 0.95, "沟通方式": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("客户：长广溪智造，手机号：13800138000")
+
+    assert result.fields == {"线索名称": "长广溪智造", "手机": "13800138000"}
+    assert len(provider.requests) == 1
+
+
+def test_gateway_splits_natural_company_contact_from_activity_sentence() -> None:
+    """验证“公司的人找我沟通事项”不会把整句活动描述写成线索名称。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                customer_reference={
+                    "company_name": "安生的罗总找我沟通 AISOP 事项",
+                    "contact": "罗总",
+                },
+                crm_fields={
+                    "线索名称": "安生的罗总找我沟通 AISOP 事项",
+                    "联系人": "罗总",
+                },
+                confidence_by_field={"线索名称": 0.95, "联系人": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(
+        "安生的罗总找我沟通 AISOP 事项，预计国庆之后正式开始实施，预算30万，手机号是13311112222"
+    )
+
+    assert result.fields["线索名称"] == "安生"
+    assert result.fields["联系人"] == "罗总"
+    assert "安生的罗总找我沟通 AISOP 事项" not in result.fields.values()
 
 
 def test_gateway_prompt_requires_registered_chinese_fields_and_scalar_values() -> None:

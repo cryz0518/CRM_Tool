@@ -83,7 +83,7 @@ _NATURAL_COMPANY_CONTACT_PATTERN = re.compile(
     r"(?P<company>[^，,；;。\n]{2,80}?)的"
     r"(?P<contact>[\u4e00-\u9fffA-Za-z·]{1,6}"
     r"(?:总|经理|工|先生|女士|老师|主任|老板|主管))"
-    r"(?=\s*(?:[，,；;。]|手机号|手机|电话|邮箱|是|做|想|主要|他们))"
+    r"(?=\s*(?:[，,；;。]|手机号|手机|电话|邮箱|是|做|想|主要|他们|找我|沟通|联系|对接|交流|事项|预计|计划|实施))"
 )
 _NATURAL_ROLE_PREFIXES = (
     "副总经理",
@@ -275,10 +275,12 @@ class AIGateway:
             analysis = self._drop_enum_candidates_without_evidence(analysis, safe_text)
             # 对“是做某产品”“想了解某工艺”等逐字事实补充备注素材，避免模型漏返回导致备注为空。
             analysis = self._recover_explicit_enrichment_fields(analysis, safe_text)
-            # 兼容 Qwen 兼容模式偶发漏返回置信度键的结果；无置信度字段不参与写入，但不阻塞其他字段。
-            analysis = self._drop_fields_missing_confidence(analysis)
             # 低置信度枚举按字段类型做受控预填，文本字段仍保留在后台候选。
             analysis = self._normalize_low_confidence_enum_candidates(analysis, safe_text)
+            # 单个无法映射的正式枚举只留作待确认候选，不阻断同消息其它可靠字段。
+            analysis, rejected_enum_candidates = self._drop_invalid_enum_candidates(analysis)
+            # 兼容 Qwen 兼容模式偶发漏返回置信度键；非法枚举已先保留为待确认候选。
+            analysis = self._drop_fields_missing_confidence(analysis)
             self._validate_business(analysis)
             validated_enrichment = self._validate_enrichment_evidence(analysis, safe_text)
             # 补充信息只是备注素材；证据不足时丢弃该字段，不能阻塞已通过校验的 CRM 主字段。
@@ -286,6 +288,8 @@ class AIGateway:
             fields, pending, low_candidates, pending_prefill_allowed = self._apply_confidence(
                 analysis, safe_text
             )
+            pending = tuple(dict.fromkeys((*pending, *rejected_enum_candidates)))
+            low_candidates = {**low_candidates, **rejected_enum_candidates}
         except AIGatewayError as error:
             self._log(trace_id, started_at, "failed", error_type=type(error).__name__)
             self._record_execution(
@@ -344,11 +348,16 @@ class AIGateway:
                     "content": (
                         "只做销售消息意图分类，不提取线索字段，不调用任何工具。"
                         "只能返回 JSON：intent 必须是 LEAD_CAPTURE、SUBMIT_TODAY、"
-                        "SUBMIT_ALL、SUBMIT_SINGLE、SUBMIT_ABANDONED、SUBMIT_UPDATES 或 UNKNOWN。"
+                        "SUBMIT_ALL、SUBMIT_SINGLE、SUBMIT_ABANDONED、SUBMIT_UPDATES、"
+                        "SUBMIT_RETRY_INCOMPLETE 或 UNKNOWN。"
                         "‘提交今天/今天的线索’归类 SUBMIT_TODAY；‘提交所有/全部/我的所有线索’归类 "
                         "SUBMIT_ALL；‘提交放弃提交/放弃的线索’归类 SUBMIT_ABANDONED；"
                         "‘提交更新/我的更新’归类 SUBMIT_UPDATES；明确提交某一家公司归类 "
-                        "SUBMIT_SINGLE 并只填写 company_name。录入客户资料属于 LEAD_CAPTURE；"
+                        "SUBMIT_SINGLE 并只填写 company_name。‘重新提交’、‘重新提交待完善的线索’、"
+                        "‘上次没完善的再提交’归类 SUBMIT_RETRY_INCOMPLETE；"
+                        "放弃提交专用表达优先归类 "
+                        "SUBMIT_ABANDONED，CRM 更新表达优先归类 SUBMIT_UPDATES。"
+                        "录入客户资料属于 LEAD_CAPTURE；"
                         "普通客户信息即使包含‘今天’或‘提交方案’也归类 LEAD_CAPTURE。"
                         "无法确定时返回 UNKNOWN。必须符合 JSON Schema："
                         f"{json.dumps(schema, ensure_ascii=False)}"
@@ -438,11 +447,16 @@ class AIGateway:
                     and identity_pair[1]
                     and field_name in {"线索名称", "联系人"}
                     and isinstance(field_value, str)
-                    and AIGateway._is_combined_identity_value(
-                        field_value, identity_pair[0], identity_pair[1]
+                    and (
+                        AIGateway._is_combined_identity_value(
+                            field_value, identity_pair[0], identity_pair[1]
+                        )
+                        or AIGateway._is_expanded_identity_value(
+                            field_value, identity_pair[0], identity_pair[1]
+                        )
                     )
                 ):
-                    # 仅纠正模型已语义拆分、但把公司和联系人拼回单字段的格式错误；不依赖任何分隔符。
+                    # 纠正模型把公司、联系人及后续活动描述拼回单字段的错误；不依赖具体业务词。
                     fields[field_name] = value
                     confidence_by_field[field_name] = 1.0
                     changed = True
@@ -554,6 +568,24 @@ class AIGateway:
                 or normalized_relation_value == normalized_expected
             )
             and value.strip() != company.strip()
+        )
+
+    @staticmethod
+    def _is_expanded_identity_value(value: str, company: str, contact: str) -> bool:
+        """判断模型是否把身份与额外叙述拼在同一个 CRM 身份字段中。
+
+        参数：value 为模型候选；company 与 contact 为原文核验后的公司和联系人。
+        返回值：候选同时包含两类身份且明显长于身份组合时返回 True。
+        异常：无。
+        副作用：无；仅执行本地字符串规范化。
+        """
+        normalized_value = AIGateway._normalize_identity_text(value)
+        normalized_company = AIGateway._normalize_identity_text(company)
+        normalized_contact = AIGateway._normalize_identity_text(contact)
+        return (
+            normalized_company in normalized_value
+            and normalized_contact in normalized_value
+            and len(normalized_value) > len(normalized_company) + len(normalized_contact)
         )
 
     @staticmethod
@@ -816,6 +848,43 @@ class AIGateway:
                     response.content, repaired_response.content, str(error)
                 ) from error
 
+    @staticmethod
+    def _drop_invalid_enum_candidates(
+        analysis: LeadAnalysis,
+    ) -> tuple[LeadAnalysis, dict[str, LeadFieldValue]]:
+        """将不属于受控选项的枚举候选移出正式字段并标记待确认。
+
+        参数：analysis 为已完成受控别名归一化的结构化结果。
+        返回值：移除非法枚举后的分析结果及可后台留存的原始候选。
+        异常：无；字段名、权限字段和非枚举业务校验仍由后续严格校验处理。
+        副作用：只记录字段名称，不记录客户候选值。
+        """
+        fields = dict(analysis.crm_fields)
+        confidences = dict(analysis.confidence_by_field)
+        candidates: dict[str, LeadFieldValue] = {}
+        for field_name, value in tuple(fields.items()):
+            options = _ENUM_OPTIONS.get(field_name)
+            if options is None:
+                continue
+            values = value if isinstance(value, list) else [value]
+            if not all(isinstance(item, str) for item in values):
+                continue
+            if values and all(item in options for item in values):
+                continue
+            fields.pop(field_name)
+            confidences.pop(field_name, None)
+            if any(item.strip() for item in values):
+                candidates[field_name] = value
+        if candidates or fields != analysis.crm_fields:
+            logger.warning(
+                "ai_enum_candidates_pending_confirmation",
+                extra={"field_names": list(candidates)},
+            )
+            analysis = analysis.model_copy(
+                update={"crm_fields": fields, "confidence_by_field": confidences}
+            )
+        return analysis, candidates
+
     def _validate_business(self, analysis: LeadAnalysis) -> None:
         """以确定性规则校验字段名、枚举、格式及置信度完整性。
 
@@ -978,9 +1047,9 @@ class AIGateway:
         fields = dict(analysis.crm_fields)
         confidences = dict(analysis.confidence_by_field)
         dropped_fields: list[str] = []
-        for field_name in ("客户行业", "客户级别"):
-            # 客户行业和客户级别不能由产品、金额或模型常识推断，必须有原文证据。
-            # “其他”允许通过同名 enrichment 保存原文实际内容。
+        for field_name in _ENUM_OPTIONS:
+            # 非法枚举只有在原文明确带字段语义时才交给业务校验；无语义证据的
+            # 模型臆造直接丢弃，避免一个错误枚举阻断同一消息的可靠身份字段。
             if field_name not in analysis.crm_fields:
                 continue
             value = fields.get(field_name)
@@ -989,11 +1058,20 @@ class AIGateway:
             values = value if isinstance(value, list) else [value]
             if not values or not all(isinstance(item, str) for item in values):
                 continue
-            evidence_ok = all(
-                AIGateway._has_explicit_enum_evidence(field_name, item, source_text)
-                or (field_name == "客户行业" and item in source_text)
-                for item in values
-            )
+            if field_name in {"客户行业", "客户级别"}:
+                # 行业和级别即使是合法选项，也不能从普通叙述或产品常识反推。
+                evidence_ok = all(
+                    AIGateway._has_explicit_enum_evidence(field_name, item, source_text)
+                    or (field_name == "客户行业" and item in source_text)
+                    for item in values
+                )
+            elif all(item in _ENUM_OPTIONS[field_name] for item in values):
+                continue
+            else:
+                evidence_ok = all(
+                    AIGateway._has_explicit_enum_evidence(field_name, item, source_text)
+                    for item in values
+                )
             if not evidence_ok and "其他" in values:
                 enrichment_value = analysis.enrichment.get(field_name)
                 evidence_ok = isinstance(enrichment_value, str) and bool(
@@ -1032,6 +1110,13 @@ class AIGateway:
                 rf"(?:工艺|应用工艺)\s*[:：是为]?[^。；，,\n]{{0,16}}{escaped}",
                 rf"(?:主要)?想(?:做)?[^。；，,\n]{{0,16}}{escaped}",
                 rf"用于[^。；，,\n]{{0,16}}{escaped}(?:相关|方面|项目)?",
+            )
+        elif field_name == "业务线":
+            # 业务线只接受字段标签或明确采用意图，避免把供应商主营产品当成客户需求。
+            patterns = (
+                rf"业务线\s*[:：是为]?\s*{escaped}",
+                rf"(?:想|计划|准备|考虑|希望|打算)(?:要)?(?:上|用|采用|引入|部署|采购|购买)?"
+                rf"[^。；，,\n]{{0,16}}{escaped}",
             )
         else:
             # 其他枚举只接受明确字段标签，避免普通叙述被擅自提升为业务字段。

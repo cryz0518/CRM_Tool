@@ -74,6 +74,33 @@ def test_bot_sender_uses_submitting_sales_userid_and_marks_notice_sent() -> None
         assert notice is not None and notice.status == "succeeded"
 
 
+def test_bot_sender_delivers_lead_processing_failure_notice() -> None:
+    """验证安全的线索解析失败通知由现有出站器主动发送。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    factory = sessionmaker(engine)
+    Base.metadata.create_all(engine)
+    content = "这条线索消息未能完成解析，已进入待人工处理，请稍后重试或补充信息。"
+    with factory.begin() as session:
+        session.add(
+            NotificationRecord(
+                notification_key="lead-failure-notice",
+                sales_user_id="sales-failure",
+                source_message_id="source-failure",
+                notification_type="lead_processing_failed",
+                content=content,
+            )
+        )
+    client = FakeClient()
+
+    asyncio.run(WecomOutboundNotificationSender(factory, client).send_pending_once())
+
+    assert client.calls[0][0] == "sales-failure"
+    assert client.calls[0][1]["markdown"] == {"content": content}
+    with factory() as session:
+        notice = session.get(NotificationRecord, "lead-failure-notice")
+        assert notice is not None and notice.status == "succeeded"
+
+
 def test_notification_failure_is_retryable_without_duplicate_business_work() -> None:
     """验证发送异常只将通知置为 retrying，下一次可由同一 Bot 继续消费。"""
     engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)

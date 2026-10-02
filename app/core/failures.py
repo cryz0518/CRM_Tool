@@ -44,6 +44,7 @@ def classify_task_failure(error: BaseException) -> TaskFailureCategory:
             "authentication",
             "business",
             "business_rejection",
+            "duplicate_target_unavailable",
             "malformed_response",
         }:
             return TaskFailureCategory.PERMANENT
