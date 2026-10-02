@@ -811,6 +811,20 @@ class CompanyLeadService:
                     actor=SmartTableActor.ROBOT,
                 )
             except Exception as error:
+                remote_record_id = getattr(error, "remote_record_id", None)
+                if isinstance(remote_record_id, str) and remote_record_id:
+                    # 远端 add 已返回 ID 但读回未通过时，保留原行定位并固定为待人工处理。
+                    with self._session_factory.begin() as session:
+                        lead = session.get(Lead, lead_id)
+                        sync = session.scalar(
+                            select(SmartTableSync).where(SmartTableSync.lead_id == lead_id)
+                        )
+                        if lead is not None:
+                            lead.smart_table_record_id = remote_record_id
+                        if sync is not None:
+                            sync.smart_table_record_id = remote_record_id
+                            sync.status = "failed_pending_review"
+                            sync.error_summary = type(error).__name__
                 logger.exception(
                     "company_smart_table_create_failed",
                     extra={"lead_id": lead_id, "error_type": type(error).__name__},

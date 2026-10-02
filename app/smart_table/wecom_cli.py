@@ -78,15 +78,22 @@ class WecomCliProtocolError(WecomCliSmartTableAdapterError, PermanentTaskFailure
 class SmartTableWriteVerificationError(WecomCliProtocolError):
     """表示远端写入未能在有限回读窗口内逐字段核实。"""
 
-    def __init__(self, missing_or_mismatched_fields: Sequence[str]) -> None:
+    def __init__(
+        self,
+        missing_or_mismatched_fields: Sequence[str],
+        *,
+        remote_record_id: str | None = None,
+    ) -> None:
         """构造不含字段值的写入核实失败。
 
-        参数：missing_or_mismatched_fields 为本次补丁中未能远端核实的规范字段名。
+        参数：missing_or_mismatched_fields 为本次写入中未能远端核实的规范字段名；
+        remote_record_id 为服务端已确认创建的记录标识，供上层安全恢复使用。
         返回值：无。
         异常：无。
         副作用：仅在异常对象中保存字段名元组，继承永久失败分类以阻止自动重放。
         """
         self.missing_or_mismatched_fields = tuple(missing_or_mismatched_fields)
+        self.remote_record_id = remote_record_id
         super().__init__("智能表格写入未通过远端字段核实")
 
 
@@ -300,13 +307,21 @@ class WecomCliSmartTableAdapter:
             raise ValueError("机器人新增智能表格记录时必须写入负责人")
 
         schema = self.get_schema()
+        cli_fields = self._to_cli_fields(fields, schema)
+        # 只核实本次实际发出的字段；无效日期和不可写位置已由编码阶段跳过。
+        fields_to_verify = {
+            name: value
+            for name, value in fields.items()
+            if (field := schema.get_field(name)) is not None and field.name in cli_fields
+        }
         response = self._call(
-            "records", "add", {"records": [{"values": self._to_cli_fields(fields, schema)}]}
+            "records", "add", {"records": [{"values": cli_fields}]}
         )
-        record = self._parse_written_record(response, schema)
-        # 新增响应的 values 在短暂最终一致性窗口内可能是旧行快照；只缓存本次确认提交的字段。
-        self._remember_written_record(record.record_id, fields)
-        return record
+        record_id = self._parse_written_record_id(response)
+        # 新增没有可安全重放的幂等键；只有远端逐字段回读匹配后才缓存并返回成功。
+        return self._verify_remote_write(
+            record_id, fields_to_verify, schema, operation="create"
+        )
 
     def update_record(self, record_id: str, fields: Mapping[str, object]) -> SmartTableRecord:
         """更新指定记录并在返回成功前远端回读核实每个补丁字段。
@@ -321,6 +336,13 @@ class WecomCliSmartTableAdapter:
             raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
 
         schema = self.get_schema()
+        cli_fields = self._to_cli_fields(fields, schema)
+        # 仅将实际进入本次 request 的字段纳入远端核实。
+        fields_to_verify = {
+            name: value
+            for name, value in fields.items()
+            if (field := schema.get_field(name)) is not None and field.name in cli_fields
+        }
         planned_fields = [
             field.name.removeprefix("*")
             for name in fields
@@ -330,9 +352,29 @@ class WecomCliSmartTableAdapter:
         self._call(
             "records",
             "update",
-            {"records": [{"record_id": record_id, "values": self._to_cli_fields(fields, schema)}]},
+            {"records": [{"record_id": record_id, "values": cli_fields}]},
         )
-        # CLI ACK 只代表请求被接受；有限回读以远端实际字段为唯一成功证据。
+        # CLI ACK 只代表请求被接受；有限 uncached 回读以远端实际字段为唯一成功证据。
+        return self._verify_remote_write(
+            record_id, fields_to_verify, schema, operation="update"
+        )
+
+    def _verify_remote_write(
+        self,
+        record_id: str,
+        fields: Mapping[str, object],
+        schema: SmartTableSchema,
+        *,
+        operation: Literal["create", "update"],
+    ) -> SmartTableRecord:
+        """在有限窗口内绕过缓存回读并逐项核实一次远端写入。
+
+        参数：record_id 为首次写入响应确认的目标；fields 为本次实际发送字段；schema 为字段结构；
+        operation 区分新增与更新的安全诊断事件。
+        返回值：全部字段匹配后的远端记录快照。
+        异常：回读失败或字段仍不一致时抛出只携带字段名和 record_id 的永久核实异常。
+        副作用：执行有限只读回查；仅验证成功后更新进程内近期记录缓存。
+        """
         mismatched_fields = tuple(fields)
         for delay in _WRITE_VERIFICATION_DELAYS:
             if delay:
@@ -340,31 +382,35 @@ class WecomCliSmartTableAdapter:
             try:
                 remote_record = self._get_record_remote_uncached(record_id, schema)
             except Exception as error:
-                # ACK 已成功后读回失败也不能重放写请求；以永久核实失败交给人工恢复。
+                # 写入已 ACK，任何回读异常都不能让调用方误以为可重发新增请求。
                 logger.error(
-                    "wecom_cli_write_verification_read_failed",
+                    f"wecom_cli_{operation}_verification_read_failed",
                     extra={
                         "error_type": type(error).__name__,
                         "missing_or_mismatched_fields": list(fields),
                     },
                 )
-                raise SmartTableWriteVerificationError(tuple(fields)) from None
+                raise SmartTableWriteVerificationError(
+                    tuple(fields), remote_record_id=record_id
+                ) from None
             if remote_record is None:
                 continue
             mismatched_fields = self._mismatched_write_fields(fields, remote_record, schema)
             if not mismatched_fields:
                 logger.info(
                     "wecom_cli_write_verified",
-                    extra={"persisted_fields": planned_fields},
+                    extra={"persisted_fields": list(fields)},
                 )
                 self._remember_written_record(record_id, remote_record.fields)
                 return remote_record
 
         logger.error(
-            "wecom_cli_write_verification_failed",
+            f"wecom_cli_{operation}_verification_failed",
             extra={"missing_or_mismatched_fields": list(mismatched_fields)},
         )
-        raise SmartTableWriteVerificationError(mismatched_fields)
+        raise SmartTableWriteVerificationError(
+            mismatched_fields, remote_record_id=record_id
+        )
 
     def _mismatched_write_fields(
         self,
@@ -387,11 +433,10 @@ class WecomCliSmartTableAdapter:
             if field is None:
                 mismatched.append(canonical_name)
                 continue
-            encoded = self._to_cli_value(canonical_name, field, target)
-            if encoded is None:
+            expected = self._to_cli_value(canonical_name, field, target)
+            if expected is None:
                 mismatched.append(canonical_name)
                 continue
-            expected = json.loads(encoded)
             # 反向恢复 CLI option/member 编码，使远端读值与领域目标值可直接比较。
             if (
                 field.field_type
@@ -401,6 +446,9 @@ class WecomCliSmartTableAdapter:
                 if isinstance(expected, list):
                     if expected and isinstance(expected[0], Mapping):
                         expected = [item.get("text") for item in expected]
+                    # AI待确认字段在远端回读时使用不含管理员必填前缀的规范名称。
+                    if canonical_name == "AI待确认":
+                        expected = [item.removeprefix("*") for item in expected]
                     if field.field_type is SmartTableFieldType.SINGLE_SELECT:
                         expected = expected[0] if expected else None
             elif field.field_type is SmartTableFieldType.MEMBER:
@@ -440,9 +488,16 @@ class WecomCliSmartTableAdapter:
         """
         if not self._sheet_title:
             raise SmartTableAdapterConfigurationError("完整查询缺少 WECOM_SMART_TABLE_SHEET_TITLE")
-        columns = ["RECORD_ID"] + [
-            self._quote_sql_identifier(field.name) for field in schema.fields
-        ]
+        columns = ["RECORD_ID"]
+        for field in schema.fields:
+            quoted_name = self._quote_sql_identifier(field.name)
+            if field.field_type is SmartTableFieldType.DATE:
+                # records query 默认把日期返回为 Excel 序列号；格式化后与写入值及业务快照统一。
+                columns.append(
+                    f'DATE_FORMAT({quoted_name}, "%Y-%m-%d %H:%i:%s") AS {quoted_name}'
+                )
+            else:
+                columns.append(quoted_name)
         sql = (
             f"SELECT {', '.join(columns)} FROM "
             f"{self._quote_sql_identifier(self._sheet_title)} LIMIT 1000"
@@ -523,38 +578,25 @@ class WecomCliSmartTableAdapter:
             if raw is None and field.name.startswith("*"):
                 raw = row.get(field.name.removeprefix("*"))
             canonical_name = field.name.removeprefix("*")
-            if isinstance(raw, str) and field.field_type in {
-                SmartTableFieldType.MEMBER,
-                SmartTableFieldType.SINGLE_SELECT,
-                SmartTableFieldType.MULTI_SELECT,
-                SmartTableFieldType.ATTACHMENT,
-                SmartTableFieldType.LOCATION,
-            }:
-                # records query 将结构化单元格序列化在 string 列中，先恢复其 JSON 结构。
-                try:
-                    raw = json.loads(raw)
-                except json.JSONDecodeError:
-                    # 部分 CLI 响应直接返回单元格文本，保留给下方字段类型解析。
-                    pass
-            elif isinstance(raw, str) and field.field_type in {
+            # SQL query 已返回各字段的原生类型；普通文本即使像 JSON 也必须原样保留。
+            if raw is not None and field.field_type in {
                 SmartTableFieldType.TEXT,
                 SmartTableFieldType.LONG_TEXT,
-            }:
-                # 当前 records query 会再次包装部分纯文本；只还原字符串或可读文本片段。
-                try:
-                    decoded = json.loads(raw)
-                except json.JSONDecodeError:
-                    pass
-                else:
-                    if isinstance(decoded, str) or (
-                        isinstance(decoded, list)
-                        and all(
-                            isinstance(item, str)
-                            or (isinstance(item, Mapping) and isinstance(item.get("text"), str))
-                            for item in decoded
-                        )
-                    ):
-                        raw = decoded
+                SmartTableFieldType.PHONE_NUMBER,
+                SmartTableFieldType.EMAIL,
+                SmartTableFieldType.SINGLE_SELECT,
+            } and not isinstance(raw, str):
+                raise WecomCliProtocolError("SQL 查询文本或单选字段类型不符合 CLI 契约")
+            if field.field_type is SmartTableFieldType.MULTI_SELECT and raw is not None:
+                if not isinstance(raw, list) or any(not isinstance(item, str) for item in raw):
+                    raise WecomCliProtocolError("SQL 查询多选字段类型不符合 CLI 契约")
+            if field.field_type is SmartTableFieldType.MEMBER and raw not in (None, []):
+                if not isinstance(raw, list) or any(not isinstance(item, Mapping) for item in raw):
+                    raise WecomCliProtocolError("SQL 查询人员字段类型不符合 CLI 契约")
+            if field.field_type is SmartTableFieldType.DATE and raw is not None:
+                is_number = isinstance(raw, (int, float)) and not isinstance(raw, bool)
+                if not is_number and not isinstance(raw, str):
+                    raise WecomCliProtocolError("SQL 查询日期字段类型不符合 CLI 契约")
             if field.field_type is SmartTableFieldType.MEMBER and raw in (None, []):
                 # 查询接口对未设置成员字段返回 null/空列表；不应让无关字段阻断整行读取。
                 normalized[canonical_name] = None
@@ -652,6 +694,10 @@ class WecomCliSmartTableAdapter:
             except WecomCliProcessError as error:
                 # records list/update 是幂等操作，进程异常可以安全重放；records add
                 # 可能已经在服务端成功，不能因客户端退出异常再次创建重复记录。
+                if action == "add" and error.retryable:
+                    raise WecomCliProtocolError(
+                        "wecom-cli 新增结果无法确认，禁止自动重放"
+                    ) from None
                 if action == "add" or not error.retryable:
                     raise
                 if attempt == self._retry_count:
@@ -662,6 +708,11 @@ class WecomCliSmartTableAdapter:
                 time.sleep(0.2 * (attempt + 1))
                 continue
             except (OSError, subprocess.TimeoutExpired) as error:
+                if action == "add":
+                    # 新增请求超时或进程启动结果不明时，禁止自动重放以免产生重复行。
+                    raise WecomCliProtocolError(
+                        "wecom-cli 新增结果无法确认，禁止自动重放"
+                    ) from None
                 if attempt == self._retry_count:
                     # 最后一次仍失败时隐藏底层请求和响应，避免异常泄露表格数据。
                     raise WecomCliTransportError("wecom-cli 调用失败") from error
@@ -671,6 +722,11 @@ class WecomCliSmartTableAdapter:
 
             if self._is_transient_network_error(response):
                 # CLI 明确标记的 NetworkError 才允许重放同一个请求。
+                if action == "add":
+                    # 服务端网络错误不能证明新增未执行；该不确定结果转入人工检查点。
+                    raise WecomCliProtocolError(
+                        "wecom-cli 新增结果无法确认，禁止自动重放"
+                    )
                 if attempt == self._retry_count:
                     raise WecomCliTransportError("wecom-cli 网络调用失败")
                 self._log_retry(resource, action, attempt, "NetworkError")
@@ -998,15 +1054,15 @@ class WecomCliSmartTableAdapter:
 
     def _to_cli_fields(
         self, fields: Mapping[str, object], schema: SmartTableSchema
-    ) -> dict[str, str]:
-        """把业务字段转换为标题键及 CLI 1.3.x 要求的 JSON 值字符串。
+    ) -> dict[str, object]:
+        """把业务字段转换为标题键及 CLI 1.3.x 要求的原生 JSON 值。
 
         参数：fields 为业务层字段补丁；schema 为当前真实字段快照。
-        返回：键为真实字段标题、值为单元格 JSON 序列化文本的映射。
+        返回：键为真实字段标题、值为字符串、列表或对象等原生 JSON 类型的映射。
         异常：字段未配置、成员身份或 AI待确认选项不合法时抛出异常。
         副作用：无。
         """
-        converted: dict[str, str] = {}
+        converted: dict[str, object] = {}
         for canonical_name, value in fields.items():
             field = schema.get_field(canonical_name)
             if field is None:
@@ -1046,11 +1102,11 @@ class WecomCliSmartTableAdapter:
 
     def _to_cli_value(
         self, canonical_name: str, field: SmartTableField, value: object
-    ) -> str | None:
-        """先按字段类型构造 CellValue，再序列化为 CLI map 中的字符串。
+    ) -> object | None:
+        """按字段类型构造 CLI 1.3.4 接受的原生 JSON 单元格值。
 
         参数：canonical_name 为业务规范字段名；field 为真实字段定义；value 为业务层值。
-        返回：CLI 1.3.x `values` map 所需的 JSON 序列化值；不合法日期返回 None 并跳过该字段。
+        返回：CLI `values` map 所需的原生值；不合法日期返回 None 并跳过该字段。
         异常：成员身份或 AI待确认选项格式不合法时抛出异常。
         副作用：无。
         """
@@ -1075,7 +1131,16 @@ class WecomCliSmartTableAdapter:
                 raise ValueError(f"MEMBER 字段必须传入非空 sales_user_id：{canonical_name}")
             # CLI 的 CellUserValue 写入格式为数组；业务层只保留企业微信销售身份字符串。
             cli_value = [{"userId": value}]
-        elif field.field_type is SmartTableFieldType.PHONE_NUMBER and isinstance(value, str):
+        elif field.field_type in {
+            SmartTableFieldType.TEXT,
+            SmartTableFieldType.LONG_TEXT,
+            SmartTableFieldType.EMAIL,
+        }:
+            if not isinstance(value, str):
+                raise ValueError(f"文本类字段必须传入字符串：{canonical_name}")
+        elif field.field_type is SmartTableFieldType.PHONE_NUMBER:
+            if not isinstance(value, str):
+                raise ValueError(f"手机号字段必须传入字符串：{canonical_name}")
             # 企微电话列接受标准字符串；去除常见空格、短横线和括号，保留号码及国际区号加号。
             cli_value = re.sub(r"[\s()\-]+", "", value.strip())
         elif canonical_name == "AI待确认" or field.field_type in {
@@ -1091,6 +1156,8 @@ class WecomCliSmartTableAdapter:
                 if not isinstance(item, str) or not item:
                     raise ValueError(f"选择字段必须传入非空文本列表：{canonical_name}")
                 values.append(item)
+            if field.field_type is SmartTableFieldType.SINGLE_SELECT and len(values) != 1:
+                raise ValueError(f"单选字段必须恰好传入一个合法选项：{canonical_name}")
             if not field.options:
                 # 兼容旧测试替身缺少 options 的响应；真实表结构 readiness 会拒绝缺少选项。
                 cli_value = value
@@ -1105,7 +1172,7 @@ class WecomCliSmartTableAdapter:
                     raise ValueError(
                         f"选择字段缺少选项：{canonical_name}={error.args[0]}"
                     ) from error
-        return json.dumps(cli_value, ensure_ascii=False, separators=(",", ":"))
+        return cli_value
 
     def _parse_record(
         self, item: Mapping[str, object], schema: SmartTableSchema
@@ -1233,21 +1300,22 @@ class WecomCliSmartTableAdapter:
                 return text
         raise WecomCliProtocolError("CLI CellValue 缺少文本")
 
-    def _parse_written_record(
-        self, response: Mapping[str, object], schema: SmartTableSchema
-    ) -> SmartTableRecord:
-        """从 records add 或 update 响应中取得唯一写入后的记录。
+    def _parse_written_record_id(self, response: Mapping[str, object]) -> str:
+        """从 records add 响应中取得唯一新记录的服务端标识。
 
         参数：response 为已验证成功的 CLI 写入响应。
-        返回：唯一的创建或更新记录快照。
-        异常：响应未返回恰好一条带字段值的记录时抛出异常。
+        返回：唯一新记录的 record_id。
+        异常：响应未返回恰好一条带有效标识的记录时抛出异常。
         副作用：无。
         """
         records = response.get("records")
         if not isinstance(records, list) or len(records) != 1:
             # 单条写入必须返回唯一结果，批量或空结果会导致调用方无法确定真实记录。
             raise WecomCliProtocolError("wecom-cli 写入响应未返回唯一记录")
-        return self._parse_record(self._as_mapping(records[0], "写入记录"), schema)
+        record_id = self._as_mapping(records[0], "写入记录").get("record_id")
+        if not isinstance(record_id, str) or not record_id:
+            raise WecomCliProtocolError("wecom-cli 新增响应缺少 record_id")
+        return record_id
 
     @staticmethod
     def _log_retry(resource: str, action: str, attempt: int, error_type: str) -> None:

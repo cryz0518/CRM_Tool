@@ -39,6 +39,7 @@ from app.messaging.models import (
 )
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.registry import build_required_smart_table_schema
+from app.smart_table.wecom_cli import SmartTableWriteVerificationError
 
 
 @pytest.fixture
@@ -746,6 +747,68 @@ def test_ai_review_transport_failure_retries_same_patch_before_leaving_partial_r
     assert record.fields["工艺"] == "装配"
     assert record.fields["创建人"] == "sales-1"
     assert record.fields["负责人"] == "sales-1"
+
+
+def test_ai_create_verification_failure_persists_acknowledged_record_id_and_never_readds(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证新增 ACK 后核实失败会冻结远端 ID，并将事件与同步状态置为人工处理。"""
+    event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-ai-create-verification-failed",
+        sales_user_id="sales-1",
+        text="刚和测试机器人公司聊过，他们想做协作机器人装配。",
+    )
+    provider = MockLLMProvider(
+        [
+            json.dumps(
+                {
+                    "intent": "NEW_LEAD",
+                    "customer_reference": {},
+                    "crm_fields": {"线索名称": "测试机器人公司"},
+                    "enrichment": {},
+                    "confidence_by_field": {"线索名称": 0.95},
+                    "conflicts": [],
+                    "warnings": [],
+                }
+            )
+        ]
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    create_record = patch.object(
+        adapter,
+        "create_record",
+        side_effect=SmartTableWriteVerificationError(
+            ("线索名称",), remote_record_id="acked-record-1"
+        ),
+    )
+    service = FirstTextLeadWorkspaceService(
+        session_factory, adapter, ai_gateway=AIGateway(provider)
+    )
+
+    with create_record as create_spy:
+        failed = service.consume(event_id)
+        replay = service.consume(event_id)
+
+    assert failed.status is LeadProcessingStatus.SYNC_FAILED
+    assert replay.status is LeadProcessingStatus.ALREADY_PROCESSED
+    assert create_spy.call_count == 1
+    with session_factory() as session:
+        lead = session.scalar(
+            select(Lead).where(Lead.source_message_id == "message-ai-create-verification-failed")
+        )
+        sync = (
+            session.scalar(select(SmartTableSync).where(SmartTableSync.lead_id == lead.id))
+            if lead is not None
+            else None
+        )
+        event = session.get(OutboxEvent, event_id)
+
+    assert lead is not None and lead.smart_table_record_id == "acked-record-1"
+    assert sync is not None
+    assert sync.smart_table_record_id == "acked-record-1"
+    assert sync.status == "failed_pending_review"
+    assert event is not None and event.status == "failed_pending_review"
 
 
 def test_mismatched_outbox_sales_identity_cannot_create_another_sales_record(

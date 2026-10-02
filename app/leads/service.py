@@ -1927,6 +1927,14 @@ class FirstTextLeadWorkspaceService:
             sync = session.scalar(
                 select(SmartTableSync).where(SmartTableSync.lead_id == request.lead_id)
             )
+            remote_record_id = getattr(error, "remote_record_id", None)
+            if isinstance(remote_record_id, str) and remote_record_id:
+                # add 已由远端确认但字段核实失败时，冻结该 ID，后续只能恢复原行。
+                lead = session.get(Lead, request.lead_id)
+                if lead is not None:
+                    lead.smart_table_record_id = remote_record_id
+                if sync is not None:
+                    sync.smart_table_record_id = remote_record_id
             failed_pending_review = self._record_sync_failure(
                 session,
                 event,
@@ -1934,7 +1942,9 @@ class FirstTextLeadWorkspaceService:
                 failed_event_type="ai_review_sync_failed_pending_review",
                 error=error,
             )
-            if request.creates_lead and sync is not None:
+            if sync is not None and (
+                request.creates_lead or isinstance(remote_record_id, str)
+            ):
                 sync.status = "failed_pending_review" if failed_pending_review else "retrying"
                 sync.error_summary = type(error).__name__
         logger.exception("ai_review_sync_failed", extra={"error_type": type(error).__name__})
@@ -2023,6 +2033,20 @@ class FirstTextLeadWorkspaceService:
                     select(SmartTableSync).where(SmartTableSync.lead_id == request.lead_id)
                 )
                 if sync is not None:
+                    sync.status = "failed_pending_review"
+                    sync.error_summary = type(error).__name__
+            else:
+                sync = session.scalar(
+                    select(SmartTableSync).where(SmartTableSync.lead_id == request.lead_id)
+                )
+            remote_record_id = getattr(error, "remote_record_id", None)
+            if isinstance(remote_record_id, str) and remote_record_id:
+                # 即使 create_record 抛出核实异常，也要持久化 ACK 返回的原行身份。
+                lead = session.get(Lead, request.lead_id)
+                if lead is not None:
+                    lead.smart_table_record_id = remote_record_id
+                if sync is not None:
+                    sync.smart_table_record_id = remote_record_id
                     sync.status = "failed_pending_review"
                     sync.error_summary = type(error).__name__
             self._record_audit(session, event, "ai_review_failed_pending_review")
@@ -2802,6 +2826,14 @@ class FirstTextLeadWorkspaceService:
                 sync = session.scalar(
                     select(SmartTableSync).where(SmartTableSync.lead_id == lead_id)
                 )
+                remote_record_id = getattr(error, "remote_record_id", None)
+                if isinstance(remote_record_id, str) and remote_record_id:
+                    # add ACK 后回读失败仍保留唯一远端记录，保护后续重试不再 add。
+                    lead = session.get(Lead, lead_id)
+                    if lead is not None:
+                        lead.smart_table_record_id = remote_record_id
+                    if sync is not None:
+                        sync.smart_table_record_id = remote_record_id
                 if sync is not None:
                     sync.error_summary = type(error).__name__
                 failed_pending_review = self._record_sync_failure(
