@@ -177,6 +177,38 @@ def test_gateway_recovers_process_from_wants_to_process_wording() -> None:
     assert result.fields["工艺"] == "焊接"
 
 
+def test_gateway_recovers_business_line_from_clear_adoption_intent() -> None:
+    """验证模型漏提取时，“想上协作机器人”可按明确采用意图恢复业务线。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "测试企业"},
+                confidence_by_field={"线索名称": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("测试企业的焊接工位想上协作机器人做焊缝检测")
+
+    assert result.fields["业务线"] == "协作机器人"
+
+
+def test_gateway_does_not_infer_business_line_from_company_product_mention() -> None:
+    """验证仅提及公司主营协作机器人，不会被误判为客户业务线。"""
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                crm_fields={"线索名称": "测试企业"},
+                confidence_by_field={"线索名称": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields("测试企业是协作机器人生产商")
+
+    assert "业务线" not in result.fields
+
+
 def test_gateway_recovers_process_when_model_returns_empty_placeholder() -> None:
     """验证模型返回空工艺占位值时，原文唯一证据仍能恢复合法工艺。"""
     provider = MockLLMProvider(
