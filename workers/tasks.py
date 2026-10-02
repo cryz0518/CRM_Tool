@@ -196,6 +196,16 @@ def consume_audit_mirror_outbox(outbox_id: int) -> str:
                 if outbox is not None
                 else None
             )
+            message = (
+                session.get(IncomingMessage, event.message_id)
+                if event is not None
+                else None
+            )
+            sales_original_message = (
+                message.normalized_text
+                if message is not None and message.scrubbed_at is None
+                else None
+            )
         if outbox is None or event is None:
             _finish_audit_mirror(
                 factory,
@@ -207,7 +217,10 @@ def consume_audit_mirror_outbox(outbox_id: int) -> str:
             return "retrying"
         try:
             # 依靠服务端 claim fencing、稳定镜像键和写前远端查重，避免重试重复写行。
-            SmartTableAuditSink(get_smart_table_audit_adapter()).mirror(event)
+            SmartTableAuditSink(get_smart_table_audit_adapter()).mirror(
+                event,
+                sales_original_message=sales_original_message,
+            )
         except Exception as error:
             _finish_audit_mirror(
                 factory, outbox_id, claim_token, succeeded=False, error=error

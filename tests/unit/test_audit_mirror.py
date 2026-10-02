@@ -10,7 +10,14 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.messaging.models import AuditMirrorOutbox, Base, BusinessAuditEvent, utc_now
+from app.messaging.models import (
+    AuditMirrorOutbox,
+    Base,
+    BusinessAuditEvent,
+    IncomingMessage,
+    SalesAuthorization,
+    utc_now,
+)
 from app.smart_table.audit import SmartTableAuditSink, build_mock_audit_schema
 from app.smart_table.mock import MockSmartTableAdapter
 from workers import tasks
@@ -58,6 +65,67 @@ def _persist_event(factory: sessionmaker[Session]) -> int:
         return outbox.id
 
 
+def _persist_event_with_message(
+    factory: sessionmaker[Session],
+    *,
+    normalized_text: str | None,
+    scrubbed_at=None,
+) -> int:
+    """持久化带标准化销售文本的消息和审计事件，并返回镜像任务 ID。"""
+    with factory.begin() as session:
+        session.add(
+            SalesAuthorization(
+                wecom_user_id="sales-1",
+                is_authorized=False,
+                is_active=True,
+            )
+        )
+        session.add(
+            IncomingMessage(
+                message_id="message-1",
+                sales_user_id="sales-1",
+                sequence=1,
+                raw_payload={
+                    "body": {
+                        "text": {
+                            "content": normalized_text,
+                            "phone": "13800000000",
+                            "email": "customer@example.com",
+                        }
+                    }
+                },
+                normalized_text=normalized_text,
+                scrubbed_at=scrubbed_at,
+            )
+        )
+        session.add(
+            BusinessAuditEvent(
+                message_id="message-1",
+                sales_user_id="sales-1",
+                event_type="crm_submit_result",
+                details={"status": "succeeded"},
+            )
+        )
+    with factory() as session:
+        outbox = session.scalar(select(AuditMirrorOutbox))
+        assert outbox is not None
+        return outbox.id
+
+
+def _run_worker_with_adapter(
+    factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    outbox_id: int,
+    adapter: MockSmartTableAdapter,
+) -> str:
+    """用测试会话和 Mock adapter 执行一次审计镜像 Worker。"""
+    engine = factory.kw["bind"]
+    monkeypatch.setattr(engine, "dispose", lambda: None)
+    monkeypatch.setattr(tasks, "_session_factory", lambda: (engine, factory))
+    monkeypatch.setattr(tasks, "get_smart_table_audit_adapter", lambda: adapter)
+    return tasks.consume_audit_mirror_outbox.run(outbox_id)
+
+
 def test_business_audit_event_creates_one_unique_mirror_job(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -98,6 +166,69 @@ def test_audit_mirror_retry_is_idempotent_and_drops_sensitive_details(
     assert "phone" not in fields
     assert "email" not in fields
     assert "raw_response" not in fields
+
+
+def test_audit_mirror_uses_normalized_text_and_excludes_raw_payload(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证镜像只写标准化销售文本，不写 WeCom raw payload。"""
+    message_text = "青岛远达物流的吴总，仓储中心想做AGV联动"
+    outbox_id = _persist_event_with_message(
+        session_factory,
+        normalized_text=message_text,
+    )
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+
+    assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "succeeded"
+
+    fields = adapter.get_records()[0].fields
+    assert fields["销售原始消息"] == message_text
+    assert "raw_payload" not in fields
+    assert "13800000000" not in fields.values()
+    assert "customer@example.com" not in fields.values()
+
+
+@pytest.mark.parametrize(
+    ("normalized_text", "scrubbed_at"),
+    [
+        (None, None),
+        ("仍在对象中的文本", utc_now()),
+    ],
+)
+def test_audit_mirror_omits_missing_or_scrubbed_original_message(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    normalized_text: str | None,
+    scrubbed_at,
+) -> None:
+    """验证缺失文本或已 scrub 消息不会进入管理员审计镜像。"""
+    outbox_id = _persist_event_with_message(
+        session_factory,
+        normalized_text=normalized_text,
+        scrubbed_at=scrubbed_at,
+    )
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+
+    assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "succeeded"
+    assert "销售原始消息" not in adapter.get_records()[0].fields
+
+
+def test_audit_mirror_truncates_original_message_to_2000_chars(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证销售原始消息单独限制为最多 2000 个字符。"""
+    message_text = "甲" * 2005
+    outbox_id = _persist_event_with_message(
+        session_factory,
+        normalized_text=message_text,
+    )
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+
+    assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "succeeded"
+    mirrored_message = adapter.get_records()[0].fields["销售原始消息"]
+    assert isinstance(mirrored_message, str)
+    assert mirrored_message == message_text[:2000]
+    assert len(mirrored_message) <= 2000
 
 
 def test_audit_mirror_failure_only_retries_mirror_job(

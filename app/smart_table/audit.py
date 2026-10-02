@@ -19,6 +19,7 @@ from app.smart_table.models import (
 
 AUDIT_SHEET_TITLE = "系统审计日志"
 AUDIT_MIRROR_KEY_FIELD = "audit_mirror_key"
+MAX_AUDIT_ORIGINAL_MESSAGE_LENGTH = 2000
 AUDIT_MIRROR_FIELD_NAMES = (
     AUDIT_MIRROR_KEY_FIELD,
     "audit_event_id",
@@ -26,6 +27,7 @@ AUDIT_MIRROR_FIELD_NAMES = (
     "事件类型",
     "操作人",
     "message_id",
+    "销售原始消息",
     "lead_id",
     "smart_table_record_id",
     "action_id",
@@ -97,10 +99,16 @@ class SmartTableAuditSink:
             raise ValueError("业务审计事件尚未获得持久化 ID")
         return f"audit:{event.id}"
 
-    def build_fields(self, event: BusinessAuditEvent) -> dict[str, object]:
-        """把业务审计事实转换为不含 PII、密钥和外部响应正文的表格字段。
+    def build_fields(
+        self,
+        event: BusinessAuditEvent,
+        *,
+        sales_original_message: str | None = None,
+    ) -> dict[str, object]:
+        """把业务审计事实和受控原始消息上下文转换为表格字段。
 
-        参数：event 为业务审计事实；details 仅允许受控字段进入镜像。
+        参数：event 为业务审计事实；sales_original_message 仅接受 Worker 从
+        IncomingMessage.normalized_text 读取且确认未 scrub 的文本；details 仅允许受控字段进入镜像。
         返回值：可直接写入审计子表的字段补丁。
         异常：无；未知字段会被丢弃而不是原样透传。
         副作用：无，不修改审计事实。
@@ -113,6 +121,12 @@ class SmartTableAuditSink:
             "message_id": event.message_id,
             "audit_event_id": str(event.id),
         }
+        # 系统审计日志中的销售原始消息是管理员审计副本；Smart Table ACL 由管理员控制；
+        # 该副本不会因 IncomingMessage 后续 scrub 自动删除。正文只来自受控参数，不读取 raw_payload。
+        if isinstance(sales_original_message, str):
+            original_message = sales_original_message.strip()
+            if original_message:
+                fields["销售原始消息"] = original_message[:MAX_AUDIT_ORIGINAL_MESSAGE_LENGTH]
         details = event.details if isinstance(event.details, Mapping) else {}
         for name in self._DETAIL_FIELDS:
             value = details.get(name)
@@ -126,15 +140,20 @@ class SmartTableAuditSink:
                 fields[name] = value[:256]
         return fields
 
-    def mirror(self, event: BusinessAuditEvent) -> SmartTableRecord:
+    def mirror(
+        self,
+        event: BusinessAuditEvent,
+        *,
+        sales_original_message: str | None = None,
+    ) -> SmartTableRecord:
         """按稳定镜像键写前查重后创建一条审计子表记录。
 
-        参数：event 为待镜像业务审计事实。
+        参数：event 为待镜像业务审计事实；sales_original_message 为未 scrub 的标准化销售文本。
         返回值：已存在或本次创建的审计子表记录。
         异常：审计子表缺少镜像键字段或外部写入失败时抛出适配器异常。
         副作用：配合服务端 claim fencing，重复重试通过远端查重避免重复新增。
         """
-        fields = self.build_fields(event)
+        fields = self.build_fields(event, sales_original_message=sales_original_message)
         schema = self._adapter.get_schema()
         missing_fields = [
             name for name in AUDIT_MIRROR_FIELD_NAMES if schema.get_field(name) is None
