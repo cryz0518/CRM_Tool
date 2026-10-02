@@ -431,12 +431,12 @@ def sales_authorizations(
     limit: int = Query(50, ge=1, le=100),
     cursor: str | None = None,
 ) -> ConsolePage[ConsoleSalesAuthorizationDTO]:
-    """返回销售授权范围、启用状态和 CRM 映射异常。
+    """返回 Actor Registry 范围、启用状态和 CRM 映射异常。
 
     参数：认证主体仅用于执行 Console 读取授权；service 提供只读查询；limit 和 cursor 控制分页。
     返回值：不包含 CRM 用户标识的目录分页结果。
     异常：无效查询参数由 FastAPI 返回 422；读取失败由框架转换为服务错误。
-    副作用：无，不修改销售授权、CRM 映射或线索。
+    副作用：无，不修改 actor 目录、CRM 映射或线索。
     """
     return service.list_sales_authorizations(limit=limit, cursor=cursor)
 

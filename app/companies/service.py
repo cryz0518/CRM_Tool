@@ -331,9 +331,9 @@ class CompanyLeadService:
                 raise ValueError(f"来源消息不存在：{command.source_message_id}")
             if message.sales_user_id != command.sales_user_id:
                 raise PermissionError("来源消息不属于当前销售")
-            # 企业微信机器人可见范围不能替代后端销售授权，解析服务也必须独立守住入口。
-            if not self._sales_identity_provider.is_authorized(session, command.sales_user_id):
-                raise PermissionError("销售未获授权，不能创建或更新公司线索")
+            # 企业微信机器人可见范围不能替代后端 actor 状态；停用成员仍必须 fail closed。
+            if not self._sales_identity_provider.is_active(session, command.sales_user_id):
+                raise PermissionError("销售 actor 不存在或已停用，不能创建或更新公司线索")
             if resolution.tyc_failure_event_type is not None:
                 # 将外部超时与“查无结果”区分为可审计事件，供运维和销售审核追溯。
                 self._record_audit(session, command, resolution.tyc_failure_event_type)

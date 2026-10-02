@@ -148,13 +148,14 @@ class WecomCliSmartTableAdapter:
         command: str = "wecom-cli",
         timeout_seconds: float = 20.0,
         retry_count: int = 1,
+        require_owner_field: bool = True,
         runner: CliRunner | None = None,
     ) -> None:
         """初始化固定文档、子表和可替换的 CLI 执行入口。
 
         参数：doc_id、sheet_id 为管理员配置的目标表标识；sheet_title 为完整查询接口使用的子表名称；
-        两个 sales 参数仅接受管理员
-        已核验的权限快照；command、timeout_seconds、retry_count 控制 CLI 调用；runner 供测试替换。
+        两个 sales 参数仅接受管理员已核验的权限快照；require_owner_field 控制机器人是否必须
+        写入“负责人”；command、timeout_seconds、retry_count 控制 CLI 调用；runner 供测试替换。
         异常：标识为空或重试次数为负数时抛出 SmartTableAdapterConfigurationError。
         副作用：不访问网络，仅保存不可变配置。
         """
@@ -173,6 +174,7 @@ class WecomCliSmartTableAdapter:
         self._command = command
         self._timeout_seconds = timeout_seconds
         self._retry_count = retry_count
+        self._require_owner_field = require_owner_field
         self._runner = runner or self._run_subprocess
         self._schema: SmartTableSchema | None = None
         self._recent_written_records: dict[str, tuple[float, SmartTableRecord]] = {}
@@ -303,7 +305,11 @@ class WecomCliSmartTableAdapter:
         """
         if actor is SmartTableActor.SALES:
             raise SmartTablePermissionError("wecom-cli 使用机器人凭据，不能模拟销售直接新增记录")
-        if actor is SmartTableActor.ROBOT and not fields.get("负责人"):
+        if (
+            actor is SmartTableActor.ROBOT
+            and self._require_owner_field
+            and not fields.get("负责人")
+        ):
             raise ValueError("机器人新增智能表格记录时必须写入负责人")
 
         schema = self.get_schema()

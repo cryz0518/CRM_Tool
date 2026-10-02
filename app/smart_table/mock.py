@@ -25,10 +25,12 @@ class MockSmartTableAdapter:
         schema: SmartTableSchema,
         sales_can_create_records: bool = False,
         sales_can_delete_records: bool = False,
+        require_owner_field: bool = True,
     ) -> None:
         """初始化 Mock 的预配置结构、权限和空记录集。
 
-        参数：schema 为管理员预配置结构；两个 sales 参数控制普通销售新增和删除权限。
+        参数：schema 为管理员预配置结构；两个 sales 参数控制普通销售新增和删除权限；
+        require_owner_field 控制机器人是否必须写入“负责人”，审计子表可关闭。
         副作用：创建独立的内存记录集与递增记录标识计数器。
         """
         self._schema = schema
@@ -36,6 +38,7 @@ class MockSmartTableAdapter:
             sales_can_create_records=sales_can_create_records,
             sales_can_delete_records=sales_can_delete_records,
         )
+        self._require_owner_field = require_owner_field
         self._records: dict[str, SmartTableRecord] = {}
         self._next_record_number = 1
         self.delete_calls = 0
@@ -105,7 +108,11 @@ class MockSmartTableAdapter:
         if actor is SmartTableActor.SALES and not self._permissions.sales_can_create_records:
             raise SmartTablePermissionError("普通销售没有智能表格新增记录权限")
         # 负责人是共享表记录级权限的关键字段，机器人缺失时必须拒绝创建。
-        if actor is SmartTableActor.ROBOT and not fields.get("负责人"):
+        if (
+            actor is SmartTableActor.ROBOT
+            and self._require_owner_field
+            and not fields.get("负责人")
+        ):
             raise ValueError("机器人新增智能表格记录时必须写入负责人")
 
         # 生成稳定的 Mock 记录标识，并复制输入避免调用方后续修改污染记录。

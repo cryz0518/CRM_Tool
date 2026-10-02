@@ -28,6 +28,10 @@ def build_beat_schedule(settings: Settings) -> dict[str, dict[str, object]]:
             "task": "workers.consume_pending_wecom_actions",
             "schedule": settings.lead_outbox_poll_seconds,
         },
+        "consume-pending-audit-mirrors": {
+            "task": "workers.consume_pending_audit_mirrors",
+            "schedule": settings.lead_outbox_poll_seconds,
+        },
         "reconcile-storage-ingest-operations": {
             "task": "workers.reconcile_storage_ingest_operations",
             "schedule": settings.lead_outbox_poll_seconds,

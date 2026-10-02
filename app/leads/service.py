@@ -464,12 +464,8 @@ class FirstTextLeadWorkspaceService:
                 raise ValueError("只有 failed_pending_review 消息允许人工重试")
             operator_id = operator_user_id or message.sales_user_id
             operator = session.get(SalesAuthorization, operator_id)
-            if (
-                operator is None
-                or not operator.is_active
-                or not (operator.is_authorized or operator.is_administrator)
-            ):
-                raise PermissionError("重试操作人没有可用的销售权限")
+            if operator is None or not operator.is_active:
+                raise PermissionError("重试操作人没有可用的 actor")
             # 原始采集销售只用于审计；合法转交后，普通销售权限由当前 Lead owner 决定。
             # 具体消息分段和目标 Lead 仍在 _retry_target_lead 中校验，避免借转交跨销售读取。
             operator_role = "administrator" if operator.is_administrator else "sales"
@@ -1257,11 +1253,11 @@ class FirstTextLeadWorkspaceService:
                     logger.info("lead_outbox_waiting_for_previous")
                     return LeadProcessingResult(LeadProcessingStatus.WAITING_FOR_PREVIOUS)
 
-                # Worker 在 T02 之后再次经过权威销售目录，异常 Outbox 不可绕过身份门禁。
-                if not self._sales_identity_provider.is_authorized(session, message.sales_user_id):
+                # Worker 在 T02 之后再次经过权威 Actor Registry，停用 actor 不得继续处理。
+                if not self._sales_identity_provider.is_active(session, message.sales_user_id):
                     event.status = "unauthorized"
-                    self._record_audit(session, event, "lead_unauthorized")
-                    logger.warning("lead_outbox_unauthorized")
+                    self._record_audit(session, event, "lead_actor_inactive")
+                    logger.warning("lead_outbox_actor_inactive")
                     return LeadProcessingResult(LeadProcessingStatus.UNAUTHORIZED)
 
                 if self._media_enrichment_is_pending(session, message):
@@ -1517,7 +1513,7 @@ class FirstTextLeadWorkspaceService:
                                 logger.info("lead_text_ignored")
                                 return LeadProcessingResult(LeadProcessingStatus.IGNORED)
 
-                        # 首次创建的两类销售归属同时固定为当前授权销售，后续转交不在 T05 范围内。
+                        # 首次创建的两类销售归属同时固定为当前有效 actor，后续转交不在 T05 范围内。
                         lead = Lead(
                             source_message_id=message.message_id,
                             original_capturing_sales_user_id=message.sales_user_id,
@@ -1757,7 +1753,7 @@ class FirstTextLeadWorkspaceService:
 
         lead = session.scalar(select(Lead).where(Lead.source_message_id == message.message_id))
         if lead is None:
-            # 身份与负责人完全取自当前已授权销售；模型字段只会交给 T09 作为业务字段补丁。
+            # 身份与负责人完全取自当前有效 actor；模型字段只会交给 T09 作为业务字段补丁。
             lead = Lead(
                 source_message_id=message.message_id,
                 original_capturing_sales_user_id=message.sales_user_id,
@@ -2699,12 +2695,12 @@ class FirstTextLeadWorkspaceService:
         )
 
     def _lock_sales_processing_stream(self, session: Session, sales_user_id: str) -> None:
-        """锁定一名销售的授权行，以原子判断该销售的消息消费顺序。
+        """锁定一名 actor 的注册行，以原子判断该销售的消息消费顺序。
 
         参数：session 为当前事务；sales_user_id 为待消费消息的发送销售。
         返回值：无。
-        异常：授权记录缺失时抛出 ValueError，避免未受保护的顺序判断。
-        副作用：在当前事务提交前持有该销售授权行锁；不同销售不互相阻塞。
+        异常：actor 记录缺失时抛出 ValueError，避免未受保护的顺序判断。
+        副作用：在当前事务提交前持有该 actor 注册行锁；不同销售不互相阻塞。
         """
         authorization = session.scalar(
             select(SalesAuthorization)
@@ -2712,7 +2708,7 @@ class FirstTextLeadWorkspaceService:
             .with_for_update()
         )
         if authorization is None:
-            raise ValueError(f"销售授权记录不存在：{sales_user_id}")
+            raise ValueError(f"actor registry 记录不存在：{sales_user_id}")
 
     def _has_unfinished_previous_event(self, session: Session, event: OutboxEvent) -> bool:
         """判断同一销售是否还有未越过首次消费检查点的较早事件。
@@ -2779,7 +2775,7 @@ class FirstTextLeadWorkspaceService:
     ) -> LeadProcessingResult:
         """以机器人身份新建销售可见表格记录，并持久化同步成功或失败事实。
 
-        参数：sales_user_id 为当前授权销售；fields 为确定性提取字段；
+        参数：sales_user_id 为当前有效 actor；fields 为确定性提取字段；
         lead_id、事件和分段标识用于回写。
         返回值：包含表格记录标识的创建结果，或表格失败结论。
         异常：数据库回写错误向调用方传播；表格适配器错误转换为可审计失败结果。
@@ -3104,8 +3100,8 @@ class LeadReassignmentService:
             operator = session.get(SalesAuthorization, operator_user_id)
             if message is None or resolution is None or target is None or operator is None:
                 raise ValueError("消息分段、归属结论、新目标线索或操作人不存在")
-            if not operator.is_active or not (operator.is_authorized or operator.is_administrator):
-                raise PermissionError("操作人没有可用的重归属权限")
+            if not operator.is_active:
+                raise PermissionError("操作人没有可用的 actor")
             previous = (
                 session.get(Lead, resolution.lead_id) if resolution.lead_id is not None else None
             )

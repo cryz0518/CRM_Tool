@@ -529,15 +529,15 @@ def test_non_lead_text_is_ignored_without_polluting_the_review_workspace(
         assert session.query(SmartTableSync).count() == 0
 
 
-def test_outbox_consumer_rechecks_sales_authorization_before_creating_a_lead(
+def test_outbox_consumer_ignores_legacy_authorization_flag_before_creating_a_lead(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证即使存在异常发件箱，未授权成员也不能产生任何线索或表格副作用。
+    """验证异常发件箱中的 active actor 不再受历史授权字段阻断。
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
-    异常：权限或副作用断言失败时由 pytest 报告。
-    副作用：消费一条故意模拟的未授权 Outbox 事件。
+    异常：actor 语义或副作用断言失败时由 pytest 报告。
+    副作用：消费一条 is_authorized=false 但 active 的 Outbox 事件。
     """
     event_id = persist_outbox_text(
         session_factory,
@@ -550,10 +550,10 @@ def test_outbox_consumer_rechecks_sales_authorization_before_creating_a_lead(
 
     result = FirstTextLeadWorkspaceService(session_factory, adapter).consume(event_id)
 
-    assert result.status is LeadProcessingStatus.UNAUTHORIZED
-    assert adapter.get_records() == []
+    assert result.status is LeadProcessingStatus.CREATED
+    assert adapter.get_records()
     with session_factory() as session:
-        assert session.query(Lead).count() == 0
+        assert session.query(Lead).count() == 1
 
 
 def test_consuming_the_same_succeeded_event_is_idempotent(

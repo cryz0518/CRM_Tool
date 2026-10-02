@@ -55,6 +55,7 @@ class WecomTextMessageAdapter:
         message_id = body.get("msgid")
         sender = body.get("from")
         sales_user_id = sender.get("userid") if isinstance(sender, dict) else None
+        display_name = sender.get("name") if isinstance(sender, dict) else None
         if (
             not isinstance(message_id, str)
             or not message_id
@@ -76,6 +77,7 @@ class WecomTextMessageAdapter:
                 sales_user_id=sales_user_id,
                 raw_payload=frame,
                 normalized_text=normalized_text,
+                display_name=display_name if isinstance(display_name, str) else None,
             )
         )
 
@@ -96,6 +98,7 @@ class WecomMediaMessageAdapter:
         message_id = body.get("msgid")
         sender = body.get("from")
         sales_user_id = sender.get("userid") if isinstance(sender, dict) else None
+        display_name = sender.get("name") if isinstance(sender, dict) else None
         media_kind = body["msgtype"]
         media = body.get(media_kind)
         if not isinstance(message_id, str) or not isinstance(sales_user_id, str):
@@ -112,6 +115,7 @@ class WecomMediaMessageAdapter:
                     sales_user_id=sales_user_id,
                     raw_payload=self._redact_download_credentials(frame, media_kind),
                     requires_media_enrichment=True,
+                    display_name=display_name if isinstance(display_name, str) else None,
                 )
             ),
             message_id=message_id,

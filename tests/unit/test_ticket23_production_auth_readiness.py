@@ -185,10 +185,10 @@ def test_inactive_local_administrator_is_denied(
     assert not authorizer.authorize(_principal("inactive-admin"), ConsoleCapability.CONSOLE_READ)
 
 
-def test_unauthorized_local_administrator_is_denied(
+def test_legacy_unauthorized_flag_does_not_block_local_administrator(
     authorization_session_factory: sessionmaker[Session],
 ) -> None:
-    """验证未获销售授权的管理员标记不能直接获得 Console capability。"""
+    """验证历史 is_authorized=false 不再阻断 active administrator 的 Console capability。"""
     with authorization_session_factory.begin() as session:
         session.add(
             SalesAuthorization(
@@ -201,7 +201,7 @@ def test_unauthorized_local_administrator_is_denied(
 
     authorizer = LocalCapabilityAuthorizer(authorization_session_factory)
 
-    assert not authorizer.authorize(
+    assert authorizer.authorize(
         _principal("unauthorized-admin"), ConsoleCapability.CONSOLE_READ
     )
 
@@ -224,7 +224,7 @@ def test_active_local_administrator_is_allowed(
     decision = authorizer.decide(_principal("active-admin"), ConsoleCapability.AUDIT_READ)
 
     assert decision.allowed
-    assert decision.basis == "local_sales_authorization"
+    assert decision.basis == "local_active_administrator"
 
 
 def test_break_glass_body_cannot_override_verified_actor_or_role() -> None:

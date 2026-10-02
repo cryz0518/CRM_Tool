@@ -419,7 +419,7 @@ class CrmSubmissionService:
 
         参数：command 为机器人已可靠接收的文本命令和提交销售身份。
         返回值：成功、待完善和外部失败的汇总；更新命令明确标记未实现。
-        异常：未知命令或未授权销售抛出 ValueError，避免 LLM 推断权限。
+        异常：命令不支持或 actor 不存在/已停用时抛出 ValueError，避免 LLM 推断权限。
         副作用：可能创建或重试一个冻结的 CRM Sync Record，并调用 CRM create。
         """
         if command.text == _UPDATES_COMMAND:
@@ -435,12 +435,8 @@ class CrmSubmissionService:
         target_missing = False
         with self._session_factory() as session:
             authorization = session.get(SalesAuthorization, command.sales_user_id)
-            if (
-                authorization is None
-                or not authorization.is_authorized
-                or not authorization.is_active
-            ):
-                raise ValueError("提交销售未授权")
+            if authorization is None or not authorization.is_active:
+                raise ValueError("提交销售 actor 不存在或已停用")
             if command.text == "提交指定线索":
                 if command.target_lead_id is None:
                     raise ValueError("指定线索提交缺少目标线索")
@@ -486,7 +482,7 @@ class CrmSubmissionService:
 
         参数：command 为本次重提消息事实；selected_lead_ids 来自服务端历史 action 结果。
         返回值：每个历史目标各有一条当前状态结果。
-        异常：命令不匹配或销售未授权时抛出 ValueError；外部依赖错误按既有服务边界处理。
+        异常：命令不匹配或 actor 不存在/已停用时抛出 ValueError；外部依赖错误按既有服务边界处理。
         副作用：只对重新验证仍有效且当前完整的目标复用首次创建流程。
         """
         if command.text != _RETRY_INCOMPLETE_COMMAND:
@@ -494,12 +490,8 @@ class CrmSubmissionService:
         selected = tuple(dict.fromkeys(selected_lead_ids))
         with self._session_factory() as session:
             authorization = session.get(SalesAuthorization, command.sales_user_id)
-            if (
-                authorization is None
-                or not authorization.is_authorized
-                or not authorization.is_active
-            ):
-                raise ValueError("提交销售未授权")
+            if authorization is None or not authorization.is_active:
+                raise ValueError("提交销售 actor 不存在或已停用")
             # 一次读取用于前置 fail-closed；真正创建前仍会在 _submit_create 重读 Final Snapshot。
             smart_table_snapshot = {
                 record.record_id: record for record in self._smart_table_adapter.get_records()
@@ -552,19 +544,15 @@ class CrmSubmissionService:
 
         参数：command_text 为精确命令；sales_user_id 为当前销售身份。
         返回值：只包含本人、日期与实时表格状态符合所选卡片范围的线索候选。
-        异常：销售未授权或命令不支持时抛出 ValueError。
+        异常：actor 不存在/已停用或命令不支持时抛出 ValueError。
         副作用：只读取数据库及智能表格，不改变 Lead 生命周期。
         """
         if command_text not in {_TODAY_COMMAND, _ALL_COMMAND, _ABANDONED_COMMAND}:
             raise ValueError("不支持候选卡片的 CRM 命令")
         with self._session_factory() as session:
             authorization = session.get(SalesAuthorization, sales_user_id)
-            if (
-                authorization is None
-                or not authorization.is_authorized
-                or not authorization.is_active
-            ):
-                raise ValueError("提交销售未授权")
+            if authorization is None or not authorization.is_active:
+                raise ValueError("提交销售 actor 不存在或已停用")
             # 授权通过后，一次卡片候选计算只读取一份当前表格快照。
             smart_table_snapshot = {
                 record.record_id: record for record in self._smart_table_adapter.get_records()
@@ -652,7 +640,7 @@ class CrmSubmissionService:
 
         参数：command 为原始精确命令；selected_lead_ids 为 callback 中的服务端候选标识。
         返回值：与普通批量提交相同的部分成功汇总。
-        异常：销售未授权或命令不支持时抛出 ValueError。
+        异常：actor 不存在/已停用或命令不支持时抛出 ValueError。
         副作用：每个 callback 已接受的目标均得到结果；仅仍有效的目标调用首次提交流程。
         """
         if command.text not in {_TODAY_COMMAND, _ALL_COMMAND, _ABANDONED_COMMAND}:
@@ -660,12 +648,8 @@ class CrmSubmissionService:
         selected = tuple(dict.fromkeys(selected_lead_ids))
         with self._session_factory() as session:
             authorization = session.get(SalesAuthorization, command.sales_user_id)
-            if (
-                authorization is None
-                or not authorization.is_authorized
-                or not authorization.is_active
-            ):
-                raise ValueError("提交销售未授权")
+            if authorization is None or not authorization.is_active:
+                raise ValueError("提交销售 actor 不存在或已停用")
             # 回调重新校验身份后只读取一份快照，避免多次启动 CLI 导致偶发协议/进程错误。
             smart_table_snapshot = {
                 record.record_id: record for record in self._smart_table_adapter.get_records()
@@ -725,12 +709,8 @@ class CrmSubmissionService:
         """扫描当前表格负责人的已同步记录，并仅提交规范业务快照差异。"""
         with self._session_factory() as session:
             authorization = session.get(SalesAuthorization, command.sales_user_id)
-            if (
-                authorization is None
-                or not authorization.is_authorized
-                or not authorization.is_active
-            ):
-                raise ValueError("提交销售未授权")
+            if authorization is None or not authorization.is_active:
+                raise ValueError("提交销售 actor 不存在或已停用")
             candidate_ids = list(
                 session.scalars(
                     select(Lead.id).where(
@@ -1247,7 +1227,7 @@ class CrmSubmissionService:
         参数：request_message_id 和 sales_user_id 定位原提交请求及操作者；
         continue_submission 表示继续覆盖还是停止；selected_lead_ids 为销售勾选的本地线索。
         返回值：已覆盖、已放弃、未选择和失败数量汇总。
-        异常：操作者未授权或目标不属于当前销售时抛出 ValueError。
+        异常：操作者不存在/已停用或目标不属于当前销售时抛出 ValueError。
         副作用：更新 CRM 同步状态、审计记录和智能表格提交状态，必要时调用 CRM update。
         """
         selected = set(selected_lead_ids)
@@ -1256,12 +1236,8 @@ class CrmSubmissionService:
         remaining = 0
         with self._session_factory.begin() as session:
             authorization = session.get(SalesAuthorization, sales_user_id)
-            if (
-                authorization is None
-                or not authorization.is_authorized
-                or not authorization.is_active
-            ):
-                raise ValueError("提交销售未授权")
+            if authorization is None or not authorization.is_active:
+                raise ValueError("提交销售 actor 不存在或已停用")
             rows = session.execute(
                 select(CrmSyncRecord, Lead)
                 .join(Lead, Lead.id == CrmSyncRecord.lead_id)

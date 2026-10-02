@@ -37,6 +37,8 @@ from app.media.retention import (
     retention_policy_is_configured,
 )
 from app.messaging.models import (
+    AuditMirrorOutbox,
+    BusinessAuditEvent,
     IncomingMessage,
     NotificationRecord,
     OutboxEvent,
@@ -46,7 +48,8 @@ from app.messaging.models import (
     WecomActionOutboxStatus,
     utc_now,
 )
-from app.smart_table.dependencies import get_smart_table_adapter
+from app.smart_table.audit import SmartTableAuditSink
+from app.smart_table.dependencies import get_smart_table_adapter, get_smart_table_audit_adapter
 from app.wecom_bot.actions import (
     CardCapabilityUnavailable,
     DeterministicWecomActionExecutor,
@@ -87,6 +90,163 @@ def _session_factory() -> tuple[Engine, sessionmaker[Session]]:
     """
     engine = create_engine(get_settings().database_url, pool_pre_ping=True)
     return engine, sessionmaker(engine)
+
+
+def _claim_audit_mirror_outbox(
+    session_factory: sessionmaker[Session], outbox_id: int
+) -> bool:
+    """原子认领一条审计镜像任务，防止重复 Worker 同时写表。
+
+    参数：session_factory 为数据库会话工厂；outbox_id 为镜像任务标识。
+    返回值：本次成功取得处理租约时返回 True，否则返回 False。
+    异常：数据库错误向调用方传播。
+    副作用：更新镜像任务状态、尝试次数和处理开始时间，不修改业务审计事件。
+    """
+    now = utc_now()
+    lease_expired_before = now - timedelta(
+        seconds=get_settings().lead_processing_timeout_seconds
+    )
+    with session_factory.begin() as session:
+        outbox = session.scalar(
+            select(AuditMirrorOutbox)
+            .where(
+                AuditMirrorOutbox.id == outbox_id,
+                or_(
+                    AuditMirrorOutbox.status.in_(("pending", "retrying")),
+                    and_(
+                        AuditMirrorOutbox.status == "processing",
+                        AuditMirrorOutbox.processing_started_at.is_not(None),
+                        AuditMirrorOutbox.processing_started_at < lease_expired_before,
+                    ),
+                ),
+            )
+            .with_for_update()
+        )
+        if outbox is None:
+            return False
+        # 仅镜像 Outbox 自身进入 processing；业务状态不随远端失败回滚。
+        outbox.status = "processing"
+        outbox.attempts += 1
+        outbox.processing_started_at = now
+        outbox.failure_category = None
+        outbox.failure_code = None
+        return True
+
+
+def _finish_audit_mirror(
+    session_factory: sessionmaker[Session],
+    outbox_id: int,
+    *,
+    succeeded: bool,
+    error: Exception | None = None,
+) -> None:
+    """以受控状态完成或重置审计镜像任务。
+
+    参数：session_factory 为数据库会话工厂；outbox_id 为镜像任务标识；succeeded 表示远端已确认；
+    error 为失败时仅用于记录异常类型。
+    返回值：无。
+    异常：数据库更新错误向 Worker 传播。
+    副作用：仅更新镜像 Outbox 状态，绝不修改原业务对象。
+    """
+    with session_factory.begin() as session:
+        outbox = session.get(AuditMirrorOutbox, outbox_id)
+        if outbox is None or outbox.status != "processing":
+            return
+        outbox.status = "succeeded" if succeeded else "retrying"
+        outbox.processing_started_at = None
+        if not succeeded and error is not None:
+            # 只保存受控异常类型，不保存 errmsg、HTTP body 或 traceback。
+            outbox.failure_category = "retryable"
+            outbox.failure_code = type(error).__name__[:64]
+
+
+@celery_app.task(name="workers.consume_audit_mirror_outbox")  # type: ignore[untyped-decorator]
+def consume_audit_mirror_outbox(outbox_id: int) -> str:
+    """消费一条审计镜像 Outbox，并以稳定镜像键避免重试重复写行。
+
+    参数：outbox_id 为审计镜像任务标识。
+    返回值：succeeded、retrying 或 already_processing 等安全状态文本。
+    异常：数据库异常向 Celery 传播；外部镜像异常转为 retrying。
+    副作用：最多向管理员审计子表写入一条记录，不影响原业务状态。
+    """
+    engine, factory = _session_factory()
+    try:
+        if not _claim_audit_mirror_outbox(factory, outbox_id):
+            return "already_processing"
+        with factory() as session:
+            outbox = session.get(AuditMirrorOutbox, outbox_id)
+            event = (
+                session.get(BusinessAuditEvent, outbox.audit_event_id)
+                if outbox is not None
+                else None
+            )
+        if outbox is None or event is None:
+            _finish_audit_mirror(
+                factory,
+                outbox_id,
+                succeeded=False,
+                error=ValueError("audit_event_missing"),
+            )
+            return "retrying"
+        try:
+            # sink 先按 audit:<event_id> 查重，再创建；远端成功后本地 finalize 失败也可安全重试。
+            SmartTableAuditSink(get_smart_table_audit_adapter()).mirror(event)
+        except Exception as error:
+            _finish_audit_mirror(factory, outbox_id, succeeded=False, error=error)
+            logger.warning(
+                "audit_smart_table_mirror_retrying",
+                extra={"audit_mirror_outbox_id": outbox_id, "error_type": type(error).__name__},
+            )
+            return "retrying"
+        _finish_audit_mirror(factory, outbox_id, succeeded=True)
+        logger.info(
+            "audit_smart_table_mirror_succeeded",
+            extra={"audit_mirror_outbox_id": outbox_id},
+        )
+        return "succeeded"
+    finally:
+        engine.dispose()
+
+
+@celery_app.task(name="workers.consume_pending_audit_mirrors")  # type: ignore[untyped-decorator]
+def consume_pending_audit_mirrors() -> int:
+    """扫描待处理或租约过期的审计镜像任务并投递独立 Worker。
+
+    参数：无。
+    返回值：本轮投递的镜像任务数量。
+    异常：数据库读取失败时向 Celery 传播。
+    副作用：只投递任务，不执行外部 Smart Table 调用。
+    """
+    engine, factory = _session_factory()
+    try:
+        now = utc_now()
+        expired_before = now - timedelta(
+            seconds=get_settings().lead_processing_timeout_seconds
+        )
+        with factory() as session:
+            outbox_ids = list(
+                session.scalars(
+                    select(AuditMirrorOutbox.id)
+                    .where(
+                        or_(
+                            AuditMirrorOutbox.status.in_(("pending", "retrying")),
+                            and_(
+                                AuditMirrorOutbox.status == "processing",
+                                AuditMirrorOutbox.processing_started_at.is_not(None),
+                                AuditMirrorOutbox.processing_started_at < expired_before,
+                            ),
+                        )
+                    )
+                    .order_by(AuditMirrorOutbox.created_at, AuditMirrorOutbox.id)
+                    .limit(100)
+                )
+            )
+    finally:
+        engine.dispose()
+    for outbox_id in outbox_ids:
+        # 认领留给任务本身，重复调度也由数据库条件更新收敛。
+        consume_audit_mirror_outbox.delay(outbox_id)
+    return len(outbox_ids)
 
 
 @celery_app.task(name="workers.consume_lead_outbox_event")  # type: ignore[untyped-decorator]
@@ -394,7 +554,7 @@ def _claim_lead_outbox_event(
     参数：session_factory 为数据库会话工厂；outbox_event_id 为目标事件；now 为本轮时钟；
     lease_timeout 为 processing 租约时长。
     返回值：成功时返回认领事实，不可投递或被其他扫描认领时返回 None。
-    异常：销售授权记录缺失或数据库异常时由调用方处理。
+    异常：actor registry 记录缺失或数据库异常时由调用方处理。
     副作用：成功时刷新事件 processing 开始时间。
     """
     with session_factory.begin() as session:
@@ -407,7 +567,7 @@ def _claim_lead_outbox_event(
             .with_for_update()
         )
         if authorization is None:
-            raise ValueError(f"销售授权记录不存在：{event.sales_user_id}")
+            raise ValueError(f"actor registry 记录不存在：{event.sales_user_id}")
         session.refresh(event)
         lease_expired = _processing_lease_expired(event, now, lease_timeout)
         if event.status not in {"pending", "retrying"} and not lease_expired:
