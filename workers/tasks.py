@@ -230,6 +230,59 @@ def _resolve_audit_lead_id(session: Session, event: BusinessAuditEvent) -> str |
     return None
 
 
+def _should_wait_for_audit_lead_resolution(
+    session: Session,
+    event: BusinessAuditEvent,
+    resolved_lead_id: str | None,
+) -> bool:
+    """判断审计镜像是否应等待来源消息的业务 Outbox 完成归属。
+
+    参数：session 为当前数据库会话；event 为审计事件；resolved_lead_id 为当前已解析的 Lead.id。
+    返回值：仍可能产生归属事实且来源 Outbox 未终态时返回 True，否则返回 False。
+    异常：数据库查询异常向 Worker 传播。
+    副作用：仅读取数据库，不修改任何业务状态。
+    """
+    if resolved_lead_id is not None:
+        return False
+    source_outbox = session.scalar(
+        select(OutboxEvent).where(OutboxEvent.message_id == event.message_id)
+    )
+    if source_outbox is None:
+        return False
+    # 复用线索 Worker 的检查点定义，避免审计 Worker 自己维护另一套终态集合。
+    return source_outbox.status not in COMPLETED_CHECKPOINT_STATUSES
+
+
+def _defer_audit_mirror(
+    session_factory: sessionmaker[Session], outbox_id: int, claim_token: str
+) -> None:
+    """释放当前审计镜像认领，等待来源业务 Outbox 形成归属事实。
+
+    参数：session_factory 为数据库会话工厂；outbox_id 为镜像任务标识；claim_token 为当前认领令牌。
+    返回值：无。
+    异常：数据库更新错误向 Worker 传播。
+    副作用：仅在 ID、processing 状态和 claim token 同时匹配时重置为 pending；不记录失败。
+    """
+    with session_factory.begin() as session:
+        # defer 与 finalize 一样必须做 token fencing，旧 Worker 不能释放新 Worker 的 claim。
+        outbox = session.scalar(
+            select(AuditMirrorOutbox)
+            .where(
+                AuditMirrorOutbox.id == outbox_id,
+                AuditMirrorOutbox.status == "processing",
+                AuditMirrorOutbox.claim_token == claim_token,
+            )
+            .with_for_update()
+        )
+        if outbox is None:
+            return
+        outbox.status = "pending"
+        outbox.processing_started_at = None
+        outbox.claim_token = None
+        outbox.failure_category = None
+        outbox.failure_code = None
+
+
 @celery_app.task(name="workers.consume_audit_mirror_outbox")  # type: ignore[untyped-decorator]
 def consume_audit_mirror_outbox(outbox_id: int) -> str:
     """消费一条审计镜像 Outbox，并用 claim fencing 与稳定镜像键控制重试。
@@ -264,6 +317,11 @@ def consume_audit_mirror_outbox(outbox_id: int) -> str:
             resolved_lead_id = (
                 _resolve_audit_lead_id(session, event) if event is not None else None
             )
+            should_wait_for_lead = (
+                _should_wait_for_audit_lead_resolution(session, event, resolved_lead_id)
+                if event is not None
+                else False
+            )
         if outbox is None or event is None:
             _finish_audit_mirror(
                 factory,
@@ -273,6 +331,9 @@ def consume_audit_mirror_outbox(outbox_id: int) -> str:
                 error=ValueError("audit_event_missing"),
             )
             return "retrying"
+        if should_wait_for_lead:
+            _defer_audit_mirror(factory, outbox_id, claim_token)
+            return "deferred"
         try:
             # 依靠服务端 claim fencing、稳定镜像键和写前远端查重，避免重试重复写行。
             SmartTableAuditSink(get_smart_table_audit_adapter()).mirror(

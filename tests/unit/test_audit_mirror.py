@@ -16,6 +16,7 @@ from app.messaging.models import (
     Base,
     BusinessAuditEvent,
     IncomingMessage,
+    OutboxEvent,
     SalesAuthorization,
     utc_now,
 )
@@ -133,6 +134,7 @@ def _persist_lead_audit_case(
     events: tuple[tuple[str, dict[str, object]], ...],
     leads: tuple[tuple[str, str | None, str | None], ...] = (),
     resolutions: tuple[tuple[str, int, str | None], ...] = (),
+    source_outbox_status: str | None = None,
 ) -> list[int]:
     """持久化审计事件、线索及分段归属事实，并返回镜像任务 ID。"""
     message_ids = list(dict.fromkeys(message_id for message_id, _ in events))
@@ -161,6 +163,17 @@ def _persist_lead_audit_case(
                     normalized_text=None,
                 )
             )
+        if source_outbox_status is not None:
+            for sequence, (message_id, _) in enumerate(events, start=1):
+                session.add(
+                    OutboxEvent(
+                        message_id=message_id,
+                        sales_user_id="sales-1",
+                        sequence=sequence,
+                        event_type="message_received",
+                        status=source_outbox_status,
+                    )
+                )
         for lead_id, source_message_id, smart_table_record_id in leads:
             session.add(
                 Lead(
@@ -331,10 +344,149 @@ def test_audit_mirror_leaves_ambiguous_segment_resolution_empty(
             ("message-1", 0, "lead-1"),
             ("message-1", 1, "lead-2"),
         ),
+        source_outbox_status="succeeded",
     )[0]
     adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
 
     assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "succeeded"
+    assert "线索归属ID" not in adapter.get_records()[0].fields
+
+
+def test_audit_mirror_defers_until_source_outbox_terminal_then_resolves_lead(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 message_received race 会先 defer，业务终态后再镜像唯一归属。"""
+    outbox_id = _persist_lead_audit_case(
+        session_factory,
+        events=(("message-1", {}),),
+        source_outbox_status="pending",
+    )[0]
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+
+    assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "deferred"
+    assert adapter.get_records() == []
+    with session_factory() as session:
+        audit_outbox = session.get(AuditMirrorOutbox, outbox_id)
+        assert audit_outbox is not None
+        assert audit_outbox.status == "pending"
+        assert audit_outbox.claim_token is None
+
+    with session_factory.begin() as session:
+        session.add(
+            Lead(
+                id="lead-1",
+                source_message_id=None,
+                original_capturing_sales_user_id="sales-1",
+                smart_table_owner_user_id="sales-1",
+                field_values={},
+                enrichment_values={},
+            )
+        )
+        session.add(
+            LeadMessageResolution(
+                message_id="message-1",
+                segment_index=0,
+                lead_id="lead-1",
+                status="assigned",
+            )
+        )
+        source_outbox = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.message_id == "message-1")
+        )
+        assert source_outbox is not None
+        source_outbox.status = "succeeded"
+
+    assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "succeeded"
+    assert len(adapter.get_records()) == 1
+    fields = adapter.get_records()[0].fields
+    assert fields["消息ID"] == "message-1"
+    assert fields["线索归属ID"] == "lead-1"
+
+
+def test_audit_mirror_defers_multiple_messages_then_keeps_one_lead_id(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证同一线索的多条消息分别 defer 后仍镜像同一个 Lead.id。"""
+    outbox_ids = _persist_lead_audit_case(
+        session_factory,
+        events=(("message-1", {}), ("message-2", {})),
+        source_outbox_status="pending",
+    )
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+
+    for outbox_id in outbox_ids:
+        assert (
+            _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter)
+            == "deferred"
+        )
+
+    with session_factory.begin() as session:
+        session.add(
+            Lead(
+                id="lead-1",
+                source_message_id=None,
+                original_capturing_sales_user_id="sales-1",
+                smart_table_owner_user_id="sales-1",
+                field_values={},
+                enrichment_values={},
+            )
+        )
+        session.add_all(
+            [
+                LeadMessageResolution(
+                    message_id="message-1",
+                    segment_index=0,
+                    lead_id="lead-1",
+                    status="assigned",
+                ),
+                LeadMessageResolution(
+                    message_id="message-2",
+                    segment_index=0,
+                    lead_id="lead-1",
+                    status="assigned",
+                ),
+            ]
+        )
+        for message_id, text in (
+            ("message-1", "第一条线索消息"),
+            ("message-2", "第二条补充消息"),
+        ):
+            message = session.get(IncomingMessage, message_id)
+            assert message is not None
+            message.normalized_text = text
+            source_outbox = session.scalar(
+                select(OutboxEvent).where(OutboxEvent.message_id == message_id)
+            )
+            assert source_outbox is not None
+            source_outbox.status = "succeeded"
+
+    for outbox_id in outbox_ids:
+        assert (
+            _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter)
+            == "succeeded"
+        )
+    records = adapter.get_records()
+    assert [record.fields["消息ID"] for record in records] == ["message-1", "message-2"]
+    assert [record.fields["销售原始消息"] for record in records] == [
+        "第一条线索消息",
+        "第二条补充消息",
+    ]
+    assert [record.fields["线索归属ID"] for record in records] == ["lead-1", "lead-1"]
+
+
+def test_audit_mirror_terminal_ignored_message_does_not_wait_for_lead(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 ignored 消息没有归属时仍能在业务终态完成审计镜像。"""
+    outbox_id = _persist_lead_audit_case(
+        session_factory,
+        events=(("message-1", {}),),
+        source_outbox_status="ignored",
+    )[0]
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+
+    assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "succeeded"
+    assert len(adapter.get_records()) == 1
     assert "线索归属ID" not in adapter.get_records()[0].fields
 
 
@@ -517,4 +669,36 @@ def test_stale_audit_mirror_worker_cannot_finalize_new_claim(
         outbox = session.get(AuditMirrorOutbox, outbox_id)
         assert outbox is not None
         assert outbox.status == "succeeded"
+        assert outbox.claim_token is None
+
+
+def test_stale_audit_mirror_worker_cannot_defer_new_claim(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证旧 Worker 的 defer 不能把新 Worker 的认领释放为 pending。"""
+    outbox_id = _persist_event(session_factory)
+
+    token_a = tasks._claim_audit_mirror_outbox(session_factory, outbox_id)
+    assert token_a is not None
+    with session_factory.begin() as session:
+        outbox = session.get(AuditMirrorOutbox, outbox_id)
+        assert outbox is not None
+        outbox.processing_started_at = utc_now() - timedelta(days=1)
+
+    token_b = tasks._claim_audit_mirror_outbox(session_factory, outbox_id)
+    assert token_b is not None
+    assert token_b != token_a
+
+    tasks._defer_audit_mirror(session_factory, outbox_id, token_a)
+    with session_factory() as session:
+        outbox = session.get(AuditMirrorOutbox, outbox_id)
+        assert outbox is not None
+        assert outbox.status == "processing"
+        assert outbox.claim_token == token_b
+
+    tasks._defer_audit_mirror(session_factory, outbox_id, token_b)
+    with session_factory() as session:
+        outbox = session.get(AuditMirrorOutbox, outbox_id)
+        assert outbox is not None
+        assert outbox.status == "pending"
         assert outbox.claim_token is None
