@@ -352,6 +352,7 @@ class AuditMirrorOutbox(Base):
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_token: Mapped[str | None] = mapped_column(String(64))
     failure_category: Mapped[str | None] = mapped_column(String(32))
     failure_code: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(

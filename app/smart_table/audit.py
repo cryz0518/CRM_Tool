@@ -127,12 +127,12 @@ class SmartTableAuditSink:
         return fields
 
     def mirror(self, event: BusinessAuditEvent) -> SmartTableRecord:
-        """按镜像键查重后创建一条审计子表记录。
+        """按稳定镜像键写前查重后创建一条审计子表记录。
 
         参数：event 为待镜像业务审计事实。
         返回值：已存在或本次创建的审计子表记录。
         异常：审计子表缺少镜像键字段或外部写入失败时抛出适配器异常。
-        副作用：最多新增一条 Smart Table 审计记录；重复重试不会重复新增。
+        副作用：配合服务端 claim fencing，重复重试通过远端查重避免重复新增。
         """
         fields = self.build_fields(event)
         schema = self._adapter.get_schema()

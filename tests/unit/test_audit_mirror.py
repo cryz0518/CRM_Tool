@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.messaging.models import AuditMirrorOutbox, Base, BusinessAuditEvent
+from app.messaging.models import AuditMirrorOutbox, Base, BusinessAuditEvent, utc_now
 from app.smart_table.audit import SmartTableAuditSink, build_mock_audit_schema
 from app.smart_table.mock import MockSmartTableAdapter
 from workers import tasks
@@ -123,5 +124,51 @@ def test_audit_mirror_failure_only_retries_mirror_job(
         outbox = session.get(AuditMirrorOutbox, outbox_id)
         assert outbox is not None
         assert outbox.status == "retrying"
+        assert outbox.claim_token is None
         assert outbox.failure_category == "retryable"
         assert outbox.failure_code == "RuntimeError"
+
+
+def test_stale_audit_mirror_worker_cannot_finalize_new_claim(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证旧 Worker 的 claim token 不能覆盖过期接管后的新 Worker 状态。"""
+    outbox_id = _persist_event(session_factory)
+
+    token_a = tasks._claim_audit_mirror_outbox(session_factory, outbox_id)
+    assert token_a is not None
+    with session_factory.begin() as session:
+        outbox = session.get(AuditMirrorOutbox, outbox_id)
+        assert outbox is not None
+        outbox.processing_started_at = utc_now() - timedelta(days=1)
+
+    token_b = tasks._claim_audit_mirror_outbox(session_factory, outbox_id)
+    assert token_b is not None
+    assert token_b != token_a
+
+    tasks._finish_audit_mirror(
+        session_factory,
+        outbox_id,
+        token_a,
+        succeeded=False,
+        error=RuntimeError("stale worker"),
+    )
+    with session_factory() as session:
+        outbox = session.get(AuditMirrorOutbox, outbox_id)
+        assert outbox is not None
+        assert outbox.status == "processing"
+        assert outbox.claim_token == token_b
+
+    tasks._finish_audit_mirror(session_factory, outbox_id, token_a, succeeded=True)
+    with session_factory() as session:
+        outbox = session.get(AuditMirrorOutbox, outbox_id)
+        assert outbox is not None
+        assert outbox.status == "processing"
+        assert outbox.claim_token == token_b
+
+    tasks._finish_audit_mirror(session_factory, outbox_id, token_b, succeeded=True)
+    with session_factory() as session:
+        outbox = session.get(AuditMirrorOutbox, outbox_id)
+        assert outbox is not None
+        assert outbox.status == "succeeded"
+        assert outbox.claim_token is None

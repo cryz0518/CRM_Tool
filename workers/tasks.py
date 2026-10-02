@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import cast
+from uuid import uuid4
 
 from sqlalchemy import Engine, and_, create_engine, or_, select, update
 from sqlalchemy.engine import CursorResult
@@ -94,13 +95,13 @@ def _session_factory() -> tuple[Engine, sessionmaker[Session]]:
 
 def _claim_audit_mirror_outbox(
     session_factory: sessionmaker[Session], outbox_id: int
-) -> bool:
+) -> str | None:
     """原子认领一条审计镜像任务，防止重复 Worker 同时写表。
 
     参数：session_factory 为数据库会话工厂；outbox_id 为镜像任务标识。
-    返回值：本次成功取得处理租约时返回 True，否则返回 False。
+    返回值：本次成功取得的 claim token；任务不可认领时返回 None。
     异常：数据库错误向调用方传播。
-    副作用：更新镜像任务状态、尝试次数和处理开始时间，不修改业务审计事件。
+    副作用：更新镜像任务状态、尝试次数、处理开始时间和 claim token，不修改业务审计事件。
     """
     now = utc_now()
     lease_expired_before = now - timedelta(
@@ -123,37 +124,51 @@ def _claim_audit_mirror_outbox(
             .with_for_update()
         )
         if outbox is None:
-            return False
+            return None
+        # 每次初次认领或过期接管都生成新 token，旧 Worker 不能再提交 finalize。
+        claim_token = uuid4().hex
         # 仅镜像 Outbox 自身进入 processing；业务状态不随远端失败回滚。
         outbox.status = "processing"
         outbox.attempts += 1
         outbox.processing_started_at = now
+        outbox.claim_token = claim_token
         outbox.failure_category = None
         outbox.failure_code = None
-        return True
+        return claim_token
 
 
 def _finish_audit_mirror(
     session_factory: sessionmaker[Session],
     outbox_id: int,
+    claim_token: str,
     *,
     succeeded: bool,
     error: Exception | None = None,
 ) -> None:
     """以受控状态完成或重置审计镜像任务。
 
-    参数：session_factory 为数据库会话工厂；outbox_id 为镜像任务标识；succeeded 表示远端已确认；
-    error 为失败时仅用于记录异常类型。
+    参数：session_factory 为数据库会话工厂；outbox_id 为镜像任务标识；claim_token 为本次认领令牌；
+    succeeded 表示远端已确认；error 为失败时仅用于记录异常类型。
     返回值：无。
     异常：数据库更新错误向 Worker 传播。
-    副作用：仅更新镜像 Outbox 状态，绝不修改原业务对象。
+    副作用：仅在 ID、processing 状态和 claim token 同时匹配时更新镜像 Outbox，绝不修改原业务对象。
     """
     with session_factory.begin() as session:
-        outbox = session.get(AuditMirrorOutbox, outbox_id)
-        if outbox is None or outbox.status != "processing":
+        # 使用 claim token fencing，防止过期旧 Worker 覆盖新 Worker 的 processing 结果。
+        outbox = session.scalar(
+            select(AuditMirrorOutbox)
+            .where(
+                AuditMirrorOutbox.id == outbox_id,
+                AuditMirrorOutbox.status == "processing",
+                AuditMirrorOutbox.claim_token == claim_token,
+            )
+            .with_for_update()
+        )
+        if outbox is None:
             return
         outbox.status = "succeeded" if succeeded else "retrying"
         outbox.processing_started_at = None
+        outbox.claim_token = None
         if not succeeded and error is not None:
             # 只保存受控异常类型，不保存 errmsg、HTTP body 或 traceback。
             outbox.failure_category = "retryable"
@@ -162,7 +177,7 @@ def _finish_audit_mirror(
 
 @celery_app.task(name="workers.consume_audit_mirror_outbox")  # type: ignore[untyped-decorator]
 def consume_audit_mirror_outbox(outbox_id: int) -> str:
-    """消费一条审计镜像 Outbox，并以稳定镜像键避免重试重复写行。
+    """消费一条审计镜像 Outbox，并用 claim fencing 与稳定镜像键控制重试。
 
     参数：outbox_id 为审计镜像任务标识。
     返回值：succeeded、retrying 或 already_processing 等安全状态文本。
@@ -171,7 +186,8 @@ def consume_audit_mirror_outbox(outbox_id: int) -> str:
     """
     engine, factory = _session_factory()
     try:
-        if not _claim_audit_mirror_outbox(factory, outbox_id):
+        claim_token = _claim_audit_mirror_outbox(factory, outbox_id)
+        if claim_token is None:
             return "already_processing"
         with factory() as session:
             outbox = session.get(AuditMirrorOutbox, outbox_id)
@@ -184,21 +200,24 @@ def consume_audit_mirror_outbox(outbox_id: int) -> str:
             _finish_audit_mirror(
                 factory,
                 outbox_id,
+                claim_token,
                 succeeded=False,
                 error=ValueError("audit_event_missing"),
             )
             return "retrying"
         try:
-            # sink 先按 audit:<event_id> 查重，再创建；远端成功后本地 finalize 失败也可安全重试。
+            # 依靠服务端 claim fencing、稳定镜像键和写前远端查重，避免重试重复写行。
             SmartTableAuditSink(get_smart_table_audit_adapter()).mirror(event)
         except Exception as error:
-            _finish_audit_mirror(factory, outbox_id, succeeded=False, error=error)
+            _finish_audit_mirror(
+                factory, outbox_id, claim_token, succeeded=False, error=error
+            )
             logger.warning(
                 "audit_smart_table_mirror_retrying",
                 extra={"audit_mirror_outbox_id": outbox_id, "error_type": type(error).__name__},
             )
             return "retrying"
-        _finish_audit_mirror(factory, outbox_id, succeeded=True)
+        _finish_audit_mirror(factory, outbox_id, claim_token, succeeded=True)
         logger.info(
             "audit_smart_table_mirror_succeeded",
             extra={"audit_mirror_outbox_id": outbox_id},
