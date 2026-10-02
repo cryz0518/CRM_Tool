@@ -1367,3 +1367,54 @@ def test_query_record_decodes_json_stringified_member_and_multi_select_cells() -
 
     assert record.fields == {"负责人": "sales-1", "AI待确认": ["联系人"]}
     assert record.member_names == {"负责人": "测试销售"}
+
+
+def test_query_record_decodes_json_stringified_text_and_select_cells() -> None:
+    """验证查询把文本单元格编码成 JSON 字符串时会还原原文并核实选项文本。
+
+    参数：无。
+    返回值：无。
+    异常：断言失败时由 pytest 报告。
+    副作用：仅解析模拟的只读查询行，不访问外部服务。
+    """
+    schema = SmartTableSchema(
+        fields=(
+            SmartTableField("name", "线索名称", SmartTableFieldType.TEXT),
+            SmartTableField(
+                "international",
+                "是否为国际客户",
+                SmartTableFieldType.SINGLE_SELECT,
+            ),
+        )
+    )
+    row = {
+        "RECORD_ID": "record-1",
+        "线索名称": json.dumps("测试公司", ensure_ascii=False),
+        "是否为国际客户": json.dumps([{"id": "domestic-id", "text": "国内"}], ensure_ascii=False),
+    }
+
+    record = _adapter(FakeCli([]))._parse_query_record(row, schema)
+
+    assert record.fields == {"线索名称": "测试公司", "是否为国际客户": "国内"}
+
+
+def test_query_record_normalizes_sql_member_shape() -> None:
+    """验证 SQL 查询返回的人员对象形状可归一化为成员标识和展示名。
+
+    参数：无。
+    返回值：无。
+    异常：断言失败时由 pytest 报告。
+    副作用：仅解析模拟的只读查询行，不访问企业微信。
+    """
+    schema = SmartTableSchema(
+        fields=(SmartTableField("owner", "负责人", SmartTableFieldType.MEMBER),)
+    )
+    row = {
+        "RECORD_ID": "record-1",
+        "负责人": [{"id": "member-1", "name": "测试销售", "corp_name": "测试企业"}],
+    }
+
+    record = _adapter(FakeCli([]))._parse_query_record(row, schema)
+
+    assert record.fields == {"负责人": "member-1"}
+    assert record.member_names == {"负责人": "测试销售"}

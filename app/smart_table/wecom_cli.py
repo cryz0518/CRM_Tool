@@ -536,6 +536,25 @@ class WecomCliSmartTableAdapter:
                 except json.JSONDecodeError:
                     # 部分 CLI 响应直接返回单元格文本，保留给下方字段类型解析。
                     pass
+            elif isinstance(raw, str) and field.field_type in {
+                SmartTableFieldType.TEXT,
+                SmartTableFieldType.LONG_TEXT,
+            }:
+                # 当前 records query 会再次包装部分纯文本；只还原字符串或可读文本片段。
+                try:
+                    decoded = json.loads(raw)
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    if isinstance(decoded, str) or (
+                        isinstance(decoded, list)
+                        and all(
+                            isinstance(item, str)
+                            or (isinstance(item, Mapping) and isinstance(item.get("text"), str))
+                            for item in decoded
+                        )
+                    ):
+                        raw = decoded
             if field.field_type is SmartTableFieldType.MEMBER and raw in (None, []):
                 # 查询接口对未设置成员字段返回 null/空列表；不应让无关字段阻断整行读取。
                 normalized[canonical_name] = None
@@ -1127,7 +1146,7 @@ class WecomCliSmartTableAdapter:
             return None
         if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], Mapping):
             return None
-        name = value[0].get("userName")
+        name = value[0].get("userName", value[0].get("name"))
         if not isinstance(name, str):
             return None
         normalized = name.strip()
@@ -1146,14 +1165,18 @@ class WecomCliSmartTableAdapter:
         """
         if field is not None and field.field_type is SmartTableFieldType.MEMBER:
             # 创建人和负责人属于权限关键字段，业务层只接受唯一且可审计的销售身份。
+            member = value[0] if isinstance(value, list) and len(value) == 1 else None
+            member_id = (
+                member.get("userId", member.get("id"))
+                if isinstance(member, Mapping)
+                else None
+            )
             if (
-                not isinstance(value, list)
-                or len(value) != 1
-                or not isinstance(value[0], Mapping)
-                or not isinstance(value[0].get("userId"), str)
+                not isinstance(member_id, str)
+                or not member_id
             ):
                 raise WecomCliProtocolError("MEMBER 字段返回值不符合单成员 CLI 契约")
-            return value[0]["userId"]
+            return member_id
         if field is not None and field.field_type is SmartTableFieldType.MULTI_SELECT:
             # wecom-cli 对未填多选有时返回空字符串；它与 null/空数组同义，不能误报协议损坏。
             if value is None or value == "":
