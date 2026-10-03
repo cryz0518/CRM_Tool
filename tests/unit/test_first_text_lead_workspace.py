@@ -15,7 +15,7 @@ from app.ai.gateway import AIGateway
 from app.ai.provider import LLMProviderError, MockLLMProvider
 from app.companies.models import CompanyUpsertCommand, QCCCandidate, QCCLookupResult
 from app.companies.service import CompanyLeadService, MockQCCAdapter, MockTYCAdapter
-from app.core.failures import PermanentTaskFailure, RetryableTaskFailure
+from app.core.failures import RetryableTaskFailure
 from app.leads.models import (
     Lead,
     LeadFieldProvenance,
@@ -779,13 +779,15 @@ def test_ai_review_transport_failure_retries_same_patch_before_leaving_partial_r
     original_update = adapter.update_record
     failed_once = True
 
-    def update_with_one_transient_failure(record_id: str, fields: dict[str, object]):
+    def update_with_one_transient_failure(
+        record_id: str, fields: dict[str, object], **kwargs: object
+    ):
         """让首次补丁写入失败一次，随后执行真实 Mock 增量更新。"""
         nonlocal failed_once
         if failed_once:
             failed_once = False
             raise RetryableTaskFailure("temporary smart table process failure")
-        return original_update(record_id, fields)
+        return original_update(record_id, fields, **kwargs)
 
     with patch.object(adapter, "update_record", side_effect=update_with_one_transient_failure):
         result = FirstTextLeadWorkspaceService(
@@ -802,6 +804,7 @@ def test_ai_review_transport_failure_retries_same_patch_before_leaving_partial_r
     assert record.fields["工艺"] == "装配"
     assert record.fields["创建人"] == "sales-1"
     assert record.fields["负责人"] == "sales-1"
+    assert len(adapter.get_records()) == 1
 
 
 def test_ai_create_verification_failure_persists_acknowledged_record_id_and_never_readds(
@@ -1426,14 +1429,14 @@ def test_new_lead_context_is_pinned_before_smart_table_failure_and_follow_up_use
         text="公司B的董经理，电缆表面绝缘层瑕疵视觉检测",
     )
 
-    def fail_schema(*_args: object) -> object:
-        """模拟远端结构读取永久失败，避免触发真实 Smart Table。"""
-        raise PermanentTaskFailure("schema read failed")
+    def fail_update(*_args: object, **_kwargs: object) -> object:
+        """模拟创建后的远端写后核验失败，验证字段补写任务仍可恢复。"""
+        record_id = str(_args[0]) if _args else None
+        raise SmartTableWriteVerificationError(
+            ("线索名称",), remote_record_id=record_id
+        )
 
-    with (
-        patch.object(adapter, "get_schema", side_effect=fail_schema),
-        patch.object(adapter, "get_record", side_effect=fail_schema),
-    ):
+    with patch.object(adapter, "update_record", side_effect=fail_update):
         second = service.consume(second_event_id)
 
     assert second.status is LeadProcessingStatus.SYNC_FAILED
@@ -1442,6 +1445,9 @@ def test_new_lead_context_is_pinned_before_smart_table_failure_and_follow_up_use
     with session_factory() as session:
         context_after_failure = session.get(SalesLeadContext, "sales-1")
         second_event = session.get(OutboxEvent, second_event_id)
+        second_sync = session.scalar(
+            select(SmartTableSync).where(SmartTableSync.lead_id == second.lead_id)
+        )
         second_resolution = session.scalar(
             select(LeadMessageResolution).where(
                 LeadMessageResolution.message_id == "message-context-pin-b"
@@ -1449,7 +1455,10 @@ def test_new_lead_context_is_pinned_before_smart_table_failure_and_follow_up_use
         )
     assert context_after_failure is not None
     assert context_after_failure.lead_id == second.lead_id
-    assert second_event is not None and second_event.status == "failed_pending_review"
+    assert second_event is not None and second_event.status == "retrying"
+    assert second_sync is not None
+    assert second_sync.status == "retrying"
+    assert second_sync.error_summary == "field_patch_pending"
     assert second_resolution is not None and second_resolution.lead_id == second.lead_id
     assert second_resolution.status == "processing"
 
@@ -1459,26 +1468,15 @@ def test_new_lead_context_is_pinned_before_smart_table_failure_and_follow_up_use
         sales_user_id="sales-1",
         text="预算38万，项目预计今年底",
     )
-    with (
-        patch.object(adapter, "get_schema", side_effect=fail_schema),
-        patch.object(adapter, "get_record", side_effect=fail_schema),
-    ):
-        third = service.consume(third_event_id)
+    third = service.consume(third_event_id)
 
-    assert third.status is LeadProcessingStatus.SYNC_FAILED
-    assert third.lead_id == second.lead_id
+    assert third.status is LeadProcessingStatus.WAITING_FOR_PREVIOUS
     with session_factory() as session:
-        third_resolution = session.scalar(
-            select(LeadMessageResolution).where(
-                LeadMessageResolution.message_id == "message-context-pin-c"
-            )
-        )
         final_context = session.get(SalesLeadContext, "sales-1")
         assert session.query(Lead).count() == 2
-    assert third_resolution is not None and third_resolution.lead_id == second.lead_id
     assert final_context is not None
     assert final_context.lead_id == second.lead_id
-    assert final_context.last_message_sequence == 3
+    assert final_context.last_message_sequence == 2
 
 
 def test_free_form_company_contact_phone_message_is_not_unassigned(

@@ -347,17 +347,25 @@ class WecomCliSmartTableAdapter:
             record_id, fields_to_verify, schema, operation="create"
         )
 
-    def update_record(self, record_id: str, fields: Mapping[str, object]) -> SmartTableRecord:
+    def update_record(
+        self,
+        record_id: str,
+        fields: Mapping[str, object],
+        *,
+        skip_preflight: bool = False,
+    ) -> SmartTableRecord:
         """更新指定记录并在返回成功前远端回读核实每个补丁字段。
 
-        参数：record_id 为目标记录标识；fields 只包含本次变更的字段和值。
+        参数：record_id 为目标记录标识；fields 只包含本次变更的字段和值；skip_preflight 表示刚创建的
+        记录已有可信快照，可跳过写入前读取。
         返回：远端回读且逐字段匹配后的记录快照。
         异常：记录不存在、CLI 写入失败或有限核实窗口后仍有字段不匹配时抛出异常。
         副作用：只修改目标记录的传入字段，并在 ACK 后执行有上限的只读回查。
         """
-        current_record = self.get_record(record_id)
-        if current_record is None:
-            raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
+        if not skip_preflight:
+            current_record = self.get_record(record_id)
+            if current_record is None:
+                raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
 
         schema = self.get_schema()
         cli_fields = self._to_cli_fields(fields, schema)

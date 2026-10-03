@@ -1534,6 +1534,45 @@ def test_update_declares_field_title_key_type() -> None:
     assert payload["key_type"] == "CELL_VALUE_KEY_TYPE_FIELD_TITLE"
 
 
+def test_update_after_create_skips_preflight_read_and_keeps_remote_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证新建记录补写不会被首次预读限流阻断，写后仍执行远端核验。"""
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {"errcode": 0, "records": [{"record_id": "record-1", "values": {"备注": "新值"}}]},
+            {
+                "errcode": 0,
+                "values": [
+                    {
+                        "rows": [
+                            {
+                                "RECORD_ID": "record-1",
+                                "备注": "新值",
+                                "创建人": [{"userId": "sales-1"}],
+                                "负责人": [{"userId": "sales-1"}],
+                            }
+                        ]
+                    }
+                ],
+            },
+        ]
+    )
+    adapter = _adapter(fake_cli, sheet_title="CRM线索")
+    monkeypatch.setattr(
+        adapter,
+        "get_record",
+        lambda _record_id: (_ for _ in ()).throw(AssertionError("unexpected pre-read")),
+    )
+
+    record = adapter.update_record("record-1", {"备注": "新值"}, skip_preflight=True)
+
+    assert record.fields["备注"] == "新值"
+    assert len(fake_cli.calls) == 3
+    assert sum(arguments[2:4] == ("records", "query") for arguments in fake_cli.calls) == 1
+
+
 def test_update_ack_requires_matching_remote_readback() -> None:
     """验证 update ACK 后的远端 uncached 回读才是字段写入成功证据。
 

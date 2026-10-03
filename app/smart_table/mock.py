@@ -130,15 +130,23 @@ class MockSmartTableAdapter:
         self._records[record_id] = record
         return record
 
-    def update_record(self, record_id: str, fields: Mapping[str, object]) -> SmartTableRecord:
+    def update_record(
+        self,
+        record_id: str,
+        fields: Mapping[str, object],
+        *,
+        skip_preflight: bool = False,
+    ) -> SmartTableRecord:
         """合并字段补丁到原记录，仅修改本轮明确提供的字段。
 
-        参数：record_id 为目标记录标识；fields 为本轮增量字段补丁。
+        参数：record_id 为目标记录标识；fields 为本轮增量字段补丁；skip_preflight 表示调用方已持有
+        创建响应，可跳过写入前读取。
         返回：更新后的不可变记录快照。
         异常：记录不存在时抛出 SmartTableRecordNotFoundError。
         副作用：替换内存记录集中的目标记录快照。
         """
-        record = self.get_record(record_id)
+        # 新建后补写直接使用内存索引，模拟已持有创建响应且不触发一次多余预读。
+        record = self._records.get(record_id) if skip_preflight else self.get_record(record_id)
         if record is None:
             raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
 

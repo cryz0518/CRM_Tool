@@ -47,6 +47,7 @@ from app.smart_table.adapter import (
     SmartTableAdapter,
     SmartTableRecordNotFoundError,
 )
+from app.smart_table.models import SmartTableRecord
 from app.smart_table.registry import DEFAULT_SMART_TABLE_FIELD_VALUES, PROCESS_OPTIONS
 
 logger = logging.getLogger(__name__)
@@ -1899,14 +1900,22 @@ class FirstTextLeadWorkspaceService:
             self._pin_message_lead_before_external_sync(
                 session, event, message, request.lead_id
             )
-        record_id = self._ensure_ai_review_record(request)
+        record_id, initial_record, preserve_record = self._ensure_ai_review_record(request)
         if record_id is None:
             return LeadProcessingResult(LeadProcessingStatus.SYNC_FAILED, lead_id=request.lead_id)
         try:
             # T09 负责人工编辑保护、中置信度 AI待确认与增量写入；不得由本层直接写模型字段。
-            self._sync_ai_review_patch(request)
+            self._sync_ai_review_patch(
+                request,
+                initial_record=initial_record,
+                allow_recreate=not preserve_record,
+            )
         except Exception as error:
-            self._record_ai_review_sync_failure(request, error)
+            self._record_ai_review_sync_failure(
+                request,
+                error,
+                field_patch_pending=preserve_record,
+            )
             return LeadProcessingResult(LeadProcessingStatus.SYNC_FAILED, lead_id=request.lead_id)
 
         with self._session_factory.begin() as session:
@@ -1936,10 +1945,13 @@ class FirstTextLeadWorkspaceService:
         *,
         protected_supplement: bool = False,
         acknowledged_but_unverified_fields: tuple[str, ...] = (),
+        initial_record: SmartTableRecord | None = None,
+        allow_recreate: bool = True,
     ) -> ReviewSyncResult:
         """以同一份已校验补丁完成一次有限的表格恢复与重试。
 
-        参数：request 为已持久化来源消息、目标线索和 T08 补丁。
+        参数：request 为已持久化来源消息、目标线索和 T08 补丁；initial_record 为刚创建的远端快照；
+        allow_recreate 表示远端明确缺失时是否允许恢复创建。
         返回值：T09 实际写入和保护字段结果。
         异常：普通流程远端记录缺失时最多重建一次；受保护历史补充遇到远端行缺失时直接失败；
         暂态适配器失败时最多重试一次，其他异常由调用方记录失败事实。
@@ -1959,11 +1971,12 @@ class FirstTextLeadWorkspaceService:
                     request.patch,
                     protected_supplement=protected_supplement,
                     acknowledged_but_unverified_fields=acknowledged_but_unverified_fields,
+                    initial_record=initial_record,
                 )
             except SmartTableRecordNotFoundError:
                 if recovered_missing_record:
                     raise
-                if protected_supplement:
+                if protected_supplement or not allow_recreate:
                     # 历史消息恢复只能补同一行，远端行缺失时不得 delete/recreate。
                     raise
                 # 本地仍有完整后台事实时，只对已确认远端不存在的行重建一次，再复用同一补丁。
@@ -2022,10 +2035,17 @@ class FirstTextLeadWorkspaceService:
             )
         logger.warning("smart_table_record_recreated_after_missing")
 
-    def _record_ai_review_sync_failure(self, request: AIReviewRequest, error: Exception) -> None:
+    def _record_ai_review_sync_failure(
+        self,
+        request: AIReviewRequest,
+        error: Exception,
+        *,
+        field_patch_pending: bool = False,
+    ) -> None:
         """记录 T09 失败并按异常类别决定重试或人工检查点。
 
-        参数：request 为当前审核请求；error 为最终一次同步异常。
+        参数：request 为当前审核请求；error 为最终一次同步异常；
+        field_patch_pending 表示远端行已绑定、仅待补写业务字段，必须保留为可恢复任务。
         返回值：无。
         异常：数据库写入失败时向调用方传播。
         副作用：更新 Outbox、智能表格同步状态和业务审计，不伪造成功。
@@ -2049,19 +2069,27 @@ class FirstTextLeadWorkspaceService:
                 retrying_event_type="ai_review_sync_retrying",
                 failed_event_type="ai_review_sync_failed_pending_review",
                 error=error,
+                force_retrying=field_patch_pending,
+                retry_reason="field_patch_pending" if field_patch_pending else None,
             )
             if sync is not None and (
                 request.creates_lead or isinstance(remote_record_id, str)
             ):
-                sync.status = "failed_pending_review" if failed_pending_review else "retrying"
-                sync.error_summary = type(error).__name__
+                sync.status = "retrying" if field_patch_pending else (
+                    "failed_pending_review" if failed_pending_review else "retrying"
+                )
+                sync.error_summary = (
+                    "field_patch_pending" if field_patch_pending else type(error).__name__
+                )
         logger.exception("ai_review_sync_failed", extra={"error_type": type(error).__name__})
 
-    def _ensure_ai_review_record(self, request: AIReviewRequest) -> str | None:
+    def _ensure_ai_review_record(
+        self, request: AIReviewRequest
+    ) -> tuple[str | None, SmartTableRecord | None, bool]:
         """为新 AI 草稿建立最小审核记录，避免模型字段绕过 T09 直接写入。
 
         参数：request 为目标 Lead、真实销售身份和待审核字段补丁。
-        返回值：可供 T09 重读的表格记录标识；创建失败时返回 None。
+        返回值：记录标识、刚创建的记录快照和是否必须保留该记录不重建；创建失败时记录标识为 None。
         异常：数据库事实缺失时抛出 ValueError。
         副作用：首次新建记录并保存可审计的表格定位信息。
         """
@@ -2070,7 +2098,14 @@ class FirstTextLeadWorkspaceService:
             if lead is None:
                 raise ValueError(f"AI 审核线索不存在：{request.lead_id}")
             if lead.smart_table_record_id is not None:
-                return lead.smart_table_record_id
+                sync = session.scalar(
+                    select(SmartTableSync).where(SmartTableSync.lead_id == request.lead_id)
+                )
+                return (
+                    lead.smart_table_record_id,
+                    None,
+                    sync is not None and sync.error_summary == "field_patch_pending",
+                )
         try:
             # 创建人和负责人只使用接入层已授权的销售身份，模型无法影响权限关键字段。
             record = self._smart_table_adapter.create_record(
@@ -2084,7 +2119,7 @@ class FirstTextLeadWorkspaceService:
             )
         except Exception as error:
             self._mark_ai_review_failed(request, error)
-            return None
+            return None, None, False
 
         with self._session_factory.begin() as session:
             lead = session.get(Lead, request.lead_id)
@@ -2096,7 +2131,8 @@ class FirstTextLeadWorkspaceService:
             lead.smart_table_record_id = record.record_id
             sync.smart_table_record_id = record.record_id
             sync.status = "processing"
-        return record.record_id
+        # 创建响应已确认远端行存在；后续字段补写必须复用同一行，不能因预读失败重建。
+        return record.record_id, record, True
 
     @staticmethod
     def _record_lead_processing_failed_notice(session: Session, message: IncomingMessage) -> None:
@@ -3185,10 +3221,13 @@ class FirstTextLeadWorkspaceService:
         retrying_event_type: str,
         failed_event_type: str,
         error: BaseException | None = None,
+        force_retrying: bool = False,
+        retry_reason: str | None = None,
     ) -> bool:
         """记录一次外部同步失败，并在重试耗尽时将其变为顺序检查点。
 
-        参数：session 为当前事务；event 为失败来源事件；两个 event_type 分别记录可重试和耗尽结论。
+        参数：session 为当前事务；event 为失败来源事件；两个 event_type 分别记录可重试和耗尽结论；
+        force_retrying 表示已绑定的字段补写不得收敛为人工检查点；retry_reason 为安全原因码。
         返回值：本次失败是否使事件进入 failed_pending_review。
         异常：数据库写入失败时由 SQLAlchemy 抛出。
         副作用：增加尝试次数，更新任务状态并写入对应业务审计事件。
@@ -3200,13 +3239,22 @@ class FirstTextLeadWorkspaceService:
             failure_details = self._failure_audit_details(error)
             failure_category = str(failure_details["failure_category"])
             failure_code = str(failure_details["failure_code"])
+            if force_retrying:
+                # 已绑定远端记录的字段补写不能丢失；即使本轮预算耗尽也保留可恢复任务。
+                failure_category = "transient"
+                failure_code = retry_reason or failure_code
             event.failure_category = failure_category
-            event.failure_summary = safe_failure_summary(error)
+            event.failure_summary = retry_reason or safe_failure_summary(error)
         audit_details: dict[str, object] | None = (
             {"failure_category": failure_category, "failure_code": failure_code}
             if failure_category is not None and failure_code is not None
             else None
         )
+        if force_retrying:
+            event.status = "retrying"
+            self._record_audit(session, event, retrying_event_type, details=audit_details)
+            logger.warning("lead_outbox_retrying", extra={"reason_code": retry_reason})
+            return False
         if failure_category is not None and failure_category != "transient":
             # 永久或未知失败不重复调用确定性失败的外部接口，直接成为可人工处理的检查点。
             event.status = "failed_pending_review"
