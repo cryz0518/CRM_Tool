@@ -70,6 +70,30 @@ class WecomCliSmartTableAdapterError(RuntimeError):
 class WecomCliTransportError(WecomCliSmartTableAdapterError, RetryableTaskFailure):
     """表示 wecom-cli 网络或进程传输失败，可安全重试同一请求。"""
 
+    @property
+    def error_code(self) -> str | None:
+        """暴露底层受控错误分类，供上层审计保留安全诊断。"""
+        value = getattr(self.__cause__, "error_code", None)
+        return value if isinstance(value, str) else None
+
+    @property
+    def external_error_code(self) -> int | None:
+        """暴露底层远端数字错误码，不传播远端正文。"""
+        value = getattr(self.__cause__, "external_error_code", None)
+        return value if type(value) is int else None
+
+    @property
+    def external_error_type(self) -> str | None:
+        """暴露底层白名单错误类型，供结构化日志和审计使用。"""
+        value = getattr(self.__cause__, "external_error_type", None)
+        return value if isinstance(value, str) else None
+
+    @property
+    def http_status(self) -> int | None:
+        """暴露底层 HTTP 状态码，供安全重试诊断使用。"""
+        value = getattr(self.__cause__, "http_status", None)
+        return value if type(value) is int else None
+
 
 class WecomCliProtocolError(WecomCliSmartTableAdapterError, PermanentTaskFailure):
     """表示 wecom-cli 返回结构、参数或权限业务失败，不应自动重试。"""
@@ -127,7 +151,7 @@ class WecomCliProcessError(WecomCliProtocolError):
     @property
     def retryable(self) -> bool:
         """仅允许明确网络、超时或可重试 HTTP 状态触发幂等重试。"""
-        return self.error_code in {"network_error", "timeout"} or (
+        return self.error_code in {"network_error", "timeout", "rate_limited"} or (
             self.error_code == "http_error"
             and self.http_status is not None
             and (self.http_status in {408, 425, 429} or self.http_status >= 500)
@@ -613,19 +637,19 @@ class WecomCliSmartTableAdapter:
                 if attempt == self._retry_count:
                     raise WecomCliTransportError("wecom-cli 查询进程调用失败") from error
                 self._log_retry("records", "query", attempt, error.error_code)
-                time.sleep(0.2 * (attempt + 1))
+                time.sleep(self._retry_delay_seconds(error.error_code, attempt))
                 continue
             except (OSError, subprocess.TimeoutExpired) as error:
                 if attempt == self._retry_count:
                     raise WecomCliTransportError("wecom-cli 查询调用失败") from error
                 self._log_retry("records", "query", attempt, type(error).__name__)
-                time.sleep(0.2 * (attempt + 1))
+                time.sleep(self._retry_delay_seconds(type(error).__name__, attempt))
                 continue
             if self._is_transient_network_error(response):
                 if attempt == self._retry_count:
                     raise WecomCliTransportError("wecom-cli 查询网络调用失败")
                 self._log_retry("records", "query", attempt, "NetworkError")
-                time.sleep(0.2 * (attempt + 1))
+                time.sleep(self._retry_delay_seconds("network_error", attempt))
                 continue
             self._raise_for_error(response)
             return response
@@ -761,18 +785,25 @@ class WecomCliSmartTableAdapter:
             except WecomCliProcessError as error:
                 # records list/update 是幂等操作，进程异常可以安全重放；records add
                 # 可能已经在服务端成功，不能因客户端退出异常再次创建重复记录。
-                if action == "add" and error.retryable:
-                    raise WecomCliProtocolError(
-                        "wecom-cli 新增结果无法确认，禁止自动重放"
-                    ) from None
-                if action == "add" or not error.retryable:
+                safe_rate_limit_replay = (
+                    action == "add"
+                    and error.error_code == "rate_limited"
+                    and error.external_error_code == 850005
+                )
+                if action == "add" and not safe_rate_limit_replay:
+                    if error.retryable:
+                        raise WecomCliProtocolError(
+                            "wecom-cli 新增结果无法确认，禁止自动重放"
+                        ) from None
+                    raise
+                if not error.retryable:
                     raise
                 if attempt == self._retry_count:
                     raise WecomCliTransportError(
                         f"wecom-cli 进程调用失败：{error.error_code}"
                     ) from error
                 self._log_retry(resource, action, attempt, error.error_code)
-                time.sleep(0.2 * (attempt + 1))
+                time.sleep(self._retry_delay_seconds(error.error_code, attempt))
                 continue
             except (OSError, subprocess.TimeoutExpired) as error:
                 if action == "add":
@@ -784,7 +815,7 @@ class WecomCliSmartTableAdapter:
                     # 最后一次仍失败时隐藏底层请求和响应，避免异常泄露表格数据。
                     raise WecomCliTransportError("wecom-cli 调用失败") from error
                 self._log_retry(resource, action, attempt, type(error).__name__)
-                time.sleep(0.2 * (attempt + 1))
+                time.sleep(self._retry_delay_seconds(type(error).__name__, attempt))
                 continue
 
             if self._is_transient_network_error(response):
@@ -797,13 +828,26 @@ class WecomCliSmartTableAdapter:
                 if attempt == self._retry_count:
                     raise WecomCliTransportError("wecom-cli 网络调用失败")
                 self._log_retry(resource, action, attempt, "NetworkError")
-                time.sleep(0.2 * (attempt + 1))
+                time.sleep(self._retry_delay_seconds("network_error", attempt))
                 continue
             # 非暂态响应先做统一错误码校验，再交给具体解析器处理结构。
             self._raise_for_error(response)
             return response
 
         raise AssertionError("已覆盖全部 CLI 重试分支")
+
+    @staticmethod
+    def _retry_delay_seconds(error_code: str, attempt: int) -> float:
+        """计算有限重试退避，避免限流错误继续以短间隔冲击远端。
+
+        参数：error_code 为安全内部错误分类；attempt 为从零开始的重试序号。
+        返回值：限流使用 1、2、4 秒并封顶 8 秒，普通暂态保持原短退避。
+        异常：无。
+        副作用：无，不等待也不访问外部服务。
+        """
+        if error_code == "rate_limited":
+            return float(min(8, 2**attempt))
+        return 0.2 * (attempt + 1)
 
     def _run_subprocess(self, arguments: Sequence[str]) -> Mapping[str, object]:
         """运行 wecom-cli 并把 JSON 标准输出转换为映射。
@@ -961,6 +1005,7 @@ class WecomCliSmartTableAdapter:
     ) -> str:
         """把已筛选的 CLI 错误码映射为有限内部类别。"""
         code_categories = {
+            850005: "rate_limited",
             851003: "permission_denied",
             853004: "authentication",
             893003: "local_io_error",
