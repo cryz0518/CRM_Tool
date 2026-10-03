@@ -1302,7 +1302,13 @@ class FirstTextLeadWorkspaceService:
                 else:
                     multi_request = None
                 extracted_patch = extractor.extract_patch(message.normalized_text)
-                # 强身份优先于当前上下文，避免销售补充历史客户时把字段串到最近客户。
+                leading_company_hint = extractor.extract_leading_company_hint(
+                    message.normalized_text
+                )
+                explicit_new_lead_signal = self._has_explicit_new_lead_signal(
+                    message.normalized_text
+                )
+                # 明确公司身份可以切换客户；无公司名时先尊重当前会话，再回溯历史联系方式。
                 strong_identity_match = False
                 if smart_table_recovery_sync is not None:
                     # T09 失败重试必须回到原 Lead，随后复用同一来源消息重新取得 AI 补丁。
@@ -1310,25 +1316,66 @@ class FirstTextLeadWorkspaceService:
                 elif multi_request is not None or multi_company_fields is not None:
                     context_lead = None
                 else:
-                    leading_company_hint = extractor.extract_leading_company_hint(
-                        message.normalized_text
-                    )
-                    identity_fields = extracted_patch
-                    if leading_company_hint and "线索名称" not in identity_fields:
-                        # 无标签自由文本仍先按明确首段公司身份查找，禁止共享手机号或当前上下文串线。
-                        identity_fields = {"线索名称": leading_company_hint}
-                    context_lead = self._get_strong_identity_lead(session, message, identity_fields)
-                    strong_identity_match = context_lead is not None
-                leading_company_hint = (
-                    extractor.extract_leading_company_hint(message.normalized_text)
-                    if multi_request is None and multi_company_fields is None
-                    else None
-                )
+                    incoming_company_name = str(
+                        extracted_patch.get("线索名称") or leading_company_hint or ""
+                    ).strip()
+                    if incoming_company_name:
+                        # 公司身份只按公司名精确查找，不能被同一消息中的联系方式劫持。
+                        context_lead = self._get_strong_identity_lead(
+                            session, message, {"线索名称": incoming_company_name}
+                        )
+                        strong_identity_match = context_lead is not None
+                    elif not explicit_new_lead_signal:
+                        active_context = self._get_active_context_lead(session, message)
+                        if active_context is not None:
+                            context_lead = active_context
+                            self._record_audit(
+                                session,
+                                event,
+                                "lead_context_continuation_selected",
+                                {
+                                    "lead_id": active_context.id,
+                                    "reason": "active_context_without_company",
+                                },
+                            )
+                            contact_fields = {
+                                field_name: value
+                                for field_name, value in extracted_patch.items()
+                                if field_name in {"联系人", "手机", "电话", "邮箱"}
+                            }
+                            historical_match = self._get_strong_identity_lead(
+                                session, message, contact_fields
+                            ) if contact_fields else None
+                            if (
+                                historical_match is not None
+                                and historical_match.id != active_context.id
+                            ):
+                                self._record_audit(
+                                    session,
+                                    event,
+                                    "historical_contact_match_ignored_for_active_context",
+                                    {"lead_id": active_context.id},
+                                )
+                        else:
+                            # 没有有效会话时，联系方式才允许回溯历史线索。
+                            contact_fields = {
+                                field_name: value
+                                for field_name, value in extracted_patch.items()
+                                if field_name in {"联系人", "手机", "电话", "邮箱"}
+                            }
+                            context_lead = self._get_strong_identity_lead(
+                                session, message, contact_fields
+                            ) if contact_fields else None
+                            strong_identity_match = context_lead is not None
+                    else:
+                        # 显式新客户但没有公司身份时，不能静默跳转到历史联系方式命中的线索。
+                        context_lead = None
                 if (
                     context_lead is None
                     and multi_request is None
                     and multi_company_fields is None
                     and leading_company_hint is None
+                    and not explicit_new_lead_signal
                 ):
                     active_context = self._get_active_context_lead(session, message)
                     # 无公司名时沿用当前上下文；有公司名时只允许补全尚未入表的 temporary 草稿，
@@ -1514,6 +1561,10 @@ class FirstTextLeadWorkspaceService:
                     and ai_review is None
                     and company_initial_command is None
                 ):
+                    if explicit_new_lead_signal and not extracted_patch.get("线索名称"):
+                        # 明确切换客户但没有公司身份时，联系方式不足以安全创建或定位线索。
+                        self._mark_unassigned(session, event)
+                        return LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
                     existing_lead = session.scalar(
                         select(Lead).where(Lead.source_message_id == message.message_id)
                     )
@@ -1695,26 +1746,19 @@ class FirstTextLeadWorkspaceService:
             for field_name, value in fields.items()
             if field_name in {"线索名称", "手机", "电话", "邮箱"} and value
         }
+        contact_identity_fields = {
+            field_name: value
+            for field_name, value in ai_identity_fields.items()
+            if field_name != "线索名称" and isinstance(value, str)
+        }
         strong_identity_lead = None
-        if ai_identity_fields:
-            # 自由文本的强身份字段只有 T08 才能提取；它们优先于过期或不相关的当前销售会话。
-            strong_identity_lead = self._get_strong_identity_lead(
-                session, message, ai_identity_fields
-            )
-        if strong_identity_lead is not None:
-            # 唯一命中当前销售历史线索时，强身份仍然优先于当前上下文。
-            context_lead = strong_identity_lead
-        elif (
+        if media_context_continuation or (
             active_context_lead is not None
             and not explicit_new_lead_signal
-            and (
-                weak_context_fragment
-                or media_context_continuation
-                or (not incoming_company_name and patch.analysis.intent == "UPDATE_LEAD")
-            )
+            and not incoming_company_name
         ):
-            # 名片/OCR 等新身份候选未命中旧表格时，以 AI 关系判断、媒体连续性或
-            # 弱片段规则保留当前客户。
+            # 名片/OCR 或普通无公司名补充优先沿用当前客户，联系方式不再抢占路由。
+            assert active_context_lead is not None
             context_lead = active_context_lead
             use_active_context = True
             if weak_context_fragment:
@@ -1726,8 +1770,32 @@ class FirstTextLeadWorkspaceService:
                 logger.info("ai_context_continuation_selected", extra={"reason": "media_message"})
             else:
                 logger.info("ai_context_continuation_selected", extra={"reason": "ai_update"})
+            if contact_identity_fields:
+                historical_match = self._get_strong_identity_lead(
+                    session, message, contact_identity_fields
+                )
+                if historical_match is not None and historical_match.id != active_context_lead.id:
+                    self._record_audit(
+                        session,
+                        event,
+                        "historical_contact_match_ignored_for_active_context",
+                        {"lead_id": active_context_lead.id},
+                    )
+        elif incoming_company_name:
+            # 普通文本明确公司身份时，联系方式不能改变公司身份的精确匹配结果。
+            strong_identity_lead = self._get_strong_identity_lead(
+                session, message, {"线索名称": incoming_company_name}
+            )
+            context_lead = strong_identity_lead
+        elif not explicit_new_lead_signal and contact_identity_fields:
+            # 没有有效上下文时，联系方式才允许回溯当前销售历史线索。
+            strong_identity_lead = self._get_strong_identity_lead(
+                session, message, contact_identity_fields
+            )
+            if strong_identity_lead is not None:
+                context_lead = strong_identity_lead
         elif ai_identity_fields:
-            # 有明确 AI 身份且没有可靠历史命中时，继续按新线索处理，避免把不同客户串入当前线索。
+            # 有明确 AI 身份且没有可靠历史命中时，继续按新线索处理，避免串入旧客户。
             if (
                 active_context_lead is not None
                 and incoming_company_name
@@ -1742,6 +1810,9 @@ class FirstTextLeadWorkspaceService:
                     "ai_company_identity_overrode_active_context",
                     {"active_context_present": True, "new_company_identity_present": True},
                 )
+            context_lead = None
+        else:
+            # 显式新客户但没有可核验公司身份时，不继承旧客户上下文。
             context_lead = None
         # 弱片段可能在上一步移除了模型伪造的身份字段，后续逻辑必须使用清理后的补丁。
         fields = patch.fields
@@ -2307,25 +2378,40 @@ class FirstTextLeadWorkspaceService:
         }
 
     @staticmethod
-    def _has_explicit_identity_evidence(text: str | None) -> bool:
-        """判断弱片段中是否仍存在足以支持新线索的明确身份证据。
+    def _has_explicit_company_identity_evidence(text: str | None) -> bool:
+        """判断文本中是否存在足以支持新线索的明确公司身份证据。
 
         参数：text 为当前消息标准化文本。
-        返回值：出现公司标签、企业名称后缀、手机号或邮箱时返回 True。
+        返回值：出现公司标签或企业名称后缀时返回 True。
         异常：无。
         副作用：无；仅进行本地正则判断。
         """
         if not text:
             return False
-        # 仅将可直接定位客户主体或联系方式的表达视为强身份，不把金额和数量当作公司名。
         return bool(
             re.search(r"(?:客户|公司|企业)\s*[:：]", text)
             or re.search(r"(?:有限公司|有限责任公司|集团)", text)
-            or re.search(r"(?<!\d)(?:\+?86[ -]?)?1[3-9]\d{9}(?!\d)", text)
+        )
+
+    @staticmethod
+    def _has_explicit_contact_evidence(text: str | None) -> bool:
+        """判断文本中是否出现手机号或邮箱等联系方式证据。
+
+        参数：text 为当前消息标准化文本。
+        返回值：出现手机号或邮箱时返回 True。
+        异常：无。
+        副作用：无；仅进行本地正则判断。
+        """
+        if not text:
+            return False
+        return bool(
+            re.search(r"(?<!\d)(?:\+?86[ -]?)?1[3-9]\d{9}(?!\d)", text)
             or re.search(r"[^\s；;，,、]+@[^\s；;，,、]+\.[^\s；,、]+", text)
         )
 
-    def _is_weak_context_fragment(self, text: str | None, fields: Mapping[str, str]) -> bool:
+    def _is_weak_context_fragment(
+        self, text: str | None, fields: Mapping[str, LeadFieldValue]
+    ) -> bool:
         """判断 AI 提取结果是否只是当前线索的无身份补充片段。
 
         参数：text 为当前消息文本；fields 为 AI 已通过网关校验的字段补丁。
@@ -2333,7 +2419,9 @@ class FirstTextLeadWorkspaceService:
         异常：无；不访问数据库或外部服务。
         副作用：无。
         """
-        if not self._is_weak_identity_fragment(text) or self._has_explicit_identity_evidence(text):
+        if not self._is_weak_identity_fragment(text) or (
+            self._has_explicit_company_identity_evidence(text)
+        ):
             return False
         # 模型把“采购10台”误放到线索名称时，字段本身含弱语义，仍应回到当前上下文。
         candidate_name = fields.get("线索名称", "")
@@ -2351,7 +2439,7 @@ class FirstTextLeadWorkspaceService:
         异常：无；只复制不可变补丁，不触发数据库或模型调用。
         副作用：无。
         """
-        if "线索名称" not in patch.fields or cls._has_explicit_identity_evidence(text):
+        if "线索名称" not in patch.fields or cls._has_explicit_company_identity_evidence(text):
             return patch
         fields = dict(patch.fields)
         fields.pop("线索名称", None)

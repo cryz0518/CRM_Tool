@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Generator
 from datetime import timedelta
 
@@ -10,6 +11,8 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.ai.gateway import AIGateway
+from app.ai.provider import MockLLMProvider
 from app.leads.models import LeadFieldProvenance, LeadMessageResolution, SalesLeadContext
 from app.leads.service import FirstTextLeadWorkspaceService, LeadProcessingStatus
 from app.messaging.models import (
@@ -665,46 +668,181 @@ def test_explicit_new_customer_does_not_inherit_active_card_context(
     assert len(adapter.get_records()) == 2
 
 
-def test_strong_identity_beats_an_active_context_from_another_lead(
+def test_active_context_beats_historical_phone_match(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证历史客户的唯一手机号优先于仍有效的另一条当前客户上下文。
+    """验证有效销售上下文优先于无公司名消息中的历史手机号匹配。
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
-    异常：手机号补充被串入当前上下文线索时由 pytest 报告断言失败。
-    副作用：创建两条销售私有线索，手动恢复首条上下文后消费第二条的手机号补充。
+    异常：手机号补充被历史线索劫持时由 pytest 报告断言失败。
+    副作用：创建历史线索和当前线索，再消费一条含历史手机号的当前线索补充。
     """
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     service = FirstTextLeadWorkspaceService(session_factory, adapter)
     first_event_id = persist_outbox_texts(
         session_factory,
         "sales-1",
-        ["客户：客户甲；手机号：13800000001"],
+        ["客户：历史客户；手机号：13800000001"],
     )[0]
     first = service.consume(first_event_id)
     second_event_id = persist_outbox_texts(
         session_factory,
         "sales-1",
-        ["客户：客户乙；手机号：13800000002"],
+        ["客户：当前客户；手机号：13800000002"],
     )[0]
     second = service.consume(second_event_id)
     assert first.lead_id is not None
     assert second.lead_id is not None
-    with session_factory.begin() as session:
-        context = session.get(SalesLeadContext, "sales-1")
-        assert context is not None
-        context.lead_id = first.lead_id
     third_event_id = persist_outbox_texts(
         session_factory,
         "sales-1",
-        ["手机号：13800000002；需求：码垛机器人"],
+        ["手机号：13800000001；需求：码垛机器人"],
     )[0]
 
     updated = service.consume(third_event_id)
 
     assert updated.status is LeadProcessingStatus.UPDATED
     assert updated.lead_id == second.lead_id
+
+
+def test_ai_active_context_beats_historical_phone_match(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 AI 补丁中的历史手机号也不能劫持有效当前上下文。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：AI 路径跳转历史线索时由 pytest 报告断言失败。
+    副作用：创建历史线索和当前线索，再通过 AI 补丁消费当前线索补充。
+    """
+    first_event_id = persist_outbox_texts(
+        session_factory, "sales-1", ["客户：历史客户；手机号：13800000001"]
+    )[0]
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    gateway = AIGateway(
+        MockLLMProvider(
+            [
+                json.dumps(
+                    {
+                        "intent": "UPDATE_LEAD",
+                        "customer_reference": {},
+                        "crm_fields": {"手机": "13800000001"},
+                        "enrichment": {"预算": "预算38万"},
+                        "confidence_by_field": {"手机": 0.99},
+                        "conflicts": [],
+                        "warnings": [],
+                    }
+                )
+            ]
+        )
+    )
+    service = FirstTextLeadWorkspaceService(session_factory, adapter, ai_gateway=gateway)
+
+    first = service.consume(first_event_id)
+    second_event_id = persist_outbox_texts(
+        session_factory, "sales-1", ["客户：当前客户；手机号：13800000002"]
+    )[0]
+    second = service.consume(second_event_id)
+    third_event_id = persist_outbox_texts(
+        session_factory, "sales-1", ["预算38万，联系电话为13800000001"]
+    )[0]
+    updated = service.consume(third_event_id)
+
+    assert first.lead_id is not None
+    assert second.lead_id is not None
+    assert updated.status is LeadProcessingStatus.UPDATED
+    assert updated.lead_id == second.lead_id
+
+
+def test_no_context_allows_historical_phone_fallback(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证没有销售上下文时仍可用唯一历史手机号回溯线索。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：无上下文时历史联系方式不能定位线索时由 pytest 报告失败。
+    副作用：创建历史线索，删除测试上下文后消费一条联系方式补充消息。
+    """
+    first_event_id = persist_outbox_texts(
+        session_factory, "sales-1", ["客户：历史客户；手机号：13800000001"]
+    )[0]
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+    first = service.consume(first_event_id)
+    with session_factory.begin() as session:
+        context = session.get(SalesLeadContext, "sales-1")
+        assert context is not None
+        session.delete(context)
+
+    second_event_id = persist_outbox_texts(
+        session_factory, "sales-1", ["手机号：13800000001；需求：码垛机器人"]
+    )[0]
+    updated = service.consume(second_event_id)
+
+    assert first.lead_id is not None
+    assert updated.status is LeadProcessingStatus.UPDATED
+    assert updated.lead_id == first.lead_id
+
+
+def test_explicit_company_switches_to_historical_lead(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证明确公司名仍可从当前上下文切换到历史线索。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：明确公司身份未切换到历史线索时由 pytest 报告失败。
+    副作用：创建两条线索，再消费一条明确指向第一条公司的补充消息。
+    """
+    first_event_id = persist_outbox_texts(
+        session_factory, "sales-1", ["客户：历史客户；手机号：13800000001"]
+    )[0]
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+    first = service.consume(first_event_id)
+    second_event_id = persist_outbox_texts(
+        session_factory, "sales-1", ["客户：当前客户；手机号：13800000002"]
+    )[0]
+    second = service.consume(second_event_id)
+    third_event_id = persist_outbox_texts(
+        session_factory, "sales-1", ["客户：历史客户；需求：码垛机器人"]
+    )[0]
+
+    switched = service.consume(third_event_id)
+
+    assert first.lead_id is not None
+    assert second.lead_id is not None
+    assert switched.status is LeadProcessingStatus.UPDATED
+    assert switched.lead_id == first.lead_id
+
+
+def test_explicit_new_customer_without_company_fails_closed(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证明确新客户但只有历史联系方式时不会静默切换旧线索。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：消息被静默归入历史线索时由 pytest 报告失败。
+    副作用：创建历史线索并消费一条明确切换但缺少公司身份的消息。
+    """
+    first_event_id = persist_outbox_texts(
+        session_factory, "sales-1", ["客户：历史客户；手机号：13800000001"]
+    )[0]
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+    first = service.consume(first_event_id)
+    second_event_id = persist_outbox_texts(
+        session_factory, "sales-1", ["另一个客户；电话：13800000001；需求：码垛机器人"]
+    )[0]
+
+    result = service.consume(second_event_id)
+
+    assert first.lead_id is not None
+    assert result.status is LeadProcessingStatus.UNASSIGNED
+    assert result.lead_id is None
 
 
 def test_explicit_company_name_precedes_shared_phone_identity(
