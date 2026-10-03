@@ -2649,7 +2649,12 @@ class FirstTextLeadWorkspaceService:
         """
         self._mark_processing_assignment(session, event, lead_id, segment_index)
         self._refresh_context(session, message, lead_id)
-        self._record_audit(session, event, "lead_routing_context_pinned")
+        self._record_audit(
+            session,
+            event,
+            "lead_routing_context_pinned",
+            details={"lead_id": lead_id},
+        )
 
     def _only_empty_fields(self, lead: Lead, fields: dict[str, str]) -> dict[str, str]:
         """从字段补丁中保留当前线索尚无值的字段，避免覆盖既有或人工数据。
@@ -2681,27 +2686,100 @@ class FirstTextLeadWorkspaceService:
         return ("\n" in value or "\r" in value) and "：" in value
 
     def _refresh_context(self, session: Session, message: IncomingMessage, lead_id: str) -> None:
-        """将一条成功处理消息设为该销售当前线索上下文的最新时间点。
+        """按消息序号单调推进一名销售的当前线索上下文。
 
-        参数：session 为当前事务；message 为成功消息；lead_id 为其归属线索。
+        参数：session 为当前事务；message 为已持久化消息；lead_id 为其归属线索。
         返回值：无。
-        异常：数据库写入失败时由 SQLAlchemy 抛出。
-        副作用：新增或更新销售当前客户上下文。
+        异常：销售 actor 缺失或同序号归属冲突时抛出 ValueError；数据库错误由 SQLAlchemy 抛出。
+        副作用：在销售锁和上下文行锁保护下，按消息序号新增或更新当前客户上下文。
         """
-        context = session.get(SalesLeadContext, message.sales_user_id)
+        # 先锁 actor 行，和消息消费顺序锁保持同一并发边界；SQLite 会忽略行锁语义。
+        authorization = session.scalar(
+            select(SalesAuthorization)
+            .where(SalesAuthorization.wecom_user_id == message.sales_user_id)
+            .with_for_update()
+        )
+        if authorization is None:
+            raise ValueError(f"actor registry 记录不存在：{message.sales_user_id}")
+        # 再锁上下文行，避免两个 Worker 按完成时间交错覆盖销售当前线索。
+        context = session.scalar(
+            select(SalesLeadContext)
+            .where(SalesLeadContext.sales_user_id == message.sales_user_id)
+            .with_for_update()
+        )
         if context is None:
-            # 首条成功归属消息为该销售创建独立上下文，不与其他销售共享。
+            # 首条成功归属消息同时保存序号，建立后续单调推进的事实基线。
             session.add(
                 SalesLeadContext(
                     sales_user_id=message.sales_user_id,
                     lead_id=lead_id,
                     last_message_received_at=message.received_at,
+                    last_message_sequence=message.sequence,
                 )
             )
             return
-        # 同一销售的后续成功消息才推进上下文，保留其当前线索和接收时间。
+
+        current_sequence = context.last_message_sequence
+        if current_sequence is None:
+            # 历史 context 没有序号时，不能让更早收到的旧消息覆盖已有时间点。
+            if message.received_at < context.last_message_received_at:
+                logger.info(
+                    "lead_context_stale_message_ignored",
+                    extra={
+                        "incoming_sequence": message.sequence,
+                        "current_sequence": None,
+                    },
+                )
+                return
+        elif message.sequence < current_sequence:
+            # 重试和旧 Worker 只能观察旧事实，绝不能回退当前销售上下文。
+            logger.info(
+                "lead_context_stale_message_ignored",
+                extra={
+                    "incoming_sequence": message.sequence,
+                    "current_sequence": current_sequence,
+                },
+            )
+            return
+        elif message.sequence == current_sequence:
+            if context.lead_id == lead_id:
+                # 同一消息的重复完成是幂等重放，不需要再次写入时间点。
+                return
+            distinct_segment_leads = {
+                resolved_lead_id
+                for resolved_lead_id in session.scalars(
+                    select(LeadMessageResolution.lead_id).where(
+                        LeadMessageResolution.message_id == message.message_id,
+                        LeadMessageResolution.lead_id.is_not(None),
+                    )
+                )
+                if resolved_lead_id is not None
+            }
+            if len(distinct_segment_leads) > 1:
+                # 同一消息的多客户分段没有唯一当前线索，保持现有上下文而不任选目标。
+                logger.error(
+                    "lead_context_same_sequence_conflict",
+                    extra={
+                        "incoming_sequence": message.sequence,
+                        "current_sequence": current_sequence,
+                        "multi_segment": True,
+                    },
+                )
+                return
+            # 同序号对应不同线索无法确定正确目标，必须阻止静默覆盖。
+            logger.error(
+                "lead_context_same_sequence_conflict",
+                extra={
+                    "incoming_sequence": message.sequence,
+                    "current_sequence": current_sequence,
+                },
+            )
+            raise ValueError("同一消息序号对应不同线索上下文")
+
+        # 只有新消息序号，或尚未完成序号回填的非旧消息，才可推进当前上下文。
         context.lead_id = lead_id
         context.last_message_received_at = message.received_at
+        context.last_message_sequence = message.sequence
 
     def _update_smart_table_record(self, request: ContextUpdateRequest) -> LeadProcessingResult:
         """将当前客户上下文中的安全字段补丁增量写入既有智能表格记录。

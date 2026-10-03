@@ -88,6 +88,107 @@ def persist_outbox_texts(
     return event_ids
 
 
+def test_late_old_message_cannot_move_context_back_to_previous_lead(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证旧消息晚完成时不能把销售上下文从新线索回退到旧线索。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：上下文按完成时间回退时由 pytest 报告断言失败。
+    副作用：在测试数据库中写入两条消息和一条销售上下文。
+    """
+    event_ids = persist_outbox_texts(
+        session_factory,
+        "sales-1",
+        ["客户：线索 A", "客户：线索 B"],
+    )
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        MockSmartTableAdapter(schema=build_required_smart_table_schema()),
+    )
+
+    with session_factory.begin() as session:
+        first_event, first_message = service._load_event_and_message(session, event_ids[0])
+        second_event, second_message = service._load_event_and_message(session, event_ids[1])
+        del first_event, second_event
+        service._refresh_context(session, first_message, "lead-a")
+        service._refresh_context(session, second_message, "lead-b")
+        service._refresh_context(session, first_message, "lead-a")
+
+    with session_factory() as session:
+        context = session.get(SalesLeadContext, "sales-1")
+
+    assert context is not None
+    assert context.lead_id == "lead-b"
+    assert context.last_message_sequence == 2
+
+
+def test_same_message_sequence_for_different_lead_fails_closed(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证同一消息序号指向不同线索时不会静默选择任一目标。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：错误目标未抛出 ValueError 时由 pytest 报告断言失败。
+    副作用：在测试数据库中创建一条销售上下文。
+    """
+    event_id = persist_outbox_texts(session_factory, "sales-1", ["客户：冲突消息"])[0]
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        MockSmartTableAdapter(schema=build_required_smart_table_schema()),
+    )
+
+    with session_factory.begin() as session:
+        _, message = service._load_event_and_message(session, event_id)
+        service._refresh_context(session, message, "lead-a")
+        with pytest.raises(ValueError, match="同一消息序号"):
+            service._refresh_context(session, message, "lead-b")
+
+
+def test_legacy_context_without_sequence_rejects_older_received_message(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证尚未回填序号的历史上下文不会被更早消息覆盖。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：旧消息覆盖历史上下文或新消息未完成序号回填时由 pytest 报告断言失败。
+    副作用：在测试数据库中写入一个无序号的历史销售上下文。
+    """
+    event_ids = persist_outbox_texts(
+        session_factory,
+        "sales-1",
+        ["客户：旧消息", "客户：当前消息"],
+    )
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        MockSmartTableAdapter(schema=build_required_smart_table_schema()),
+    )
+
+    with session_factory.begin() as session:
+        _, first_message = service._load_event_and_message(session, event_ids[0])
+        _, second_message = service._load_event_and_message(session, event_ids[1])
+        first_message.received_at = second_message.received_at - timedelta(seconds=1)
+        session.add(
+            SalesLeadContext(
+                sales_user_id="sales-1",
+                lead_id="lead-current",
+                last_message_received_at=second_message.received_at,
+            )
+        )
+        service._refresh_context(session, first_message, "lead-old")
+        service._refresh_context(session, second_message, "lead-current")
+
+    with session_factory() as session:
+        context = session.get(SalesLeadContext, "sales-1")
+
+    assert context is not None
+    assert context.lead_id == "lead-current"
+    assert context.last_message_sequence == 2
+
+
 def test_later_message_waits_for_earlier_pending_message_from_same_salesperson(
     session_factory: sessionmaker[Session],
 ) -> None:

@@ -696,9 +696,17 @@ def test_smart_table_failure_pins_deterministic_lead_context_before_retry(
                 BusinessAuditEvent.event_type == "smart_table_sync_failed_pending_review",
             )
         )
+        pin_audit = session.scalar(
+            select(BusinessAuditEvent).where(
+                BusinessAuditEvent.message_id == "message-deterministic-context-pin",
+                BusinessAuditEvent.event_type == "lead_routing_context_pinned",
+            )
+        )
     assert context is not None and context.lead_id == failed.lead_id
+    assert context is not None and context.last_message_sequence == 1
     assert resolution is not None and resolution.lead_id == failed.lead_id
     assert resolution.status == "processing"
+    assert pin_audit is not None and pin_audit.details == {"lead_id": failed.lead_id}
     assert failure_audit is not None
     assert failure_audit.details["failure_category"] == "permanent"
     assert failure_audit.details["failure_code"] == "640027"
@@ -1465,8 +1473,12 @@ def test_new_lead_context_is_pinned_before_smart_table_failure_and_follow_up_use
                 LeadMessageResolution.message_id == "message-context-pin-c"
             )
         )
+        final_context = session.get(SalesLeadContext, "sales-1")
         assert session.query(Lead).count() == 2
     assert third_resolution is not None and third_resolution.lead_id == second.lead_id
+    assert final_context is not None
+    assert final_context.lead_id == second.lead_id
+    assert final_context.last_message_sequence == 3
 
 
 def test_free_form_company_contact_phone_message_is_not_unassigned(
