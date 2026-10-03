@@ -210,15 +210,15 @@ def test_robot_update_resets_submission_status_to_unsubmitted(
     assert adapter.get_record(created.smart_table_record_id).fields["提交状态"] == "未提交"
 
 
-def test_unauthorized_salesperson_cannot_use_company_lead_service(
+def test_salesperson_with_legacy_authorization_false_can_use_company_lead_service(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证公司解析服务同样执行销售授权校验。
+    """验证历史 is_authorized=false 不再阻断有效 actor 的公司解析。
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
-    异常：越权录入未被拒绝时由 pytest 报告断言失败。
-    副作用：创建一条来源消息并显式撤销销售授权。
+    异常：旧授权字段重新成为业务门槛时由 pytest 报告断言失败。
+    副作用：创建一条来源消息并显式保留 is_authorized=false。
     """
     persist_source_message(session_factory, "unauthorized-message", "sales-1")
     with session_factory.begin() as session:
@@ -228,16 +228,15 @@ def test_unauthorized_salesperson_cannot_use_company_lead_service(
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     service = CompanyLeadService(session_factory, adapter, MockQCCAdapter())
 
-    with pytest.raises(PermissionError, match="销售未获授权"):
-        service.upsert(
-            CompanyUpsertCommand(
-                source_message_id="unauthorized-message",
-                sales_user_id="sales-1",
-                fields={"联系人": "张三"},
-            )
+    result = service.upsert(
+        CompanyUpsertCommand(
+            source_message_id="unauthorized-message",
+            sales_user_id="sales-1",
+            fields={"联系人": "张三"},
         )
+    )
 
-    assert adapter.get_records() == []
+    assert result.lead_id is not None
 
 
 def test_salesperson_can_confirm_only_own_temporary_lead_without_llm(

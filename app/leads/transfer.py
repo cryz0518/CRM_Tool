@@ -524,8 +524,8 @@ class SmartTableOwnerTransferService:
                 raise PermissionError("维护写入角色必须是 administrator")
             if not auth_source.strip():
                 raise ValueError("管理操作必须记录 auth_source")
-            if target is None or not target.is_active or not target.is_authorized:
-                raise ValueError("目标销售必须处于 active 且 authorized 状态")
+            if target is None or not target.is_active:
+                raise ValueError("目标销售必须是 active actor")
             if not lead.smart_table_record_id:
                 raise ValueError("线索尚未绑定智能表格记录")
             old_owner = lead.smart_table_owner_user_id

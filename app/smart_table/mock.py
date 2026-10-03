@@ -25,10 +25,12 @@ class MockSmartTableAdapter:
         schema: SmartTableSchema,
         sales_can_create_records: bool = False,
         sales_can_delete_records: bool = False,
+        require_owner_field: bool = True,
     ) -> None:
         """初始化 Mock 的预配置结构、权限和空记录集。
 
-        参数：schema 为管理员预配置结构；两个 sales 参数控制普通销售新增和删除权限。
+        参数：schema 为管理员预配置结构；两个 sales 参数控制普通销售新增和删除权限；
+        require_owner_field 控制机器人是否必须写入“负责人”，审计子表可关闭。
         副作用：创建独立的内存记录集与递增记录标识计数器。
         """
         self._schema = schema
@@ -36,6 +38,7 @@ class MockSmartTableAdapter:
             sales_can_create_records=sales_can_create_records,
             sales_can_delete_records=sales_can_delete_records,
         )
+        self._require_owner_field = require_owner_field
         self._records: dict[str, SmartTableRecord] = {}
         self._next_record_number = 1
         self.delete_calls = 0
@@ -105,7 +108,11 @@ class MockSmartTableAdapter:
         if actor is SmartTableActor.SALES and not self._permissions.sales_can_create_records:
             raise SmartTablePermissionError("普通销售没有智能表格新增记录权限")
         # 负责人是共享表记录级权限的关键字段，机器人缺失时必须拒绝创建。
-        if actor is SmartTableActor.ROBOT and not fields.get("负责人"):
+        if (
+            actor is SmartTableActor.ROBOT
+            and self._require_owner_field
+            and not fields.get("负责人")
+        ):
             raise ValueError("机器人新增智能表格记录时必须写入负责人")
 
         # 生成稳定的 Mock 记录标识，并复制输入避免调用方后续修改污染记录。
@@ -123,15 +130,23 @@ class MockSmartTableAdapter:
         self._records[record_id] = record
         return record
 
-    def update_record(self, record_id: str, fields: Mapping[str, object]) -> SmartTableRecord:
+    def update_record(
+        self,
+        record_id: str,
+        fields: Mapping[str, object],
+        *,
+        skip_preflight: bool = False,
+    ) -> SmartTableRecord:
         """合并字段补丁到原记录，仅修改本轮明确提供的字段。
 
-        参数：record_id 为目标记录标识；fields 为本轮增量字段补丁。
+        参数：record_id 为目标记录标识；fields 为本轮增量字段补丁；skip_preflight 表示调用方已持有
+        创建响应，可跳过写入前读取。
         返回：更新后的不可变记录快照。
         异常：记录不存在时抛出 SmartTableRecordNotFoundError。
         副作用：替换内存记录集中的目标记录快照。
         """
-        record = self.get_record(record_id)
+        # 新建后补写直接使用内存索引，模拟已持有创建响应且不触发一次多余预读。
+        record = self._records.get(record_id) if skip_preflight else self.get_record(record_id)
         if record is None:
             raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
 

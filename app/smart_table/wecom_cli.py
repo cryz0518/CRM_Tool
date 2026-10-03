@@ -70,6 +70,30 @@ class WecomCliSmartTableAdapterError(RuntimeError):
 class WecomCliTransportError(WecomCliSmartTableAdapterError, RetryableTaskFailure):
     """表示 wecom-cli 网络或进程传输失败，可安全重试同一请求。"""
 
+    @property
+    def error_code(self) -> str | None:
+        """暴露底层受控错误分类，供上层审计保留安全诊断。"""
+        value = getattr(self.__cause__, "error_code", None)
+        return value if isinstance(value, str) else None
+
+    @property
+    def external_error_code(self) -> int | None:
+        """暴露底层远端数字错误码，不传播远端正文。"""
+        value = getattr(self.__cause__, "external_error_code", None)
+        return value if type(value) is int else None
+
+    @property
+    def external_error_type(self) -> str | None:
+        """暴露底层白名单错误类型，供结构化日志和审计使用。"""
+        value = getattr(self.__cause__, "external_error_type", None)
+        return value if isinstance(value, str) else None
+
+    @property
+    def http_status(self) -> int | None:
+        """暴露底层 HTTP 状态码，供安全重试诊断使用。"""
+        value = getattr(self.__cause__, "http_status", None)
+        return value if type(value) is int else None
+
 
 class WecomCliProtocolError(WecomCliSmartTableAdapterError, PermanentTaskFailure):
     """表示 wecom-cli 返回结构、参数或权限业务失败，不应自动重试。"""
@@ -127,7 +151,7 @@ class WecomCliProcessError(WecomCliProtocolError):
     @property
     def retryable(self) -> bool:
         """仅允许明确网络、超时或可重试 HTTP 状态触发幂等重试。"""
-        return self.error_code in {"network_error", "timeout"} or (
+        return self.error_code in {"network_error", "timeout", "rate_limited"} or (
             self.error_code == "http_error"
             and self.http_status is not None
             and (self.http_status in {408, 425, 429} or self.http_status >= 500)
@@ -148,13 +172,14 @@ class WecomCliSmartTableAdapter:
         command: str = "wecom-cli",
         timeout_seconds: float = 20.0,
         retry_count: int = 1,
+        require_owner_field: bool = True,
         runner: CliRunner | None = None,
     ) -> None:
         """初始化固定文档、子表和可替换的 CLI 执行入口。
 
         参数：doc_id、sheet_id 为管理员配置的目标表标识；sheet_title 为完整查询接口使用的子表名称；
-        两个 sales 参数仅接受管理员
-        已核验的权限快照；command、timeout_seconds、retry_count 控制 CLI 调用；runner 供测试替换。
+        两个 sales 参数仅接受管理员已核验的权限快照；require_owner_field 控制机器人是否必须
+        写入“负责人”；command、timeout_seconds、retry_count 控制 CLI 调用；runner 供测试替换。
         异常：标识为空或重试次数为负数时抛出 SmartTableAdapterConfigurationError。
         副作用：不访问网络，仅保存不可变配置。
         """
@@ -173,6 +198,7 @@ class WecomCliSmartTableAdapter:
         self._command = command
         self._timeout_seconds = timeout_seconds
         self._retry_count = retry_count
+        self._require_owner_field = require_owner_field
         self._runner = runner or self._run_subprocess
         self._schema: SmartTableSchema | None = None
         self._recent_written_records: dict[str, tuple[float, SmartTableRecord]] = {}
@@ -210,20 +236,17 @@ class WecomCliSmartTableAdapter:
         )
 
     def get_record(self, record_id: str) -> SmartTableRecord | None:
-        """在当前子表分页读取记录并按标识返回目标记录。
+        """按记录标识读取目标记录，并在配置完整子表名称时使用服务端单行查询。
 
         参数：record_id 为企业微信返回的记录标识。
         返回：记录快照；不存在时返回 None。
         异常：CLI 调用或响应结构异常时抛出异常。
-        副作用：调用 wecom-cli 的 records list 接口。
+        副作用：调用 wecom-cli 的 records query 或 records list 接口。
         """
         schema = self.get_schema()
         if self._sheet_title:
-            # 完整查询可读取机器人在列表接口中不可见的受限记录，避免按负责人提交时漏行。
-            return next(
-                (record for record in self._query_records(schema) if record.record_id == record_id),
-                None,
-            )
+            # 完整查询可读取机器人在列表接口中不可见的受限记录，且服务端只返回目标行。
+            return self._query_record_by_id(record_id, schema)
         for item in self._list_pages("records"):
             # records list 没有按记录标识读取的独立接口，先按原始标识定位。
             # 这样历史异常行不会阻断目标行回读。
@@ -247,14 +270,11 @@ class WecomCliSmartTableAdapter:
         参数：record_id 为目标记录标识；schema 为已读取的字段定义。
         返回值：远端记录快照；远端暂不可见或不存在时返回 None。
         异常：CLI 传输、权限和响应协议错误向调用方传播。
-        副作用：配置 sheet_title 时执行 records query，否则分页执行 records list。
+        副作用：配置 sheet_title 时按 RECORD_ID 执行单行 records query，否则分页执行 records list。
         """
         if self._sheet_title:
-            # 有完整查询配置时绕过权限受限的 list，并直接按远端查询结果定位记录。
-            return next(
-                (record for record in self._query_records(schema) if record.record_id == record_id),
-                None,
-            )
+            # 写后核实必须绕过近期缓存，并通过服务端过滤读取真实目标行。
+            return self._query_record_by_id(record_id, schema)
         # list 分页是该配置下唯一可用的远端读路径；本方法刻意不查 _recent_written_records。
         for item in self._list_pages("records"):
             if item.get("record_id") == record_id:
@@ -303,7 +323,11 @@ class WecomCliSmartTableAdapter:
         """
         if actor is SmartTableActor.SALES:
             raise SmartTablePermissionError("wecom-cli 使用机器人凭据，不能模拟销售直接新增记录")
-        if actor is SmartTableActor.ROBOT and not fields.get("负责人"):
+        if (
+            actor is SmartTableActor.ROBOT
+            and self._require_owner_field
+            and not fields.get("负责人")
+        ):
             raise ValueError("机器人新增智能表格记录时必须写入负责人")
 
         schema = self.get_schema()
@@ -323,17 +347,25 @@ class WecomCliSmartTableAdapter:
             record_id, fields_to_verify, schema, operation="create"
         )
 
-    def update_record(self, record_id: str, fields: Mapping[str, object]) -> SmartTableRecord:
+    def update_record(
+        self,
+        record_id: str,
+        fields: Mapping[str, object],
+        *,
+        skip_preflight: bool = False,
+    ) -> SmartTableRecord:
         """更新指定记录并在返回成功前远端回读核实每个补丁字段。
 
-        参数：record_id 为目标记录标识；fields 只包含本次变更的字段和值。
+        参数：record_id 为目标记录标识；fields 只包含本次变更的字段和值；skip_preflight 表示刚创建的
+        记录已有可信快照，可跳过写入前读取。
         返回：远端回读且逐字段匹配后的记录快照。
         异常：记录不存在、CLI 写入失败或有限核实窗口后仍有字段不匹配时抛出异常。
         副作用：只修改目标记录的传入字段，并在 ACK 后执行有上限的只读回查。
         """
-        current_record = self.get_record(record_id)
-        if current_record is None:
-            raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
+        if not skip_preflight:
+            current_record = self.get_record(record_id)
+            if current_record is None:
+                raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
 
         schema = self.get_schema()
         cli_fields = self._to_cli_fields(fields, schema)
@@ -478,6 +510,24 @@ class WecomCliSmartTableAdapter:
             SmartTableRecord(record_id=record_id, fields=dict(fields)),
         )
 
+    def _query_record_by_id(
+        self, record_id: str, schema: SmartTableSchema
+    ) -> SmartTableRecord | None:
+        """使用 RECORD_ID 服务端过滤读取单条智能表格记录。
+
+        参数：record_id 为目标记录标识；schema 为启动时校验过的字段结构。
+        返回值：命中的记录快照；服务端返回空行时为 None。
+        异常：查询协议、权限或字段结构异常时抛出适配器异常。
+        副作用：启动一次带 WHERE 和 LIMIT 1 的只读 records query，不修改智能表格。
+        """
+        sql = self._build_query_sql(
+            schema,
+            where=f"RECORD_ID = {self._quote_sql_string_literal(record_id)}",
+            limit=1,
+        )
+        rows = self._query_rows(sql)
+        return self._parse_query_record(rows[0], schema) if rows else None
+
     def _query_records(self, schema: SmartTableSchema) -> list[SmartTableRecord]:
         """使用完整查询接口读取目标子表的全部记录。
 
@@ -485,6 +535,23 @@ class WecomCliSmartTableAdapter:
         返回值：按查询结果顺序转换后的记录快照。
         异常：查询协议、权限或字段结构异常时抛出适配器异常。
         副作用：启动一次只读的 wecom-cli records query，不修改智能表格。
+        """
+        sql = self._build_query_sql(schema, limit=1000)
+        return [self._parse_query_record(row, schema) for row in self._query_rows(sql)]
+
+    def _build_query_sql(
+        self,
+        schema: SmartTableSchema,
+        *,
+        limit: int,
+        where: str | None = None,
+    ) -> str:
+        """根据字段结构构造只读 records query SQL。
+
+        参数：schema 为字段结构；limit 为服务端结果上限；where 为已安全编码的筛选子句。
+        返回值：供 wecom-cli records query 使用的 SELECT 语句。
+        异常：未配置子表名称时抛出 SmartTableAdapterConfigurationError。
+        副作用：无；不执行查询。
         """
         if not self._sheet_title:
             raise SmartTableAdapterConfigurationError("完整查询缺少 WECOM_SMART_TABLE_SHEET_TITLE")
@@ -498,10 +565,22 @@ class WecomCliSmartTableAdapter:
                 )
             else:
                 columns.append(quoted_name)
-        sql = (
+        query = (
             f"SELECT {', '.join(columns)} FROM "
-            f"{self._quote_sql_identifier(self._sheet_title)} LIMIT 1000"
+            f"{self._quote_sql_identifier(self._sheet_title)}"
         )
+        if where:
+            query += f" WHERE {where}"
+        return f"{query} LIMIT {limit}"
+
+    def _query_rows(self, sql: str) -> list[Mapping[str, object]]:
+        """执行 records query 并解析其 values/rows 外层协议。
+
+        参数：sql 为已经完成安全编码的只读 SELECT 语句。
+        返回值：查询返回的结构化行列表。
+        异常：CLI 调用失败、业务错误或响应结构异常时抛出受控适配器异常。
+        副作用：启动一次只读 wecom-cli records query，不修改智能表格。
+        """
         response = self._call_query(sql)
         values = response.get("values")
         if not isinstance(values, list) or len(values) != 1:
@@ -520,15 +599,33 @@ class WecomCliSmartTableAdapter:
         rows = result.get("rows", [])
         if not isinstance(rows, list):
             raise WecomCliProtocolError("wecom-cli records query 的 rows 不是列表")
-        return [self._parse_query_record(self._as_mapping(row, "查询记录"), schema) for row in rows]
+        return [self._as_mapping(row, "查询记录") for row in rows]
 
     @staticmethod
     def _quote_sql_identifier(value: str) -> str:
         """为智能表格查询安全引用字段或子表名称。"""
         return f"`{value.replace('`', '``')}`"
 
+    @staticmethod
+    def _quote_sql_string_literal(value: str) -> str:
+        """按 records query 的双引号字符串语法安全引用记录标识。
+
+        参数：value 为待放入 SQL WHERE 子句的记录标识。
+        返回值：已转义的双引号字符串字面量。
+        异常：无。
+        副作用：无；不执行 SQL。
+        """
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+
     def _call_query(self, sql: str) -> Mapping[str, object]:
-        """调用 records query 并复用 CLI 的有限重试与错误转换。"""
+        """调用 records query 并按底层错误的 retryable 属性执行有限重试。
+
+        参数：sql 为已经安全构造的只读 SELECT 语句。
+        返回值：CLI 成功响应映射。
+        异常：永久 WecomCliProcessError 原样抛出；暂态错误耗尽后包装为传输错误。
+        副作用：启动只读 wecom-cli 子进程，并可能按配置短暂重试。
+        """
         arguments = (
             self._command,
             "smartsheet",
@@ -543,22 +640,24 @@ class WecomCliSmartTableAdapter:
             try:
                 response = self._runner(arguments)
             except WecomCliProcessError as error:
+                if not error.retryable:
+                    raise
                 if attempt == self._retry_count:
                     raise WecomCliTransportError("wecom-cli 查询进程调用失败") from error
-                self._log_retry("records", "query", attempt, "ProcessExit")
-                time.sleep(0.2 * (attempt + 1))
+                self._log_retry("records", "query", attempt, error.error_code)
+                time.sleep(self._retry_delay_seconds(error.error_code, attempt))
                 continue
             except (OSError, subprocess.TimeoutExpired) as error:
                 if attempt == self._retry_count:
                     raise WecomCliTransportError("wecom-cli 查询调用失败") from error
                 self._log_retry("records", "query", attempt, type(error).__name__)
-                time.sleep(0.2 * (attempt + 1))
+                time.sleep(self._retry_delay_seconds(type(error).__name__, attempt))
                 continue
             if self._is_transient_network_error(response):
                 if attempt == self._retry_count:
                     raise WecomCliTransportError("wecom-cli 查询网络调用失败")
                 self._log_retry("records", "query", attempt, "NetworkError")
-                time.sleep(0.2 * (attempt + 1))
+                time.sleep(self._retry_delay_seconds("network_error", attempt))
                 continue
             self._raise_for_error(response)
             return response
@@ -694,18 +793,25 @@ class WecomCliSmartTableAdapter:
             except WecomCliProcessError as error:
                 # records list/update 是幂等操作，进程异常可以安全重放；records add
                 # 可能已经在服务端成功，不能因客户端退出异常再次创建重复记录。
-                if action == "add" and error.retryable:
-                    raise WecomCliProtocolError(
-                        "wecom-cli 新增结果无法确认，禁止自动重放"
-                    ) from None
-                if action == "add" or not error.retryable:
+                safe_rate_limit_replay = (
+                    action == "add"
+                    and error.error_code == "rate_limited"
+                    and error.external_error_code == 850005
+                )
+                if action == "add" and not safe_rate_limit_replay:
+                    if error.retryable:
+                        raise WecomCliProtocolError(
+                            "wecom-cli 新增结果无法确认，禁止自动重放"
+                        ) from None
+                    raise
+                if not error.retryable:
                     raise
                 if attempt == self._retry_count:
                     raise WecomCliTransportError(
                         f"wecom-cli 进程调用失败：{error.error_code}"
                     ) from error
-                self._log_retry(resource, action, attempt, f"ProcessExit:{error.error_code}")
-                time.sleep(0.2 * (attempt + 1))
+                self._log_retry(resource, action, attempt, error.error_code)
+                time.sleep(self._retry_delay_seconds(error.error_code, attempt))
                 continue
             except (OSError, subprocess.TimeoutExpired) as error:
                 if action == "add":
@@ -717,7 +823,7 @@ class WecomCliSmartTableAdapter:
                     # 最后一次仍失败时隐藏底层请求和响应，避免异常泄露表格数据。
                     raise WecomCliTransportError("wecom-cli 调用失败") from error
                 self._log_retry(resource, action, attempt, type(error).__name__)
-                time.sleep(0.2 * (attempt + 1))
+                time.sleep(self._retry_delay_seconds(type(error).__name__, attempt))
                 continue
 
             if self._is_transient_network_error(response):
@@ -730,13 +836,26 @@ class WecomCliSmartTableAdapter:
                 if attempt == self._retry_count:
                     raise WecomCliTransportError("wecom-cli 网络调用失败")
                 self._log_retry(resource, action, attempt, "NetworkError")
-                time.sleep(0.2 * (attempt + 1))
+                time.sleep(self._retry_delay_seconds("network_error", attempt))
                 continue
             # 非暂态响应先做统一错误码校验，再交给具体解析器处理结构。
             self._raise_for_error(response)
             return response
 
         raise AssertionError("已覆盖全部 CLI 重试分支")
+
+    @staticmethod
+    def _retry_delay_seconds(error_code: str, attempt: int) -> float:
+        """计算有限重试退避，避免限流错误继续以短间隔冲击远端。
+
+        参数：error_code 为安全内部错误分类；attempt 为从零开始的重试序号。
+        返回值：限流使用 1、2、4 秒并封顶 8 秒，普通暂态保持原短退避。
+        异常：无。
+        副作用：无，不等待也不访问外部服务。
+        """
+        if error_code == "rate_limited":
+            return float(min(8, 2**attempt))
+        return 0.2 * (attempt + 1)
 
     def _run_subprocess(self, arguments: Sequence[str]) -> Mapping[str, object]:
         """运行 wecom-cli 并把 JSON 标准输出转换为映射。
@@ -775,8 +894,12 @@ class WecomCliSmartTableAdapter:
                     rejected_field_candidates,
                 ) = parsed_error
             logger.error(
-                "wecom_cli_process_failed error_code=%s",
+                "wecom_cli_process_failed error_code=%s external_error_code=%s "
+                "external_error_type=%s http_status=%s",
                 error_code,
+                external_error_code,
+                external_error_type,
+                http_status,
                 extra={
                     "returncode": completed.returncode,
                     "error_code": error_code,
@@ -890,6 +1013,7 @@ class WecomCliSmartTableAdapter:
     ) -> str:
         """把已筛选的 CLI 错误码映射为有限内部类别。"""
         code_categories = {
+            850005: "rate_limited",
             851003: "permission_denied",
             853004: "authentication",
             893003: "local_io_error",
@@ -1318,10 +1442,10 @@ class WecomCliSmartTableAdapter:
         return record_id
 
     @staticmethod
-    def _log_retry(resource: str, action: str, attempt: int, error_type: str) -> None:
+    def _log_retry(resource: str, action: str, attempt: int, error_code: str) -> None:
         """记录不包含请求数据、内部标识或 CLI 响应的重试日志。
 
-        参数：resource、action 标识调用；attempt 为从零开始的重试次数；error_type 为异常类型。
+        参数：resource、action 标识调用；attempt 为从零开始的重试次数；error_code 为安全内部分类。
         副作用：写入结构化警告日志。
         """
         logger.warning(
@@ -1330,6 +1454,6 @@ class WecomCliSmartTableAdapter:
                 "smart_table_resource": resource,
                 "smart_table_action": action,
                 "retry_attempt": attempt + 1,
-                "error_type": error_type,
+                "error_code": error_code,
             },
         )

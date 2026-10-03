@@ -119,12 +119,14 @@ class LeadReviewService:
         *,
         protected_supplement: bool = False,
         acknowledged_but_unverified_fields: tuple[str, ...] = (),
+        initial_record: SmartTableRecord | None = None,
     ) -> ReviewSyncResult:
         """重读智能表格后同步 T08 的合法字段，并永久保护人工编辑字段。
 
         参数：lead_id 为目标线索；source_message_id 为已持久化 AI 来源消息；patch 为 T08 结果；
         protected_supplement 表示该补丁来自历史失败消息，只允许补充当前空字段；
-        acknowledged_but_unverified_fields 是旧版 ACK 假成功后需重新核验的原计划字段。
+        acknowledged_but_unverified_fields 是旧版 ACK 假成功后需重新核验的原计划字段；
+        initial_record 是刚由 create_record 返回的快照，用于避免创建后再次预读远端。
         返回值：实际写入与被保护字段的确定性结果。
         异常：线索、消息或表格记录缺失时抛出 ValueError；适配器错误向调用方传播。
         副作用：可能更新表格、字段来源、人工编辑标记和审计记录。
@@ -138,10 +140,15 @@ class LeadReviewService:
                 raise ValueError(f"线索缺少智能表格记录：{lead_id}")
             record_id = lead.smart_table_record_id
 
-        # 每次 AI 写入前都从 T03 Adapter 重读，不能使用过期的后台字段快照判断人工编辑。
-        record = self._smart_table_adapter.get_record(record_id)
+        # 刚创建的记录快照已由 Adapter 返回；此处直接进入补丁规划，避免限流预读阻断字段写入。
+        record = initial_record
         if record is None:
-            raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
+            # 普通既有记录仍需从 T03 Adapter 重读，不能使用过期后台字段快照判断人工编辑。
+            record = self._smart_table_adapter.get_record(record_id)
+            if record is None:
+                raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
+        elif record.record_id != record_id:
+            raise ValueError(f"创建响应记录标识不一致：{record_id}")
         current_fields = dict(record.fields)
         plan = self._plan_safe_patch(
             lead_id,
@@ -153,19 +160,20 @@ class LeadReviewService:
         )
 
         # 在外部写入前再读一次表格；并发的后续消息若已提交，必须基于最新状态重算补丁。
-        latest_record = self._smart_table_adapter.get_record(record_id)
-        if latest_record is None:
-            raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
-        if dict(latest_record.fields) != current_fields:
-            current_fields = dict(latest_record.fields)
-            plan = self._plan_safe_patch(
-                lead_id,
-                source_message_id,
-                patch,
-                current_fields,
-                protected_supplement,
-                acknowledged_but_unverified_fields,
-            )
+        if initial_record is None:
+            latest_record = self._smart_table_adapter.get_record(record_id)
+            if latest_record is None:
+                raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
+            if dict(latest_record.fields) != current_fields:
+                current_fields = dict(latest_record.fields)
+                plan = self._plan_safe_patch(
+                    lead_id,
+                    source_message_id,
+                    patch,
+                    current_fields,
+                    protected_supplement,
+                    acknowledged_but_unverified_fields,
+                )
 
         # 外部写入前再次短暂锁定 Lead；若废弃已提交，不能再把表格或后台事实写成补充结果。
         with self._session_factory.begin() as session:
@@ -177,7 +185,14 @@ class LeadReviewService:
 
         # 数据库事务不包裹外部调用；Adapter 只收到确有变化的字段补丁。
         if plan.fields_to_write:
-            self._smart_table_adapter.update_record(record_id, plan.fields_to_write)
+            if initial_record is None:
+                self._smart_table_adapter.update_record(record_id, plan.fields_to_write)
+            else:
+                self._smart_table_adapter.update_record(
+                    record_id,
+                    plan.fields_to_write,
+                    skip_preflight=True,
+                )
 
         with self._session_factory.begin() as session:
             # 最终写回仍要取得 Lead 行锁，并只合并本次计划中未被并发后续写入改变的字段。

@@ -97,10 +97,17 @@ class SmartTableAdapter(Protocol):
         """
         ...
 
-    def update_record(self, record_id: str, fields: Mapping[str, object]) -> SmartTableRecord:
+    def update_record(
+        self,
+        record_id: str,
+        fields: Mapping[str, object],
+        *,
+        skip_preflight: bool = False,
+    ) -> SmartTableRecord:
         """仅更新传入字段补丁，禁止用整行数据覆盖既有记录。
 
-        参数：record_id 为目标记录标识；fields 为本轮字段补丁。
+        参数：record_id 为目标记录标识；fields 为本轮字段补丁；skip_preflight 表示调用方
+        已持有刚创建的远端记录快照，可跳过写入前重复读取，但写后仍必须远端核实。
         返回：更新后的记录快照。
         异常：记录不存在、无权限或底层写入失败时由具体适配器抛出。
         副作用：修改目标记录的传入字段。

@@ -439,13 +439,13 @@ class LocalCapabilityAuthorizer:
             return AuthorizationDecision(False, capability, "local_authorization_unavailable")
         if authorization is None:
             return AuthorizationDecision(False, capability, "local_authorization_missing")
-        if not authorization.is_authorized:
-            return AuthorizationDecision(False, capability, "local_authorization_not_authorized")
         if not authorization.is_active:
             return AuthorizationDecision(False, capability, "local_authorization_inactive")
         if not authorization.is_administrator:
             return AuthorizationDecision(False, capability, "local_authorization_not_administrator")
-        return AuthorizationDecision(True, capability, "local_sales_authorization", "administrator")
+        return AuthorizationDecision(
+            True, capability, "local_active_administrator", "administrator"
+        )
 
     def verified_context(
         self, principal: AuthenticatedPrincipal, capability: ConsoleCapability

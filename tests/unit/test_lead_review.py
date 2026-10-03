@@ -129,6 +129,32 @@ def _lead_with_record(
         return lead.id
 
 
+def test_new_record_snapshot_skips_pre_read_and_still_updates_business_fields(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证创建响应可直接进入字段补写，预读失败不会阻断 update。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead_with_record(session_factory, adapter)
+    created_record = next(iter(adapter.get_records()))
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            adapter,
+            "get_record",
+            lambda _record_id: (_ for _ in ()).throw(AssertionError("unexpected pre-read")),
+        )
+        result = LeadReviewService(session_factory, adapter).sync_ai_patch(
+            lead_id,
+            "message-9",
+            _patch(fields={"工艺": ["上下料"]}),
+            initial_record=created_record,
+        )
+
+    updated_record = next(iter(adapter.get_records()))
+    assert set(result.updated_fields) == {"工艺", "备注"}
+    assert updated_record.fields["工艺"] == ["上下料"]
+
+
 def test_sync_rechecks_user_edit_and_only_writes_safe_medium_confidence_field(
     session_factory: sessionmaker[Session],
 ) -> None:

@@ -71,6 +71,21 @@ def test_failure_classification_uses_explicit_adapter_and_gateway_categories() -
     assert classify_task_failure(RuntimeError("unclassified")) is TaskFailureCategory.UNKNOWN
 
 
+def test_rate_limited_transport_preserves_safe_code_for_business_audit() -> None:
+    """验证 850005 耗尽适配器重试后仍能进入 transient 审计并保留数字码。"""
+    cause = WecomCliProcessError(
+        "wecom-cli 退出失败",
+        error_code="rate_limited",
+        external_error_code=850005,
+    )
+    try:
+        raise WecomCliTransportError("wecom-cli 调用失败") from cause
+    except WecomCliTransportError as error:
+        details = FirstTextLeadWorkspaceService._failure_audit_details(error)
+
+    assert details == {"failure_category": "transient", "failure_code": "850005"}
+
+
 def test_permanent_message_failure_skips_automatic_retry(
     session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:

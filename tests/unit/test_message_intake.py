@@ -350,16 +350,56 @@ def test_authorized_messages_receive_monotonic_sales_sequence(
     assert [event.sequence for event in events] == [1, 2]
 
 
-def test_unauthorized_message_creates_no_processing_work_and_one_notice(
+def test_new_actor_is_registered_and_message_enters_processing_work(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证未授权成员不进入处理链路，重复发送只保留一条权限不足提示记录。"""
+    """验证新 WeCom actor 自动注册、从 sequence 1 开始且不依赖 is_authorized。"""
     service = MessageIntakeService(session_factory)
     command = IncomingMessageCommand(
         message_id="message-1",
         sales_user_id="visitor-1",
         raw_payload={"text": "这是测试消息"},
         normalized_text="这是测试消息",
+        display_name="测试成员",
+    )
+
+    first_result = service.receive(command)
+    duplicate_result = service.receive(command)
+
+    assert first_result.accepted is True
+    assert first_result.duplicate is False
+    assert duplicate_result.duplicate is True
+    with session_factory() as session:
+        actor = session.get(SalesAuthorization, "visitor-1")
+        messages = session.scalars(select(IncomingMessage)).all()
+        outbox = session.scalars(select(OutboxEvent)).all()
+        notices = session.scalars(select(NotificationRecord)).all()
+
+    assert actor is not None
+    assert actor.display_name == "测试成员"
+    assert actor.is_authorized is False
+    assert actor.is_active is True
+    assert actor.next_message_sequence == 1
+    assert len(messages) == 1 and messages[0].sequence == 1
+    assert len(outbox) == 1 and outbox[0].sequence == 1
+    assert notices == []
+
+
+def test_inactive_actor_is_rejected_without_processing_work(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证管理员停用 actor 后消息 fail closed，且通知仍保持幂等。"""
+    with session_factory.begin() as session:
+        session.add(
+            SalesAuthorization(
+                wecom_user_id="inactive-1", is_authorized=False, is_active=False
+            )
+        )
+    service = MessageIntakeService(session_factory)
+    command = IncomingMessageCommand(
+        message_id="inactive-message",
+        sales_user_id="inactive-1",
+        raw_payload={"text": "不应进入处理"},
     )
 
     first_result = service.receive(command)
@@ -371,9 +411,5 @@ def test_unauthorized_message_creates_no_processing_work_and_one_notice(
         assert session.scalars(select(IncomingMessage)).all() == []
         assert session.scalars(select(OutboxEvent)).all() == []
         notices = session.scalars(select(NotificationRecord)).all()
-
     assert len(notices) == 1
-    assert notices[0].notification_type == "sales_authorization_denied"
-    assert notices[0].attempts == 0
-    assert notices[0].provider_message_id is None
-    assert notices[0].sent_at is None
+    assert notices[0].notification_type == "sales_actor_inactive"

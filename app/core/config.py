@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     wecom_smart_table_doc_id: str | None = None
     wecom_smart_table_sheet_id: str | None = None
     wecom_smart_table_sheet_title: str | None = None
+    wecom_audit_sheet_id: str | None = None
+    wecom_audit_sheet_title: str | None = None
     wecom_smart_table_sales_can_create_records: bool | None = None
     wecom_smart_table_sales_can_delete_records: bool | None = None
     wecom_cli_command: str = "wecom-cli"

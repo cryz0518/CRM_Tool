@@ -2578,16 +2578,39 @@ def test_unknown_crm_failure_does_not_finalize_discard_request(
     assert audit is not None and audit.details["attempts"] == 1
 
 
-def test_update_command_requires_authorized_submitting_salesperson(
+def test_update_command_requires_active_actor(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证更新命令仍由确定性销售授权边界保护。"""
+    """验证更新命令仍由确定性 actor active 边界保护。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     crm = MockCRMAdapter()
-    with pytest.raises(ValueError, match="提交销售未授权"):
+    with pytest.raises(ValueError, match="提交销售 actor 不存在或已停用"):
         CrmSubmissionService(session_factory, adapter, crm).submit(
             SubmissionCommand("提交我的更新", "sales-1", "message-12")
         )
+    assert crm.calls == 0
+
+
+def test_crm_submission_does_not_use_legacy_authorization_flag_as_gate(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 active actor 即使 is_authorized=false 也可进入 CRM 提交入口。"""
+    with session_factory.begin() as session:
+        session.add(
+            SalesAuthorization(
+                wecom_user_id="sales-legacy-flag",
+                is_authorized=False,
+                is_active=True,
+            )
+        )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    crm = MockCRMAdapter()
+
+    result = CrmSubmissionService(session_factory, adapter, crm).submit(
+        SubmissionCommand("提交我的更新", "sales-legacy-flag", "message-13")
+    )
+
+    assert result == SubmissionBatchResult()
     assert crm.calls == 0
 
 

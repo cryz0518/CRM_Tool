@@ -396,10 +396,10 @@ class AdminLeadCreationService:
             owner = session.get(SalesAuthorization, smart_table_owner_user_id)
             if operator is None or not operator.is_active or not operator.is_administrator:
                 raise PermissionError("只有活跃管理员可以补建线索")
-            if capture is None or not capture.is_active or not capture.is_authorized:
-                raise ValueError("Original Capturing Salesperson 必须是 active 且 authorized")
-            if owner is None or not owner.is_active or not owner.is_authorized:
-                raise ValueError("Smart Table Owner 必须是 active 且 authorized")
+            if capture is None or not capture.is_active:
+                raise ValueError("Original Capturing Salesperson 必须是 active actor")
+            if owner is None or not owner.is_active:
+                raise ValueError("Smart Table Owner 必须是 active actor")
             lead_id = new_lead_id()
             company_name = field_values["线索名称"]
             duplicate = session.scalar(

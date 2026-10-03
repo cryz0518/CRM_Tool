@@ -27,6 +27,7 @@ from app.smart_table.wecom_cli import (
     WecomCliProcessError,
     WecomCliSmartTableAdapter,
     WecomCliSmartTableAdapterError,
+    WecomCliTransportError,
 )
 
 
@@ -820,6 +821,80 @@ def test_create_returns_only_after_remote_uncached_values_match() -> None:
     assert len(fake_cli.calls) == 3
 
 
+def test_create_rate_limit_850005_is_the_only_process_error_safe_to_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 records add 仅对明确 850005 限流进行有限安全重试。"""
+    monkeypatch.setattr("app.smart_table.wecom_cli.time.sleep", lambda _delay: None)
+    fields = {"负责人": "sales-1"}
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            WecomCliProcessError(
+                "rate limited", error_code="rate_limited", external_error_code=850005
+            ),
+            {"errcode": 0, "records": [{"record_id": "record-created"}]},
+            {
+                "errcode": 0,
+                "values": [
+                    json.dumps(
+                        {
+                            "rows": [
+                                {
+                                    "RECORD_ID": "record-created",
+                                    "负责人": [{"id": "sales-1", "name": "测试销售"}],
+                                }
+                            ]
+                        }
+                    )
+                ],
+            },
+        ]
+    )
+
+    record = _adapter(fake_cli, sheet_title="CRM线索").create_record(
+        fields, actor=SmartTableActor.ROBOT
+    )
+
+    assert record.record_id == "record-created"
+    add_calls = [arguments for arguments in fake_cli.calls if arguments[2:4] == ("records", "add")]
+    assert len(add_calls) == 2
+
+
+@pytest.mark.parametrize(
+    "uncertain_result",
+    [
+        subprocess.TimeoutExpired(cmd="wecom-cli", timeout=1),
+        {"error": {"type": "NetworkError"}},
+        WecomCliProcessError(
+            "wecom-cli 退出失败，退出码：1",
+            error_code="network_error",
+            external_error_code=893101,
+            external_error_type="NetworkError",
+        ),
+        WecomCliProcessError(
+            "wecom-cli 退出失败，退出码：1",
+            error_code="http_error",
+            external_error_code=893102,
+            http_status=503,
+        ),
+    ],
+)
+def test_uncertain_add_result_is_permanent_and_never_replayed(
+    uncertain_result: Mapping[str, object] | BaseException,
+) -> None:
+    """验证网络、超时或 5xx 的新增结果不明时仍禁止自动重放。"""
+    fake_cli = FakeCli([_field_response(), uncertain_result])
+
+    with pytest.raises(WecomCliSmartTableAdapterError, match="新增结果无法确认"):
+        _adapter(fake_cli).create_record(
+            {"负责人": "sales-1"}, actor=SmartTableActor.ROBOT
+        )
+
+    add_calls = [arguments for arguments in fake_cli.calls if arguments[2:4] == ("records", "add")]
+    assert len(add_calls) == 1
+
+
 def test_configured_sheet_title_uses_full_query_and_parses_member_rows() -> None:
     """验证配置子表名称后读取完整查询结果，不受 records list 可见范围影响。"""
     fake_cli = FakeCli(
@@ -851,6 +926,71 @@ def test_configured_sheet_title_uses_full_query_and_parses_member_rows() -> None
     assert records[0].member_names == {"创建人": "测试销售", "负责人": "测试销售"}
     assert records[0].fields["AI待确认"] == []
     assert fake_cli.calls[1][0:5] == ("wecom-cli", "smartsheet", "records", "query", "--docid")
+
+
+@pytest.mark.parametrize(
+    ("record_id", "expected_literal"),
+    [
+        ("record-123", '"record-123"'),
+        ('record"\\tail', '"record\\"\\\\tail"'),
+    ],
+)
+def test_get_record_uses_server_side_record_id_filter(
+    record_id: str, expected_literal: str
+) -> None:
+    """验证单行读取使用 RECORD_ID 服务端过滤和安全字符串字面量。"""
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "values": [json.dumps({"rows": [{"RECORD_ID": record_id}]})],
+            },
+        ]
+    )
+
+    record = _adapter(fake_cli, sheet_title="CRM线索").get_record(record_id)
+
+    assert record is not None and record.record_id == record_id
+    sql = fake_cli.calls[1][fake_cli.calls[1].index("--sql") + 1]
+    assert f"WHERE RECORD_ID = {expected_literal}" in sql
+    assert "LIMIT 1" in sql
+    assert "LIMIT 1000" not in sql
+
+
+def test_create_verification_uses_server_side_record_id_query() -> None:
+    """验证新增 ACK 后的远端核实只查询目标记录。"""
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {"errcode": 0, "records": [{"record_id": "record-created", "values": {}}]},
+            {
+                "errcode": 0,
+                "values": [
+                    json.dumps(
+                        {
+                            "rows": [
+                                {
+                                    "RECORD_ID": "record-created",
+                                    "负责人": [{"id": "sales-1", "name": "测试销售"}],
+                                }
+                            ]
+                        }
+                    )
+                ],
+            },
+        ]
+    )
+
+    record = _adapter(fake_cli, sheet_title="CRM线索").create_record(
+        {"负责人": "sales-1"}, actor=SmartTableActor.ROBOT
+    )
+
+    assert record.record_id == "record-created"
+    sql = fake_cli.calls[2][fake_cli.calls[2].index("--sql") + 1]
+    assert "WHERE RECORD_ID = \"record-created\"" in sql
+    assert "LIMIT 1" in sql
+    assert "LIMIT 1000" not in sql
 
 
 def test_empty_multi_select_string_is_normalized_to_empty_list() -> None:
@@ -944,6 +1084,183 @@ def test_idempotent_cli_network_process_error_is_retried() -> None:
     assert len(fake_cli.calls) == 2
 
 
+@pytest.mark.parametrize(
+    "error_code", ["remote_business_error", "permission_denied", "authentication"]
+)
+def test_query_permanent_process_error_is_preserved_without_retry(error_code: str) -> None:
+    """验证 records query 的永久进程错误原样向上传递且不重试。"""
+    original = WecomCliProcessError(
+        "wecom-cli 退出失败",
+        error_code=error_code,
+        external_error_code=640027 if error_code == "remote_business_error" else None,
+    )
+    fake_cli = FakeCli([original])
+
+    with pytest.raises(WecomCliProcessError) as captured:
+        _adapter(fake_cli)._call_query("SELECT RECORD_ID FROM `CRM线索` LIMIT 1")
+
+    assert captured.value is original
+    assert captured.value.error_code == error_code
+    assert len(fake_cli.calls) == 1
+
+
+def test_query_network_process_error_retries_then_succeeds(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """验证 records query 的网络进程错误按配置重试后返回成功响应。"""
+    caplog.set_level(logging.WARNING)
+    fake_cli = FakeCli(
+        [
+            WecomCliProcessError("network", error_code="network_error"),
+            {"errcode": 0},
+        ]
+    )
+
+    assert _adapter(fake_cli)._call_query("SELECT RECORD_ID FROM `CRM线索` LIMIT 1") == {
+        "errcode": 0
+    }
+    assert len(fake_cli.calls) == 2
+    retry_log = next(
+        record
+        for record in caplog.records
+        if record.message == "wecom_cli_smart_table_retry"
+    )
+    assert retry_log.error_code == "network_error"
+
+
+def test_850005_is_rate_limited_and_query_retries_with_longer_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 850005 归类为限流并使用一秒起步的退避后恢复。"""
+    delays: list[float] = []
+    monkeypatch.setattr("app.smart_table.wecom_cli.time.sleep", delays.append)
+    fake_cli = FakeCli(
+        [
+            WecomCliProcessError(
+                "rate limited",
+                error_code="rate_limited",
+                external_error_code=850005,
+            ),
+            {"errcode": 0},
+        ]
+    )
+
+    assert _adapter(fake_cli)._call_query("SELECT RECORD_ID FROM `CRM线索` LIMIT 1") == {
+        "errcode": 0
+    }
+    assert len(fake_cli.calls) == 2
+    assert delays == [1.0]
+    assert WecomCliSmartTableAdapter._structured_error_category(850005, None, None) == (
+        "rate_limited"
+    )
+    assert [
+        WecomCliSmartTableAdapter._retry_delay_seconds("rate_limited", attempt)
+        for attempt in range(5)
+    ] == [1.0, 2.0, 4.0, 8.0, 8.0]
+    assert WecomCliProcessError(
+        "rate limited", error_code="rate_limited", external_error_code=850005
+    ).retryable is True
+
+
+def test_rate_limited_query_exhaustion_preserves_850005_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证限流重试耗尽后转换为传输错误但保留 850005 原因。"""
+    monkeypatch.setattr("app.smart_table.wecom_cli.time.sleep", lambda _delay: None)
+    last_error = WecomCliProcessError(
+        "rate limited",
+        error_code="rate_limited",
+        external_error_code=850005,
+    )
+    fake_cli = FakeCli(
+        [
+            WecomCliProcessError(
+                "rate limited",
+                error_code="rate_limited",
+                external_error_code=850005,
+            ),
+            last_error,
+        ]
+    )
+
+    with pytest.raises(WecomCliTransportError) as captured:
+        _adapter(fake_cli)._call_query("SELECT RECORD_ID FROM `CRM线索` LIMIT 1")
+
+    assert captured.value.__cause__ is last_error
+    assert last_error.external_error_code == 850005
+    assert len(fake_cli.calls) == 2
+
+
+def test_rate_limited_fields_list_retries_once() -> None:
+    """验证 fields list 遇到 850005 时使用有限重试。"""
+    fake_cli = FakeCli(
+        [
+            WecomCliProcessError(
+                "rate limited", error_code="rate_limited", external_error_code=850005
+            ),
+            {"errcode": 0, "fields": []},
+        ]
+    )
+
+    assert _adapter(fake_cli).get_schema().fields == ()
+    assert len(fake_cli.calls) == 2
+
+
+def test_rate_limited_update_retries_once() -> None:
+    """验证 records update 遇到 850005 时使用有限重试。"""
+    fake_cli = FakeCli(
+        [
+            WecomCliProcessError(
+                "rate limited", error_code="rate_limited", external_error_code=850005
+            ),
+            {"errcode": 0},
+        ]
+    )
+
+    assert _adapter(fake_cli)._call(
+        "records", "update", {"records": [{"record_id": "record-1", "values": {}}]}
+    ) == {"errcode": 0}
+    assert len(fake_cli.calls) == 2
+
+
+def test_query_network_process_error_exhaustion_becomes_transport_error() -> None:
+    """验证 records query 的网络错误耗尽有限重试后才包装为传输错误。"""
+    last_error = WecomCliProcessError("network", error_code="network_error")
+    fake_cli = FakeCli(
+        [
+            WecomCliProcessError("network", error_code="network_error"),
+            last_error,
+        ]
+    )
+
+    with pytest.raises(WecomCliTransportError) as captured:
+        _adapter(fake_cli)._call_query("SELECT RECORD_ID FROM `CRM线索` LIMIT 1")
+
+    assert captured.value.__cause__ is last_error
+    assert len(fake_cli.calls) == 2
+
+
+@pytest.mark.parametrize("http_status, expected_calls", [(429, 2), (503, 2), (400, 1)])
+def test_query_http_status_controls_process_error_retry(
+    http_status: int, expected_calls: int
+) -> None:
+    """验证 records query 只重试 429、503 等明确暂态 HTTP 错误。"""
+    error = WecomCliProcessError("HTTP error", error_code="http_error", http_status=http_status)
+    responses: list[Mapping[str, object] | BaseException] = [error]
+    if expected_calls == 2:
+        responses.append({"errcode": 0})
+    fake_cli = FakeCli(responses)
+
+    if expected_calls == 1:
+        with pytest.raises(WecomCliProcessError):
+            _adapter(fake_cli)._call_query("SELECT RECORD_ID FROM `CRM线索` LIMIT 1")
+    else:
+        assert _adapter(fake_cli)._call_query("SELECT RECORD_ID FROM `CRM线索` LIMIT 1") == {
+            "errcode": 0
+        }
+    assert len(fake_cli.calls) == expected_calls
+
+
 def test_permanent_cli_process_error_is_not_retried() -> None:
     """验证 CLI 明确报告权限或参数错误时不重复提交同一更新。"""
     fake_cli = FakeCli(
@@ -992,6 +1309,7 @@ def test_subprocess_failure_keeps_only_controlled_error_code(
     assert caplog.records[-1].external_error_code == 851003
     formatted_log = JsonFormatter().format(caplog.records[-1])
     assert '"external_error_code": 851003' in formatted_log
+    assert "external_error_code=851003" in caplog.records[-1].getMessage()
     assert "private response text" not in formatted_log
 
 
@@ -1025,6 +1343,36 @@ def test_subprocess_network_error_parses_only_safe_stdout_fields(
     assert "private response" not in str(error.value)
     assert "private body" not in caplog.text
     assert "ignored private stderr" not in caplog.text
+
+
+def test_subprocess_850005_logs_rate_limited_without_remote_text(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """验证真实子进程错误解析和日志均保留 850005 的安全限流分类。"""
+
+    def failed_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        """返回含限流码及不得外泄正文的结构化模拟错误。"""
+        return subprocess.CompletedProcess(
+            args=["wecom-cli"],
+            returncode=1,
+            stdout='{"errcode":850005,"errmsg":"private response"}',
+            stderr="private stderr",
+        )
+
+    monkeypatch.setattr(subprocess, "run", failed_run)
+    caplog.set_level(logging.ERROR)
+
+    with pytest.raises(WecomCliProcessError) as captured:
+        _adapter(FakeCli([]))._run_subprocess(("wecom-cli", "--json", "{}"))
+
+    assert captured.value.error_code == "rate_limited"
+    assert captured.value.external_error_code == 850005
+    assert captured.value.retryable is True
+    assert caplog.records[-1].error_code == "rate_limited"
+    assert caplog.records[-1].external_error_code == 850005
+    assert "private response" not in caplog.text
+    assert "private stderr" not in caplog.text
 
 
 def test_remote_parameter_error_extracts_only_exact_schema_field_title(
@@ -1186,6 +1534,45 @@ def test_update_declares_field_title_key_type() -> None:
     assert payload["key_type"] == "CELL_VALUE_KEY_TYPE_FIELD_TITLE"
 
 
+def test_update_after_create_skips_preflight_read_and_keeps_remote_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证新建记录补写不会被首次预读限流阻断，写后仍执行远端核验。"""
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {"errcode": 0, "records": [{"record_id": "record-1", "values": {"备注": "新值"}}]},
+            {
+                "errcode": 0,
+                "values": [
+                    {
+                        "rows": [
+                            {
+                                "RECORD_ID": "record-1",
+                                "备注": "新值",
+                                "创建人": [{"userId": "sales-1"}],
+                                "负责人": [{"userId": "sales-1"}],
+                            }
+                        ]
+                    }
+                ],
+            },
+        ]
+    )
+    adapter = _adapter(fake_cli, sheet_title="CRM线索")
+    monkeypatch.setattr(
+        adapter,
+        "get_record",
+        lambda _record_id: (_ for _ in ()).throw(AssertionError("unexpected pre-read")),
+    )
+
+    record = adapter.update_record("record-1", {"备注": "新值"}, skip_preflight=True)
+
+    assert record.fields["备注"] == "新值"
+    assert len(fake_cli.calls) == 3
+    assert sum(arguments[2:4] == ("records", "query") for arguments in fake_cli.calls) == 1
+
+
 def test_update_ack_requires_matching_remote_readback() -> None:
     """验证 update ACK 后的远端 uncached 回读才是字段写入成功证据。
 
@@ -1236,6 +1623,14 @@ def test_update_ack_requires_matching_remote_readback() -> None:
 
     assert record.fields["备注"] == "新值"
     assert len(fake_cli.calls) == 4
+    query_sqls = [
+        arguments[arguments.index("--sql") + 1]
+        for arguments in fake_cli.calls
+        if arguments[2:4] == ("records", "query")
+    ]
+    assert len(query_sqls) == 2
+    assert all("WHERE RECORD_ID = \"record-1\"" in sql for sql in query_sqls)
+    assert all("LIMIT 1" in sql and "LIMIT 1000" not in sql for sql in query_sqls)
 
 
 def test_update_waits_for_eventually_consistent_remote_readback(
@@ -1469,34 +1864,6 @@ def test_cli_process_exit_during_add_is_not_retried() -> None:
             actor=SmartTableActor.ROBOT,
         )
     assert len(fake_cli.calls) == 2
-
-
-@pytest.mark.parametrize(
-    "uncertain_result",
-    [
-        subprocess.TimeoutExpired(cmd="wecom-cli", timeout=1),
-        {"error": {"type": "NetworkError"}},
-        WecomCliProcessError(
-            "wecom-cli 退出失败，退出码：1",
-            error_code="network_error",
-            external_error_code=893101,
-            external_error_type="NetworkError",
-        ),
-    ],
-)
-def test_uncertain_add_result_is_permanent_and_never_replayed(
-    uncertain_result: Mapping[str, object] | BaseException,
-) -> None:
-    """验证 add 超时或网络结果未知时作为永久检查点处理且只发送一次。"""
-    fake_cli = FakeCli([_field_response(), uncertain_result])
-
-    with pytest.raises(WecomCliSmartTableAdapterError, match="新增结果无法确认"):
-        _adapter(fake_cli).create_record(
-            {"负责人": "sales-1"}, actor=SmartTableActor.ROBOT
-        )
-
-    add_calls = [arguments for arguments in fake_cli.calls if arguments[2:4] == ("records", "add")]
-    assert len(add_calls) == 1
 
 
 def test_query_record_accepts_native_sql_select_values_and_empty_members() -> None:

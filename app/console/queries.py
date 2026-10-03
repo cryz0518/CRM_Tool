@@ -351,9 +351,8 @@ class ConsoleQueryService:
         ]
         # CRM 提交身份由当前智能表格负责人和员工目录解析，不再要求授权目录预填 CRM 映射。
         with self._session_factory() as session:
-            authorized_count = session.scalar(
+            active_actor_count = session.scalar(
                 select(func.count(SalesAuthorization.wecom_user_id)).where(
-                    SalesAuthorization.is_authorized.is_(True),
                     SalesAuthorization.is_active.is_(True),
                 )
             ) or 0
@@ -362,7 +361,7 @@ class ConsoleQueryService:
                 source="sales_authorization",
                 status="ok",
                 issues=[
-                    f"已启用销售授权 {authorized_count} 条；"
+                    f"已启用 WeCom actor {active_actor_count} 条；"
                     "CRM 提交身份按智能表格负责人目录解析"
                 ],
             )
@@ -372,12 +371,12 @@ class ConsoleQueryService:
     def list_sales_authorizations(
         self, *, limit: int = 50, cursor: str | None = None
     ) -> ConsolePage[ConsoleSalesAuthorizationDTO]:
-        """分页返回销售授权目录和当前智能表格负责人提交范围。
+        """分页返回 Actor Registry 兼容目录和当前智能表格负责人提交范围。
 
         参数：limit 与 cursor 控制只读分页。
-        返回值：不含 CRM 用户标识的销售授权目录 DTO 分页结果。
+        返回值：不含 CRM 用户标识的 Actor Registry DTO 分页结果。
         异常：非法游标抛出 ValueError；数据库读取失败时向上传播。
-        副作用：仅读取授权目录和待同步线索，不修改任何业务状态。
+        副作用：仅读取 actor 目录和待同步线索，不修改任何业务状态。
         """
         offset = self._parse_cursor(cursor)
         bounded_limit = self._bounded_limit(limit)
@@ -759,12 +758,13 @@ class ConsoleQueryService:
     def _crm_mapping_status(
         crm_user_id: str | None, is_authorized: bool, is_active: bool
     ) -> str:
-        """将 CRM 用户标识和销售有效状态转换为控制台可展示的非敏感映射状态。
+        """将 CRM 用户标识和 actor 状态转换为控制台可展示的非敏感映射状态。
 
-        参数：crm_user_id 为目录中的 CRM 用户标识；is_authorized 和 is_active 为销售有效状态。
-        返回值：当前提交不依赖授权目录映射，所有状态均返回 not_required。
+        参数：crm_user_id 为目录中的 CRM 用户标识；is_authorized 为历史兼容字段；
+        is_active 为 actor 状态。
+        返回值：当前提交不依赖旧授权字段，所有状态均返回 not_required。
         异常：无。
-        副作用：无，不修改授权目录或 CRM 映射。
+        副作用：无，不修改 actor 目录或 CRM 映射。
         """
         del crm_user_id, is_authorized, is_active
         return "not_required"

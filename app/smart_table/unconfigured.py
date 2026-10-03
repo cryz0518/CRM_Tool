@@ -80,10 +80,16 @@ class UnconfiguredSmartTableAdapter:
         """
         self._raise_not_configured()
 
-    def update_record(self, record_id: str, fields: Mapping[str, object]) -> SmartTableRecord:
+    def update_record(
+        self,
+        record_id: str,
+        fields: Mapping[str, object],
+        *,
+        skip_preflight: bool = False,
+    ) -> SmartTableRecord:
         """尝试增量更新记录，但未配置时明确失败。
 
-        参数：record_id 为目标记录标识；fields 为字段补丁。
+        参数：record_id 为目标记录标识；fields 为字段补丁；skip_preflight 为已持有创建快照标记。
         异常：始终抛出 SmartTableAdapterConfigurationError。
         """
         self._raise_not_configured()

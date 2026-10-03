@@ -1,4 +1,4 @@
-"""消息接收、销售授权与事务发件箱持久化模型。"""
+"""消息接收、Actor Registry 与事务发件箱持久化模型。"""
 
 from __future__ import annotations
 
@@ -16,8 +16,9 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
+    event,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 
 def utc_now() -> datetime:
@@ -42,12 +43,13 @@ class Base(DeclarativeBase):
 
 
 class SalesAuthorization(Base):
-    """保存销售授权目录及该销售的持久化消息顺序号。
+    """兼容保存 Actor Registry 及该成员的持久化消息顺序号。
 
     参数：字段由 SQLAlchemy 映射初始化。
     返回值：无。
     异常：数据库约束异常由会话层抛出。
-    副作用：持久化后成为销售身份判定权威数据。
+    副作用：持久化后成为企业微信 actor、消息顺序和管理员身份的事实来源；
+    `is_authorized` 仅保留兼容字段，不再作为普通业务访问门槛。
     """
 
     __tablename__ = "sales_authorizations"
@@ -71,7 +73,7 @@ class SalesAuthorization(Base):
 
 
 class IncomingMessage(Base):
-    """保存授权销售已接收的原始消息及标准化文本。
+    """保存有效 WeCom actor 已接收的原始消息及标准化文本。
 
     参数：字段由 SQLAlchemy 映射初始化。
     返回值：无。
@@ -308,12 +310,13 @@ class WecomCallbackDelivery(Base):
 
 
 class BusinessAuditEvent(Base):
-    """保存 T02 消息接收链路的可查询业务审计事件。
+    """保存可查询的结构化业务审计事实。
 
     参数：字段由 SQLAlchemy 映射初始化。
     返回值：无。
     异常：数据库约束异常由会话层抛出。
-    副作用：持久化后可追溯消息接收、去重和未授权拒绝。
+    副作用：持久化后可追溯消息接收、去重、业务操作和受控失败结果；
+    原始消息、客户联系方式和外部响应正文不得放入 details。
     """
 
     __tablename__ = "business_audit_events"
@@ -328,6 +331,63 @@ class BusinessAuditEvent(Base):
     )
 
     __table_args__ = (UniqueConstraint("message_id", "event_type"),)
+
+
+class AuditMirrorOutbox(Base):
+    """保存业务审计事件的 Smart Table 镜像任务。
+
+    参数：字段由 SQLAlchemy 映射初始化。
+    返回值：无。
+    异常：数据库约束异常由会话层抛出。
+    副作用：允许 Worker 独立重试管理员审计镜像，不改变原业务状态。
+    """
+
+    __tablename__ = "audit_mirror_outbox"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    audit_event_id: Mapped[int] = mapped_column(
+        ForeignKey("business_audit_events.id"), nullable=False, unique=True
+    )
+    mirror_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_token: Mapped[str | None] = mapped_column(String(64))
+    failure_category: Mapped[str | None] = mapped_column(String(32))
+    failure_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+@event.listens_for(Session, "after_flush")
+def _enqueue_audit_mirror_outbox(session: Session, _flush_context: object) -> None:
+    """为本次事务新建的业务审计事件生成唯一镜像任务。
+
+    参数：session 为当前 SQLAlchemy 会话；flush_context 为 SQLAlchemy flush 上下文。
+    返回值：无。
+    异常：对象构造或会话写入异常由当前事务传播并回滚。
+    副作用：在审计事实成功 flush 后追加 AuditMirrorOutbox；不调用外部系统。
+    """
+    # after_flush 时审计事件已经获得数据库 ID，镜像键因此稳定且不携带客户数据。
+    # SQLAlchemy 在 after_flush 期间仍会把新对象留在 session.new；用会话标记防止递归 flush。
+    queued_event_ids = session.info.setdefault("audit_mirror_queued_event_ids", set())
+    for audit_event in tuple(session.new):
+        if not isinstance(audit_event, BusinessAuditEvent) or audit_event.id is None:
+            continue
+        if audit_event.id in queued_event_ids:
+            continue
+        # 每个事件只入队一次；数据库唯一约束继续作为并发兜底。
+        session.add(
+            AuditMirrorOutbox(
+                audit_event_id=audit_event.id,
+                mirror_key=f"audit:{audit_event.id}",
+            )
+        )
+        queued_event_ids.add(audit_event.id)
 
 
 class MessageAttachment(Base):

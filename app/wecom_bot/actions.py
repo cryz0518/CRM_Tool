@@ -470,7 +470,7 @@ class WecomActionService:
         title/description 为卡片展示摘要；source_message_id 为可选的已持久化来源消息；
         preview_markdown_chunks 为卡片前发送的完整 Markdown 明细分片。
         返回值：已持久化的动作副本。
-        异常：能力未就绪、动作参数非法或销售未授权时抛出 ValueError/PermissionError。
+        异常：能力未就绪、动作参数非法或 actor 不存在/已停用时抛出 ValueError/PermissionError。
         副作用：新增 WecomAction 与 NotificationRecord，但不直接调用企业微信。
         """
         if not self._card_callback_ready:
@@ -501,12 +501,8 @@ class WecomActionService:
         with self._session_factory.begin() as session:
             # 每次发卡片前重新读取授权目录，禁止用旧会话或 UI 可见范围代替后端授权。
             authorization = session.get(SalesAuthorization, actor_user_id)
-            if (
-                authorization is None
-                or not authorization.is_active
-                or not authorization.is_authorized
-            ):
-                raise PermissionError("卡片动作操作者未授权")
+            if authorization is None or not authorization.is_active:
+                raise PermissionError("卡片动作操作者不存在或已停用")
             # 发行幂等键由服务端业务事实生成；并发发行由数据库唯一约束收敛。
             existing = session.scalar(
                 select(WecomAction).where(WecomAction.issuance_key == issuance_key)
@@ -670,13 +666,9 @@ class WecomActionService:
                 return self._reject_delivery(delivery, "unknown_task", "卡片动作不存在或已失效")
             # 授权和 actor 绑定在每次 callback 重新读取，不能相信卡片发行时的旧权限。
             authorization = session.get(SalesAuthorization, callback.actor_user_id)
-            if (
-                authorization is None
-                or not authorization.is_active
-                or not authorization.is_authorized
-            ):
+            if authorization is None or not authorization.is_active:
                 return self._deny_action(
-                    action, delivery, "actor_unauthorized", "当前账号无操作权限"
+                    action, delivery, "actor_inactive", "当前账号不存在或已停用"
                 )
             if callback.actor_user_id != action.bound_actor_wecom_user_id:
                 return self._deny_action(action, delivery, "actor_mismatch", "该卡片不属于当前账号")
@@ -976,20 +968,16 @@ class WecomActionService:
 
             # Worker 可能在 callback claim 后延迟执行；执行前再次读取授权，避免撤销后仍产生副作用。
             authorization = session.get(SalesAuthorization, action.bound_actor_wecom_user_id)
-            if (
-                authorization is None
-                or not authorization.is_active
-                or not authorization.is_authorized
-            ):
+            if authorization is None or not authorization.is_active:
                 _transition_action(action, WecomActionStatus.DENIED.value)
                 action.processed_at = now
-                action.result_code = "actor_unauthorized"
-                action.result_summary = "操作人授权已撤销，未执行该动作"
+                action.result_code = "actor_inactive"
+                action.result_summary = "操作人不存在或已停用，未执行该动作"
                 outbox.status = WecomActionOutboxStatus.FAILED.value
                 outbox.processing_started_at = None
                 outbox.processing_lease_expires_at = None
                 self._add_result_notification(session, action, action.result_summary)
-                return ActionExecutionResult("actor_unauthorized", action.result_summary, False)
+                return ActionExecutionResult("actor_inactive", action.result_summary, False)
 
             # 每次初次执行或 takeover 都生成新 token；旧 Worker 的 token 随即失效。
             claim_token = uuid4().hex
@@ -1419,7 +1407,7 @@ class WecomActionService:
         参数：actor_user_id 为销售身份；request_message_id 为原提交消息；
         duplicates 为服务端冻结命中集合。
         返回值：已持久化的重复确认动作。
-        异常：重复事实不完整、销售未授权或卡片能力未就绪时抛出异常。
+        异常：重复事实不完整、actor 不存在/已停用或卡片能力未就绪时抛出异常。
         副作用：写入动作、卡片通知和可靠发送 outbox，不直接执行 CRM 写操作。
         """
         duplicate_context = []
@@ -2550,7 +2538,7 @@ class DeterministicWecomActionExecutor:
 
         参数：action 为已完成 callback 鉴权并冻结选择结果的动作快照。
         返回值：供企业微信回复和动作审计使用的结果码、脱敏摘要。
-        异常：动作上下文非法或提交销售未授权时抛出 ValueError。
+        异常：动作上下文非法或提交 actor 不存在/已停用时抛出 ValueError。
         副作用：调用 CRM 提交服务，更新重复同步状态和智能表格提交状态。
         """
         from app.crm.service import CrmSubmissionService

@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 class IncomingMessageCommand:
     """定义接入层交给消息接收服务的已标准化消息。
 
-    参数：message_id 为企业微信消息幂等键，sales_user_id 为发送人，raw_payload 为原始载荷。
+    参数：message_id 为企业微信消息幂等键，sales_user_id 为发送人，raw_payload 为原始载荷；
+    display_name 为可信企业微信来源可提供的成员展示名。
     返回值：本类仅承载输入；外部副作用由 MessageIntakeService 负责。
     异常：数据库异常由调用方统一处理，避免伪造接收成功结果。
     """
@@ -39,13 +40,14 @@ class IncomingMessageCommand:
     raw_payload: dict[str, Any]
     normalized_text: str | None = None
     requires_media_enrichment: bool = False
+    display_name: str | None = None
 
 
 @dataclass(frozen=True)
 class MessageIntakeResult:
     """描述一次消息接收的确定性结果。
 
-    参数：accepted 表示是否具备销售授权，duplicate 表示同一输入是否已处理。
+    参数：accepted 表示消息是否已被系统接收，duplicate 表示同一输入是否已处理。
     返回值：调用方据此决定是否继续后续接入动作。
     异常：不吞没数据库异常，以便上层触发安全重试。
     """
@@ -55,7 +57,7 @@ class MessageIntakeResult:
 
 
 class MessageIntakeService:
-    """在一个数据库事务内完成销售授权、消息去重和发件箱写入。"""
+    """在一个数据库事务内完成 Actor Registry、消息去重和发件箱写入。"""
 
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         """保存创建数据库事务的工厂。
@@ -68,12 +70,12 @@ class MessageIntakeService:
         self._session_factory = session_factory
 
     def receive(self, command: IncomingMessageCommand) -> MessageIntakeResult:
-        """接收一条消息并原子保存授权消息及其待处理 Outbox 事件。
+        """接收一条消息并原子保存 actor 消息及其待处理 Outbox 事件。
 
         参数：command 为标准化后的企业微信消息。
         返回值：返回授权结果和重复处理标记。
         异常：任何数据库错误都会回滚整个事务并向调用方抛出。
-        副作用：授权消息会新增原始消息和 Outbox；未授权消息只保留幂等通知记录。
+        副作用：有效 actor 会新增原始消息和 Outbox；已停用 actor 只保留幂等通知记录。
         """
         token = bind_log_context(message_id=command.message_id, wecom_user_id=command.sales_user_id)
         try:
@@ -84,18 +86,16 @@ class MessageIntakeService:
                     logger.info("重复消息已忽略")
                     return MessageIntakeResult(accepted=True, duplicate=True)
 
-                # 先锁定销售授权目录记录，既保证授权读取一致，也串行分配该销售的顺序号。
+                # 先锁定 Actor Registry 行，既保证启用状态一致，也串行分配该成员的顺序号。
                 authorization = session.scalar(
                     select(SalesAuthorization)
                     .where(SalesAuthorization.wecom_user_id == command.sales_user_id)
                     .with_for_update()
                 )
-                if (
-                    authorization is None
-                    or not authorization.is_authorized
-                    or not authorization.is_active
-                ):
-                    return self._record_unauthorized_notification(session, command)
+                if authorization is None:
+                    authorization = self._register_actor(session, command)
+                if not authorization.is_active:
+                    return self._record_actor_inactive_notification(session, command)
 
                 # 同一销售的并发重投会在授权目录行锁后串行到达，此处再次读取才能稳定返回幂等结果。
                 if session.get(IncomingMessage, command.message_id) is not None:
@@ -140,7 +140,7 @@ class MessageIntakeService:
                     )
                 )
                 self._record_audit_event(session, command, "message_received")
-                logger.info("授权销售消息与发件箱事件已入库")
+                logger.info("有效 actor 消息与发件箱事件已入库")
                 return MessageIntakeResult(accepted=True, duplicate=False)
         except Exception:
             # 事务异常必须保留完整堆栈，供 Docker 日志与后续运维界面定位失败原因。
@@ -150,28 +150,64 @@ class MessageIntakeService:
             # 无论事务成功、回滚还是提前返回，都清理当前消息的链路上下文。
             reset_log_context(token)
 
-    def _record_unauthorized_notification(
+    @staticmethod
+    def _register_actor(session: Session, command: IncomingMessageCommand) -> SalesAuthorization:
+        """在首次收到合法 WeCom 成员消息时创建最小 Actor Registry 记录。
+
+        参数：session 为当前接收事务；command 携带成员标识和可信展示名。
+        返回值：已锁定的 Actor Registry 记录。
+        异常：并发创建由唯一键收敛；数据库异常在无法读取 actor 时向上抛出。
+        副作用：最多新增一条启用 actor 记录，不设置业务授权门槛。
+        """
+        try:
+            # 嵌套事务只包住首次插入，唯一键冲突不会回滚消息接收外层事务。
+            with session.begin_nested():
+                created_actor = SalesAuthorization(
+                    wecom_user_id=command.sales_user_id,
+                    display_name=(
+                        command.display_name.strip()
+                        if isinstance(command.display_name, str) and command.display_name.strip()
+                        else None
+                    ),
+                    is_authorized=False,
+                    is_active=True,
+                )
+                session.add(created_actor)
+                session.flush()
+        except IntegrityError:
+            # 另一个并发接收已完成注册；随后用行锁取得同一顺序分配主体。
+            existing_actor = session.scalar(
+                select(SalesAuthorization)
+                .where(SalesAuthorization.wecom_user_id == command.sales_user_id)
+                .with_for_update()
+            )
+            if existing_actor is None:
+                raise
+            return existing_actor
+        return created_actor
+
+    def _record_actor_inactive_notification(
         self, session: Session, command: IncomingMessageCommand
     ) -> MessageIntakeResult:
-        """为未授权成员登记一次权限不足通知。
+        """为已停用 actor 登记一次幂等通知。
 
         参数：session 为当前接收事务，command 为来源消息。
-        返回值：返回未授权结果及通知是否已存在。
+        返回值：返回停用 actor 的拒绝结果及通知是否已存在。
         异常：数据库写入异常会使当前事务整体回滚。
-        副作用：首次未授权消息新增一条待发送通知，不新增消息或 Outbox 处理任务。
+        副作用：首次停用 actor 消息新增一条待发送通知，不新增消息或 Outbox 处理任务。
         """
-        # 通知键绑定销售、来源消息和通知类型，确保重连不会重复打扰未授权成员。
-        notification_type = "sales_authorization_denied"
+        # 通知键绑定销售、来源消息和通知类型，确保重连不会重复打扰已停用成员。
+        notification_type = "sales_actor_inactive"
         notification_key = hashlib.sha256(
             f"{command.sales_user_id}:{command.message_id}:{notification_type}".encode()
         ).hexdigest()
         if session.get(NotificationRecord, notification_key) is not None:
-            self._record_audit_event(session, command, "unauthorized_message_deduplicated")
-            logger.info("未授权通知已登记")
+            self._record_audit_event(session, command, "actor_inactive_message_deduplicated")
+            logger.info("停用 actor 通知已登记")
             return MessageIntakeResult(accepted=False, duplicate=True)
 
         try:
-            # 无授权目录行可锁时，以唯一键与嵌套事务吸收并发插入冲突，保持通知幂等返回。
+            # actor 行已存在但无法继续接收时，以唯一键与嵌套事务吸收并发插入冲突，保持通知幂等返回。
             with session.begin_nested():
                 session.add(
                     NotificationRecord(
@@ -183,12 +219,12 @@ class MessageIntakeService:
                 )
                 session.flush()
         except IntegrityError:
-            self._record_audit_event(session, command, "unauthorized_message_deduplicated")
-            logger.info("未授权通知已登记")
+            self._record_audit_event(session, command, "actor_inactive_message_deduplicated")
+            logger.info("停用 actor 通知已登记")
             return MessageIntakeResult(accepted=False, duplicate=True)
 
-        self._record_audit_event(session, command, "unauthorized_message_rejected")
-        logger.warning("未授权成员消息已拒绝并登记通知")
+        self._record_audit_event(session, command, "actor_inactive_message_rejected")
+        logger.warning("停用 actor 消息已拒绝并登记通知")
         return MessageIntakeResult(accepted=False, duplicate=False)
 
     def _record_audit_event(
