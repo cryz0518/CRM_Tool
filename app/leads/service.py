@@ -1468,7 +1468,7 @@ class FirstTextLeadWorkspaceService:
                         # 只修复早期解析把整段多行表单吞进公司字段的临时草稿；正常非空值仍不可覆盖。
                         safe_patch["线索名称"] = incoming_company_name
                         repaired_stale_company_name = True
-                    if not safe_patch:
+                    if not safe_patch and context_lead.smart_table_record_id is not None:
                         bind_log_context(lead_id=context_lead.id)
                         self._mark_assigned(session, event, context_lead.id)
                         self._refresh_context(session, message, context_lead.id)
@@ -1511,19 +1511,41 @@ class FirstTextLeadWorkspaceService:
                                 LeadProcessingStatus.UPDATED,
                                 lead_id=context_lead.id,
                             )
-                        raise ValueError(f"当前线索缺少智能表格记录：{context_lead.id}")
-                    event.status = "processing"
-                    event.processing_started_at = utc_now()
-                    self._mark_processing_assignment(session, event, context_lead.id)
-                    bind_log_context(lead_id=context_lead.id)
-                    # 外部表格调用必须等本事务提交后执行，避免在销售顺序锁内等待网络。
-                    context_update = ContextUpdateRequest(
-                        source_message_id=message.message_id,
-                        lead_id=context_lead.id,
-                        record_id=context_lead.smart_table_record_id,
-                        fields=safe_patch,
-                        outbox_event_id=outbox_event_id,
-                    )
+                        # 已有 Lead 但远端行缺失时，复用 T09 的建行与补写事务，不能永久化同步失败。
+                        event.status = "processing"
+                        event.processing_started_at = utc_now()
+                        self._mark_processing_assignment(session, event, context_lead.id)
+                        bind_log_context(lead_id=context_lead.id)
+                        recovery_fields = _normalize_company_patch(
+                            {**context_lead.field_values, **safe_patch}
+                        )
+                        ai_review = AIReviewRequest(
+                            source_message_id=message.message_id,
+                            sales_user_id=message.sales_user_id,
+                            lead_id=context_lead.id,
+                            outbox_event_id=outbox_event_id,
+                            patch=ExtractedLeadPatch(
+                                trace_id=f"deterministic-recovery-{outbox_event_id}",
+                                analysis=LeadAnalysis(intent="UPDATE_LEAD"),
+                                fields=recovery_fields,
+                                pending_confirmation_fields=(),
+                                low_confidence_candidates={},
+                            ),
+                            creates_lead=False,
+                        )
+                    else:
+                        event.status = "processing"
+                        event.processing_started_at = utc_now()
+                        self._mark_processing_assignment(session, event, context_lead.id)
+                        bind_log_context(lead_id=context_lead.id)
+                        # 外部表格调用必须等本事务提交后执行，避免在销售顺序锁内等待网络。
+                        context_update = ContextUpdateRequest(
+                            source_message_id=message.message_id,
+                            lead_id=context_lead.id,
+                            record_id=context_lead.smart_table_record_id,
+                            fields=safe_patch,
+                            outbox_event_id=outbox_event_id,
+                        )
 
                 if (
                     multi_request is None
@@ -2072,9 +2094,8 @@ class FirstTextLeadWorkspaceService:
                 force_retrying=field_patch_pending,
                 retry_reason="field_patch_pending" if field_patch_pending else None,
             )
-            if sync is not None and (
-                request.creates_lead or isinstance(remote_record_id, str)
-            ):
+            if sync is not None and sync.status != "succeeded":
+                # 既有 Lead 也可能在本轮首次补建远端记录；失败状态不能因 creates_lead=False 被丢掉。
                 sync.status = "retrying" if field_patch_pending else (
                     "failed_pending_review" if failed_pending_review else "retrying"
                 )
@@ -2108,13 +2129,18 @@ class FirstTextLeadWorkspaceService:
                 )
         try:
             # 创建人和负责人只使用接入层已授权的销售身份，模型无法影响权限关键字段。
+            record_fields: dict[str, object] = {
+                **DEFAULT_SMART_TABLE_FIELD_VALUES,
+                "线索来源": "展会",
+                "创建人": request.sales_user_id,
+                "负责人": request.sales_user_id,
+            }
+            if not request.creates_lead:
+                # 已有 Lead 缺少远端行时，把后台已确认字段随首个 create 一并落表，
+                # 避免新行的空值被 T09 误判为销售清空而保护掉。
+                record_fields.update(request.patch.fields)
             record = self._smart_table_adapter.create_record(
-                {
-                    **DEFAULT_SMART_TABLE_FIELD_VALUES,
-                    "线索来源": "展会",
-                    "创建人": request.sales_user_id,
-                    "负责人": request.sales_user_id,
-                },
+                record_fields,
                 actor=SmartTableActor.ROBOT,
             )
         except Exception as error:
@@ -2159,30 +2185,29 @@ class FirstTextLeadWorkspaceService:
             )
 
     def _mark_ai_review_failed(self, request: AIReviewRequest, error: Exception) -> None:
-        """把 AI 或审核表格失败固定为失败待审，避免重放模型结果或伪造成功。
+        """记录 AI 审核表格建行失败，并按外部错误类别保留可恢复状态。
 
         参数：request 定位来源事件和线索；error 为已捕获的外部异常。
         返回值：无。
         异常：数据库写入失败时由 SQLAlchemy 抛出。
-        副作用：事件进入 failed_pending_review，并在新线索时更新同步失败事实。
+        副作用：增加失败尝试次数，更新 Outbox、同步事实和受控审计，不伪造成功。
         """
         with self._session_factory.begin() as session:
             event, _ = self._load_event_and_message(session, request.outbox_event_id)
-            event.status = "failed_pending_review"
-            event.failure_category = classify_task_failure(error).value
-            event.failure_summary = safe_failure_summary(error)
-            event.failed_at = utc_now()
-            if request.creates_lead:
-                sync = session.scalar(
-                    select(SmartTableSync).where(SmartTableSync.lead_id == request.lead_id)
-                )
-                if sync is not None:
-                    sync.status = "failed_pending_review"
-                    sync.error_summary = type(error).__name__
-            else:
-                sync = session.scalar(
-                    select(SmartTableSync).where(SmartTableSync.lead_id == request.lead_id)
-                )
+            sync = session.scalar(
+                select(SmartTableSync).where(SmartTableSync.lead_id == request.lead_id)
+            )
+            failed_pending_review = self._record_sync_failure(
+                session,
+                event,
+                retrying_event_type="ai_review_sync_retrying",
+                # 保留旧审计事件名，兼容既有管理员查询和历史诊断。
+                failed_event_type="ai_review_failed_pending_review",
+                error=error,
+            )
+            if sync is not None:
+                sync.status = "failed_pending_review" if failed_pending_review else "retrying"
+                sync.error_summary = type(error).__name__
             remote_record_id = getattr(error, "remote_record_id", None)
             if isinstance(remote_record_id, str) and remote_record_id:
                 # 即使 create_record 抛出核实异常，也要持久化 ACK 返回的原行身份。
@@ -2191,14 +2216,6 @@ class FirstTextLeadWorkspaceService:
                     lead.smart_table_record_id = remote_record_id
                 if sync is not None:
                     sync.smart_table_record_id = remote_record_id
-                    sync.status = "failed_pending_review"
-                    sync.error_summary = type(error).__name__
-            self._record_audit(
-                session,
-                event,
-                "ai_review_failed_pending_review",
-                details=self._failure_audit_details(error),
-            )
         logger.exception("ai_review_sync_failed", extra={"error_type": type(error).__name__})
 
     def _consume_multi_companies_before_smart_table(
@@ -2941,16 +2958,22 @@ class FirstTextLeadWorkspaceService:
                 ),
             )
         except Exception as error:
-            # 失败只留下可重试任务状态，当前销售的后续消息会等待或在失败终态后继续。
+            # 失败只留下可重试任务状态；retrying 不阻塞当前销售的后续消息。
             with self._session_factory.begin() as session:
                 event, _ = self._load_event_and_message(session, request.outbox_event_id)
-                self._record_sync_failure(
+                failed_pending_review = self._record_sync_failure(
                     session,
                     event,
                     retrying_event_type="smart_table_context_update_retrying",
                     failed_event_type="smart_table_context_update_failed_pending_review",
                     error=error,
                 )
+                sync = session.scalar(
+                    select(SmartTableSync).where(SmartTableSync.lead_id == request.lead_id)
+                )
+                if sync is not None and sync.status != "succeeded":
+                    sync.status = "failed_pending_review" if failed_pending_review else "retrying"
+                    sync.error_summary = type(error).__name__
             logger.exception(
                 "smart_table_context_update_failed",
                 extra={"error_type": type(error).__name__},
@@ -2998,13 +3021,13 @@ class FirstTextLeadWorkspaceService:
         异常：数据库查询失败时由 SQLAlchemy 抛出。
         副作用：仅读取同一销售且 sequence 更小的 Outbox 事件。
         """
-        # failed_pending_review 是失败重试耗尽后的顺序检查点，后续消息不能被它永久阻塞。
+        # retrying 已完成本轮外部调用且可安全重试，不能阻塞后续消息；pending/processing 仍保持顺序。
         previous_event_id = session.scalar(
             select(OutboxEvent.id)
             .where(
                 OutboxEvent.sales_user_id == event.sales_user_id,
                 OutboxEvent.sequence < event.sequence,
-                OutboxEvent.status.not_in(COMPLETED_CHECKPOINT_STATUSES),
+                OutboxEvent.status.not_in(COMPLETED_CHECKPOINT_STATUSES | {"retrying"}),
             )
             .order_by(OutboxEvent.sequence)
             .limit(1)
@@ -3167,16 +3190,16 @@ class FirstTextLeadWorkspaceService:
                 sync = session.scalar(
                     select(SmartTableSync).where(SmartTableSync.lead_id == lead_id)
                 )
-                if sync is not None:
-                    sync.error_summary = type(error).__name__
-                    sync.status = "failed_pending_review"
-                self._record_sync_failure(
+                failed_pending_review = self._record_sync_failure(
                     session,
                     event,
                     retrying_event_type="smart_table_sync_retrying",
                     failed_event_type="smart_table_sync_failed_pending_review",
                     error=error,
                 )
+                if sync is not None and sync.status != "succeeded":
+                    sync.status = "failed_pending_review" if failed_pending_review else "retrying"
+                    sync.error_summary = type(error).__name__
             logger.exception("smart_table_first_lead_remark_failed")
             return LeadProcessingResult(LeadProcessingStatus.SYNC_FAILED, lead_id=lead_id)
 

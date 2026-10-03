@@ -657,6 +657,197 @@ def test_smart_table_failure_can_be_consumed_again_without_creating_a_second_lea
     assert event.status == "succeeded"
 
 
+def test_retrying_ai_record_creation_does_not_block_followups_or_create_duplicate_records(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 Smart Table 瞬态失败不阻塞后续消息，并最终只保留同一条记录。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：瞬态失败阻塞后续消息、丢失同步状态或重复创建记录时由 pytest 报告。
+    副作用：模拟首条 AI 线索创建失败，随后用两条补充消息恢复同一条远端记录。
+    """
+    first_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-smart-table-recovery-a",
+        sales_user_id="sales-1",
+        text="刚接触到一个新的协作机器人客户，首条需求待补充",
+    )
+    gateway = AIGateway(
+        MockLLMProvider(
+            [
+                json.dumps(
+                    {
+                        "intent": "NEW_LEAD",
+                        "customer_reference": {},
+                        "crm_fields": {"线索名称": "恢复客户", "联系人": "张三"},
+                        "enrichment": {},
+                        "confidence_by_field": {"线索名称": 0.99, "联系人": 0.95},
+                        "conflicts": [],
+                        "warnings": [],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "intent": "UPDATE_LEAD",
+                        "customer_reference": {},
+                        "crm_fields": {"工艺": "装配"},
+                        "enrichment": {},
+                        "confidence_by_field": {"工艺": 0.95},
+                        "conflicts": [],
+                        "warnings": [],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "intent": "UPDATE_LEAD",
+                        "customer_reference": {},
+                        "crm_fields": {"业务线": "协作机器人"},
+                        "enrichment": {},
+                        "confidence_by_field": {"业务线": 0.95},
+                        "conflicts": [],
+                        "warnings": [],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "intent": "NEW_LEAD",
+                        "customer_reference": {},
+                        "crm_fields": {"线索名称": "恢复客户", "联系人": "张三"},
+                        "enrichment": {},
+                        "confidence_by_field": {"线索名称": 0.99, "联系人": 0.95},
+                        "conflicts": [],
+                        "warnings": [],
+                    }
+                ),
+            ]
+        )
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    original_create = adapter.create_record
+    create_attempts = 0
+
+    def fail_first_create(fields: dict[str, object], **kwargs: object):
+        """让首次建行失败一次，随后恢复到真实 Mock 建行行为。"""
+        nonlocal create_attempts
+        create_attempts += 1
+        if create_attempts == 1:
+            raise RetryableTaskFailure("temporary smart table failure")
+        return original_create(fields, **kwargs)
+
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        ai_gateway=gateway,
+    )
+    with patch.object(adapter, "create_record", side_effect=fail_first_create):
+        first = service.consume(first_event_id)
+
+        with session_factory() as session:
+            first_event = session.get(OutboxEvent, first_event_id)
+            first_sync = session.scalar(
+                select(SmartTableSync).where(SmartTableSync.lead_id == first.lead_id)
+            )
+        assert first.status is LeadProcessingStatus.SYNC_FAILED
+        assert first_event is not None and first_event.status == "retrying"
+        assert first_sync is not None and first_sync.status == "retrying"
+
+        second_event_id = persist_outbox_text(
+            session_factory,
+            message_id="message-smart-table-recovery-b",
+            sales_user_id="sales-1",
+            text="补充该客户的装配工艺需求",
+        )
+        second = service.consume(second_event_id)
+
+        third_event_id = persist_outbox_text(
+            session_factory,
+            message_id="message-smart-table-recovery-c",
+            sales_user_id="sales-1",
+            text="补充该客户的业务线",
+        )
+        third = service.consume(third_event_id)
+
+    assert first.lead_id is not None
+    assert second.status is LeadProcessingStatus.UPDATED
+    assert second.lead_id == first.lead_id
+    assert third.status is LeadProcessingStatus.UPDATED
+    assert third.lead_id == first.lead_id
+    assert create_attempts == 2
+    assert len(adapter.get_records()) == 1
+
+    # 失败消息恢复时只能复用已经绑定的 Lead/record，不能再新增第二行。
+    replayed = service.consume(first_event_id)
+    assert replayed.lead_id == first.lead_id
+    assert len(adapter.get_records()) == 1
+
+    with session_factory() as session:
+        sync = session.scalar(select(SmartTableSync).where(SmartTableSync.lead_id == first.lead_id))
+        first_event = session.get(OutboxEvent, first_event_id)
+        second_event = session.get(OutboxEvent, second_event_id)
+        third_event = session.get(OutboxEvent, third_event_id)
+    assert sync is not None and sync.status == "succeeded"
+    assert first_event is not None and first_event.status == "succeeded"
+    assert second_event is not None and second_event.status == "succeeded"
+    assert third_event is not None and third_event.status == "succeeded"
+
+
+def test_existing_lead_without_record_reenters_create_path_after_transient_failure(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证已有 Lead 缺少 Smart Table record 时，后续同线索消息仍能重新建行。"""
+    first_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-missing-record-recovery-a",
+        sales_user_id="sales-1",
+        text="客户：缺记录恢复客户；联系人：张三",
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    original_create = adapter.create_record
+    create_attempts = 0
+
+    def fail_first_create(fields: dict[str, object], **kwargs: object):
+        """让首条消息的建行失败，验证后续消息能重新进入建行流程。"""
+        nonlocal create_attempts
+        create_attempts += 1
+        if create_attempts == 1:
+            raise RetryableTaskFailure("temporary smart table failure")
+        return original_create(fields, **kwargs)
+
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+    with patch.object(adapter, "create_record", side_effect=fail_first_create):
+        first = service.consume(first_event_id)
+        with session_factory() as session:
+            first_lead = session.get(Lead, first.lead_id)
+        assert first_lead is not None
+        assert first_lead.field_values.get("线索名称") == "缺记录恢复客户"
+        with session_factory.begin() as session:
+            first_event = session.get(OutboxEvent, first_event_id)
+            first_sync = session.scalar(
+                select(SmartTableSync).where(SmartTableSync.lead_id == first.lead_id)
+            )
+            assert first_event is not None and first_sync is not None
+            first_event.status = "failed_pending_review"
+            first_sync.status = "failed_pending_review"
+        second_event_id = persist_outbox_text(
+            session_factory,
+            message_id="message-missing-record-recovery-b",
+            sales_user_id="sales-1",
+            text="客户：缺记录恢复客户；需求：装配",
+        )
+        second = service.consume(second_event_id)
+
+    assert first.status is LeadProcessingStatus.SYNC_FAILED
+    assert second.status is LeadProcessingStatus.UPDATED
+    assert second.lead_id == first.lead_id
+    assert create_attempts == 2
+    assert len(adapter.get_records()) == 1
+    record = adapter.get_records()[0]
+    assert record.fields["线索名称"] == "缺记录恢复客户"
+    assert record.fields["联系人"] == "张三"
+    assert record.fields["工艺"] == ["装配"]
+
+
 def test_smart_table_failure_pins_deterministic_lead_context_before_retry(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -1459,6 +1650,8 @@ def test_new_lead_context_is_pinned_before_smart_table_failure_and_follow_up_use
     assert second_sync is not None
     assert second_sync.status == "retrying"
     assert second_sync.error_summary == "field_patch_pending"
+    second_record_id = second_sync.smart_table_record_id
+    assert second_record_id is not None
     assert second_resolution is not None and second_resolution.lead_id == second.lead_id
     assert second_resolution.status == "processing"
 
@@ -1470,13 +1663,15 @@ def test_new_lead_context_is_pinned_before_smart_table_failure_and_follow_up_use
     )
     third = service.consume(third_event_id)
 
-    assert third.status is LeadProcessingStatus.WAITING_FOR_PREVIOUS
+    assert third.status is LeadProcessingStatus.UPDATED
+    assert third.lead_id == second.lead_id
+    assert third.smart_table_record_id == second_record_id
     with session_factory() as session:
         final_context = session.get(SalesLeadContext, "sales-1")
         assert session.query(Lead).count() == 2
     assert final_context is not None
     assert final_context.lead_id == second.lead_id
-    assert final_context.last_message_sequence == 2
+    assert final_context.last_message_sequence == 3
 
 
 def test_free_form_company_contact_phone_message_is_not_unassigned(
