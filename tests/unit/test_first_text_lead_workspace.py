@@ -15,7 +15,7 @@ from app.ai.gateway import AIGateway
 from app.ai.provider import LLMProviderError, MockLLMProvider
 from app.companies.models import CompanyUpsertCommand, QCCCandidate, QCCLookupResult
 from app.companies.service import CompanyLeadService, MockQCCAdapter, MockTYCAdapter
-from app.core.failures import RetryableTaskFailure
+from app.core.failures import PermanentTaskFailure, RetryableTaskFailure
 from app.leads.models import (
     Lead,
     LeadFieldProvenance,
@@ -39,7 +39,7 @@ from app.messaging.models import (
 )
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.registry import build_required_smart_table_schema
-from app.smart_table.wecom_cli import SmartTableWriteVerificationError
+from app.smart_table.wecom_cli import SmartTableWriteVerificationError, WecomCliProcessError
 
 
 @pytest.fixture
@@ -657,6 +657,53 @@ def test_smart_table_failure_can_be_consumed_again_without_creating_a_second_lea
     assert event.status == "succeeded"
 
 
+def test_smart_table_failure_pins_deterministic_lead_context_before_retry(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证确定性首录在表格失败后仍保留消息归属和销售上下文。"""
+    event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-deterministic-context-pin",
+        sales_user_id="sales-1",
+        text="客户：表格失败上下文客户；联系人：张三",
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+
+    with patch.object(
+        adapter,
+        "create_record",
+        side_effect=WecomCliProcessError(
+            "safe cli failure",
+            error_code="remote_business_error",
+            external_error_code=640027,
+        ),
+    ):
+        failed = service.consume(event_id)
+
+    assert failed.status is LeadProcessingStatus.SYNC_FAILED
+    assert failed.lead_id is not None
+    with session_factory() as session:
+        context = session.get(SalesLeadContext, "sales-1")
+        resolution = session.scalar(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id == "message-deterministic-context-pin"
+            )
+        )
+        failure_audit = session.scalar(
+            select(BusinessAuditEvent).where(
+                BusinessAuditEvent.message_id == "message-deterministic-context-pin",
+                BusinessAuditEvent.event_type == "smart_table_sync_failed_pending_review",
+            )
+        )
+    assert context is not None and context.lead_id == failed.lead_id
+    assert resolution is not None and resolution.lead_id == failed.lead_id
+    assert resolution.status == "processing"
+    assert failure_audit is not None
+    assert failure_audit.details["failure_category"] == "permanent"
+    assert failure_audit.details["failure_code"] == "640027"
+
+
 def test_remark_failure_after_record_creation_recovers_without_sticking(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -803,12 +850,21 @@ def test_ai_create_verification_failure_persists_acknowledged_record_id_and_neve
             else None
         )
         event = session.get(OutboxEvent, event_id)
+        failed_audit = session.scalar(
+            select(BusinessAuditEvent).where(
+                BusinessAuditEvent.message_id == "message-ai-create-verification-failed",
+                BusinessAuditEvent.event_type == "ai_review_failed_pending_review",
+            )
+        )
 
     assert lead is not None and lead.smart_table_record_id == "acked-record-1"
     assert sync is not None
     assert sync.smart_table_record_id == "acked-record-1"
     assert sync.status == "failed_pending_review"
     assert event is not None and event.status == "failed_pending_review"
+    assert failed_audit is not None
+    assert failed_audit.details["failure_category"] == "permanent"
+    assert failed_audit.details["failure_code"] == "SmartTableWriteVerificationError"
 
 
 def test_mismatched_outbox_sales_identity_cannot_create_another_sales_record(
@@ -1288,6 +1344,129 @@ def test_new_company_update_intent_starts_new_lead_and_follow_up_uses_new_contex
     records = adapter.get_records()
     assert len(records) == 2
     assert {record.fields["线索名称"] for record in records} == {"公司A", "公司B"}
+
+
+def test_new_lead_context_is_pinned_before_smart_table_failure_and_follow_up_uses_it(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证新线索表格失败后仍固定业务归属，后续补充不会回到旧上下文。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：B 的表格失败后 context 未推进、C 串回 A 或线索数量错误时由 pytest 报告。
+    副作用：模拟 A 成功、B 表格结构读取永久失败、C 无公司名补充的连续消息。
+    """
+    first_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-context-pin-a",
+        sales_user_id="sales-1",
+        text="公司A的张经理，需要协作机器人方案",
+    )
+    gateway = AIGateway(
+        MockLLMProvider(
+            [
+                json.dumps(
+                    {
+                        "intent": "NEW_LEAD",
+                        "customer_reference": {},
+                        "crm_fields": {"线索名称": "公司A", "联系人": "张经理"},
+                        "enrichment": {},
+                        "confidence_by_field": {"线索名称": 0.99, "联系人": 0.95},
+                        "conflicts": [],
+                        "warnings": [],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "intent": "UPDATE_LEAD",
+                        "customer_reference": {},
+                        "crm_fields": {"线索名称": "公司B", "联系人": "董经理"},
+                        "enrichment": {},
+                        "confidence_by_field": {"线索名称": 0.99, "联系人": 0.95},
+                        "conflicts": [],
+                        "warnings": [],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "intent": "UPDATE_LEAD",
+                        "customer_reference": {},
+                        "crm_fields": {"手机": "13800000000"},
+                        "enrichment": {"预算": "预算38万", "线索来源": "电缆行业展会"},
+                        "confidence_by_field": {"手机": 0.99},
+                        "conflicts": [],
+                        "warnings": [],
+                    }
+                ),
+            ]
+        )
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        ai_gateway=gateway,
+    )
+
+    first = service.consume(first_event_id)
+    assert first.status is LeadProcessingStatus.CREATED
+
+    second_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-context-pin-b",
+        sales_user_id="sales-1",
+        text="公司B的董经理，电缆表面绝缘层瑕疵视觉检测",
+    )
+
+    def fail_schema(*_args: object) -> object:
+        """模拟远端结构读取永久失败，避免触发真实 Smart Table。"""
+        raise PermanentTaskFailure("schema read failed")
+
+    with (
+        patch.object(adapter, "get_schema", side_effect=fail_schema),
+        patch.object(adapter, "get_record", side_effect=fail_schema),
+    ):
+        second = service.consume(second_event_id)
+
+    assert second.status is LeadProcessingStatus.SYNC_FAILED
+    assert second.lead_id is not None
+    assert second.lead_id != first.lead_id
+    with session_factory() as session:
+        context_after_failure = session.get(SalesLeadContext, "sales-1")
+        second_event = session.get(OutboxEvent, second_event_id)
+        second_resolution = session.scalar(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id == "message-context-pin-b"
+            )
+        )
+    assert context_after_failure is not None
+    assert context_after_failure.lead_id == second.lead_id
+    assert second_event is not None and second_event.status == "failed_pending_review"
+    assert second_resolution is not None and second_resolution.lead_id == second.lead_id
+    assert second_resolution.status == "processing"
+
+    third_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-context-pin-c",
+        sales_user_id="sales-1",
+        text="预算38万，项目预计今年底",
+    )
+    with (
+        patch.object(adapter, "get_schema", side_effect=fail_schema),
+        patch.object(adapter, "get_record", side_effect=fail_schema),
+    ):
+        third = service.consume(third_event_id)
+
+    assert third.status is LeadProcessingStatus.SYNC_FAILED
+    assert third.lead_id == second.lead_id
+    with session_factory() as session:
+        third_resolution = session.scalar(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id == "message-context-pin-c"
+            )
+        )
+        assert session.query(Lead).count() == 2
+    assert third_resolution is not None and third_resolution.lead_id == second.lead_id
 
 
 def test_free_form_company_contact_phone_message_is_not_unassigned(

@@ -992,6 +992,7 @@ def test_subprocess_failure_keeps_only_controlled_error_code(
     assert caplog.records[-1].external_error_code == 851003
     formatted_log = JsonFormatter().format(caplog.records[-1])
     assert '"external_error_code": 851003' in formatted_log
+    assert "external_error_code=851003" in caplog.records[-1].getMessage()
     assert "private response text" not in formatted_log
 
 

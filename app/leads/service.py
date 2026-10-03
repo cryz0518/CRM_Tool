@@ -1340,6 +1340,14 @@ class FirstTextLeadWorkspaceService:
                     ):
                         context_lead = active_context
                 if (
+                    context_lead is not None
+                    and context_lead.source_message_id == message.message_id
+                    and context_lead.smart_table_record_id is None
+                ):
+                    # 同一来源消息的首次表格创建失败时，恢复原 Lead 的建档路径，不能把已推进的
+                    # context 当成普通补充而返回 UPDATED；后续新消息仍保留该 context。
+                    context_lead = None
+                if (
                     multi_request is None
                     and multi_company_fields is None
                     and not extracted_patch
@@ -1356,6 +1364,17 @@ class FirstTextLeadWorkspaceService:
                     )
                     if ai_result is not None:
                         return ai_result
+                if (
+                    context_lead is not None
+                    and not extracted_patch
+                    and ai_review is None
+                    and not self._is_weak_identity_fragment(message.normalized_text)
+                ):
+                    # 提前固定的上下文不能把普通问候升级成待归属消息；只有弱补充才继承线索。
+                    event.status = "ignored"
+                    self._record_audit(session, event, "lead_text_ignored")
+                    logger.info("lead_text_ignored")
+                    return LeadProcessingResult(LeadProcessingStatus.IGNORED)
                 same_context_company = context_lead is not None and extracted_patch.get(
                     "线索名称"
                 ) == context_lead.field_values.get("线索名称")
@@ -1803,6 +1822,12 @@ class FirstTextLeadWorkspaceService:
         异常：关键数据库事实缺失时抛出 ValueError；其他外部失败转为失败待审事实。
         副作用：可能创建智能表格记录、调用 T09，并完成消息归属和当前客户上下文。
         """
+        # 先固定业务归属和销售会话，再允许 T09/Smart Table 产生任何外部副作用。
+        with self._session_factory.begin() as session:
+            event, message = self._load_event_and_message(session, request.outbox_event_id)
+            self._pin_message_lead_before_external_sync(
+                session, event, message, request.lead_id
+            )
         record_id = self._ensure_ai_review_record(request)
         if record_id is None:
             return LeadProcessingResult(LeadProcessingStatus.SYNC_FAILED, lead_id=request.lead_id)
@@ -2061,7 +2086,12 @@ class FirstTextLeadWorkspaceService:
                     sync.smart_table_record_id = remote_record_id
                     sync.status = "failed_pending_review"
                     sync.error_summary = type(error).__name__
-            self._record_audit(session, event, "ai_review_failed_pending_review")
+            self._record_audit(
+                session,
+                event,
+                "ai_review_failed_pending_review",
+                details=self._failure_audit_details(error),
+            )
         logger.exception("ai_review_sync_failed", extra={"error_type": type(error).__name__})
 
     def _consume_multi_companies_before_smart_table(
@@ -2568,11 +2598,12 @@ class FirstTextLeadWorkspaceService:
         logger.info("lead_message_assigned")
 
     def _mark_processing_assignment(
-        self, session: Session, event: OutboxEvent, lead_id: str
+        self, session: Session, event: OutboxEvent, lead_id: str, segment_index: int = 0
     ) -> None:
         """在外部同步开始前持久化已确定的消息目标，供失败补充重试复用。
 
-        参数：session 为当前处理事务；event 为消息 Outbox 事实；lead_id 为已由 T07 确定的线索。
+        参数：session 为当前处理事务；event 为消息 Outbox 事实；lead_id 为已由 T07 确定的线索；
+        segment_index 为消息分段序号。
         返回值：无。
         异常：数据库写入失败时由 SQLAlchemy 抛出。
         副作用：新增或补全 processing 归属，不改变 Outbox 的任务状态或线索生命周期。
@@ -2580,14 +2611,14 @@ class FirstTextLeadWorkspaceService:
         resolution = session.scalar(
             select(LeadMessageResolution).where(
                 LeadMessageResolution.message_id == event.message_id,
-                LeadMessageResolution.segment_index == 0,
+                LeadMessageResolution.segment_index == segment_index,
             )
         )
         if resolution is None:
             session.add(
                 LeadMessageResolution(
                     message_id=event.message_id,
-                    segment_index=0,
+                    segment_index=segment_index,
                     lead_id=lead_id,
                     status="processing",
                 )
@@ -2596,6 +2627,29 @@ class FirstTextLeadWorkspaceService:
             # 已有待归属事实没有目标时，只能补入本次确定的同一消息目标，不能覆盖已有归属。
             resolution.lead_id = lead_id
             resolution.status = "processing"
+        elif resolution.lead_id == lead_id:
+            # 重试同一外部同步时继续保留同一个业务目标，不允许状态回退造成重新猜测。
+            resolution.status = "processing"
+
+    def _pin_message_lead_before_external_sync(
+        self,
+        session: Session,
+        event: OutboxEvent,
+        message: IncomingMessage,
+        lead_id: str,
+        segment_index: int = 0,
+    ) -> None:
+        """在首次 Smart Table 外部调用前固定消息归属和销售当前线索。
+
+        参数：session 为当前事务；event 和 message 为同一来源事实；lead_id 为已确定目标；
+        segment_index 为消息分段序号。
+        返回值：无。
+        异常：归属或上下文持久化失败时向调用方传播。
+        副作用：写入 processing 归属、推进 SalesLeadContext，并记录受控审计事件；不调用外部系统。
+        """
+        self._mark_processing_assignment(session, event, lead_id, segment_index)
+        self._refresh_context(session, message, lead_id)
+        self._record_audit(session, event, "lead_routing_context_pinned")
 
     def _only_empty_fields(self, lead: Lead, fields: dict[str, str]) -> dict[str, str]:
         """从字段补丁中保留当前线索尚无值的字段，避免覆盖既有或人工数据。
@@ -2658,6 +2712,14 @@ class FirstTextLeadWorkspaceService:
         副作用：调用 SmartTableAdapter，成功后保存字段来源、消息归属、上下文和审计。
         """
         logger.info("smart_table_context_update_started")
+        # 即使后续 T09 读取或写入失败，当前销售也必须留在已确定的目标线索上。
+        with self._session_factory.begin() as session:
+            event, message = self._load_event_and_message(session, request.outbox_event_id)
+            if message.message_id != request.source_message_id:
+                raise ValueError(f"上下文更新来源消息不一致：{request.outbox_event_id}")
+            self._pin_message_lead_before_external_sync(
+                session, event, message, request.lead_id, request.segment_index
+            )
         try:
             # 确定性补充也必须复用 T09：它负责人工保护、字段来源和基于安全快照的备注重建。
             LeadReviewService(
@@ -2813,6 +2875,14 @@ class FirstTextLeadWorkspaceService:
                     )
                 # 记录已经由前一次调用创建，但 T09 或回写阶段失败时只恢复后续短步骤。
                 existing_record_id = existing_lead.smart_table_record_id
+        # Smart Table 是外部投影；先提交业务归属和销售上下文，再执行创建/核实/更新。
+        with self._session_factory.begin() as session:
+            event, message = self._load_event_and_message(session, outbox_event_id)
+            if message.sales_user_id != sales_user_id:
+                raise ValueError(f"智能表格同步销售身份不一致：{outbox_event_id}")
+            self._pin_message_lead_before_external_sync(
+                session, event, message, lead_id, segment_index
+            )
         # 创建人和负责人共同写为当前销售，绝不使用机器人、管理员或公共账号。
         record_fields: dict[str, object] = {
             **DEFAULT_SMART_TABLE_FIELD_VALUES,
@@ -2959,28 +3029,58 @@ class FirstTextLeadWorkspaceService:
         """
         event.attempts += 1
         failure_category: str | None = None
+        failure_code: str | None = None
         if error is not None:
-            failure_category = classify_task_failure(error).value
+            failure_details = self._failure_audit_details(error)
+            failure_category = str(failure_details["failure_category"])
+            failure_code = str(failure_details["failure_code"])
             event.failure_category = failure_category
             event.failure_summary = safe_failure_summary(error)
+        audit_details: dict[str, object] | None = (
+            {"failure_category": failure_category, "failure_code": failure_code}
+            if failure_category is not None and failure_code is not None
+            else None
+        )
         if failure_category is not None and failure_category != "transient":
             # 永久或未知失败不重复调用确定性失败的外部接口，直接成为可人工处理的检查点。
             event.status = "failed_pending_review"
             event.failed_at = utc_now()
-            self._record_audit(session, event, failed_event_type)
+            self._record_audit(session, event, failed_event_type, details=audit_details)
             logger.error("lead_outbox_failed_pending_review")
             return True
         # 配置值表示额外重试次数：首次失败可重试，超过上限后才允许后续消息越过。
         if event.attempts > self._lead_message_retry_count:
             event.status = "failed_pending_review"
             event.failed_at = utc_now()
-            self._record_audit(session, event, failed_event_type)
+            self._record_audit(session, event, failed_event_type, details=audit_details)
             logger.error("lead_outbox_failed_pending_review")
             return True
         event.status = "retrying"
-        self._record_audit(session, event, retrying_event_type)
+        self._record_audit(session, event, retrying_event_type, details=audit_details)
         logger.warning("lead_outbox_retrying")
         return False
+
+    @staticmethod
+    def _failure_audit_details(error: BaseException) -> dict[str, object]:
+        """生成可写入业务审计的受控失败分类和代码。
+
+        参数：error 为外部同步异常。
+        返回值：只包含失败分类与安全失败代码，不包含异常正文、响应体或凭据。
+        异常：无；未知异常使用异常类型名作为最后兜底。
+        副作用：无。
+        """
+        failure_category = classify_task_failure(error).value
+        external_error_code = getattr(error, "external_error_code", None)
+        if type(external_error_code) is int:
+            failure_code = str(external_error_code)
+        else:
+            internal_error_code = getattr(error, "error_code", None)
+            failure_code = (
+                internal_error_code[:64]
+                if isinstance(internal_error_code, str) and internal_error_code
+                else type(error).__name__[:64]
+            )
+        return {"failure_category": failure_category, "failure_code": failure_code}
 
     def _record_audit(
         self,

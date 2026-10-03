@@ -781,8 +781,12 @@ class WecomCliSmartTableAdapter:
                     rejected_field_candidates,
                 ) = parsed_error
             logger.error(
-                "wecom_cli_process_failed error_code=%s",
+                "wecom_cli_process_failed error_code=%s external_error_code=%s "
+                "external_error_type=%s http_status=%s",
                 error_code,
+                external_error_code,
+                external_error_type,
+                http_status,
                 extra={
                     "returncode": completed.returncode,
                     "error_code": error_code,
