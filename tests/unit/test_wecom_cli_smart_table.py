@@ -27,6 +27,7 @@ from app.smart_table.wecom_cli import (
     WecomCliProcessError,
     WecomCliSmartTableAdapter,
     WecomCliSmartTableAdapterError,
+    WecomCliTransportError,
 )
 
 
@@ -853,6 +854,71 @@ def test_configured_sheet_title_uses_full_query_and_parses_member_rows() -> None
     assert fake_cli.calls[1][0:5] == ("wecom-cli", "smartsheet", "records", "query", "--docid")
 
 
+@pytest.mark.parametrize(
+    ("record_id", "expected_literal"),
+    [
+        ("record-123", '"record-123"'),
+        ('record"\\tail', '"record\\"\\\\tail"'),
+    ],
+)
+def test_get_record_uses_server_side_record_id_filter(
+    record_id: str, expected_literal: str
+) -> None:
+    """验证单行读取使用 RECORD_ID 服务端过滤和安全字符串字面量。"""
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "values": [json.dumps({"rows": [{"RECORD_ID": record_id}]})],
+            },
+        ]
+    )
+
+    record = _adapter(fake_cli, sheet_title="CRM线索").get_record(record_id)
+
+    assert record is not None and record.record_id == record_id
+    sql = fake_cli.calls[1][fake_cli.calls[1].index("--sql") + 1]
+    assert f"WHERE RECORD_ID = {expected_literal}" in sql
+    assert "LIMIT 1" in sql
+    assert "LIMIT 1000" not in sql
+
+
+def test_create_verification_uses_server_side_record_id_query() -> None:
+    """验证新增 ACK 后的远端核实只查询目标记录。"""
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {"errcode": 0, "records": [{"record_id": "record-created", "values": {}}]},
+            {
+                "errcode": 0,
+                "values": [
+                    json.dumps(
+                        {
+                            "rows": [
+                                {
+                                    "RECORD_ID": "record-created",
+                                    "负责人": [{"id": "sales-1", "name": "测试销售"}],
+                                }
+                            ]
+                        }
+                    )
+                ],
+            },
+        ]
+    )
+
+    record = _adapter(fake_cli, sheet_title="CRM线索").create_record(
+        {"负责人": "sales-1"}, actor=SmartTableActor.ROBOT
+    )
+
+    assert record.record_id == "record-created"
+    sql = fake_cli.calls[2][fake_cli.calls[2].index("--sql") + 1]
+    assert "WHERE RECORD_ID = \"record-created\"" in sql
+    assert "LIMIT 1" in sql
+    assert "LIMIT 1000" not in sql
+
+
 def test_empty_multi_select_string_is_normalized_to_empty_list() -> None:
     """验证真实 CLI 对空多选返回空字符串时不会被误判为协议错误。"""
     field = SmartTableField(
@@ -942,6 +1008,88 @@ def test_idempotent_cli_network_process_error_is_retried() -> None:
 
     assert _adapter(fake_cli).get_schema().fields == ()
     assert len(fake_cli.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "error_code", ["remote_business_error", "permission_denied", "authentication"]
+)
+def test_query_permanent_process_error_is_preserved_without_retry(error_code: str) -> None:
+    """验证 records query 的永久进程错误原样向上传递且不重试。"""
+    original = WecomCliProcessError(
+        "wecom-cli 退出失败",
+        error_code=error_code,
+        external_error_code=640027 if error_code == "remote_business_error" else None,
+    )
+    fake_cli = FakeCli([original])
+
+    with pytest.raises(WecomCliProcessError) as captured:
+        _adapter(fake_cli)._call_query("SELECT RECORD_ID FROM `CRM线索` LIMIT 1")
+
+    assert captured.value is original
+    assert captured.value.error_code == error_code
+    assert len(fake_cli.calls) == 1
+
+
+def test_query_network_process_error_retries_then_succeeds(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """验证 records query 的网络进程错误按配置重试后返回成功响应。"""
+    caplog.set_level(logging.WARNING)
+    fake_cli = FakeCli(
+        [
+            WecomCliProcessError("network", error_code="network_error"),
+            {"errcode": 0},
+        ]
+    )
+
+    assert _adapter(fake_cli)._call_query("SELECT RECORD_ID FROM `CRM线索` LIMIT 1") == {
+        "errcode": 0
+    }
+    assert len(fake_cli.calls) == 2
+    retry_log = next(
+        record
+        for record in caplog.records
+        if record.message == "wecom_cli_smart_table_retry"
+    )
+    assert retry_log.error_code == "network_error"
+
+
+def test_query_network_process_error_exhaustion_becomes_transport_error() -> None:
+    """验证 records query 的网络错误耗尽有限重试后才包装为传输错误。"""
+    last_error = WecomCliProcessError("network", error_code="network_error")
+    fake_cli = FakeCli(
+        [
+            WecomCliProcessError("network", error_code="network_error"),
+            last_error,
+        ]
+    )
+
+    with pytest.raises(WecomCliTransportError) as captured:
+        _adapter(fake_cli)._call_query("SELECT RECORD_ID FROM `CRM线索` LIMIT 1")
+
+    assert captured.value.__cause__ is last_error
+    assert len(fake_cli.calls) == 2
+
+
+@pytest.mark.parametrize("http_status, expected_calls", [(429, 2), (503, 2), (400, 1)])
+def test_query_http_status_controls_process_error_retry(
+    http_status: int, expected_calls: int
+) -> None:
+    """验证 records query 只重试 429、503 等明确暂态 HTTP 错误。"""
+    error = WecomCliProcessError("HTTP error", error_code="http_error", http_status=http_status)
+    responses: list[Mapping[str, object] | BaseException] = [error]
+    if expected_calls == 2:
+        responses.append({"errcode": 0})
+    fake_cli = FakeCli(responses)
+
+    if expected_calls == 1:
+        with pytest.raises(WecomCliProcessError):
+            _adapter(fake_cli)._call_query("SELECT RECORD_ID FROM `CRM线索` LIMIT 1")
+    else:
+        assert _adapter(fake_cli)._call_query("SELECT RECORD_ID FROM `CRM线索` LIMIT 1") == {
+            "errcode": 0
+        }
+    assert len(fake_cli.calls) == expected_calls
 
 
 def test_permanent_cli_process_error_is_not_retried() -> None:
@@ -1237,6 +1385,14 @@ def test_update_ack_requires_matching_remote_readback() -> None:
 
     assert record.fields["备注"] == "新值"
     assert len(fake_cli.calls) == 4
+    query_sqls = [
+        arguments[arguments.index("--sql") + 1]
+        for arguments in fake_cli.calls
+        if arguments[2:4] == ("records", "query")
+    ]
+    assert len(query_sqls) == 2
+    assert all("WHERE RECORD_ID = \"record-1\"" in sql for sql in query_sqls)
+    assert all("LIMIT 1" in sql and "LIMIT 1000" not in sql for sql in query_sqls)
 
 
 def test_update_waits_for_eventually_consistent_remote_readback(
