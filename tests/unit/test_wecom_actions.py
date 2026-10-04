@@ -2075,8 +2075,10 @@ def test_final_notification_retry_does_not_repeat_domain_action(
     assert calls == 1
 
 
-def test_inactive_or_unauthorized_actor_is_denied(session_factory: sessionmaker[Session]) -> None:
-    """验证卡片发行后停用或撤销授权都会阻止业务动作。"""
+def test_inactive_actor_is_denied_but_legacy_flag_is_ignored(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证卡片发行后停用 actor 会阻止动作，但历史授权字段不再阻断。"""
 
     _authorize(session_factory)
     action = _service(session_factory).issue_discard_action(
@@ -2090,7 +2092,7 @@ def test_inactive_or_unauthorized_actor_is_denied(session_factory: sessionmaker[
         _service(session_factory)
         .claim_callback(_frame_for_action(action, msgid="provider-msg-300"))
         .code
-        == "actor_unauthorized"
+        == "actor_inactive"
     )
 
     _authorize(session_factory, "sales-b")
@@ -2105,7 +2107,7 @@ def test_inactive_or_unauthorized_actor_is_denied(session_factory: sessionmaker[
         _service(session_factory)
         .claim_callback(_frame_for_action(action_b, msgid="provider-msg-301", actor="sales-b"))
         .code
-        == "actor_unauthorized"
+        == "claimed"
     )
 
 

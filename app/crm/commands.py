@@ -658,7 +658,7 @@ def _link_existing_smart_table_record(
     """把当前销售负责的既有表格记录安全登记为待提交 Lead。
 
     参数：session 为当前事务；record 为智能表格快照；command 提供当前销售和审计消息。
-    返回值：新建或已存在的 Lead；负责人不匹配、销售未授权或公司名无效时返回 None。
+    返回值：新建或已存在的 Lead；负责人不匹配、actor 不可用或公司名无效时返回 None。
     异常：数据库约束异常向调用方传播；不调用外部 CRM。
     副作用：写入一条 pending_create Lead；write_audit 为 True 时追加绑定审计事件。
     """
@@ -667,11 +667,7 @@ def _link_existing_smart_table_record(
     if owner != command.sales_user_id or not isinstance(company_name, str) or not company_name:
         return None
     authorization = session.get(SalesAuthorization, command.sales_user_id)
-    if (
-        authorization is None
-        or not authorization.is_authorized
-        or not authorization.is_active
-    ):
+    if authorization is None or not authorization.is_active:
         return None
     existing = session.scalar(
         select(Lead).where(Lead.smart_table_record_id == record.record_id).with_for_update()

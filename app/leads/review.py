@@ -10,12 +10,13 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.ai.models import ExtractedLeadPatch
+from app.ai.models import ExtractedLeadPatch, LeadFieldValue
 from app.core.config import get_settings
 from app.leads.models import (
     Lead,
     LeadFieldProvenance,
     UserConfirmationEvent,
+    deserialize_field_value,
     field_values_equal,
     serialize_field_value,
 )
@@ -119,12 +120,14 @@ class LeadReviewService:
         *,
         protected_supplement: bool = False,
         acknowledged_but_unverified_fields: tuple[str, ...] = (),
+        initial_record: SmartTableRecord | None = None,
     ) -> ReviewSyncResult:
         """重读智能表格后同步 T08 的合法字段，并永久保护人工编辑字段。
 
         参数：lead_id 为目标线索；source_message_id 为已持久化 AI 来源消息；patch 为 T08 结果；
         protected_supplement 表示该补丁来自历史失败消息，只允许补充当前空字段；
-        acknowledged_but_unverified_fields 是旧版 ACK 假成功后需重新核验的原计划字段。
+        acknowledged_but_unverified_fields 是旧版 ACK 假成功后需重新核验的原计划字段；
+        initial_record 是刚由 create_record 返回的快照，用于避免创建后再次预读远端。
         返回值：实际写入与被保护字段的确定性结果。
         异常：线索、消息或表格记录缺失时抛出 ValueError；适配器错误向调用方传播。
         副作用：可能更新表格、字段来源、人工编辑标记和审计记录。
@@ -138,10 +141,15 @@ class LeadReviewService:
                 raise ValueError(f"线索缺少智能表格记录：{lead_id}")
             record_id = lead.smart_table_record_id
 
-        # 每次 AI 写入前都从 T03 Adapter 重读，不能使用过期的后台字段快照判断人工编辑。
-        record = self._smart_table_adapter.get_record(record_id)
+        # 刚创建的记录快照已由 Adapter 返回；此处直接进入补丁规划，避免限流预读阻断字段写入。
+        record = initial_record
         if record is None:
-            raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
+            # 普通既有记录仍需从 T03 Adapter 重读，不能使用过期后台字段快照判断人工编辑。
+            record = self._smart_table_adapter.get_record(record_id)
+            if record is None:
+                raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
+        elif record.record_id != record_id:
+            raise ValueError(f"创建响应记录标识不一致：{record_id}")
         current_fields = dict(record.fields)
         plan = self._plan_safe_patch(
             lead_id,
@@ -153,19 +161,23 @@ class LeadReviewService:
         )
 
         # 在外部写入前再读一次表格；并发的后续消息若已提交，必须基于最新状态重算补丁。
-        latest_record = self._smart_table_adapter.get_record(record_id)
-        if latest_record is None:
-            raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
-        if dict(latest_record.fields) != current_fields:
-            current_fields = dict(latest_record.fields)
-            plan = self._plan_safe_patch(
-                lead_id,
-                source_message_id,
-                patch,
-                current_fields,
-                protected_supplement,
-                acknowledged_but_unverified_fields,
-            )
+        if initial_record is None:
+            latest_record = self._smart_table_adapter.get_record(record_id)
+            if latest_record is None:
+                raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
+            if dict(latest_record.fields) != current_fields:
+                current_fields = dict(latest_record.fields)
+                plan = self._plan_safe_patch(
+                    lead_id,
+                    source_message_id,
+                    patch,
+                    current_fields,
+                    protected_supplement,
+                    acknowledged_but_unverified_fields,
+                )
+
+        # 先保存后台字段快照；外部表格失败时，后续消息仍能恢复这批待补写字段。
+        self._persist_planned_snapshot(lead_id, source_message_id, plan, patch.enrichment)
 
         # 外部写入前再次短暂锁定 Lead；若废弃已提交，不能再把表格或后台事实写成补充结果。
         with self._session_factory.begin() as session:
@@ -177,7 +189,14 @@ class LeadReviewService:
 
         # 数据库事务不包裹外部调用；Adapter 只收到确有变化的字段补丁。
         if plan.fields_to_write:
-            self._smart_table_adapter.update_record(record_id, plan.fields_to_write)
+            if initial_record is None:
+                self._smart_table_adapter.update_record(record_id, plan.fields_to_write)
+            else:
+                self._smart_table_adapter.update_record(
+                    record_id,
+                    plan.fields_to_write,
+                    skip_preflight=True,
+                )
 
         with self._session_factory.begin() as session:
             # 最终写回仍要取得 Lead 行锁，并只合并本次计划中未被并发后续写入改变的字段。
@@ -192,7 +211,10 @@ class LeadReviewService:
             for field_name in plan.written_names:
                 value = plan.synced_values[field_name]
                 # 后续消息若已改写该字段，旧失败消息只能保留当前事实，不能以整份 JSON 回写覆盖它。
-                if current_values.get(field_name) != plan.base_lead_values.get(field_name):
+                if current_values.get(field_name) not in (
+                    plan.base_lead_values.get(field_name),
+                    value,
+                ):
                     continue
                 current_values[field_name] = value
                 actual_written_names.append(field_name)
@@ -229,6 +251,56 @@ class LeadReviewService:
 
         logger.info("lead_review_patch_synced", extra={"lead_id": lead_id, "record_id": record_id})
         return ReviewSyncResult(tuple(actual_written_names), plan.protected_fields)
+
+    def _persist_planned_snapshot(
+        self,
+        lead_id: str,
+        source_message_id: str,
+        plan: _SafePatchPlan,
+        enrichment: Mapping[str, str],
+    ) -> None:
+        """在外部表格调用前持久化安全字段计划，保留失败后的可恢复事实。
+
+        参数：lead_id 为目标线索；source_message_id 为当前消息；plan 为已完成保护判断的补丁计划；
+        enrichment 为本次新增补充信息。
+        返回值：无。
+        异常：线索不存在或数据库写入失败时抛出异常。
+        副作用：更新 Lead 字段快照与字段来源；待外部写入的来源暂不标记为已同步。
+        """
+        pending_external_names = set(plan.fields_to_write)
+        with self._session_factory.begin() as session:
+            lead = session.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
+            if lead is None:
+                raise ValueError(f"线索不存在：{lead_id}")
+            current_values = dict(lead.field_values)
+            provenance = self._latest_provenance_by_field(session, lead_id)
+            for field_name, value in plan.synced_values.items():
+                current_values[field_name] = value
+                source = provenance.get(field_name)
+                serialized_value = serialize_field_value(value)
+                synced_value = (
+                    None if field_name in pending_external_names else serialized_value
+                )
+                if source is None:
+                    session.add(
+                        LeadFieldProvenance(
+                            lead_id=lead_id,
+                            source_message_id=source_message_id,
+                            field_name=field_name,
+                            value=serialized_value,
+                            last_ai_synced_value=synced_value,
+                        )
+                    )
+                else:
+                    source.value = serialized_value
+                    if synced_value is not None:
+                        source.last_ai_synced_value = synced_value
+                    else:
+                        source.last_ai_synced_value = None
+            if plan.synced_values:
+                lead.field_values = current_values
+            if enrichment:
+                lead.enrichment_values = {**lead.enrichment_values, **enrichment}
 
     def _plan_safe_patch(
         self,
@@ -272,12 +344,23 @@ class LeadReviewService:
             fields_to_write: dict[str, object] = {}
             written_names: list[str] = []
             synced_values: dict[str, object] = {}
+            # 失败消息留下的来源值属于未完成外部同步，后续消息必须把它们重新纳入远端补丁。
+            candidate_fields: dict[str, LeadFieldValue] = dict(patch.fields)
+            for field_name, field_provenance in provenance.items():
+                if field_provenance.last_ai_synced_value is not None:
+                    continue
+                pending_value = deserialize_field_value(field_provenance.value)
+                if isinstance(pending_value, str) or (
+                    isinstance(pending_value, list)
+                    and all(isinstance(item, str) for item in pending_value)
+                ):
+                    candidate_fields.setdefault(field_name, pending_value)
             # T08 已完成结构和业务校验；本层仅决定是否可安全写入，不重新解释 AI 内容。
-            for field_name, value in patch.fields.items():
+            for field_name, value in candidate_fields.items():
                 if field_name == "备注":
                     # 备注只由本关口在正式字段保护完成后按冻结模板生成。
                     continue
-                field_provenance = provenance.get(field_name)
+                field_source = provenance.get(field_name)
                 current_value = current_fields.get(field_name)
                 is_pending = field_name in patch.pending_confirmation_fields
                 if is_pending and self._must_not_prefill_without_confirmation(
@@ -285,8 +368,8 @@ class LeadReviewService:
                 ):
                     # 没有可靠卡片时，冻结规则要求必填中置信度候选仅留在后台，不写正式字段。
                     continue
-                if field_provenance is not None and (
-                    field_provenance.is_user_modified or field_provenance.is_user_confirmed
+                if field_source is not None and (
+                    field_source.is_user_modified or field_source.is_user_confirmed
                 ):
                     # 已被销售确认的字段即使仍等于最后 AI 值，也不得被失败消息重试改写。
                     protected.add(field_name)
@@ -294,8 +377,8 @@ class LeadReviewService:
                     continue
                 # 多选字段的空值由智能表格返回 []；空数组与 None/空字符串一样不能阻止首次写入。
                 if current_value and (
-                    field_provenance is None
-                    or not field_values_equal(current_value, field_provenance.last_ai_synced_value)
+                    field_source is None
+                    or not field_values_equal(current_value, field_source.last_ai_synced_value)
                 ):
                     # 未由 AI 写入过的非空值同样不能被本轮建议静默覆盖。
                     protected.add(field_name)
@@ -306,6 +389,9 @@ class LeadReviewService:
                     pending.discard(field_name)
                     continue
                 if field_values_equal(current_value, value):
+                    if lead.field_values.get(field_name) != value:
+                        written_names.append(field_name)
+                        synced_values[field_name] = value
                     if is_pending:
                         pending.add(field_name)
                     else:

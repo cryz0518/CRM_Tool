@@ -62,7 +62,7 @@ class LeadDiscardService:
     ) -> LeadDiscardResult:
         """受控废弃未同步线索，并在 CRM create 在途时等待外部最终事实。
 
-        参数：lead_id 为目标线索；operator_user_id 为当前授权销售或管理员；reason 为审计原因。
+        参数：lead_id 为目标线索；operator_user_id 为当前有效 actor 或管理员；reason 为审计原因。
         返回值：废弃成功、等待 CRM 或已处理的确定性结果。
         异常：线索/操作人不存在、权限不足、状态不允许或原因为空时抛出 ValueError/PermissionError。
         副作用：新增废弃请求和审计；仅在未启动 create 时将生命周期改为 discarded，
@@ -79,7 +79,7 @@ class LeadDiscardService:
             operator = session.get(SalesAuthorization, operator_user_id)
             if lead is None or operator is None:
                 raise ValueError("线索或废弃操作人不存在")
-            if not operator.is_active or not (operator.is_authorized or operator.is_administrator):
+            if not operator.is_active:
                 raise PermissionError("操作人没有废弃线索权限")
             if not operator.is_administrator and lead.smart_table_owner_user_id != operator_user_id:
                 raise PermissionError("普通销售只能废弃自己负责的线索")

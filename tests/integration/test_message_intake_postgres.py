@@ -157,10 +157,10 @@ def test_concurrent_authorized_duplicate_message_returns_one_duplicate(
     assert all(result.accepted for result in results)
 
 
-def test_concurrent_unauthorized_message_returns_one_duplicate_notice(
+def test_concurrent_new_actor_message_returns_one_duplicate(
     postgres_session_factory: sessionmaker[Session],
 ) -> None:
-    """验证无授权目录成员的并发重复消息只保留一个待发送权限通知。"""
+    """验证新 actor 的并发重复消息自动注册且保持幂等。"""
     results = receive_at_the_same_time(
         MessageIntakeService(postgres_session_factory),
         IncomingMessageCommand(
@@ -171,7 +171,49 @@ def test_concurrent_unauthorized_message_returns_one_duplicate_notice(
     )
 
     assert sorted(result.duplicate for result in results) == [False, True]
-    assert not any(result.accepted for result in results)
+    assert all(result.accepted for result in results)
+    with postgres_session_factory() as session:
+        actor = session.get(SalesAuthorization, "visitor-1")
+        assert actor is not None
+        assert actor.is_authorized is False
+        assert actor.next_message_sequence == 1
+
+
+def test_concurrent_new_actor_messages_get_unique_stable_sequences(
+    postgres_session_factory: sessionmaker[Session],
+) -> None:
+    """验证同一新 actor 的并发不同消息取得唯一连续 sequence。"""
+    service = MessageIntakeService(postgres_session_factory)
+    barrier = Barrier(2)
+
+    def receive(message_id: str) -> MessageIntakeResult:
+        """等待另一条消息就绪后提交不同消息标识。"""
+        barrier.wait()
+        return service.receive(
+            IncomingMessageCommand(
+                message_id=message_id,
+                sales_user_id="new-actor-1",
+                raw_payload={"text": message_id},
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(receive, "new-message-1"),
+            executor.submit(receive, "new-message-2"),
+        ]
+        results = [future.result() for future in futures]
+
+    assert all(result.accepted and not result.duplicate for result in results)
+    with postgres_session_factory() as session:
+        actor = session.get(SalesAuthorization, "new-actor-1")
+        messages = session.scalars(
+            select(IncomingMessage)
+            .where(IncomingMessage.sales_user_id == "new-actor-1")
+            .order_by(IncomingMessage.sequence)
+        ).all()
+    assert actor is not None and actor.next_message_sequence == 2
+    assert [message.sequence for message in messages] == [1, 2]
 
 
 def test_concurrent_first_submission_reserves_exactly_one_global_crm_identity(

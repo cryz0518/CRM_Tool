@@ -175,7 +175,7 @@ class UserConfirmationEvent(Base):
 
 
 class SalesLeadContext(Base):
-    """保存一名销售最近一次可安全补充的线索上下文。"""
+    """保存一名销售最近一次可安全补充的线索上下文及其消息顺序。"""
 
     __tablename__ = "sales_lead_contexts"
 
@@ -186,6 +186,7 @@ class SalesLeadContext(Base):
     last_message_received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+    last_message_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )

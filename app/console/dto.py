@@ -177,7 +177,7 @@ class ConsoleConfigIssueDTO(ConsoleDTO):
 
 
 class ConsoleSalesAuthorizationDTO(ConsoleDTO):
-    """展示销售授权目录和 CRM 映射状态，不暴露 CRM 用户标识。"""
+    """展示 Actor Registry 兼容目录和 CRM 映射状态，不暴露 CRM 用户标识。"""
 
     wecom_user_id: str
     display_name: str | None = None

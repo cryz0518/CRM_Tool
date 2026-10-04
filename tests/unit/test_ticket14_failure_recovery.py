@@ -71,6 +71,21 @@ def test_failure_classification_uses_explicit_adapter_and_gateway_categories() -
     assert classify_task_failure(RuntimeError("unclassified")) is TaskFailureCategory.UNKNOWN
 
 
+def test_rate_limited_transport_preserves_safe_code_for_business_audit() -> None:
+    """验证 850005 耗尽适配器重试后仍能进入 transient 审计并保留数字码。"""
+    cause = WecomCliProcessError(
+        "wecom-cli 退出失败",
+        error_code="rate_limited",
+        external_error_code=850005,
+    )
+    try:
+        raise WecomCliTransportError("wecom-cli 调用失败") from cause
+    except WecomCliTransportError as error:
+        details = FirstTextLeadWorkspaceService._failure_audit_details(error)
+
+    assert details == {"failure_category": "transient", "failure_code": "850005"}
+
+
 def test_permanent_message_failure_skips_automatic_retry(
     session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -292,7 +307,8 @@ def test_retry_failed_message_is_protected_supplement_not_history_replay(
 
     assert result.status is ProtectedSupplementStatus.SUCCEEDED
     assert repeated.attempt_id == result.attempt_id
-    assert result.updated_fields == ("联系人",)
+    # 后续消息已补偿写入失败消息留下的联系人字段，人工重试应保持幂等。
+    assert result.updated_fields == ()
     with session_factory() as session:
         lead = session.scalar(select(Lead).where(Lead.source_message_id == "message-1"))
         failed_event = session.get(OutboxEvent, event_ids[1])
@@ -312,8 +328,7 @@ def test_retry_failed_message_is_protected_supplement_not_history_replay(
     assert all(event.status == "succeeded" for event in later_events)
     assert len(attempts) == 2 and all(attempt.status == "succeeded" for attempt in attempts)
     # 第二次人工点击只命中同一 attempt；retry 不会再次调用 N+1/N+2 的历史消费路径。
-    assert len(update_calls) == calls_before_retry + 1
-    assert update_calls[-1] == {"联系人": "失败联系人"}
+    assert len(update_calls) == calls_before_retry
 
 
 def test_retry_failed_message_keeps_sales_edit_protected(
