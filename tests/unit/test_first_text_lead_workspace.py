@@ -998,6 +998,204 @@ def test_ai_review_transport_failure_retries_same_patch_before_leaving_partial_r
     assert len(adapter.get_records()) == 1
 
 
+def test_later_message_recovers_pending_fields_after_first_smart_table_patch_fails(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证首条字段补丁失败后，后续补充仍会恢复同一 Lead 的全部字段。"""
+    first_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-pending-fields-first",
+        sales_user_id="sales-1",
+        text="公司A的林总，需要视觉检测方案",
+    )
+    second_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-pending-fields-second",
+        sales_user_id="sales-1",
+        text="13500000000",
+    )
+    provider = MockLLMProvider(
+        [
+            json.dumps(
+                {
+                    "intent": "NEW_LEAD",
+                    "customer_reference": {},
+                    "crm_fields": {
+                        "线索名称": "公司A",
+                        "联系人": "林总",
+                        "工艺": "视觉检测",
+                    },
+                    "enrichment": {"需求": "视觉检测方案"},
+                    "confidence_by_field": {
+                        "线索名称": 0.99,
+                        "联系人": 0.99,
+                        "工艺": 0.99,
+                    },
+                    "conflicts": [],
+                    "warnings": [],
+                }
+            ),
+            json.dumps(
+                {
+                    "intent": "UPDATE_LEAD",
+                    "customer_reference": {},
+                    "crm_fields": {"手机": "13500000000"},
+                    "enrichment": {},
+                    "confidence_by_field": {"手机": 0.99},
+                    "conflicts": [],
+                    "warnings": [],
+                }
+            ),
+        ]
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    original_update = adapter.update_record
+    failed_updates = 0
+
+    def fail_first_patch(record_id: str, fields: dict[str, object], **kwargs: object):
+        """让首条消息的两次有限补丁尝试失败，后续消息恢复同一行。"""
+        nonlocal failed_updates
+        if failed_updates < 2:
+            failed_updates += 1
+            raise RetryableTaskFailure("temporary smart table patch failure")
+        return original_update(record_id, fields, **kwargs)
+
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        ai_gateway=AIGateway(provider),
+    )
+    with patch.object(adapter, "update_record", side_effect=fail_first_patch):
+        first = service.consume(first_event_id)
+    with session_factory() as session:
+        first_lead = session.get(Lead, first.lead_id)
+        first_sources = session.scalars(
+            select(LeadFieldProvenance).where(LeadFieldProvenance.lead_id == first.lead_id)
+        ).all()
+    assert first_lead is not None
+    assert first_lead.field_values["线索名称"] == "公司A"
+    assert first_lead.field_values["联系人"] == "林总"
+    assert first_lead.field_values["工艺"] == "视觉检测"
+    assert {source.field_name for source in first_sources} >= {
+        "线索名称",
+        "联系人",
+        "工艺",
+    }
+    assert all(
+        source.last_ai_synced_value is None
+        for source in first_sources
+        if source.field_name in {"线索名称", "联系人", "工艺"}
+    )
+    second = service.consume(second_event_id)
+
+    assert first.status is LeadProcessingStatus.SYNC_FAILED
+    assert second.status is LeadProcessingStatus.UPDATED
+    assert len(adapter.get_records()) == 1
+    record = adapter.get_record(second.smart_table_record_id or "")
+    assert record is not None
+    assert record.fields["线索名称"] == "公司A"
+    assert record.fields["联系人"] == "林总"
+    assert record.fields["工艺"] == "视觉检测"
+    assert record.fields["手机"] == "13500000000"
+    with session_factory() as session:
+        lead = session.get(Lead, second.lead_id)
+    assert lead is not None
+    assert lead.field_values["线索名称"] == "公司A"
+    assert lead.field_values["联系人"] == "林总"
+    assert lead.field_values["工艺"] == "视觉检测"
+    assert lead.field_values["手机"] == "13500000000"
+
+
+def test_same_lead_three_messages_create_once_and_merge_incremental_fields(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证同一 Lead 连续三条消息只创建一行并保留所有增量字段。"""
+    provider = MockLLMProvider(
+        [
+            json.dumps(
+                {
+                    "intent": "NEW_LEAD",
+                    "customer_reference": {},
+                    "crm_fields": {"线索名称": "公司三", "联系人": "王总"},
+                    "enrichment": {},
+                    "confidence_by_field": {"线索名称": 0.99, "联系人": 0.99},
+                    "conflicts": [],
+                    "warnings": [],
+                }
+            ),
+            json.dumps(
+                {
+                    "intent": "UPDATE_LEAD",
+                    "customer_reference": {},
+                    "crm_fields": {"手机": "13600000000"},
+                    "enrichment": {},
+                    "confidence_by_field": {"手机": 0.99},
+                    "conflicts": [],
+                    "warnings": [],
+                }
+            ),
+            json.dumps(
+                {
+                    "intent": "UPDATE_LEAD",
+                    "customer_reference": {},
+                    "crm_fields": {"工艺": "视觉检测"},
+                    "enrichment": {"预算": "16万"},
+                    "confidence_by_field": {"工艺": 0.99},
+                    "conflicts": [],
+                    "warnings": [],
+                }
+            ),
+        ]
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        ai_gateway=AIGateway(provider),
+    )
+    first_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-three-step-first",
+        sales_user_id="sales-1",
+        text="公司三的王总，需要视觉方案",
+    )
+    first = service.consume(first_event_id)
+    second_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-three-step-second",
+        sales_user_id="sales-1",
+        text="13600000000",
+    )
+    second = service.consume(second_event_id)
+    third_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-three-step-third",
+        sales_user_id="sales-1",
+        text="补充工艺，预算16万",
+    )
+    third = service.consume(third_event_id)
+
+    assert first.status is LeadProcessingStatus.CREATED
+    assert second.status is LeadProcessingStatus.UPDATED
+    assert third.status is LeadProcessingStatus.UPDATED
+    assert first.lead_id == second.lead_id == third.lead_id
+    assert len(adapter.get_records()) == 1
+    record = adapter.get_record(first.smart_table_record_id or "")
+    assert record is not None
+    assert record.fields["线索名称"] == "公司三"
+    assert record.fields["联系人"] == "王总"
+    assert record.fields["手机"] == "13600000000"
+    assert record.fields["工艺"] == "视觉检测"
+    with session_factory() as session:
+        lead = session.get(Lead, first.lead_id)
+    assert lead is not None
+    assert lead.field_values["线索名称"] == "公司三"
+    assert lead.field_values["联系人"] == "王总"
+    assert lead.field_values["手机"] == "13600000000"
+    assert lead.field_values["工艺"] == "视觉检测"
+    assert lead.enrichment_values["预算"] == "16万"
+
+
 def test_ai_create_verification_failure_persists_acknowledged_record_id_and_never_readds(
     session_factory: sessionmaker[Session],
 ) -> None:

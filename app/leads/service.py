@@ -1455,18 +1455,21 @@ class FirstTextLeadWorkspaceService:
                         return LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
 
                     # 既有非空值不允许被碎片消息静默覆盖，只向当前线索补充空字段。
-                    safe_patch = self._only_empty_fields(context_lead, context_patch)
+                    safe_patch = {
+                        **self._pending_snapshot_fields(session, context_lead.id),
+                        **self._only_empty_fields(context_lead, context_patch),
+                    }
                     repaired_stale_company_name = False
-                    incoming_company_name = context_patch.get("线索名称")
+                    context_company_name = context_patch.get("线索名称")
                     stored_company_name = context_lead.field_values.get("线索名称")
                     if (
                         temporary_context
-                        and incoming_company_name
+                        and context_company_name
                         and self._is_stale_multiline_company_name(stored_company_name)
-                        and incoming_company_name != stored_company_name
+                        and context_company_name != stored_company_name
                     ):
                         # 只修复早期解析把整段多行表单吞进公司字段的临时草稿；正常非空值仍不可覆盖。
-                        safe_patch["线索名称"] = incoming_company_name
+                        safe_patch["线索名称"] = context_company_name
                         repaired_stale_company_name = True
                     if not safe_patch and context_lead.smart_table_record_id is not None:
                         bind_log_context(lead_id=context_lead.id)
@@ -2797,7 +2800,34 @@ class FirstTextLeadWorkspaceService:
             details={"lead_id": lead_id},
         )
 
-    def _only_empty_fields(self, lead: Lead, fields: dict[str, str]) -> dict[str, str]:
+    def _pending_snapshot_fields(
+        self, session: Session, lead_id: str
+    ) -> dict[str, LeadFieldValue]:
+        """读取尚未完成智能表格同步的后台字段计划，供后续消息补偿写回。
+
+        参数：session 为当前消费事务；lead_id 为目标线索。
+        返回值：字段名到待补写值的安全映射；无法恢复的历史值会被忽略。
+        异常：数据库读取异常由 SQLAlchemy 向调用方传播。
+        副作用：无，仅读取字段来源事实。
+        """
+        pending_sources = session.scalars(
+            select(LeadFieldProvenance).where(
+                LeadFieldProvenance.lead_id == lead_id,
+                LeadFieldProvenance.last_ai_synced_value.is_(None),
+            )
+        ).all()
+        pending_fields: dict[str, LeadFieldValue] = {}
+        for source in pending_sources:
+            value = deserialize_field_value(source.value)
+            if isinstance(value, str) or (
+                isinstance(value, list) and all(isinstance(item, str) for item in value)
+            ):
+                pending_fields[source.field_name] = value
+        return pending_fields
+
+    def _only_empty_fields(
+        self, lead: Lead, fields: Mapping[str, LeadFieldValue]
+    ) -> dict[str, LeadFieldValue]:
         """从字段补丁中保留当前线索尚无值的字段，避免覆盖既有或人工数据。
 
         参数：lead 为归属线索；fields 为本次确定性字段补丁。
