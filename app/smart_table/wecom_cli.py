@@ -99,8 +99,8 @@ class WecomCliProtocolError(WecomCliSmartTableAdapterError, PermanentTaskFailure
     """表示 wecom-cli 返回结构、参数或权限业务失败，不应自动重试。"""
 
 
-class SmartTableWriteVerificationError(WecomCliProtocolError):
-    """表示远端写入未能在有限回读窗口内逐字段核实。"""
+class SmartTableWriteVerificationError(WecomCliSmartTableAdapterError, RetryableTaskFailure):
+    """表示写入已获 ACK 但远端事实暂未在有限窗口内可核实。"""
 
     def __init__(
         self,
@@ -114,10 +114,11 @@ class SmartTableWriteVerificationError(WecomCliProtocolError):
         remote_record_id 为服务端已确认创建的记录标识，供上层安全恢复使用。
         返回值：无。
         异常：无。
-        副作用：仅在异常对象中保存字段名元组，继承永久失败分类以阻止自动重放。
+        副作用：仅在异常对象中保存字段名和远端记录标识，标记为可恢复核实等待。
         """
         self.missing_or_mismatched_fields = tuple(missing_or_mismatched_fields)
         self.remote_record_id = remote_record_id
+        self.error_code = "write_verification_pending"
         super().__init__("智能表格写入未通过远端字段核实")
 
 
@@ -404,7 +405,7 @@ class WecomCliSmartTableAdapter:
         参数：record_id 为首次写入响应确认的目标；fields 为本次实际发送字段；schema 为字段结构；
         operation 区分新增与更新的安全诊断事件。
         返回值：全部字段匹配后的远端记录快照。
-        异常：回读失败或字段仍不一致时抛出只携带字段名和 record_id 的永久核实异常。
+        异常：明确永久读错误原样传播；有限窗口后仍未核实时抛出可恢复核实异常。
         副作用：执行有限只读回查；仅验证成功后更新进程内近期记录缓存。
         """
         mismatched_fields = tuple(fields)
@@ -413,18 +414,19 @@ class WecomCliSmartTableAdapter:
                 time.sleep(delay)
             try:
                 remote_record = self._get_record_remote_uncached(record_id, schema)
-            except Exception as error:
-                # 写入已 ACK，任何回读异常都不能让调用方误以为可重发新增请求。
+            except RetryableTaskFailure as error:
+                # 回读暂态失败只消耗本次核实窗口，不把已获 ACK 的写入误判为永久失败。
                 logger.error(
                     f"wecom_cli_{operation}_verification_read_failed",
                     extra={
-                        "error_type": type(error).__name__,
+                        "error_code": getattr(error, "error_code", type(error).__name__),
                         "missing_or_mismatched_fields": list(fields),
                     },
                 )
-                raise SmartTableWriteVerificationError(
-                    tuple(fields), remote_record_id=record_id
-                ) from None
+                continue
+            except PermanentTaskFailure:
+                # 权限、认证、业务拒绝和协议错误必须保留原始安全诊断，不能洗成核实等待。
+                raise
             if remote_record is None:
                 continue
             mismatched_fields = self._mismatched_write_fields(fields, remote_record, schema)

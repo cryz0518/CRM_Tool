@@ -1954,6 +1954,7 @@ class FirstTextLeadWorkspaceService:
             if sync is not None and sync.status != "succeeded":
                 sync.status = "succeeded"
                 sync.completed_at = utc_now()
+            if sync is not None:
                 sync.error_summary = None
             self._mark_assigned(session, event, lead.id)
             self._refresh_context(session, message, lead.id)
@@ -2012,6 +2013,8 @@ class FirstTextLeadWorkspaceService:
                     raise
                 # update/list 是幂等操作；直接重试同一补丁，避免因一次 CLI 进程抖动留下半行记录。
                 retried_transient_failure = True
+                # 首次 ACK 可能已经落地；重试必须重新读取远端当前事实，而不是复用旧快照。
+                initial_record = None
                 logger.warning("ai_review_sync_retrying_same_patch")
 
     def _recreate_missing_ai_review_record(self, request: AIReviewRequest) -> None:
@@ -2102,8 +2105,11 @@ class FirstTextLeadWorkspaceService:
                 sync.status = "retrying" if field_patch_pending else (
                     "failed_pending_review" if failed_pending_review else "retrying"
                 )
+                error_code = getattr(error, "error_code", None)
                 sync.error_summary = (
-                    "field_patch_pending" if field_patch_pending else type(error).__name__
+                    "field_patch_pending"
+                    if field_patch_pending
+                    else error_code if isinstance(error_code, str) else type(error).__name__
                 )
         logger.exception("ai_review_sync_failed", extra={"error_type": type(error).__name__})
 
@@ -2128,7 +2134,9 @@ class FirstTextLeadWorkspaceService:
                 return (
                     lead.smart_table_record_id,
                     None,
-                    sync is not None and sync.error_summary == "field_patch_pending",
+                    sync is not None
+                    and sync.error_summary
+                    in {"field_patch_pending", "write_verification_pending"},
                 )
         try:
             # 创建人和负责人只使用接入层已授权的销售身份，模型无法影响权限关键字段。
@@ -2210,7 +2218,10 @@ class FirstTextLeadWorkspaceService:
             )
             if sync is not None:
                 sync.status = "failed_pending_review" if failed_pending_review else "retrying"
-                sync.error_summary = type(error).__name__
+                error_code = getattr(error, "error_code", None)
+                sync.error_summary = (
+                    error_code if isinstance(error_code, str) else type(error).__name__
+                )
             remote_record_id = getattr(error, "remote_record_id", None)
             if isinstance(remote_record_id, str) and remote_record_id:
                 # 即使 create_record 抛出核实异常，也要持久化 ACK 返回的原行身份。
@@ -2738,6 +2749,11 @@ class FirstTextLeadWorkspaceService:
             resolution.lead_id = lead_id
             resolution.status = "assigned"
         event.status = "succeeded"
+        # 成功终态必须清理旧的暂态失败元数据，但保留 attempts 作为处理次数事实。
+        event.failure_category = None
+        event.failure_summary = None
+        event.failed_at = None
+        event.processing_started_at = None
         self._record_audit(session, event, "lead_message_assigned")
         logger.info("lead_message_assigned")
 

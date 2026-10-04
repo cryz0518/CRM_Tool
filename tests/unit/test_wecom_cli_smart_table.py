@@ -9,6 +9,12 @@ from collections.abc import Mapping, Sequence
 
 import pytest
 
+from app.core.failures import (
+    PermanentTaskFailure,
+    RetryableTaskFailure,
+    TaskFailureCategory,
+    classify_task_failure,
+)
 from app.core.logging import JsonFormatter
 from app.smart_table.adapter import (
     SmartTableActor,
@@ -789,6 +795,16 @@ def test_create_ack_requires_uncached_remote_readback_and_keeps_record_id_on_mis
     assert error.value.missing_or_mismatched_fields == ("线索名称",)
     assert "QA原生写入" not in str(error.value)
     assert sum(arguments[2:4] == ("records", "add") for arguments in fake_cli.calls) == 1
+
+
+def test_write_verification_failure_is_retryable_with_safe_error_code() -> None:
+    """验证 ACK 后核实等待属于暂态，并只暴露稳定错误码。"""
+    error = SmartTableWriteVerificationError(("线索名称",), remote_record_id="record-1")
+
+    assert isinstance(error, RetryableTaskFailure)
+    assert not isinstance(error, PermanentTaskFailure)
+    assert error.error_code == "write_verification_pending"
+    assert classify_task_failure(error) is TaskFailureCategory.TRANSIENT
 
 
 def test_create_returns_only_after_remote_uncached_values_match() -> None:
@@ -1704,6 +1720,76 @@ def test_update_waits_for_eventually_consistent_remote_readback(
     assert len(fake_cli.calls) == 5
 
 
+def test_update_verification_rate_limit_uses_remaining_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证核实阶段遇到 850005 时继续回读窗口，后续看到新值即可成功。"""
+    monkeypatch.setattr("app.smart_table.wecom_cli.time.sleep", lambda _delay: None)
+    rate_limited = WecomCliProcessError(
+        "wecom-cli 退出失败",
+        error_code="rate_limited",
+        external_error_code=850005,
+    )
+    expected_row = {
+        "RECORD_ID": "record-1",
+        "备注": "新值",
+        "创建人": [{"userId": "sales-1"}],
+        "负责人": [{"userId": "sales-1"}],
+    }
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "values": [
+                    {
+                        "rows": [
+                            {
+                                "RECORD_ID": "record-1",
+                                "备注": "旧值",
+                                "创建人": [{"userId": "sales-1"}],
+                                "负责人": [{"userId": "sales-1"}],
+                            }
+                        ]
+                    }
+                ],
+            },
+            {"errcode": 0, "records": [{"record_id": "record-1", "values": {}}]},
+            rate_limited,
+            rate_limited,
+            {"errcode": 0, "values": [{"rows": [expected_row]}]},
+        ]
+    )
+
+    record = _adapter(fake_cli, retry_count=1, sheet_title="CRM线索").update_record(
+        "record-1", {"备注": "新值"}
+    )
+
+    assert record.fields["备注"] == "新值"
+    assert sum(arguments[2:4] == ("records", "update") for arguments in fake_cli.calls) == 1
+    # 一次首读、两次 CLI 限流重试、一次后续核实读取。
+    assert sum(arguments[2:4] == ("records", "query") for arguments in fake_cli.calls) == 4
+
+
+def test_verification_permanent_read_error_is_not_wrapped() -> None:
+    """验证明确永久读错误原样向上传递，不被洗成核实等待。"""
+    permanent = WecomCliProcessError(
+        "wecom-cli 退出失败",
+        error_code="permission_denied",
+        external_error_code=851003,
+    )
+    fake_cli = FakeCli([_field_response(), permanent])
+    adapter = _adapter(fake_cli, sheet_title="CRM线索")
+
+    with pytest.raises(WecomCliProcessError) as error:
+        adapter._verify_remote_write(
+            "record-1", {"备注": "新值"}, adapter.get_schema(), operation="update"
+        )
+
+    assert error.value.error_code == "permission_denied"
+    assert error.value.external_error_code == 851003
+
+
 def test_update_verification_bypasses_recent_write_cache_and_hides_values() -> None:
     """验证远端目标缺失时近期写缓存不能伪造成功，异常只暴露规范字段名。
 
@@ -1724,6 +1810,8 @@ def test_update_verification_bypasses_recent_write_cache_and_hides_values() -> N
 
     assert type(error.value).__name__ == "SmartTableWriteVerificationError"
     assert error.value.missing_or_mismatched_fields == ("备注",)
+    assert error.value.error_code == "write_verification_pending"
+    assert classify_task_failure(error.value) is TaskFailureCategory.TRANSIENT
     assert "敏感目标值" not in str(error.value)
     assert len(fake_cli.calls) == 5
 

@@ -1196,15 +1196,15 @@ def test_same_lead_three_messages_create_once_and_merge_incremental_fields(
     assert lead.enrichment_values["预算"] == "16万"
 
 
-def test_ai_create_verification_failure_persists_acknowledged_record_id_and_never_readds(
+def test_verification_pending_retries_same_patch_from_remote_record(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证新增 ACK 后核实失败会冻结远端 ID，并将事件与同步状态置为人工处理。"""
+    """验证 ACK 后核实等待会重读同一行，并避免重复更新或新建。"""
     event_id = persist_outbox_text(
         session_factory,
-        message_id="message-ai-create-verification-failed",
+        message_id="message-verification-pending-retry",
         sales_user_id="sales-1",
-        text="刚和测试机器人公司聊过，他们想做协作机器人装配。",
+        text="公司核实等待测试的林总，需要视觉检测",
     )
     provider = MockLLMProvider(
         [
@@ -1212,15 +1212,86 @@ def test_ai_create_verification_failure_persists_acknowledged_record_id_and_neve
                 {
                     "intent": "NEW_LEAD",
                     "customer_reference": {},
-                    "crm_fields": {"线索名称": "测试机器人公司"},
+                    "crm_fields": {
+                        "线索名称": "公司核实等待测试",
+                        "联系人": "林总",
+                    },
                     "enrichment": {},
-                    "confidence_by_field": {"线索名称": 0.95},
+                    "confidence_by_field": {"线索名称": 0.99, "联系人": 0.99},
                     "conflicts": [],
                     "warnings": [],
                 }
             )
         ]
     )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    original_update = adapter.update_record
+    update_calls = 0
+
+    def update_then_report_pending(
+        record_id: str, fields: dict[str, object], **kwargs: object
+    ) -> object:
+        """先让远端字段落地，再模拟 ACK 后的暂时核实失败。"""
+        nonlocal update_calls
+        update_calls += 1
+        record = original_update(record_id, fields, **kwargs)
+        if update_calls == 1:
+            raise SmartTableWriteVerificationError(
+                tuple(fields), remote_record_id=record_id
+            )
+        return record
+
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        ai_gateway=AIGateway(provider),
+    )
+    with patch.object(adapter, "update_record", side_effect=update_then_report_pending):
+        result = service.consume(event_id)
+
+    assert result.status is LeadProcessingStatus.CREATED
+    assert update_calls == 1
+    assert len(adapter.get_records()) == 1
+    with session_factory() as session:
+        event = session.get(OutboxEvent, event_id)
+        resolution = session.scalar(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id == "message-verification-pending-retry"
+            )
+        )
+        sync = session.scalar(
+            select(SmartTableSync).where(SmartTableSync.lead_id == resolution.lead_id)
+        ) if resolution is not None and resolution.lead_id is not None else None
+    assert event is not None and event.status == "succeeded"
+    assert event.failure_category is None
+    assert event.failure_summary is None
+    assert event.failed_at is None
+    assert resolution is not None and resolution.status == "assigned"
+    assert sync is not None and sync.status == "succeeded"
+
+
+def test_ai_create_verification_failure_persists_acknowledged_record_id_and_never_readds(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证新增 ACK 后核实失败会冻结远端 ID，并保留同一行的可恢复状态。"""
+    event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-ai-create-verification-failed",
+        sales_user_id="sales-1",
+        text="刚和测试机器人公司聊过，他们想做协作机器人装配。",
+    )
+    ai_response = json.dumps(
+        {
+            "intent": "NEW_LEAD",
+            "customer_reference": {},
+            "crm_fields": {"线索名称": "测试机器人公司"},
+            "enrichment": {},
+            "confidence_by_field": {"线索名称": 0.95},
+            "conflicts": [],
+            "warnings": [],
+        }
+    )
+    provider = MockLLMProvider([ai_response, ai_response])
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     create_record = patch.object(
         adapter,
@@ -1235,11 +1306,18 @@ def test_ai_create_verification_failure_persists_acknowledged_record_id_and_neve
 
     with create_record as create_spy:
         failed = service.consume(event_id)
+        with session_factory() as session:
+            first_sync = session.scalar(
+                select(SmartTableSync).where(SmartTableSync.lead_id.is_not(None))
+            )
+            first_event = session.get(OutboxEvent, event_id)
         replay = service.consume(event_id)
 
     assert failed.status is LeadProcessingStatus.SYNC_FAILED
-    assert replay.status is LeadProcessingStatus.ALREADY_PROCESSED
+    assert replay.status is LeadProcessingStatus.SYNC_FAILED
     assert create_spy.call_count == 1
+    assert first_sync is not None and first_sync.error_summary == "write_verification_pending"
+    assert first_event is not None and first_event.status == "retrying"
     with session_factory() as session:
         lead = session.scalar(
             select(Lead).where(Lead.source_message_id == "message-ai-create-verification-failed")
@@ -1250,21 +1328,13 @@ def test_ai_create_verification_failure_persists_acknowledged_record_id_and_neve
             else None
         )
         event = session.get(OutboxEvent, event_id)
-        failed_audit = session.scalar(
-            select(BusinessAuditEvent).where(
-                BusinessAuditEvent.message_id == "message-ai-create-verification-failed",
-                BusinessAuditEvent.event_type == "ai_review_failed_pending_review",
-            )
-        )
 
     assert lead is not None and lead.smart_table_record_id == "acked-record-1"
     assert sync is not None
     assert sync.smart_table_record_id == "acked-record-1"
-    assert sync.status == "failed_pending_review"
-    assert event is not None and event.status == "failed_pending_review"
-    assert failed_audit is not None
-    assert failed_audit.details["failure_category"] == "permanent"
-    assert failed_audit.details["failure_code"] == "SmartTableWriteVerificationError"
+    assert sync.status == "retrying"
+    assert sync.error_summary == "field_patch_pending"
+    assert event is not None and event.status == "retrying"
 
 
 def test_mismatched_outbox_sales_identity_cannot_create_another_sales_record(
