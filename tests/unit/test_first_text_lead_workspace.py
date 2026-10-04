@@ -117,6 +117,46 @@ def persist_outbox_text(
         return event.id
 
 
+def semantic_segments_json(
+    segments: list[dict[str, object]], *, intent: str = "MULTI_LEAD"
+) -> str:
+    """构造测试用语义分段响应，不为模型增加业务目标字段。"""
+    return json.dumps(
+        {
+            "intent": intent,
+            "customer_reference": {},
+            "crm_fields": {},
+            "enrichment": {},
+            "confidence_by_field": {},
+            "segments": segments,
+            "conflicts": [],
+            "warnings": [],
+        },
+        ensure_ascii=False,
+    )
+
+
+def semantic_single_json(
+    *,
+    intent: str,
+    crm_fields: dict[str, object],
+    enrichment: dict[str, str] | None = None,
+) -> str:
+    """构造测试用单客户 AI 分析响应，保持单 Lead API 兼容。"""
+    return json.dumps(
+        {
+            "intent": intent,
+            "customer_reference": {},
+            "crm_fields": crm_fields,
+            "enrichment": enrichment or {},
+            "confidence_by_field": {field_name: 0.99 for field_name in crm_fields},
+            "conflicts": [],
+            "warnings": [],
+        },
+        ensure_ascii=False,
+    )
+
+
 def test_multiline_labeled_message_keeps_all_fields_in_one_lead() -> None:
     """多行标签应合并为一条线索，不能把联系人等字段吞进公司名。"""
     text = (
@@ -876,7 +916,7 @@ def test_retrying_ai_record_creation_does_not_block_followups_or_create_duplicat
         session_factory,
         message_id="message-smart-table-recovery-a",
         sales_user_id="sales-1",
-        text="刚接触到一个新的协作机器人客户，首条需求待补充",
+        text="刚接触到恢复客户，首条需求待补充",
     )
     gateway = AIGateway(
         MockLLMProvider(
@@ -2215,6 +2255,381 @@ def test_free_form_company_contact_phone_message_is_not_unassigned(
         )
     assert resolution is not None
     assert resolution.status == "assigned"
+
+
+def test_ai_semantic_segments_create_independent_resolutions(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证无标签多客户消息按 AI 原文分段分别进入服务端归属。"""
+    source_text = (
+        "今天见了苏州安科的李经理，需要视觉检测，预算30万；"
+        "另外无锡宏达王总想做机器人上下料，预算45万。"
+    )
+    event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-ai-semantic-two-leads",
+        sales_user_id="sales-1",
+        text=source_text,
+    )
+    provider = MockLLMProvider(
+        [
+            json.dumps(
+                {
+                    "intent": "MULTI_LEAD",
+                    "customer_reference": {},
+                    "crm_fields": {},
+                    "enrichment": {},
+                    "confidence_by_field": {},
+                    "segments": [
+                        {
+                            "segment_index": 0,
+                            "source_text_span": "苏州安科的李经理，需要视觉检测，预算30万",
+                            "customer_reference": {"company": "苏州安科", "contact": "李经理"},
+                            "crm_fields": {"线索名称": "苏州安科", "联系人": "李经理"},
+                            "enrichment": {"预算": "预算30万"},
+                            "confidence_by_field": {"线索名称": 0.99, "联系人": 0.95},
+                        },
+                        {
+                            "segment_index": 1,
+                            "source_text_span": "无锡宏达王总想做机器人上下料，预算45万",
+                            "customer_reference": {"company": "无锡宏达", "contact": "王总"},
+                            "crm_fields": {"线索名称": "无锡宏达", "联系人": "王总"},
+                            "enrichment": {"预算": "预算45万"},
+                            "confidence_by_field": {"线索名称": 0.99, "联系人": 0.95},
+                        },
+                    ],
+                    "conflicts": [],
+                    "warnings": [],
+                }
+            )
+        ]
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+
+    result = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        ai_gateway=AIGateway(provider),
+    ).consume(event_id)
+
+    assert result.status is LeadProcessingStatus.CREATED
+    assert len(result.lead_ids) == 2
+    with session_factory() as session:
+        resolutions = session.scalars(
+            select(LeadMessageResolution)
+            .where(LeadMessageResolution.message_id == "message-ai-semantic-two-leads")
+            .order_by(LeadMessageResolution.segment_index)
+        ).all()
+        leads = session.scalars(
+            select(Lead).where(Lead.source_message_id == "message-ai-semantic-two-leads")
+        ).all()
+    assert [resolution.segment_index for resolution in resolutions] == [0, 1]
+    assert [resolution.lead_id for resolution in resolutions] == list(result.lead_ids)
+    assert {lead.field_values["线索名称"] for lead in leads} == {"苏州安科", "无锡宏达"}
+
+
+def test_ai_semantic_segments_without_punctuation_still_route_independently(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证无标签、无分号的连续自然语言仍可由可靠原文 span 拆成两条线索。"""
+    source_text = "苏州安科李经理要视觉检测预算30万，另外无锡宏达王总准备做机器人上下料"
+    event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-ai-semantic-no-punctuation",
+        sales_user_id="sales-1",
+        text=source_text,
+    )
+    provider = MockLLMProvider(
+        [
+            semantic_segments_json(
+                [
+                    {
+                        "segment_index": 0,
+                        "source_text_span": "苏州安科李经理要视觉检测预算30万",
+                        "customer_reference": {"company": "苏州安科", "contact": "李经理"},
+                        "crm_fields": {"线索名称": "苏州安科", "联系人": "李经理"},
+                        "enrichment": {},
+                        "confidence_by_field": {"线索名称": 0.99, "联系人": 0.95},
+                    },
+                    {
+                        "segment_index": 1,
+                        "source_text_span": "无锡宏达王总准备做机器人上下料",
+                        "customer_reference": {"company": "无锡宏达", "contact": "王总"},
+                        "crm_fields": {"线索名称": "无锡宏达", "联系人": "王总"},
+                        "enrichment": {},
+                        "confidence_by_field": {"线索名称": 0.99, "联系人": 0.95},
+                    },
+                ]
+            )
+        ]
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+
+    result = FirstTextLeadWorkspaceService(
+        session_factory, adapter, ai_gateway=AIGateway(provider)
+    ).consume(event_id)
+
+    assert result.status is LeadProcessingStatus.CREATED
+    assert len(result.lead_ids) == 2
+    with session_factory() as session:
+        resolutions = session.scalars(
+            select(LeadMessageResolution)
+            .where(LeadMessageResolution.message_id == "message-ai-semantic-no-punctuation")
+            .order_by(LeadMessageResolution.segment_index)
+        ).all()
+    assert [resolution.lead_id for resolution in resolutions] == list(result.lead_ids)
+
+
+def test_ai_semantic_three_segments_keep_unique_segment_indexes(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证同一消息三个可靠客户候选不会共享 segment_index 或归属。"""
+    source_text = "甲公司李工要视觉检测；乙2号王总要上下料；丙视觉科技刘博士要装配"
+    event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-ai-semantic-three-leads",
+        sales_user_id="sales-1",
+        text=source_text,
+    )
+    segments = [
+        {
+            "segment_index": 0,
+            "source_text_span": "甲公司李工要视觉检测",
+            "customer_reference": {"company": "甲公司", "contact": "李工"},
+            "crm_fields": {"线索名称": "甲公司", "联系人": "李工"},
+            "enrichment": {},
+            "confidence_by_field": {"线索名称": 0.99, "联系人": 0.95},
+        },
+        {
+            "segment_index": 1,
+            "source_text_span": "乙2号王总要上下料",
+            "customer_reference": {"company": "乙2号", "contact": "王总"},
+            "crm_fields": {"线索名称": "乙2号", "联系人": "王总"},
+            "enrichment": {},
+            "confidence_by_field": {"线索名称": 0.99, "联系人": 0.95},
+        },
+        {
+            "segment_index": 2,
+            "source_text_span": "丙视觉科技刘博士要装配",
+            "customer_reference": {"company": "丙视觉科技", "contact": "刘博士"},
+            "crm_fields": {"线索名称": "丙视觉科技", "联系人": "刘博士"},
+            "enrichment": {},
+            "confidence_by_field": {"线索名称": 0.99, "联系人": 0.95},
+        },
+    ]
+    provider = MockLLMProvider([semantic_segments_json(segments)])
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+
+    result = FirstTextLeadWorkspaceService(
+        session_factory, adapter, ai_gateway=AIGateway(provider)
+    ).consume(event_id)
+
+    assert result.status is LeadProcessingStatus.CREATED
+    assert len(result.lead_ids) == 3
+    with session_factory() as session:
+        resolutions = session.scalars(
+            select(LeadMessageResolution)
+            .where(LeadMessageResolution.message_id == "message-ai-semantic-three-leads")
+            .order_by(LeadMessageResolution.segment_index)
+        ).all()
+    assert [resolution.segment_index for resolution in resolutions] == [0, 1, 2]
+    assert len({resolution.lead_id for resolution in resolutions}) == 3
+
+
+def test_shared_ambiguous_budget_is_not_copied_to_each_segment() -> None:
+    """验证无法归属的共享预算不会被模型结果复制到多个客户。"""
+    source_text = "安科和宏达都想做检测，预算差不多30万"
+    provider = MockLLMProvider(
+        [
+            semantic_segments_json(
+                [
+                    {
+                        "segment_index": 0,
+                        "source_text_span": "安科",
+                        "customer_reference": {"company": "安科"},
+                        "crm_fields": {"线索名称": "安科"},
+                        "enrichment": {"预算": "预算差不多30万"},
+                        "confidence_by_field": {"线索名称": 0.99},
+                    },
+                    {
+                        "segment_index": 1,
+                        "source_text_span": "宏达",
+                        "customer_reference": {"company": "宏达"},
+                        "crm_fields": {"线索名称": "宏达"},
+                        "enrichment": {"预算": "预算差不多30万"},
+                        "confidence_by_field": {"线索名称": 0.99},
+                    },
+                ]
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(source_text)
+
+    assert len(result.segments) == 2
+    assert all(segment.patch.enrichment == {} for segment in result.segments)
+
+
+def test_ambiguous_multi_lead_without_reliable_spans_is_unassigned(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证模型无法给出可靠边界时，服务器不猜测任何 Lead 目标。"""
+    event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-ai-ambiguous-multi",
+        sales_user_id="sales-1",
+        text="安科和宏达都想做检测，预算差不多30万",
+    )
+    provider = MockLLMProvider(
+        [
+            semantic_single_json(
+                intent="MULTI_LEAD_AMBIGUOUS",
+                crm_fields={},
+            )
+        ]
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+
+    result = FirstTextLeadWorkspaceService(
+        session_factory, adapter, ai_gateway=AIGateway(provider)
+    ).consume(event_id)
+
+    assert result.status is LeadProcessingStatus.UNASSIGNED
+    with session_factory() as session:
+        assert session.query(Lead).count() == 0
+
+
+def test_ai_hallucinated_company_cannot_replace_active_context(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证不在原文中的 AI 公司名不能劫持有效当前客户上下文。"""
+    first_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-ai-grounding-first",
+        sales_user_id="sales-1",
+        text="客户：苏州安科",
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+    first = service.consume(first_event_id)
+    second_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-ai-grounding-update",
+        sales_user_id="sales-1",
+        text="他们现在想做视觉检测",
+    )
+    provider = MockLLMProvider(
+        [
+            semantic_single_json(
+                intent="UPDATE_LEAD",
+                crm_fields={"线索名称": "模型猜测公司", "工艺": "视觉检测"},
+            )
+        ]
+    )
+
+    updated = FirstTextLeadWorkspaceService(
+        session_factory, adapter, ai_gateway=AIGateway(provider)
+    ).consume(second_event_id)
+
+    assert first.lead_id is not None
+    assert updated.lead_id == first.lead_id
+    with session_factory() as session:
+        assert session.query(Lead).count() == 1
+        lead = session.get(Lead, first.lead_id)
+    assert lead is not None
+    assert lead.field_values["线索名称"] == "苏州安科"
+
+
+def test_eight_natural_language_messages_follow_aaaaabbb_context_rule(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证五条连续补充后切换第二客户，后续消息仍全部留在第二客户。"""
+    messages = [
+        ("message-aaaaa-1", "刚见了苏州安科的李经理"),
+        ("message-aaaaa-2", "他们想做视觉检测"),
+        ("message-aaaaa-3", "预算大概35万"),
+        ("message-aaaaa-4", "手机号13800000001"),
+        ("message-aaaaa-5", "预计明年Q1启动"),
+        ("message-bbb-1", "另外无锡宏达王总要做上下料"),
+        ("message-bbb-2", "预算50万"),
+        ("message-bbb-3", "手机号13900000002"),
+    ]
+    first_event_id = 0
+    for message_id, text in messages:
+        event_id = persist_outbox_text(
+            session_factory,
+            message_id=message_id,
+            sales_user_id="sales-1",
+            text=text,
+        )
+        if first_event_id == 0:
+            first_event_id = event_id
+    provider = MockLLMProvider(
+        [
+            semantic_single_json(
+                intent="NEW_LEAD",
+                crm_fields={"线索名称": "苏州安科", "联系人": "李经理"},
+            ),
+            semantic_single_json(intent="UPDATE_LEAD", crm_fields={"工艺": ["视觉检测"]}),
+            semantic_single_json(
+                intent="UPDATE_LEAD", crm_fields={}, enrichment={"预算": "预算大概35万"}
+            ),
+            semantic_single_json(
+                intent="UPDATE_LEAD", crm_fields={"手机": "13800000001"}
+            ),
+            semantic_single_json(
+                intent="UPDATE_LEAD", crm_fields={}, enrichment={"特殊要求": "预计明年Q1启动"}
+            ),
+            semantic_single_json(
+                intent="NEW_LEAD",
+                crm_fields={"线索名称": "无锡宏达", "联系人": "王总", "工艺": ["装配"]},
+            ),
+            semantic_single_json(
+                intent="UPDATE_LEAD", crm_fields={}, enrichment={"预算": "预算50万"}
+            ),
+            semantic_single_json(
+                intent="UPDATE_LEAD", crm_fields={"手机": "13900000002"}
+            ),
+        ]
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+
+    FirstTextLeadWorkspaceService(
+        session_factory, adapter, ai_gateway=AIGateway(provider)
+    ).consume(first_event_id)
+
+    with session_factory() as session:
+        resolutions = session.scalars(
+            select(LeadMessageResolution)
+            .where(
+                LeadMessageResolution.message_id.in_([message_id for message_id, _ in messages])
+            )
+            .order_by(LeadMessageResolution.message_id)
+        ).all()
+        leads = session.scalars(select(Lead)).all()
+        context = session.scalar(
+            select(SalesLeadContext).where(SalesLeadContext.sales_user_id == "sales-1")
+        )
+    lead_by_company = {
+        lead.field_values.get("线索名称"): lead.id for lead in leads
+    }
+    resolution_by_message = {
+        resolution.message_id: resolution.lead_id for resolution in resolutions
+    }
+    assert len(leads) == 2
+    assert [resolution_by_message[message_id] for message_id, _ in messages] == [
+        lead_by_company["苏州安科"],
+        lead_by_company["苏州安科"],
+        lead_by_company["苏州安科"],
+        lead_by_company["苏州安科"],
+        lead_by_company["苏州安科"],
+        lead_by_company["无锡宏达"],
+        lead_by_company["无锡宏达"],
+        lead_by_company["无锡宏达"],
+    ]
+    assert context is not None
+    assert context.lead_id == lead_by_company["无锡宏达"]
+    assert context.last_message_sequence == 8
 
 
 def test_different_company_with_shared_phone_gets_tyc_name_on_new_record(

@@ -14,8 +14,10 @@ from pydantic import ValidationError
 
 from app.ai.models import (
     ExtractedLeadPatch,
+    ExtractedLeadSegmentPatch,
     LeadAnalysis,
     LeadFieldValue,
+    LeadSegmentAnalysis,
     LLMRequest,
     LLMResponse,
     SubmissionIntent,
@@ -263,33 +265,39 @@ class AIGateway:
             analysis, repair_response, repair_attempts = self._parse_schema_or_repair(
                 request, response, trace_id
             )
-            # 只把原文可逐字核验的身份引用提升为正式字段，避免自然表达因模型字段放错位置而待归属。
-            analysis = self._recover_verified_identity_fields(analysis, safe_text)
-            # 先将少量可确定映射的沟通自然表达归一化，再执行枚举校验。
-            analysis = self._normalize_communication_candidate(analysis, safe_text)
-            # 模型偶发漏掉原文中明确的合法枚举；仅恢复唯一且有字段语义提示的候选，不做猜测。
-            analysis = self._recover_explicit_enum_fields(analysis, safe_text)
-            # 兼容模型把预算、痛点等备注素材误放入 CRM 字段的结果，先归位再做业务白名单校验。
-            analysis = self._normalize_enrichment_field_placement(analysis, safe_text)
-            # 枚举候选必须有当前消息的明确证据，禁止模型凭经验补填客户级别等字段。
-            analysis = self._drop_enum_candidates_without_evidence(analysis, safe_text)
-            # 对“是做某产品”“想了解某工艺”等逐字事实补充备注素材，避免模型漏返回导致备注为空。
-            analysis = self._recover_explicit_enrichment_fields(analysis, safe_text)
-            # 低置信度枚举按字段类型做受控预填，文本字段仍保留在后台候选。
-            analysis = self._normalize_low_confidence_enum_candidates(analysis, safe_text)
-            # 单个无法映射的正式枚举只留作待确认候选，不阻断同消息其它可靠字段。
-            analysis, rejected_enum_candidates = self._drop_invalid_enum_candidates(analysis)
-            # 兼容 Qwen 兼容模式偶发漏返回置信度键；非法枚举已先保留为待确认候选。
-            analysis = self._drop_fields_missing_confidence(analysis)
-            self._validate_business(analysis)
-            validated_enrichment = self._validate_enrichment_evidence(analysis, safe_text)
-            # 补充信息只是备注素材；证据不足时丢弃该字段，不能阻塞已通过校验的 CRM 主字段。
-            analysis = analysis.model_copy(update={"enrichment": validated_enrichment})
-            fields, pending, low_candidates, pending_prefill_allowed = self._apply_confidence(
-                analysis, safe_text
+            (
+                analysis,
+                fields,
+                pending,
+                low_candidates,
+                validated_enrichment,
+                pending_prefill_allowed,
+            ) = (
+                self._prepare_analysis_patch(analysis, safe_text)
             )
-            pending = tuple(dict.fromkeys((*pending, *rejected_enum_candidates)))
-            low_candidates = {**low_candidates, **rejected_enum_candidates}
+            segment_patches = self._prepare_segment_patches(analysis, text)
+            if segment_patches:
+                analysis = analysis.model_copy(
+                    update={
+                        "segments": [
+                            LeadSegmentAnalysis(
+                                segment_index=segment.segment_index,
+                                source_text_span=segment.source_text_span,
+                                customer_reference={
+                                    key: value
+                                    for key, value in (
+                                        segment.patch.analysis.customer_reference.items()
+                                    )
+                                    if value in segment.source_text_span
+                                },
+                                crm_fields=segment.patch.analysis.crm_fields,
+                                enrichment=segment.patch.enrichment,
+                                confidence_by_field=segment.patch.analysis.confidence_by_field,
+                            )
+                            for segment in segment_patches
+                        ]
+                    }
+                )
         except AIGatewayError as error:
             self._log(trace_id, started_at, "failed", error_type=type(error).__name__)
             self._record_execution(
@@ -329,7 +337,126 @@ class AIGateway:
             low_candidates,
             validated_enrichment,
             pending_prefill_allowed,
+            tuple(segment_patches),
         )
+
+    def _prepare_analysis_patch(
+        self, analysis: LeadAnalysis, source_text: str
+    ) -> tuple[
+        LeadAnalysis,
+        dict[str, LeadFieldValue],
+        tuple[str, ...],
+        dict[str, LeadFieldValue],
+        dict[str, str],
+        tuple[str, ...],
+    ]:
+        """对单个消息或单个语义分段复用同一套确定性字段校验。"""
+        # 只把原文可逐字核验的身份引用提升为正式字段，避免自然表达因模型字段放错位置而待归属。
+        analysis = self._recover_verified_identity_fields(analysis, source_text)
+        # 先将少量可确定映射的沟通自然表达归一化，再执行枚举校验。
+        analysis = self._normalize_communication_candidate(analysis, source_text)
+        # 模型偶发漏掉原文中明确的合法枚举；仅恢复唯一且有字段语义提示的候选，不做猜测。
+        analysis = self._recover_explicit_enum_fields(analysis, source_text)
+        # 兼容模型把预算、痛点等备注素材误放入 CRM 字段的结果，先归位再做业务白名单校验。
+        analysis = self._normalize_enrichment_field_placement(analysis, source_text)
+        # 枚举候选必须有当前消息的明确证据，禁止模型凭经验补填客户级别等字段。
+        analysis = self._drop_enum_candidates_without_evidence(analysis, source_text)
+        # 对“是做某产品”“想了解某工艺”等逐字事实补充备注素材，避免模型漏返回导致备注为空。
+        analysis = self._recover_explicit_enrichment_fields(analysis, source_text)
+        # 低置信度枚举按字段类型做受控预填，文本字段仍保留在后台候选。
+        analysis = self._normalize_low_confidence_enum_candidates(analysis, source_text)
+        # 单个无法映射的正式枚举只留作待确认候选，不阻断同消息其它可靠字段。
+        analysis, rejected_enum_candidates = self._drop_invalid_enum_candidates(analysis)
+        # 兼容 Qwen 兼容模式偶发漏返回置信度键；非法枚举已先保留为待确认候选。
+        analysis = self._drop_fields_missing_confidence(analysis)
+        self._validate_business(analysis)
+        validated_enrichment = self._validate_enrichment_evidence(analysis, source_text)
+        # 补充信息只是备注素材；证据不足时丢弃该字段，不能阻塞已通过校验的 CRM 主字段。
+        analysis = analysis.model_copy(update={"enrichment": validated_enrichment})
+        fields, pending, low_candidates, pending_prefill_allowed = self._apply_confidence(
+            analysis, source_text
+        )
+        pending = tuple(dict.fromkeys((*pending, *rejected_enum_candidates)))
+        low_candidates = {**low_candidates, **rejected_enum_candidates}
+        return (
+            analysis,
+            fields,
+            pending,
+            low_candidates,
+            validated_enrichment,
+            pending_prefill_allowed,
+        )
+
+    def _prepare_segment_patches(
+        self, analysis: LeadAnalysis, source_text: str
+    ) -> tuple[ExtractedLeadSegmentPatch, ...]:
+        """仅保留能回指原文的语义分段，并逐段执行完整网关校验。"""
+        if not analysis.segments:
+            return ()
+        indices = [segment.segment_index for segment in analysis.segments]
+        if len(indices) != len(set(indices)):
+            return ()
+        # source_text_span 是模型可见事实边界；任一分段越界则整个拆分结果失效，避免部分建档。
+        if any(segment.source_text_span not in source_text for segment in analysis.segments):
+            return ()
+        prepared: list[ExtractedLeadSegmentPatch] = []
+        for segment in analysis.segments:
+            segment_analysis = LeadAnalysis(
+                intent="UPDATE_LEAD",
+                customer_reference=segment.customer_reference,
+                crm_fields=segment.crm_fields,
+                enrichment=segment.enrichment,
+                confidence_by_field=segment.confidence_by_field,
+            )
+            (
+                segment_analysis,
+                fields,
+                pending,
+                low_candidates,
+                enrichment,
+                pending_prefill_allowed,
+            ) = self._prepare_analysis_patch(segment_analysis, segment.source_text_span)
+            # 公司与联系人候选必须落在该 segment 的原文边界内；模型扩写直接丢弃。
+            grounded_fields = dict(fields)
+            grounded_crm_fields = dict(segment_analysis.crm_fields)
+            grounded_confidences = dict(segment_analysis.confidence_by_field)
+            for field_name in ("线索名称", "联系人"):
+                value = grounded_fields.get(field_name)
+                if isinstance(value, str) and value not in segment.source_text_span:
+                    grounded_fields.pop(field_name, None)
+                value = grounded_crm_fields.get(field_name)
+                if isinstance(value, str) and value not in segment.source_text_span:
+                    grounded_crm_fields.pop(field_name, None)
+                    grounded_confidences.pop(field_name, None)
+            grounded_analysis = segment_analysis.model_copy(
+                update={
+                    "crm_fields": grounded_crm_fields,
+                    "confidence_by_field": grounded_confidences,
+                }
+            )
+            grounded_patch = ExtractedLeadPatch(
+                trace_id="segment",
+                analysis=grounded_analysis,
+                fields=grounded_fields,
+                pending_confirmation_fields=tuple(
+                    field_name for field_name in pending if field_name in grounded_fields
+                ),
+                low_confidence_candidates=low_candidates,
+                enrichment=enrichment,
+                pending_prefill_allowed_fields=tuple(
+                    field_name
+                    for field_name in pending_prefill_allowed
+                    if field_name in grounded_fields
+                ),
+            )
+            prepared.append(
+                ExtractedLeadSegmentPatch(
+                    segment_index=segment.segment_index,
+                    source_text_span=segment.source_text_span,
+                    patch=grounded_patch,
+                )
+            )
+        return tuple(prepared)
 
     def classify_submission_intent(self, text: str) -> SubmissionIntent:
         """用结构化模型识别消息工作流意图，不生成任何 CRM 业务参数。
@@ -1802,7 +1929,9 @@ class AIGateway:
                     "CRM 合并或覆盖人工值。"
                     "intent 只用于判断当前消息与销售会话的关系：明确介绍另一个客户时返回 "
                     "NEW_LEAD；名片、OCR、语音转写或碎片补充属于当前客户时返回 "
-                    "UPDATE_LEAD；无法可靠判断时不要伪造公司名。"
+                    "UPDATE_LEAD；一条消息可靠拆出多个客户时返回 MULTI_LEAD 并填写 segments；"
+                    "客户数量或边界不可靠时返回 MULTI_LEAD_AMBIGUOUS，不猜测分段；"
+                    "无法可靠判断时不要伪造公司名。"
                     f"{context_instruction}"
                     f"必须符合此 JSON Schema：{json.dumps(json_schema, ensure_ascii=False)}"
                     f"{self._field_contract_instructions()}"
@@ -1874,7 +2003,9 @@ class AIGateway:
             "主营产品、客户需求/痛点、预算、年销售额和特殊要求属于 enrichment，"
             "按语义归类但 value 必须保留当前原文中的连续事实片段；模型摘要或扩写不得写入。"
             "一条消息包含多个不同候选时，必须先判断是否为多个客户；"
-            "无法可靠拆分时返回 MULTI_LEAD 或省略不确定字段。"
+            "可靠拆分时返回 segments，每个 segment_index 唯一，"
+            "source_text_span 必须是当前原文的连续片段；"
+            "无法可靠拆分时返回 MULTI_LEAD_AMBIGUOUS，不得复制共享字段或猜测归属。"
             "允许输出的只有 CRM 注册业务字段（不含备注）及 enrichment 冻结字段。"
             "禁止输出 JSON key：备注、comment、remark、notes、description；"
             "也禁止输出 AI待确认、缺失字段、审核状态、provenance 或其他系统计算字段。"
