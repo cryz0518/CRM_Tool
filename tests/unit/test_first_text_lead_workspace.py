@@ -140,6 +140,211 @@ def test_multiline_labeled_message_keeps_all_fields_in_one_lead() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "合肥光曜新能源孙经理，光伏组件，外观缺陷视觉检测",
+            {"线索名称": "合肥光曜新能源", "联系人": "孙经理"},
+        ),
+        (
+            "天津华印包装马经理，印刷包装",
+            {"线索名称": "天津华印包装", "联系人": "马经理"},
+        ),
+        (
+            "江苏通达电缆董经理，电缆表面绝缘层瑕疵视觉检测",
+            {"线索名称": "江苏通达电缆", "联系人": "董经理"},
+        ),
+        (
+            "苏州微视医疗刘博士，医疗器械视觉检测",
+            {"线索名称": "苏州微视医疗", "联系人": "刘博士"},
+        ),
+    ],
+)
+def test_leading_company_contact_hint_extracts_only_narrow_sales_format(
+    text: str, expected: dict[str, str]
+) -> None:
+    """窄范围识别公司主体与单姓称谓，避免让自由文本公司名依赖模型。"""
+    extractor = DeterministicFirstTextLeadExtractor()
+
+    assert extractor.extract_leading_company_contact_hint(text) == expected
+    assert extractor.extract_leading_company_hint(text) == expected["线索名称"]
+
+
+def test_leading_company_contact_hint_rejects_demand_text_with_phone() -> None:
+    """需求片段即使后文出现手机号，也不能升级为公司身份。"""
+    extractor = DeterministicFirstTextLeadExtractor()
+    text = "表面缺陷视觉检测，预算28万，电话13752288666，官网SEO，下季度招标。"
+
+    assert extractor.extract_leading_company_contact_hint(text) is None
+    assert extractor.extract_leading_company_hint(text) is None
+
+
+@pytest.mark.parametrize("company_prefix", ["视觉检测", "装配", "预算120万"])
+def test_leading_company_contact_hint_rejects_registered_process_or_demand_prefix(
+    company_prefix: str,
+) -> None:
+    """注册工艺或明显需求前缀不能仅凭联系人称谓升级为公司。"""
+    text = f"{company_prefix}孙经理，客户现场补充信息"
+
+    assert DeterministicFirstTextLeadExtractor().extract_leading_company_contact_hint(text) is None
+
+
+def test_leading_company_contact_hint_allows_business_word_with_legal_suffix() -> None:
+    """公司法律主体后缀是强身份证据，不因包含业务词而误拒。"""
+    text = "视觉检测设备有限公司孙经理，设备外观检测"
+
+    assert DeterministicFirstTextLeadExtractor().extract_leading_company_contact_hint(text) == {
+        "线索名称": "视觉检测设备有限公司",
+        "联系人": "孙经理",
+    }
+
+
+def test_four_message_natural_language_routing_stays_on_two_leads(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证真实四消息结构稳定得到 A/A/B/B，且只建立两条销售线索。"""
+    messages = (
+        (
+            "message-real-a1",
+            "合肥光曜新能源孙经理，光伏组件，外观缺陷视觉检测",
+        ),
+        (
+            "message-real-a2",
+            "手机号17315865903，预算120万，SNEC展会收的名片，今年内定标。",
+        ),
+        ("message-real-b1", "天津华印包装马经理，印刷包装"),
+        (
+            "message-real-b2",
+            "表面缺陷视觉检测，预算28万，电话13752288666，官网SEO，下季度招标。",
+        ),
+    )
+    provider = MockLLMProvider(
+        [
+            json.dumps(
+                {
+                    "intent": "UPDATE_LEAD",
+                    "customer_reference": {},
+                    "crm_fields": {"工艺": "视觉检测"},
+                    "enrichment": {"预算": "预算120万"},
+                    "confidence_by_field": {"工艺": 0.95},
+                    "conflicts": [],
+                    "warnings": [],
+                }
+            ),
+            json.dumps(
+                {
+                    "intent": "UPDATE_LEAD",
+                    "customer_reference": {},
+                    "crm_fields": {"电话": "13752288666"},
+                    "enrichment": {"预算": "预算28万"},
+                    "confidence_by_field": {"电话": 0.99},
+                    "conflicts": [],
+                    "warnings": [],
+                }
+            ),
+            json.dumps(
+                {
+                    "intent": "NEW_LEAD",
+                    "customer_reference": {},
+                    "crm_fields": {
+                        "线索名称": "天津华印包装",
+                        "联系人": "马经理",
+                    },
+                    "enrichment": {},
+                    "confidence_by_field": {
+                        "线索名称": 0.99,
+                        "联系人": 0.95,
+                    },
+                    "conflicts": [],
+                    "warnings": [],
+                }
+            ),
+            json.dumps(
+                {
+                    "intent": "UPDATE_LEAD",
+                    "customer_reference": {},
+                    "crm_fields": {"电话": "13752288666"},
+                    "enrichment": {},
+                    "confidence_by_field": {"电话": 0.99},
+                    "conflicts": [],
+                    "warnings": [],
+                }
+            ),
+        ]
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    company_service = CompanyLeadService(
+        session_factory,
+        adapter,
+        MockTYCAdapter(
+            {
+                "合肥光曜新能源": QCCLookupResult.matched(
+                    QCCCandidate("合肥光曜新能源有限公司", "qcc-a")
+                ),
+                "天津华印包装": QCCLookupResult.matched(
+                    QCCCandidate("天津华印包装有限公司", "qcc-b")
+                ),
+            }
+        ),
+    )
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        ai_gateway=AIGateway(provider),
+        company_lead_service=company_service,
+    )
+
+    # 逐条持久化并消费，避免测试辅助逻辑提前推进同销售的后续发件箱事件。
+    results = [
+        service.consume(
+            persist_outbox_text(
+                session_factory,
+                message_id=message_id,
+                sales_user_id="sales-1",
+                text=text,
+            )
+        )
+        for message_id, text in messages
+    ]
+
+    assert len(provider.requests) == 2
+    assert [result.status for result in results] == [
+        LeadProcessingStatus.CREATED,
+        LeadProcessingStatus.UPDATED,
+        LeadProcessingStatus.CREATED,
+        LeadProcessingStatus.UPDATED,
+    ]
+    assert results[0].lead_id is not None
+    assert results[1].lead_id == results[0].lead_id
+    assert results[2].lead_id is not None
+    assert results[2].lead_id != results[0].lead_id
+    assert results[3].lead_id == results[2].lead_id
+
+    with session_factory() as session:
+        leads = session.scalars(select(Lead).order_by(Lead.created_at)).all()
+        resolutions = session.scalars(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id.in_(
+                    ("message-real-a1", "message-real-a2", "message-real-b1", "message-real-b2")
+                )
+            )
+        ).all()
+        context = session.get(SalesLeadContext, "sales-1")
+
+    assert len(leads) == 2
+    resolution_by_message = {item.message_id: item.lead_id for item in resolutions}
+    assert resolution_by_message == {
+        "message-real-a1": results[0].lead_id,
+        "message-real-a2": results[0].lead_id,
+        "message-real-b1": results[2].lead_id,
+        "message-real-b2": results[2].lead_id,
+    }
+    assert context is not None
+    assert context.lead_id == results[2].lead_id
+    assert context.last_message_sequence == 4
+
+
 def test_authorized_sales_text_creates_a_personal_review_record(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -1608,12 +1813,6 @@ def test_free_text_company_hint_prevents_context_cross_lead_and_keeps_tyc_pendin
         sales_user_id="sales-1",
         text="汇川技术，张华杰经理，17318902311，做电气自动化，主要想做喷涂方面，预算25万左右",
     )
-    second_event_id = persist_outbox_text(
-        session_factory,
-        message_id="message-ai-company-b",
-        sales_user_id="sales-1",
-        text="艾利特，杨经理，17318902085，做智能机器人，主要想做视觉检测，预算25万左右",
-    )
     provider = MockLLMProvider(
         [
             json.dumps(
@@ -1674,6 +1873,12 @@ def test_free_text_company_hint_prevents_context_cross_lead_and_keeps_tyc_pendin
     )
 
     first = service.consume(first_event_id)
+    second_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-ai-company-b",
+        sales_user_id="sales-1",
+        text="艾利特，杨经理，17318902085，做智能机器人，主要想做视觉检测，预算25万左右",
+    )
     second = service.consume(second_event_id)
 
     assert first.lead_id is not None
