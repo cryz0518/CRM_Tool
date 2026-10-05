@@ -1391,14 +1391,28 @@ class FirstTextLeadWorkspaceService:
                 for item in source_resolutions
             )
         )
-        if (
-            source_event is None
-            or source_event.status != "succeeded"
-            or not source_is_explicitly_unassigned
-        ):
-            # quote relationship 已解析，但 source 尚未形成稳定业务结论，当前消息保留待重试状态。
+        if source_event is not None and source_event.status in {
+            "pending",
+            "retrying",
+            "processing",
+        }:
+            # source 仍可由正常 Worker 推进，reply 应等待 source 形成稳定业务结论。
             logger.info("quote_routing_waiting_for_source_resolution")
             return QuoteRouteDecision(waiting_for_source=True)
+        if not (
+            source_event is not None
+            and source_event.status == "succeeded"
+            and source_is_explicitly_unassigned
+        ):
+            # source 已经结束或状态不可识别，但没有唯一 Lead identity / 明确 unassigned。
+            self._finish_quote_unresolved(
+                session,
+                event,
+                resolution,
+                conflict_code="QUOTE_SOURCE_UNROUTABLE",
+                audit_type="QUOTE_SOURCE_UNROUTABLE",
+            )
+            return QuoteRouteDecision(fail_closed=True)
 
         # source 已明确为 unassigned 时，quote relationship 固定双片段恢复边界。
         recovery_request = QuoteRecoveryExtractionRequest(
@@ -1679,6 +1693,7 @@ class FirstTextLeadWorkspaceService:
                     quote_target_lead = quote_decision.target_lead
                     quote_recovery_completed = quote_decision.recovery_completed
                     if quote_decision.waiting_for_source:
+                        self._release_processing_claim(event)
                         return LeadProcessingResult(LeadProcessingStatus.WAITING_FOR_PREVIOUS)
                     if quote_decision.fail_closed:
                         return LeadProcessingResult(LeadProcessingStatus.QUOTE_UNRESOLVED)
@@ -1695,8 +1710,7 @@ class FirstTextLeadWorkspaceService:
                 if self._media_enrichment_is_pending(session, message):
                     # 媒体接收与 Outbox 调度并发时，附件可能尚未落库；释放本次认领，
                     # 由下一轮调度在附件就绪后执行 OCR，不能占用 processing 租约至超时。
-                    event.status = "pending"
-                    event.processing_started_at = None
+                    self._release_processing_claim(event)
                     logger.info("lead_outbox_waiting_for_media_enrichment")
                     return LeadProcessingResult(LeadProcessingStatus.WAITING_FOR_PREVIOUS)
 
@@ -3397,6 +3411,18 @@ class FirstTextLeadWorkspaceService:
         """
         weak_keywords = ("预算", "需求", "报价", "项目", "采购")
         return bool(text and any(keyword in text for keyword in weak_keywords))
+
+    @staticmethod
+    def _release_processing_claim(event: OutboxEvent) -> None:
+        """释放当前 Worker claim，使等待处理的事件可由后续调度再次认领。
+
+        参数：event 为当前 reply 的 Outbox 事件。
+        返回值：无。
+        异常：无。
+        副作用：将事件重置为 pending 并清空 processing lease 起始时间。
+        """
+        event.status = "pending"
+        event.processing_started_at = None
 
     @staticmethod
     def _media_enrichment_is_pending(session: Session, message: IncomingMessage) -> bool:

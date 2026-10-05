@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -26,6 +27,7 @@ from app.messaging.models import (
     MessageQuoteResolution,
     OutboxEvent,
     SalesAuthorization,
+    utc_now,
 )
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.registry import build_required_smart_table_schema
@@ -281,6 +283,45 @@ def test_quote_waits_when_source_has_no_resolution_and_outbox_is_pending() -> No
         assert quote is not None and quote.resolution_status == "resolved"
 
 
+def test_claimed_reply_releases_worker_lease_when_quote_source_is_pending() -> None:
+    """验证真实 Worker claim 等待 source 后释放 processing lease 并保留 quote 关系。"""
+    factory = _session_factory()
+    _persist_message(factory, "source", "sales-1", 10, "客户：甲公司")
+    current_id = _persist_message(
+        factory, "current", "sales-1", 15, "预算30万", quote_text="客户：甲公司"
+    )
+    with factory.begin() as session:
+        current_event = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.message_id == "current")
+        )
+        assert current_event is not None
+        current_event.status = "processing"
+        current_event.processing_started_at = utc_now()
+
+    result = FirstTextLeadWorkspaceService(factory, _adapter()).consume(
+        current_id, claimed_for_processing=True
+    )
+
+    assert result.status is LeadProcessingStatus.WAITING_FOR_PREVIOUS
+    with factory() as session:
+        current_event = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.message_id == "current")
+        )
+        quote = session.scalar(select(MessageQuoteResolution))
+        assert current_event is not None
+        assert current_event.status == "pending"
+        assert current_event.processing_started_at is None
+        assert session.scalar(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id == "current"
+            )
+        ) is None
+        assert session.scalars(select(Lead)).all() == []
+        assert quote is not None
+        assert quote.resolution_status == "resolved"
+        assert quote.quoted_source_message_id == "source"
+
+
 def test_quote_waits_when_source_resolution_is_processing_without_lead() -> None:
     """验证 processing 且 lead_id 为空时不能伪装成 unassigned recovery。"""
     factory = _session_factory()
@@ -314,8 +355,8 @@ def test_quote_waits_when_source_resolution_is_processing_without_lead() -> None
         assert current_resolution is None
 
 
-def test_quote_waiting_then_explicit_unassigned_source_recovers_once() -> None:
-    """验证 source 准备完成为 unassigned 后，原先等待的 reply 才能 recovery。"""
+def test_claimed_reply_waits_then_claims_again_and_recovers_explicit_unassigned_source() -> None:
+    """验证真实 Worker 两次 claim 间 source 变为 unassigned 后只 recovery 一次。"""
     factory = _session_factory()
     source_id = _persist_message(factory, "source", "sales-1", 10, "客户：甲公司")
     current_id = _persist_message(
@@ -327,7 +368,14 @@ def test_quote_waiting_then_explicit_unassigned_source_recovers_once() -> None:
         quote_text="客户：甲公司",
     )
     service = FirstTextLeadWorkspaceService(factory, _adapter())
-    first = service.consume(current_id)
+    with factory.begin() as session:
+        current_event = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.message_id == "current")
+        )
+        assert current_event is not None
+        current_event.status = "processing"
+        current_event.processing_started_at = utc_now()
+    first = service.consume(current_id, claimed_for_processing=True)
     assert first.status is LeadProcessingStatus.WAITING_FOR_PREVIOUS
     with factory.begin() as session:
         source_event = session.get(OutboxEvent, source_id)
@@ -338,15 +386,107 @@ def test_quote_waiting_then_explicit_unassigned_source_recovers_once() -> None:
                 message_id="source", segment_index=0, status="unassigned"
             )
         )
-    second = service.consume(current_id)
+        current_event = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.message_id == "current")
+        )
+        assert current_event is not None and current_event.status == "pending"
+        current_event.status = "processing"
+        current_event.processing_started_at = utc_now()
+    second = service.consume(current_id, claimed_for_processing=True)
     assert second.lead_id is not None
     with factory() as session:
         assert session.scalar(select(func.count(Lead.id))) == 1
+        assert session.scalar(select(func.count(MessageQuoteResolution.id))) == 1
         assert session.scalar(
             select(func.count(BusinessAuditEvent.id)).where(
                 BusinessAuditEvent.event_type == "quoted_unassigned_message_recovered"
             )
         ) == 1
+        resolutions = session.scalars(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id.in_(["source", "current"])
+            )
+        ).all()
+        context = session.get(SalesLeadContext, "sales-1")
+        assert {item.lead_id for item in resolutions} == {second.lead_id}
+        assert context is not None and context.last_message_sequence == 15
+
+
+@pytest.mark.parametrize(
+    "source_status",
+    [
+        pytest.param("succeeded", id="succeeded-without-resolution"),
+        pytest.param("ignored", id="ignored"),
+        pytest.param("failed_pending_review", id="failed-pending-review"),
+    ],
+)
+def test_terminal_quote_source_without_identity_fails_closed(source_status: str) -> None:
+    """验证终态 source 无 Lead identity 时给出 SOURCE_UNROUTABLE，不等待或借用 context。"""
+    factory = _session_factory()
+    _persist_message(
+        factory, "context-source", "sales-1", 1, "客户：上下文公司"
+    )
+    _persist_message(factory, "source", "sales-1", 10, "客户：目标公司")
+    current_id = _persist_message(
+        factory, "current", "sales-1", 15, "预算30万", quote_text="客户：目标公司"
+    )
+    with factory.begin() as session:
+        context_event = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.message_id == "context-source")
+        )
+        source_event = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.message_id == "source")
+        )
+        assert context_event is not None and source_event is not None
+        context_event.status = "succeeded"
+        source_event.status = source_status
+        context_lead = Lead(
+            source_message_id="context-source",
+            original_capturing_sales_user_id="sales-1",
+            smart_table_owner_user_id="sales-1",
+            field_values={"线索名称": "上下文公司", "线索来源": "展会"},
+        )
+        session.add(context_lead)
+        session.flush()
+        session.add(
+            LeadMessageResolution(
+                message_id="context-source",
+                segment_index=0,
+                lead_id=context_lead.id,
+                status="assigned",
+            )
+        )
+        session.add(
+            SalesLeadContext(
+                sales_user_id="sales-1",
+                lead_id=context_lead.id,
+                last_message_received_at=utc_now(),
+                last_message_sequence=1,
+            )
+        )
+
+    result = FirstTextLeadWorkspaceService(factory, _adapter()).consume(current_id)
+
+    assert result.status is LeadProcessingStatus.QUOTE_UNRESOLVED
+    with factory() as session:
+        quote = session.scalar(
+            select(MessageQuoteResolution).where(
+                MessageQuoteResolution.current_message_id == "current"
+            )
+        )
+        current_resolution = session.scalar(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id == "current"
+            )
+        )
+        assert quote is not None
+        assert quote.resolution_status == "conflict"
+        assert quote.quoted_source_message_id == "source"
+        assert quote.conflict_code == "QUOTE_SOURCE_UNROUTABLE"
+        assert current_resolution is not None
+        assert current_resolution.status == "unassigned"
+        assert current_resolution.lead_id is None
+        assert session.scalar(select(func.count(Lead.id))) == 1
 
 
 def test_quote_recovery_calls_ai_for_each_segment_and_preserves_field_provenance() -> None:
@@ -451,8 +591,8 @@ def test_assigned_quote_inherits_same_lead_and_advances_context_to_reply() -> No
     assert context is not None and context.last_message_sequence == 15
 
 
-def test_processing_quote_inherits_local_lead_even_when_projection_is_pending() -> None:
-    """验证 source resolution=processing 且有 Lead 时不因外部投影状态失去路由。"""
+def test_processing_quote_inherits_local_lead_when_source_event_failed_pending_review() -> None:
+    """验证 Outbox 已失败待审但本地 processing resolution 有 Lead 时仍可继承。"""
     factory = _session_factory()
     source_id = _persist_message(factory, "source", "sales-1", 10, "预算30万")
     current_id = _persist_message(factory, "current", "sales-1", 15, "补充", quote_text="预算30万")
@@ -480,7 +620,7 @@ def test_processing_quote_inherits_local_lead_even_when_projection_is_pending() 
         )
         source_event = session.get(OutboxEvent, source_id)
         assert source_event is not None
-        source_event.status = "succeeded"
+        source_event.status = "failed_pending_review"
     # source 的本地 Lead identity 处于 processing，当前 reply 仍应能够直接继承。
     del source_id
     result = FirstTextLeadWorkspaceService(factory, _adapter()).consume(current_id)
