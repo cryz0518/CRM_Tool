@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import httpx
 
+import app.smart_table.readiness as readiness_module
 from app.smart_table.adapter import SmartTableActor
 from app.smart_table.dependencies import get_smart_table_adapter
 from app.smart_table.mock import MockSmartTableAdapter
@@ -13,6 +15,7 @@ from app.smart_table.models import (
     SmartTableField,
     SmartTableFieldType,
     SmartTableOption,
+    SmartTablePermissions,
     SmartTableSchema,
 )
 from app.smart_table.readiness import SmartTableReadinessChecker
@@ -114,6 +117,80 @@ def test_readiness_rejects_an_adapter_that_has_not_been_configured() -> None:
 
     assert report.ready is False
     assert report.issues == ("智能表格适配器未配置：需要部署真实 CLI/API 适配器或显式启用 Mock",)
+
+
+class CountingReadinessAdapter:
+    """记录 readiness schema/permissions 调用次数的内存假适配器。"""
+
+    def __init__(self, *, fails: bool = False) -> None:
+        """创建成功或在 schema 阶段失败的假适配器。"""
+        self.schema_calls = 0
+        self.permission_calls = 0
+        self.fails = fails
+
+    def get_schema(self) -> SmartTableSchema:
+        """返回测试 schema，或抛出不可缓存正文的模拟外部异常。"""
+        self.schema_calls += 1
+        if self.fails:
+            raise RuntimeError("secret payload must not be cached")
+        return build_required_smart_table_schema()
+
+    def get_permissions(self) -> SmartTablePermissions:
+        """返回符合 readiness 的权限快照并记录调用次数。"""
+        self.permission_calls += 1
+        return SmartTablePermissions(
+            sales_can_create_records=False,
+            sales_can_delete_records=False,
+        )
+
+
+def _fake_readiness_clock(monkeypatch):  # type: ignore[no-untyped-def]
+    """固定 readiness 单调时钟和短 TTL，供缓存边界测试使用。"""
+    timestamp = [100.0]
+    monkeypatch.setattr(readiness_module, "monotonic", lambda: timestamp[0])
+    monkeypatch.setattr(
+        readiness_module,
+        "get_settings",
+        lambda: SimpleNamespace(smart_table_readiness_cache_seconds=30),
+    )
+    return timestamp
+
+
+def test_readiness_success_report_is_cached_until_ttl_expires(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """验证成功 readiness 在 TTL 内复用，过期后重新检查 schema 和权限。"""
+    timestamp = _fake_readiness_clock(monkeypatch)
+    adapter = CountingReadinessAdapter()
+    checker = SmartTableReadinessChecker()
+
+    first = checker.check(adapter)
+    second = checker.check(adapter)
+    assert first is second
+    assert first.ready is True
+    assert (adapter.schema_calls, adapter.permission_calls) == (1, 1)
+
+    timestamp[0] = 130.0
+    third = checker.check(adapter)
+    assert third.ready is True
+    assert (adapter.schema_calls, adapter.permission_calls) == (2, 2)
+
+
+def test_readiness_failure_report_is_cached_without_external_error_text(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """验证失败 readiness 在 TTL 内不重探测，且缓存只含脱敏报告。"""
+    timestamp = _fake_readiness_clock(monkeypatch)
+    adapter = CountingReadinessAdapter(fails=True)
+    checker = SmartTableReadinessChecker()
+
+    first = checker.check(adapter)
+    second = checker.check(adapter)
+    assert first is second
+    assert first.ready is False
+    assert "secret" not in str(first)
+    assert adapter.schema_calls == 1
+    assert adapter.permission_calls == 0
+
+    timestamp[0] = 130.0
+    checker.check(adapter)
+    assert adapter.schema_calls == 2
 
 
 class ExplodingSmartTableAdapter:

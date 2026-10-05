@@ -14,6 +14,7 @@ from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from app.core.failures import PermanentTaskFailure, RetryableTaskFailure
+from app.core.logging import LOG_CONTEXT
 from app.smart_table.adapter import (
     SmartTableActor,
     SmartTableAdapterConfigurationError,
@@ -643,25 +644,64 @@ class WecomCliSmartTableAdapter:
                 response = self._runner(arguments)
             except WecomCliProcessError as error:
                 if not error.retryable:
+                    self._log_final_failure(
+                        "records",
+                        "query",
+                        error,
+                        attempt + 1,
+                        fallback_error_code="remote_business_error",
+                    )
                     raise
                 if attempt == self._retry_count:
+                    self._log_final_failure(
+                        "records",
+                        "query",
+                        error,
+                        attempt + 1,
+                        fallback_error_code="transport_error",
+                    )
                     raise WecomCliTransportError("wecom-cli 查询进程调用失败") from error
                 self._log_retry("records", "query", attempt, error.error_code)
                 time.sleep(self._retry_delay_seconds(error.error_code, attempt))
                 continue
             except (OSError, subprocess.TimeoutExpired) as error:
                 if attempt == self._retry_count:
+                    fallback_code = (
+                        "timeout"
+                        if isinstance(error, subprocess.TimeoutExpired)
+                        else "process_error"
+                    )
+                    self._log_final_failure(
+                        "records", "query", error, attempt + 1, fallback_error_code=fallback_code
+                    )
                     raise WecomCliTransportError("wecom-cli 查询调用失败") from error
                 self._log_retry("records", "query", attempt, type(error).__name__)
                 time.sleep(self._retry_delay_seconds(type(error).__name__, attempt))
                 continue
             if self._is_transient_network_error(response):
                 if attempt == self._retry_count:
+                    self._log_final_failure(
+                        "records",
+                        "query",
+                        None,
+                        attempt + 1,
+                        fallback_error_code="network_error",
+                    )
                     raise WecomCliTransportError("wecom-cli 查询网络调用失败")
                 self._log_retry("records", "query", attempt, "NetworkError")
                 time.sleep(self._retry_delay_seconds("network_error", attempt))
                 continue
-            self._raise_for_error(response)
+            try:
+                self._raise_for_error(response)
+            except WecomCliSmartTableAdapterError as error:
+                self._log_final_failure(
+                    "records",
+                    "query",
+                    error,
+                    attempt + 1,
+                    fallback_error_code="remote_business_error",
+                )
+                raise
             return response
         raise AssertionError("已覆盖全部 CLI 查询重试分支")
 
@@ -801,14 +841,35 @@ class WecomCliSmartTableAdapter:
                     and error.external_error_code == 850005
                 )
                 if action == "add" and not safe_rate_limit_replay:
+                    self._log_final_failure(
+                        resource,
+                        action,
+                        error,
+                        attempt + 1,
+                        fallback_error_code="remote_business_error",
+                    )
                     if error.retryable:
                         raise WecomCliProtocolError(
                             "wecom-cli 新增结果无法确认，禁止自动重放"
                         ) from None
                     raise
                 if not error.retryable:
+                    self._log_final_failure(
+                        resource,
+                        action,
+                        error,
+                        attempt + 1,
+                        fallback_error_code="remote_business_error",
+                    )
                     raise
                 if attempt == self._retry_count:
+                    self._log_final_failure(
+                        resource,
+                        action,
+                        error,
+                        attempt + 1,
+                        fallback_error_code="transport_error",
+                    )
                     raise WecomCliTransportError(
                         f"wecom-cli 进程调用失败：{error.error_code}"
                     ) from error
@@ -818,11 +879,35 @@ class WecomCliSmartTableAdapter:
             except (OSError, subprocess.TimeoutExpired) as error:
                 if action == "add":
                     # 新增请求超时或进程启动结果不明时，禁止自动重放以免产生重复行。
+                    fallback_code = (
+                        "timeout"
+                        if isinstance(error, subprocess.TimeoutExpired)
+                        else "process_error"
+                    )
+                    self._log_final_failure(
+                        resource,
+                        action,
+                        error,
+                        attempt + 1,
+                        fallback_error_code=fallback_code,
+                    )
                     raise WecomCliProtocolError(
                         "wecom-cli 新增结果无法确认，禁止自动重放"
                     ) from None
                 if attempt == self._retry_count:
                     # 最后一次仍失败时隐藏底层请求和响应，避免异常泄露表格数据。
+                    fallback_code = (
+                        "timeout"
+                        if isinstance(error, subprocess.TimeoutExpired)
+                        else "process_error"
+                    )
+                    self._log_final_failure(
+                        resource,
+                        action,
+                        error,
+                        attempt + 1,
+                        fallback_error_code=fallback_code,
+                    )
                     raise WecomCliTransportError("wecom-cli 调用失败") from error
                 self._log_retry(resource, action, attempt, type(error).__name__)
                 time.sleep(self._retry_delay_seconds(type(error).__name__, attempt))
@@ -832,16 +917,40 @@ class WecomCliSmartTableAdapter:
                 # CLI 明确标记的 NetworkError 才允许重放同一个请求。
                 if action == "add":
                     # 服务端网络错误不能证明新增未执行；该不确定结果转入人工检查点。
+                    self._log_final_failure(
+                        resource,
+                        action,
+                        None,
+                        attempt + 1,
+                        fallback_error_code="network_error",
+                    )
                     raise WecomCliProtocolError(
                         "wecom-cli 新增结果无法确认，禁止自动重放"
                     )
                 if attempt == self._retry_count:
+                    self._log_final_failure(
+                        resource,
+                        action,
+                        None,
+                        attempt + 1,
+                        fallback_error_code="network_error",
+                    )
                     raise WecomCliTransportError("wecom-cli 网络调用失败")
                 self._log_retry(resource, action, attempt, "NetworkError")
                 time.sleep(self._retry_delay_seconds("network_error", attempt))
                 continue
             # 非暂态响应先做统一错误码校验，再交给具体解析器处理结构。
-            self._raise_for_error(response)
+            try:
+                self._raise_for_error(response)
+            except WecomCliSmartTableAdapterError as error:
+                self._log_final_failure(
+                    resource,
+                    action,
+                    error,
+                    attempt + 1,
+                    fallback_error_code="remote_business_error",
+                )
+                raise
             return response
 
         raise AssertionError("已覆盖全部 CLI 重试分支")
@@ -1030,6 +1139,7 @@ class WecomCliSmartTableAdapter:
         if error_code in code_categories:
             return code_categories[error_code]
         if error_code is not None and error_code > 0:
+            # 850003 当前没有经验证的外部语义；与其他未知远端码一样保留通用分类且不重试。
             # 893xxx 是 CLI 自身分类，其余正数按远端业务码 fail closed。
             return "other" if 893000 <= error_code <= 893999 else "remote_business_error"
         if error_type == "NetworkError":
@@ -1442,6 +1552,54 @@ class WecomCliSmartTableAdapter:
         if not isinstance(record_id, str) or not record_id:
             raise WecomCliProtocolError("wecom-cli 新增响应缺少 record_id")
         return record_id
+
+    @staticmethod
+    def _log_final_failure(
+        resource: str,
+        action: str,
+        error: BaseException | None,
+        retry_attempt: int,
+        *,
+        fallback_error_code: str,
+    ) -> None:
+        """记录最终 CLI 操作失败的安全分类，不输出请求或响应内容。
+
+        参数：resource、action 为 CLI 操作类别；error 为可选受控错误；retry_attempt 为本次调用序号；
+        fallback_error_code 为无结构化进程错误时使用的内部分类。
+        返回值：无。
+        异常：无；错误属性只接受稳定字符串或整数类型。
+        副作用：写入不含文档、子表、记录、字段值或正文的结构化错误日志。
+        """
+        process_error = error if isinstance(error, WecomCliProcessError) else None
+        error_code = process_error.error_code if process_error is not None else fallback_error_code
+        external_error_type = (
+            process_error.external_error_type
+            if process_error is not None
+            and process_error.external_error_type in _SAFE_PROCESS_ERROR_TYPES
+            else None
+        )
+        # 通用日志上下文可能绑定写入后的 record_id；操作诊断必须主动去除该字段。
+        context = LOG_CONTEXT.get()
+        safe_context_token = LOG_CONTEXT.set(
+            {key: value for key, value in context.items() if key != "record_id"}
+        )
+        try:
+            logger.error(
+                "wecom_cli_smart_table_failed",
+                extra={
+                    "smart_table_resource": resource,
+                    "smart_table_action": action,
+                    "error_code": error_code,
+                    "external_error_code": (
+                        process_error.external_error_code if process_error is not None else None
+                    ),
+                    "external_error_type": external_error_type,
+                    "http_status": process_error.http_status if process_error is not None else None,
+                    "retry_attempt": retry_attempt,
+                },
+            )
+        finally:
+            LOG_CONTEXT.reset(safe_context_token)
 
     @staticmethod
     def _log_retry(resource: str, action: str, attempt: int, error_code: str) -> None:

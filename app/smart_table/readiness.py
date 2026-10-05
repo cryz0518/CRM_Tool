@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import logging
-from time import perf_counter
+from threading import Lock
+from time import monotonic, perf_counter
 
+from app.core.config import get_settings
 from app.smart_table.adapter import SmartTableAdapter, SmartTableAdapterConfigurationError
 from app.smart_table.models import SmartTableReadinessReport
 from app.smart_table.registry import REQUIRED_SMART_TABLE_FIELDS
 
 logger = logging.getLogger(__name__)
+_readiness_cache_lock = Lock()
+_readiness_cache: tuple[SmartTableAdapter, float, SmartTableReadinessReport] | None = None
 
 
 class SmartTableReadinessChecker:
@@ -22,6 +26,31 @@ class SmartTableReadinessChecker:
         返回：包含是否就绪和全部中文配置问题的报告。
         异常：所有适配器异常均转换为稳定 not-ready 报告，不向 API 泄露异常正文。
         副作用：记录结构化的适配器、耗时、结果和问题数量日志。
+        """
+        global _readiness_cache
+
+        ttl_seconds = get_settings().smart_table_readiness_cache_seconds
+        # readiness 可能由多个 HTTP/容器探针并发触发；同一进程只允许一个 cache miss 探测。
+        with _readiness_cache_lock:
+            now = monotonic()
+            if (
+                _readiness_cache is not None
+                and _readiness_cache[0] is adapter
+                and now < _readiness_cache[1]
+            ):
+                return _readiness_cache[2]
+            report = self._probe(adapter)
+            # 仅缓存脱敏的领域报告和进程内 deadline，不保留异常、响应正文或凭据。
+            _readiness_cache = (adapter, monotonic() + ttl_seconds, report)
+            return report
+
+    def _probe(self, adapter: SmartTableAdapter) -> SmartTableReadinessReport:
+        """执行一次未缓存的只读 schema 与权限检查。
+
+        参数：adapter 为稳定智能表格适配器。
+        返回值：成功或脱敏失败的 readiness 报告。
+        异常：适配器错误转换为 not-ready 报告；其余代码错误按原有处理边界传播。
+        副作用：调用适配器只读接口并记录安全结构化日志。
         """
         adapter_name = type(adapter).__name__
         started_at = perf_counter()
