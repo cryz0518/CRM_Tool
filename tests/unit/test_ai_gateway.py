@@ -58,6 +58,81 @@ def test_gateway_repairs_only_one_malformed_structured_response() -> None:
     assert len(provider.requests) == 2
 
 
+def test_gateway_preserves_source_grounded_semantic_segments() -> None:
+    """验证网关允许模型返回多个带原文连续片段的语义客户候选。"""
+    source_text = (
+        "今天见了苏州安科的李经理，需要视觉检测，预算30万；"
+        "另外无锡宏达王总想做机器人上下料，预算45万。"
+    )
+    provider = MockLLMProvider(
+        responses=[
+            valid_analysis(
+                intent="MULTI_LEAD",
+                crm_fields={},
+                confidence_by_field={},
+                segments=[
+                    {
+                        "segment_index": 0,
+                        "source_text_span": "苏州安科的李经理，需要视觉检测，预算30万",
+                        "customer_reference": {"company": "苏州安科", "contact": "李经理"},
+                        "crm_fields": {"线索名称": "苏州安科", "联系人": "李经理"},
+                        "enrichment": {"预算": "预算30万"},
+                        "confidence_by_field": {"线索名称": 0.99, "联系人": 0.95},
+                    },
+                    {
+                        "segment_index": 1,
+                        "source_text_span": "无锡宏达王总想做机器人上下料，预算45万",
+                        "customer_reference": {"company": "无锡宏达", "contact": "王总"},
+                        "crm_fields": {"线索名称": "无锡宏达", "联系人": "王总"},
+                        "enrichment": {"预算": "预算45万"},
+                        "confidence_by_field": {"线索名称": 0.99, "联系人": 0.95},
+                    },
+                ],
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(source_text)
+
+    assert [segment.segment_index for segment in result.analysis.segments] == [0, 1]
+    assert [segment.source_text_span for segment in result.analysis.segments] == [
+        "苏州安科的李经理，需要视觉检测，预算30万",
+        "无锡宏达王总想做机器人上下料，预算45万",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("source_text", "company", "contact"),
+    [
+        ("刚跟光曜新能源的孙经理聊完，光伏组件外观检测", "光曜新能源", "孙经理"),
+        ("孙经理，光曜新能源那边的，预算120万", "光曜新能源", "孙经理"),
+        ("ABB机器人华东区王总，想做上下料", "ABB机器人华东区", "王总"),
+        ("3M中国的陈经理问视觉检测", "3M中国", "陈经理"),
+        ("欧阳经理，光曜新能源那边的", "光曜新能源", "欧阳经理"),
+        ("今天见了光曜新能源，联系人孙", "光曜新能源", "孙"),
+        ("XX视觉科技刘博士，想做装配", "XX视觉科技", "刘博士"),
+    ],
+)
+def test_ai_identity_candidates_support_natural_language_order_and_names(
+    source_text: str, company: str, contact: str
+) -> None:
+    """验证自然语序、英文数字公司名和非单姓联系人均由原文证据约束。"""
+    provider = MockLLMProvider(
+        [
+            valid_analysis(
+                customer_reference={"company": company, "contact": contact},
+                crm_fields={"线索名称": company, "联系人": contact},
+                confidence_by_field={"线索名称": 0.99, "联系人": 0.95},
+            )
+        ]
+    )
+
+    result = AIGateway(provider).extract_fields(source_text)
+
+    assert result.fields["线索名称"] == company
+    assert result.fields["联系人"] == contact
+
+
 def test_gateway_drops_invalid_enum_without_losing_reliable_fields() -> None:
     """验证非法枚举留待销售补充，但同消息的公司和联系方式仍可使用。"""
     provider = MockLLMProvider(

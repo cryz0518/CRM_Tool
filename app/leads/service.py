@@ -157,6 +157,7 @@ class AIReviewRequest:
     outbox_event_id: int
     patch: ExtractedLeadPatch
     creates_lead: bool
+    segment_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -171,7 +172,7 @@ class ReassignmentRequest:
 
 
 class DeterministicFirstTextLeadExtractor:
-    """仅识别显式标签文本，作为 T05 不调用 LLM 的临时确定性提取器。"""
+    """以窄范围规则提取首条消息的确定性字段，避免公司身份依赖 LLM。"""
 
     _label_to_field = {
         "客户": "线索名称",
@@ -186,6 +187,29 @@ class DeterministicFirstTextLeadExtractor:
         "备注": "备注",
     }
     _process_values = PROCESS_OPTIONS
+    _leading_contact_pattern = re.compile(
+        r"^(?P<company>[\u4e00-\u9fff（）()·&\-]{2,80}?)\s*"
+        r"(?P<contact>[\u4e00-\u9fff](?:总监|经理|主任|博士|老师|先生|女士|总))$"
+    )
+    _contact_segment_pattern = re.compile(
+        r"^[\u4e00-\u9fff]{1,4}(?:总监|经理|主任|博士|老师|先生|女士|总)$"
+    )
+    _company_legal_suffixes = ("有限责任公司", "有限公司", "集团", "公司")
+    _leading_negative_keywords = (
+        "需求",
+        "预算",
+        "报价",
+        "项目",
+        "采购",
+        "检测",
+        "视觉",
+        "缺陷",
+        "上下料",
+        "焊接",
+        "装配",
+        "喷涂",
+        "贴标",
+    )
 
     def extract(self, text: str | None) -> dict[str, str] | None:
         """从显式中文标签文本提取首条可审核线索的安全字段补丁。
@@ -241,50 +265,91 @@ class DeterministicFirstTextLeadExtractor:
 
     @staticmethod
     def extract_leading_company_hint(text: str | None) -> str | None:
-        """从“公司，联系人，手机号”格式提取无标签公司身份提示。
+        """从窄范围“公司主体+联系人称谓”格式提取公司身份提示。
 
         参数：text 为销售发送的自由文本消息。
-        返回值：在手机号之前出现、且不是常见需求描述开头的首段公司名；无法安全确定时返回 None。
+        返回值：可靠首段公司名；不满足公司主体与称谓结构时返回 None。
         异常：无。
         副作用：仅做本地字符串解析，不调用模型或外部服务。
+        """
+        hint = DeterministicFirstTextLeadExtractor.extract_leading_company_contact_hint(text)
+        if hint is not None:
+            return hint["线索名称"]
+        return DeterministicFirstTextLeadExtractor._extract_separated_company_hint(text)
+
+    @classmethod
+    def extract_leading_company_contact_hint(cls, text: str | None) -> dict[str, str] | None:
+        """从首段窄格式中提取公司主体和单姓联系人称谓。
+
+        参数：text 为销售发送的自由文本消息。
+        返回值：同时包含“线索名称”和“联系人”的确定性补丁；无法安全确认时返回 None。
+        异常：无；不调用 LLM 或外部服务。
+        副作用：无，仅执行本地正则与注册枚举负向校验。
+        """
+        if not text:
+            return None
+        segments = [segment.strip() for segment in re.split(r"[\r\n；;，,、]+", text)]
+        if not segments:
+            return None
+        first = segments[0]
+        if not first or ":" in first or "：" in first:
+            return None
+        match = cls._leading_contact_pattern.fullmatch(first)
+        if match is None:
+            return None
+        raw_company = match.group("company").strip()
+        # 带“的”的叙述句交给既有 AI/上下文链路，避免把语法连接词当成公司名。
+        if raw_company.endswith("的"):
+            return None
+        company = raw_company
+        contact = match.group("contact").strip()
+        if not cls._is_reliable_leading_company_prefix(company):
+            return None
+        return {"线索名称": company, "联系人": contact}
+
+    @classmethod
+    def _extract_separated_company_hint(cls, text: str | None) -> str | None:
+        """识别“公司，联系人称谓”格式，不再把手机号单独当作公司证据。
+
+        参数：text 为销售发送的自由文本消息。
+        返回值：首段可靠公司名；联系人段缺少明确称谓时返回 None。
+        异常：无；不调用 LLM 或外部服务。
+        副作用：无，仅执行本地结构校验。
         """
         if not text:
             return None
         segments = [segment.strip() for segment in re.split(r"[\r\n；;，,、]+", text)]
         if len(segments) < 2:
             return None
-        first = segments[0]
-        if not first or len(first) > 80 or ":" in first or "：" in first:
+        company = segments[0]
+        if not company or ":" in company or "：" in company:
             return None
-        # 需求描述通常以这些动词或字段名开头，不能被误认成公司身份。
-        if first.startswith(
-            (
-                "做",
-                "主要",
-                "预算",
-                "联系人",
-                "手机",
-                "电话",
-                "邮箱",
-                "业务",
-                "备注",
-                "想",
-                "需要",
-                "采购",
-            )
+        if cls._contact_segment_pattern.fullmatch(segments[1]) is None:
+            return None
+        return company if cls._is_reliable_leading_company_prefix(company) else None
+
+    @classmethod
+    def _is_reliable_leading_company_prefix(cls, company: str) -> bool:
+        """校验首段公司主体不是明显需求或工艺片段。
+
+        参数：company 为已匹配联系人称谓前缀的候选公司文本。
+        返回值：主体长度合理且没有明显需求负向证据时返回 True。
+        异常：无。
+        副作用：无，仅读取本类注册的工艺枚举。
+        """
+        if not 2 <= len(company) <= 80:
+            return False
+        has_legal_suffix = company.endswith(cls._company_legal_suffixes)
+        if company in cls._process_values:
+            return False
+        if not has_legal_suffix and company.startswith(cls._leading_negative_keywords):
+            return False
+        if not has_legal_suffix and any(
+            keyword in company
+            for keyword in (*cls._process_values, *cls._leading_negative_keywords)
         ):
-            return None
-        phone_index = next(
-            (
-                index
-                for index, segment in enumerate(segments[1:], start=1)
-                if re.search(r"(?<!\d)1\d{10}(?!\d)", segment)
-            ),
-            None,
-        )
-        if phone_index is None:
-            return None
-        return first
+            return False
+        return True
 
     def extract_many(self, text: str | None) -> list[dict[str, str]]:
         """从明确客户标签分段中提取一条或多条独立字段补丁。
@@ -926,6 +991,7 @@ class FirstTextLeadWorkspaceService:
                         lead_id,
                         CompanyUpsertCommand(
                             source_message_id=message.message_id,
+                            source_segment_index=lead.source_segment_index,
                             sales_user_id=message.sales_user_id,
                             fields=dict(lead.field_values),
                             existing_lead_id=lead.id,
@@ -1205,7 +1271,7 @@ class FirstTextLeadWorkspaceService:
         """
         log_token = None
         context_update: ContextUpdateRequest | None = None
-        ai_review: AIReviewRequest | None = None
+        ai_review: AIReviewRequest | tuple[AIReviewRequest, ...] | None = None
         temporary_capture: LeadProcessingResult | None = None
         company_initial_command: CompanyUpsertCommand | None = None
         multi_company_fields: list[dict[str, str]] | None = None
@@ -1303,8 +1369,16 @@ class FirstTextLeadWorkspaceService:
                 else:
                     multi_request = None
                 extracted_patch = extractor.extract_patch(message.normalized_text)
-                leading_company_hint = extractor.extract_leading_company_hint(
+                leading_company_contact_hint = extractor.extract_leading_company_contact_hint(
                     message.normalized_text
+                )
+                if leading_company_contact_hint is not None:
+                    # 首段公司+称谓是确定性身份事实，优先于后续 AI 字段；显式标签仍可覆盖同名字段。
+                    extracted_patch = {**leading_company_contact_hint, **extracted_patch}
+                leading_company_hint = (
+                    leading_company_contact_hint["线索名称"]
+                    if leading_company_contact_hint is not None
+                    else extractor.extract_leading_company_hint(message.normalized_text)
                 )
                 explicit_new_lead_signal = self._has_explicit_new_lead_signal(
                     message.normalized_text
@@ -1667,6 +1741,8 @@ class FirstTextLeadWorkspaceService:
             if multi_request is not None:
                 return self._create_multi_smart_table_records(multi_request)
             if ai_review is not None:
+                if isinstance(ai_review, tuple):
+                    return self._sync_ai_reviews(ai_review)
                 return self._sync_ai_review(ai_review)
             if context_update is not None:
                 return self._update_smart_table_record(context_update)
@@ -1689,7 +1765,10 @@ class FirstTextLeadWorkspaceService:
         message: IncomingMessage,
         context_lead: Lead | None,
         company_name_hint: str | None = None,
-    ) -> tuple[AIReviewRequest | None, LeadProcessingResult | None]:
+    ) -> tuple[
+        AIReviewRequest | tuple[AIReviewRequest, ...] | None,
+        LeadProcessingResult | None,
+    ]:
         """调用 T08 并以确定性规则决定安全的新增、更新或待归属结论。
 
         参数：session、event 和 message 为当前有序消费事实；
@@ -1726,6 +1805,7 @@ class FirstTextLeadWorkspaceService:
                     }
                 )
                 patch = replace(patch, analysis=analysis, fields=fields)
+            patch = self._ground_source_identity_patch(patch, message.normalized_text)
         except AIGatewayError as error:
             # 网关已完成自身传输重试；此处绝不伪造建档成功，也不能阻塞该销售的后续消息。
             event.status = "failed_pending_review"
@@ -1739,10 +1819,46 @@ class FirstTextLeadWorkspaceService:
             )
             return None, LeadProcessingResult(LeadProcessingStatus.SYNC_FAILED)
 
+        explicit_new_lead_signal = self._has_explicit_new_lead_signal(message.normalized_text)
+        if patch.analysis.intent == "MULTI_LEAD_AMBIGUOUS":
+            self._mark_unassigned(session, event)
+            return None, LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
+        if patch.segments:
+            # 多客户分段只携带候选事实，实际目标仍由本服务按公司、上下文和联系方式解析。
+            segment_reviews = self._prepare_ai_segment_reviews(
+                session,
+                event,
+                message,
+                context_lead,
+                patch,
+                explicit_new_lead_signal,
+            )
+            if segment_reviews is None:
+                self._mark_unassigned(session, event)
+                return None, LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
+            return segment_reviews, None
+        incoming_company_candidate = patch.fields.get("线索名称")
+        has_reliable_company_evidence = (
+            company_name_hint is not None
+            or self._has_explicit_company_identity_evidence(message.normalized_text)
+            or self.validate_company_candidate_against_source(
+                incoming_company_candidate
+                if isinstance(incoming_company_candidate, str)
+                else None,
+                message.normalized_text,
+            )
+        )
+        if (
+            active_context_lead is not None
+            and not explicit_new_lead_signal
+            and not has_reliable_company_evidence
+            and "线索名称" in patch.fields
+        ):
+            # 没有原文公司证据时，模型猜出的公司名不能抢占当前销售上下文。
+            patch = self._drop_unreliable_company_candidate(patch, message.normalized_text)
         weak_context_fragment = self._is_weak_context_fragment(
             message.normalized_text, patch.fields
         )
-        explicit_new_lead_signal = self._has_explicit_new_lead_signal(message.normalized_text)
         media_context_continuation = (
             active_context_lead is not None
             and message.requires_media_enrichment
@@ -1759,7 +1875,7 @@ class FirstTextLeadWorkspaceService:
             use_active_context = True
             context_lead = active_context_lead
             logger.info("ai_context_continuation_selected", extra={"reason": "ignored_fragment"})
-        if patch.analysis.intent == "MULTI_LEAD":
+        if patch.analysis.intent in {"MULTI_LEAD", "MULTI_LEAD_AMBIGUOUS"}:
             # T07 只支持明确标签切分；模型声称多客户时不猜测边界或创建多条线索。
             self._mark_unassigned(session, event)
             return None, LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
@@ -1911,7 +2027,131 @@ class FirstTextLeadWorkspaceService:
             None,
         )
 
-    def _sync_ai_review(self, request: AIReviewRequest) -> LeadProcessingResult:
+    def _prepare_ai_segment_reviews(
+        self,
+        session: Session,
+        event: OutboxEvent,
+        message: IncomingMessage,
+        context_lead: Lead | None,
+        patch: ExtractedLeadPatch,
+        explicit_new_lead_signal: bool,
+    ) -> tuple[AIReviewRequest, ...] | None:
+        """把 AI 语义分段转换为多个独立请求，但不接受模型指定 Lead 目标。"""
+        if len(patch.segments) > 1 and any(
+            not segment.patch.fields.get("线索名称") for segment in patch.segments
+        ):
+            # 多客户中没有公司身份的分段无法安全继承同一个 context，整体 fail closed。
+            return None
+        requests: list[AIReviewRequest] = []
+        for segment in sorted(patch.segments, key=lambda item: item.segment_index):
+            segment_fields = dict(segment.patch.fields)
+            company_name = str(segment_fields.get("线索名称") or "").strip()
+            contact_fields = {
+                field_name: value
+                for field_name, value in segment_fields.items()
+                if field_name in {"手机", "电话", "邮箱"} and isinstance(value, str)
+            }
+            target: Lead | None = None
+            creates_lead = False
+            if company_name:
+                # 公司候选已由网关验证来自当前 segment 原文；服务器只按公司身份查历史目标。
+                target = self._get_strong_identity_lead(
+                    session, message, {"线索名称": company_name}
+                )
+            elif not explicit_new_lead_signal and len(patch.segments) == 1:
+                # 单 segment 没有新公司时才允许沿用当前有效上下文。
+                target = context_lead or (
+                    self._get_strong_identity_lead(session, message, contact_fields)
+                    if contact_fields
+                    else None
+                )
+            elif not explicit_new_lead_signal and contact_fields:
+                # 多 segment 无公司时只接受联系方式的唯一历史命中，不复制当前上下文。
+                target = self._get_strong_identity_lead(session, message, contact_fields)
+            if target is None:
+                if not company_name:
+                    return None
+                target = session.scalar(
+                    select(Lead).where(
+                        Lead.source_message_id == message.message_id,
+                        Lead.source_segment_index == segment.segment_index,
+                    )
+                )
+                if target is None:
+                    target = Lead(
+                        source_message_id=message.message_id,
+                        source_segment_index=segment.segment_index,
+                        original_capturing_sales_user_id=message.sales_user_id,
+                        smart_table_owner_user_id=message.sales_user_id,
+                        field_values={"线索来源": "展会"},
+                    )
+                    session.add(target)
+                    session.flush()
+                    session.add(
+                        SmartTableSync(
+                            lead_id=target.id,
+                            source_message_id=message.message_id,
+                            source_segment_index=segment.segment_index,
+                        )
+                    )
+                    self._record_audit(session, event, "ai_lead_segment_created")
+                creates_lead = True
+            else:
+                self._mark_processing_assignment(
+                    session, event, target.id, segment.segment_index
+                )
+            event.status = "processing"
+            event.processing_started_at = utc_now()
+            requests.append(
+                AIReviewRequest(
+                    source_message_id=message.message_id,
+                    sales_user_id=message.sales_user_id,
+                    lead_id=target.id,
+                    outbox_event_id=event.id,
+                    patch=segment.patch,
+                    creates_lead=creates_lead,
+                    segment_index=segment.segment_index,
+                )
+            )
+        return tuple(requests)
+
+    def _sync_ai_reviews(
+        self, requests: tuple[AIReviewRequest, ...]
+    ) -> LeadProcessingResult:
+        """按 segment 顺序同步多个 AI 请求，并保留最后一个 segment 的会话上下文。"""
+        results: list[LeadProcessingResult] = []
+        for index, request in enumerate(requests):
+            result = self._sync_ai_review(request, refresh_context=index == len(requests) - 1)
+            if result.status is LeadProcessingStatus.SYNC_FAILED:
+                return LeadProcessingResult(
+                    LeadProcessingStatus.SYNC_FAILED,
+                    lead_ids=tuple(
+                        lead_id
+                        for item in results
+                        for lead_id in (item.lead_ids or ((item.lead_id,) if item.lead_id else ()))
+                    ),
+                )
+            results.append(result)
+        lead_ids = tuple(
+            lead_id
+            for item in results
+            for lead_id in (item.lead_ids or ((item.lead_id,) if item.lead_id else ()))
+        )
+        return LeadProcessingResult(
+            LeadProcessingStatus.CREATED
+            if any(item.status is LeadProcessingStatus.CREATED for item in results)
+            else LeadProcessingStatus.UPDATED,
+            lead_id=lead_ids[0] if lead_ids else None,
+            smart_table_record_id=next(
+                (item.smart_table_record_id for item in results if item.smart_table_record_id),
+                None,
+            ),
+            lead_ids=lead_ids,
+        )
+
+    def _sync_ai_review(
+        self, request: AIReviewRequest, *, refresh_context: bool = True
+    ) -> LeadProcessingResult:
         """为 AI 已安全决定的目标创建审核记录（如需）并经 T09 写入字段补丁。
 
         参数：request 为事务提交后可执行的 AI 结果及真实销售身份。
@@ -1923,7 +2163,12 @@ class FirstTextLeadWorkspaceService:
         with self._session_factory.begin() as session:
             event, message = self._load_event_and_message(session, request.outbox_event_id)
             self._pin_message_lead_before_external_sync(
-                session, event, message, request.lead_id
+                session,
+                event,
+                message,
+                request.lead_id,
+                request.segment_index,
+                refresh_context=refresh_context,
             )
         record_id, initial_record, preserve_record = self._ensure_ai_review_record(request)
         if record_id is None:
@@ -1956,8 +2201,9 @@ class FirstTextLeadWorkspaceService:
                 sync.completed_at = utc_now()
             if sync is not None:
                 sync.error_summary = None
-            self._mark_assigned(session, event, lead.id)
-            self._refresh_context(session, message, lead.id)
+            self._mark_assigned(session, event, lead.id, request.segment_index)
+            if refresh_context:
+                self._refresh_context(session, message, lead.id)
             self._record_audit(session, event, "ai_review_fields_synced")
         return LeadProcessingResult(
             LeadProcessingStatus.CREATED if request.creates_lead else LeadProcessingStatus.UPDATED,
@@ -2458,6 +2704,11 @@ class FirstTextLeadWorkspaceService:
         return bool(
             re.search(r"(?:客户|公司|企业)\s*[:：]", text)
             or re.search(r"(?:有限公司|有限责任公司|集团)", text)
+            or re.search(
+                r"(?:客户|公司|企业)[\u4e00-\u9fffA-Za-z0-9（）()·&._-]{1,60}的"
+                r"[\u4e00-\u9fff](?:总监|经理|主任|博士|老师|先生|女士|总)",
+                text,
+            )
         )
 
     @staticmethod
@@ -2494,6 +2745,52 @@ class FirstTextLeadWorkspaceService:
         candidate_name = fields.get("线索名称", "")
         weak_keywords = ("预算", "需求", "报价", "项目", "采购")
         return not candidate_name or any(keyword in candidate_name for keyword in weak_keywords)
+
+    @classmethod
+    def validate_company_candidate_against_source(
+        cls, candidate: str | None, normalized_text: str | None
+    ) -> bool:
+        """确认公司候选是当前消息中的连续原文，而不是模型扩写或标准化名称。"""
+        return bool(candidate and normalized_text and candidate.strip() in normalized_text)
+
+    @classmethod
+    def _ground_source_identity_patch(
+        cls, patch: ExtractedLeadPatch, normalized_text: str | None
+    ) -> ExtractedLeadPatch:
+        """移除无法回指当前消息的公司与联系人候选，统一保护单客户路由。"""
+        fields = dict(patch.fields)
+        crm_fields = dict(patch.analysis.crm_fields)
+        confidences = dict(patch.analysis.confidence_by_field)
+        pending = tuple(patch.pending_confirmation_fields)
+        low_candidates = dict(patch.low_confidence_candidates)
+        for field_name in ("线索名称", "联系人"):
+            field_value = fields.get(field_name)
+            if isinstance(field_value, str) and not cls.validate_company_candidate_against_source(
+                field_value, normalized_text
+            ):
+                fields.pop(field_name, None)
+                pending = tuple(item for item in pending if item != field_name)
+                low_candidates.pop(field_name, None)
+            crm_value = crm_fields.get(field_name)
+            if isinstance(crm_value, str) and not cls.validate_company_candidate_against_source(
+                crm_value, normalized_text
+            ):
+                crm_fields.pop(field_name, None)
+                confidences.pop(field_name, None)
+        if crm_fields == patch.analysis.crm_fields and fields == patch.fields:
+            return patch
+        return replace(
+            patch,
+            fields=fields,
+            pending_confirmation_fields=pending,
+            low_confidence_candidates=low_candidates,
+            analysis=patch.analysis.model_copy(
+                update={
+                    "crm_fields": crm_fields,
+                    "confidence_by_field": confidences,
+                }
+            ),
+        )
 
     @classmethod
     def _drop_unreliable_company_candidate(
@@ -2798,6 +3095,8 @@ class FirstTextLeadWorkspaceService:
         message: IncomingMessage,
         lead_id: str,
         segment_index: int = 0,
+        *,
+        refresh_context: bool = True,
     ) -> None:
         """在首次 Smart Table 外部调用前固定消息归属和销售当前线索。
 
@@ -2808,7 +3107,8 @@ class FirstTextLeadWorkspaceService:
         副作用：写入 processing 归属、推进 SalesLeadContext，并记录受控审计事件；不调用外部系统。
         """
         self._mark_processing_assignment(session, event, lead_id, segment_index)
-        self._refresh_context(session, message, lead_id)
+        if refresh_context:
+            self._refresh_context(session, message, lead_id)
         self._record_audit(
             session,
             event,

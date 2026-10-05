@@ -12,16 +12,62 @@ from app.smart_table.registry import AI_FIELD_ALIASES
 LeadFieldValue: TypeAlias = str | list[str]
 
 
+class LeadSegmentAnalysis(BaseModel):
+    """描述模型从一条消息中拆出的单个、原文有边界的客户候选。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    segment_index: int
+    source_text_span: str
+    customer_reference: dict[str, str] = Field(default_factory=dict)
+    crm_fields: dict[str, LeadFieldValue] = Field(default_factory=dict)
+    enrichment: dict[str, str] = Field(default_factory=dict)
+    confidence_by_field: dict[str, float] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_segment_shape(self) -> LeadSegmentAnalysis:
+        """限制分段序号和字段多值结构，避免模型借分段绕过现有字段契约。
+
+        返回值：当前已校验的分段模型。
+        异常：分段序号为负数、原文片段为空或非工艺字段为数组时抛出 ValueError。
+        副作用：无。
+        """
+        if self.segment_index < 0:
+            raise ValueError("segment_index 不能为负数")
+        if not self.source_text_span.strip():
+            raise ValueError("source_text_span 不能为空")
+        forbidden_reference_keys = {
+            "lead_id",
+            "database_id",
+            "smart_table_record_id",
+            "record_id",
+        }
+        if any(key.strip().lower() in forbidden_reference_keys for key in self.customer_reference):
+            raise ValueError("客户引用不得包含业务目标标识")
+        for field_name, value in self.crm_fields.items():
+            canonical_name = AI_FIELD_ALIASES.get(field_name.strip().lower(), field_name)
+            if isinstance(value, list) and canonical_name != "工艺":
+                raise ValueError(f"字段不支持多值：{field_name}")
+        return self
+
+
 class LeadAnalysis(BaseModel):
     """约束 LLM 仅返回增量线索建议，不承载任何业务写入决定。"""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    intent: Literal["NEW_LEAD", "UPDATE_LEAD", "MULTI_LEAD", "IGNORE"]
+    intent: Literal[
+        "NEW_LEAD",
+        "UPDATE_LEAD",
+        "MULTI_LEAD",
+        "MULTI_LEAD_AMBIGUOUS",
+        "IGNORE",
+    ]
     customer_reference: dict[str, str] = Field(default_factory=dict)
     crm_fields: dict[str, LeadFieldValue] = Field(default_factory=dict)
     enrichment: dict[str, str] = Field(default_factory=dict)
     confidence_by_field: dict[str, float] = Field(default_factory=dict)
+    segments: list[LeadSegmentAnalysis] = Field(default_factory=list)
     conflicts: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
@@ -37,6 +83,14 @@ class LeadAnalysis(BaseModel):
             canonical_name = AI_FIELD_ALIASES.get(field_name.strip().lower(), field_name)
             if isinstance(value, list) and canonical_name != "工艺":
                 raise ValueError(f"字段不支持多值：{field_name}")
+        forbidden_reference_keys = {
+            "lead_id",
+            "database_id",
+            "smart_table_record_id",
+            "record_id",
+        }
+        if any(key.strip().lower() in forbidden_reference_keys for key in self.customer_reference):
+            raise ValueError("客户引用不得包含业务目标标识")
         return self
 
 
@@ -88,3 +142,14 @@ class ExtractedLeadPatch:
     enrichment: dict[str, str] = field(default_factory=dict)
     # 仅允许明确来源（例如 TYC 多候选首项）的待确认字段在无卡片时预填。
     pending_prefill_allowed_fields: tuple[str, ...] = ()
+    # 多客户消息的每个分段沿用同一套字段校验与置信度规则。
+    segments: tuple["ExtractedLeadSegmentPatch", ...] = ()
+
+
+@dataclass(frozen=True)
+class ExtractedLeadSegmentPatch:
+    """保存一个经过网关校验、待服务端独立归属的语义分段补丁。"""
+
+    segment_index: int
+    source_text_span: str
+    patch: ExtractedLeadPatch
