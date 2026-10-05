@@ -41,6 +41,9 @@ class IncomingMessageCommand:
     normalized_text: str | None = None
     requires_media_enrichment: bool = False
     display_name: str | None = None
+    chat_id: str | None = None
+    chat_type: str | None = None
+    quote: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +114,8 @@ class MessageIntakeService:
                     sequence=authorization.next_message_sequence,
                     raw_payload=command.raw_payload,
                     normalized_text=command.normalized_text,
+                    chat_id=command.chat_id,
+                    chat_type=command.chat_type,
                     requires_media_enrichment=command.requires_media_enrichment,
                 )
                 session.add(message)

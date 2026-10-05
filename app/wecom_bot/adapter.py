@@ -71,6 +71,11 @@ class WecomTextMessageAdapter:
         if not isinstance(normalized_text, str):
             normalized_text = None
 
+        # 引用正文只留在完整 raw_payload；这里结构化传递协议字段，禁止新增数据库原文列。
+        chat_id = body.get("chatid")
+        chat_type = body.get("chattype")
+        quote = body.get("quote")
+
         return self._message_intake_service.receive(
             IncomingMessageCommand(
                 message_id=message_id,
@@ -78,6 +83,9 @@ class WecomTextMessageAdapter:
                 raw_payload=frame,
                 normalized_text=normalized_text,
                 display_name=display_name if isinstance(display_name, str) else None,
+                chat_id=chat_id if isinstance(chat_id, str) else None,
+                chat_type=chat_type if isinstance(chat_type, str) else None,
+                quote=quote if isinstance(quote, dict) else None,
             )
         )
 
@@ -105,6 +113,8 @@ class WecomMediaMessageAdapter:
             logger.warning("wecom_bot_media_frame_missing_identity")
             return None
         media = media if isinstance(media, dict) else {}
+        chat_id = body.get("chatid")
+        chat_type = body.get("chattype")
         download_url = media.get("url")
         aes_key = media.get("aeskey")
         declared_mime_type = media.get("mime_type")
@@ -116,6 +126,8 @@ class WecomMediaMessageAdapter:
                     raw_payload=self._redact_download_credentials(frame, media_kind),
                     requires_media_enrichment=True,
                     display_name=display_name if isinstance(display_name, str) else None,
+                    chat_id=chat_id if isinstance(chat_id, str) else None,
+                    chat_type=chat_type if isinstance(chat_type, str) else None,
                 )
             ),
             message_id=message_id,
