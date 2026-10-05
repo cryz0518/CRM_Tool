@@ -35,6 +35,7 @@ from app.leads.models import (
 from app.leads.quote_routing import (
     QuoteRecoveryExtractionRequest,
     QuoteRecoverySegment,
+    QuoteRecoverySegmentResult,
     QuoteResolutionResult,
     resolve_message_quote,
 )
@@ -124,6 +125,16 @@ class ContextUpdateRequest:
     segment_index: int = 0
     pending_confirmation_fields: tuple[str, ...] = ()
     pending_prefill_allowed_fields: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class QuoteRouteDecision:
+    """保存 quote 路由在当前事务内的唯一决策结果。"""
+
+    target_lead: Lead | None = None
+    waiting_for_source: bool = False
+    fail_closed: bool = False
+    recovery_completed: bool = False
 
 
 def _normalize_company_patch(fields: Mapping[str, object]) -> dict[str, LeadFieldValue]:
@@ -1270,12 +1281,12 @@ class FirstTextLeadWorkspaceService:
         message: IncomingMessage,
         quote_result: QuoteResolutionResult,
         extractor: DeterministicFirstTextLeadExtractor,
-    ) -> tuple[Lead | None, bool]:
+    ) -> QuoteRouteDecision:
         """在当前事务中解析 quote 目标、冲突和 unassigned recovery。
 
         参数：session 为当前消息消费事务；event/message 为当前消息事实；quote_result 为已幂等
         写入的引用解析；extractor 只用于服务器侧可靠公司身份判断。
-        返回值：返回可继承的 Lead 和是否应 fail closed；没有目标时二者均为 None/True。
+        返回值：返回可继承、等待 source 或 fail closed 的单一路由决策。
         异常：数据库错误或 AI 结构化提取错误向调用方传播并回滚整个事务。
         副作用：可能写入当前/来源消息归属、Lead、字段来源、上下文和恢复审计；不调用 Smart Table。
         """
@@ -1292,7 +1303,7 @@ class FirstTextLeadWorkspaceService:
                     else "quote_routing_ambiguous"
                 ),
             )
-            return None, True
+            return QuoteRouteDecision(fail_closed=True)
 
         source = quote_result.source_message
         if source is None:
@@ -1303,7 +1314,7 @@ class FirstTextLeadWorkspaceService:
                 conflict_code="QUOTE_SOURCE_MISSING",
                 audit_type="QUOTE_SOURCE_MISSING",
             )
-            return None, True
+            return QuoteRouteDecision(fail_closed=True)
 
         source_resolutions = session.scalars(
             select(LeadMessageResolution)
@@ -1321,7 +1332,7 @@ class FirstTextLeadWorkspaceService:
                 conflict_code="QUOTE_TARGET_AMBIGUOUS",
                 audit_type="QUOTE_TARGET_AMBIGUOUS",
             )
-            return None, True
+            return QuoteRouteDecision(fail_closed=True)
 
         if distinct_lead_ids:
             target_id = next(iter(distinct_lead_ids))
@@ -1334,7 +1345,7 @@ class FirstTextLeadWorkspaceService:
                     conflict_code="QUOTE_TARGET_MISSING",
                     audit_type="QUOTE_TARGET_MISSING",
                 )
-                return None, True
+                return QuoteRouteDecision(fail_closed=True)
             if target.smart_table_owner_user_id != message.sales_user_id:
                 # 引用关系只能复用当前销售仍拥有的本地业务事实，不能绕过权限边界。
                 self._finish_quote_unresolved(
@@ -1344,7 +1355,7 @@ class FirstTextLeadWorkspaceService:
                     conflict_code="QUOTE_TARGET_FORBIDDEN",
                     audit_type="QUOTE_TARGET_FORBIDDEN",
                 )
-                return None, True
+                return QuoteRouteDecision(fail_closed=True)
             current_company = self._extract_reliable_company_identity(message, extractor)
             if current_company is not None and not self._lead_matches_company(
                 target, current_company
@@ -1357,12 +1368,39 @@ class FirstTextLeadWorkspaceService:
                     conflict_code="QUOTE_IDENTITY_CONFLICT",
                     audit_type="QUOTE_IDENTITY_CONFLICT",
                 )
-                return None, True
+                return QuoteRouteDecision(fail_closed=True)
             # processing 也是真实的本地 Lead identity；外部投影状态不参与目标判断。
             self._mark_processing_assignment(session, event, target.id)
-            return target, False
+            return QuoteRouteDecision(target_lead=target)
 
-        # source 没有有效 Lead identity 时，quote relationship 固定双片段恢复边界。
+        source_event = session.scalar(
+            select(OutboxEvent)
+            .where(OutboxEvent.message_id == source.message_id)
+            .with_for_update()
+        )
+        source_resolution = next(
+            (item for item in source_resolutions if item.segment_index == 0), None
+        )
+        source_is_explicitly_unassigned = (
+            source_resolution is not None
+            and source_resolution.status == "unassigned"
+            and source_resolution.lead_id is None
+            and bool(source_resolutions)
+            and all(
+                item.status == "unassigned" and item.lead_id is None
+                for item in source_resolutions
+            )
+        )
+        if (
+            source_event is None
+            or source_event.status != "succeeded"
+            or not source_is_explicitly_unassigned
+        ):
+            # quote relationship 已解析，但 source 尚未形成稳定业务结论，当前消息保留待重试状态。
+            logger.info("quote_routing_waiting_for_source_resolution")
+            return QuoteRouteDecision(waiting_for_source=True)
+
+        # source 已明确为 unassigned 时，quote relationship 固定双片段恢复边界。
         recovery_request = QuoteRecoveryExtractionRequest(
             quoted_source=QuoteRecoverySegment(
                 message_id=source.message_id,
@@ -1373,7 +1411,18 @@ class FirstTextLeadWorkspaceService:
                 normalized_text=message.normalized_text or "",
             ),
         )
-        fields, enrichment = self._extract_quote_recovery_fields(recovery_request, extractor)
+        segment_results = self._extract_quote_recovery_fields(recovery_request, extractor)
+        fields: dict[str, object] = {}
+        field_sources: dict[str, str] = {}
+        enrichment: dict[str, str] = {}
+        for segment_result in segment_results:
+            # 同字段按 quote source 先于 current reply 的固定顺序保留，禁止静默覆盖。
+            for field_name, value in segment_result.fields.items():
+                if field_name not in fields:
+                    fields[field_name] = value
+                    field_sources[field_name] = segment_result.message_id
+            for field_name, value in segment_result.enrichment.items():
+                enrichment.setdefault(field_name, value)
         company_name = fields.get("线索名称")
         if not isinstance(company_name, str) or not company_name.strip():
             self._finish_quote_unresolved(
@@ -1383,7 +1432,7 @@ class FirstTextLeadWorkspaceService:
                 conflict_code="QUOTE_RECOVERY_INCOMPLETE",
                 audit_type="QUOTE_RECOVERY_INCOMPLETE",
             )
-            return None, True
+            return QuoteRouteDecision(fail_closed=True)
 
         target = session.scalar(
             select(Lead)
@@ -1416,30 +1465,17 @@ class FirstTextLeadWorkspaceService:
                 session.add(
                     LeadFieldProvenance(
                         lead_id=target.id,
-                        source_message_id=source.message_id,
+                        source_message_id=field_sources[field_name],
                         field_name=field_name,
                         value=serialize_field_value(value),
                         last_ai_synced_value=serialize_field_value(value),
                     )
                 )
 
-        source_resolution = next(
-            (item for item in source_resolutions if item.segment_index == 0), None
-        )
-        previous_source_status = (
-            source_resolution.status if source_resolution is not None else None
-        )
-        if source_resolution is None:
-            source_resolution = LeadMessageResolution(
-                message_id=source.message_id,
-                segment_index=0,
-                lead_id=target.id,
-                status="assigned",
-            )
-            session.add(source_resolution)
-        else:
-            source_resolution.lead_id = target.id
-            source_resolution.status = "assigned"
+        assert source_resolution is not None
+        previous_source_status = source_resolution.status
+        source_resolution.lead_id = target.id
+        source_resolution.status = "assigned"
         self._mark_processing_assignment(session, event, target.id)
         self._refresh_context(session, message, target.id)
         self._record_audit(
@@ -1449,54 +1485,56 @@ class FirstTextLeadWorkspaceService:
             details={
                 "quoted_source_message_id": source.message_id,
                 "lead_id": target.id,
-                "previous_source_status": previous_source_status or "unassigned",
+                "previous_source_status": previous_source_status,
                 "new_source_status": "assigned",
             },
         )
-        return target, False
+        return QuoteRouteDecision(target_lead=target, recovery_completed=True)
 
     def _extract_quote_recovery_fields(
         self,
         request: QuoteRecoveryExtractionRequest,
         extractor: DeterministicFirstTextLeadExtractor,
-    ) -> tuple[dict[str, object], dict[str, str]]:
+    ) -> tuple[QuoteRecoverySegmentResult, ...]:
         """按两个独立 quote recovery 片段提取字段并保守合并。
 
         参数：request 明确包含 quoted source 与 current reply 两个片段；extractor 提供本地规则。
-        返回值：合并后的 CRM 字段和备注补充素材；先出现的字段不会被后片段静默覆盖。
+        返回值：每个片段独立的字段和备注补充素材，调用方再按固定顺序合并。
         异常：AI Gateway 结构或传输错误向调用方传播，保证事务回滚而不留半状态。
-        副作用：必要时分别调用 AI Gateway；不向模型传入 Lead 或 quoted source ID。
+        副作用：配置 AI Gateway 时每个非空片段调用一次字段提取；不向模型传入 Lead
+        或 quoted source ID。
         """
-        fields: dict[str, object] = {}
-        enrichment: dict[str, str] = {}
+        results: list[QuoteRecoverySegmentResult] = []
         for segment in (request.quoted_source, request.current_reply):
             # 每个片段单独进入提取器，禁止把 quote 原文拼接成没有边界的普通输入。
             deterministic_fields = extractor.extract_patch(segment.normalized_text)
-            patch = None
-            if (
-                not deterministic_fields
-                and self._ai_gateway is not None
-                and segment.normalized_text
-            ):
+            segment_fields: dict[str, object] = dict(deterministic_fields)
+            segment_enrichment: dict[str, str] = {}
+            if self._ai_gateway is not None and segment.normalized_text:
+                # 确定性字段只作为已验证事实；AI 仍必须补齐同一片段的其它合法字段。
                 patch = self._ai_gateway.extract_fields(
                     segment.normalized_text,
                     source_message_id=segment.message_id,
                     lead_id=None,
                 )
-                segment_fields: dict[str, object] = dict(patch.fields)
-                segment_enrichment = patch.enrichment
-            else:
-                segment_fields = dict(deterministic_fields)
-                segment_enrichment = {}
-            for field_name, value in segment_fields.items():
-                if field_name not in fields and (
-                    isinstance(value, str)
-                    or (isinstance(value, list) and all(isinstance(item, str) for item in value))
-                ):
-                    fields[field_name] = value
-            for field_name, value in segment_enrichment.items():
-                enrichment.setdefault(field_name, value)
-        return fields, enrichment
+                for field_name, value in patch.fields.items():
+                    # 同一片段内服务器确定性字段优先，模型只补充未覆盖字段。
+                    segment_fields.setdefault(field_name, value)
+                segment_enrichment = dict(patch.enrichment)
+                for prepared_segment in patch.segments:
+                    # 单个 recovery segment 仍可能被模型包装成语义子段，字段仍属于当前消息。
+                    for field_name, value in prepared_segment.patch.fields.items():
+                        segment_fields.setdefault(field_name, value)
+                    for field_name, value in prepared_segment.patch.enrichment.items():
+                        segment_enrichment.setdefault(field_name, value)
+            results.append(
+                QuoteRecoverySegmentResult(
+                    message_id=segment.message_id,
+                    fields=segment_fields,
+                    enrichment=segment_enrichment,
+                )
+            )
+        return tuple(results)
 
     @staticmethod
     def _extract_reliable_company_identity(
@@ -1583,6 +1621,7 @@ class FirstTextLeadWorkspaceService:
         multi_company_fields: list[dict[str, str]] | None = None
         smart_table_recovery_sync: SmartTableSync | None = None
         quote_target_lead: Lead | None = None
+        quote_recovery_completed = False
         context_lead: Lead | None = None
         try:
             with self._session_factory.begin() as session:
@@ -1634,10 +1673,14 @@ class FirstTextLeadWorkspaceService:
                 extractor = DeterministicFirstTextLeadExtractor()
                 quote_result = resolve_message_quote(session, message)
                 if quote_result is not None:
-                    quote_target_lead, quote_unresolved = self._prepare_quote_route(
+                    quote_decision = self._prepare_quote_route(
                         session, event, message, quote_result, extractor
                     )
-                    if quote_unresolved:
+                    quote_target_lead = quote_decision.target_lead
+                    quote_recovery_completed = quote_decision.recovery_completed
+                    if quote_decision.waiting_for_source:
+                        return LeadProcessingResult(LeadProcessingStatus.WAITING_FOR_PREVIOUS)
+                    if quote_decision.fail_closed:
                         return LeadProcessingResult(LeadProcessingStatus.QUOTE_UNRESOLVED)
 
                 # 只有无 quote 或 quote 尚未唯一解析时才受旧消息顺序阻塞；
@@ -1813,6 +1856,7 @@ class FirstTextLeadWorkspaceService:
                     and not extracted_patch
                     and message.normalized_text
                     and self._ai_gateway is not None
+                    and not quote_recovery_completed
                 ):
                     # 显式标签和多客户仍走既有确定性路径；仅自由文本在归属判定后进入 T08。
                     ai_review, ai_result = self._prepare_ai_review(

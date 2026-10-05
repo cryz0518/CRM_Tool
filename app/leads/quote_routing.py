@@ -52,6 +52,15 @@ class QuoteRecoveryExtractionRequest:
     current_reply: QuoteRecoverySegment
 
 
+@dataclass(frozen=True)
+class QuoteRecoverySegmentResult:
+    """保存一个 recovery segment 的字段与补充信息及其真实消息来源。"""
+
+    message_id: str
+    fields: dict[str, object]
+    enrichment: dict[str, str]
+
+
 def extract_quote_payload(raw_payload: dict[str, Any]) -> QuotePayload:
     """从完整企业微信 callback 中读取引用消息的协议字段。
 

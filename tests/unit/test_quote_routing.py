@@ -10,7 +10,13 @@ from sqlalchemy.pool import StaticPool
 
 from app.ai.gateway import AIGateway
 from app.ai.provider import MockLLMProvider
-from app.leads.models import Lead, LeadMessageResolution, SalesLeadContext, SmartTableSync
+from app.leads.models import (
+    Lead,
+    LeadFieldProvenance,
+    LeadMessageResolution,
+    SalesLeadContext,
+    SmartTableSync,
+)
 from app.leads.quote_routing import resolve_message_quote
 from app.leads.service import FirstTextLeadWorkspaceService, LeadProcessingStatus
 from app.messaging.models import (
@@ -242,6 +248,184 @@ def test_quote_not_found_fails_closed_without_active_context_fallback() -> None:
         quote = session.scalar(select(MessageQuoteResolution))
         assert quote is not None and quote.resolution_status == "not_found"
     assert source.lead_id is not None
+
+
+def test_quote_waits_when_source_has_no_resolution_and_outbox_is_pending() -> None:
+    """验证 source 尚未形成归属事实时只等待，不创建 Lead 或待归属结论。"""
+    factory = _session_factory()
+    source_id = _persist_message(factory, "source", "sales-1", 10, "客户：甲公司")
+    current_id = _persist_message(
+        factory,
+        "current",
+        "sales-1",
+        15,
+        "预算30万",
+        quote_text="客户：甲公司",
+    )
+    result = FirstTextLeadWorkspaceService(factory, _adapter()).consume(current_id)
+    assert result.status is LeadProcessingStatus.WAITING_FOR_PREVIOUS
+    with factory() as session:
+        source_event = session.get(OutboxEvent, source_id)
+        current_event = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.message_id == "current")
+        )
+        assert source_event is not None and source_event.status == "pending"
+        assert current_event is not None and current_event.status == "pending"
+        assert session.scalars(select(Lead)).all() == []
+        assert session.scalar(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id == "current"
+            )
+        ) is None
+        quote = session.scalar(select(MessageQuoteResolution))
+        assert quote is not None and quote.resolution_status == "resolved"
+
+
+def test_quote_waits_when_source_resolution_is_processing_without_lead() -> None:
+    """验证 processing 且 lead_id 为空时不能伪装成 unassigned recovery。"""
+    factory = _session_factory()
+    source_id = _persist_message(factory, "source", "sales-1", 10, "客户：甲公司")
+    current_id = _persist_message(
+        factory,
+        "current",
+        "sales-1",
+        15,
+        "预算30万",
+        quote_text="客户：甲公司",
+    )
+    with factory.begin() as session:
+        source_event = session.get(OutboxEvent, source_id)
+        assert source_event is not None
+        source_event.status = "processing"
+        session.add(
+            LeadMessageResolution(
+                message_id="source", segment_index=0, status="processing"
+            )
+        )
+    result = FirstTextLeadWorkspaceService(factory, _adapter()).consume(current_id)
+    assert result.status is LeadProcessingStatus.WAITING_FOR_PREVIOUS
+    with factory() as session:
+        assert session.scalars(select(Lead)).all() == []
+        current_resolution = session.scalar(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id == "current"
+            )
+        )
+        assert current_resolution is None
+
+
+def test_quote_waiting_then_explicit_unassigned_source_recovers_once() -> None:
+    """验证 source 准备完成为 unassigned 后，原先等待的 reply 才能 recovery。"""
+    factory = _session_factory()
+    source_id = _persist_message(factory, "source", "sales-1", 10, "客户：甲公司")
+    current_id = _persist_message(
+        factory,
+        "current",
+        "sales-1",
+        15,
+        "预算30万",
+        quote_text="客户：甲公司",
+    )
+    service = FirstTextLeadWorkspaceService(factory, _adapter())
+    first = service.consume(current_id)
+    assert first.status is LeadProcessingStatus.WAITING_FOR_PREVIOUS
+    with factory.begin() as session:
+        source_event = session.get(OutboxEvent, source_id)
+        assert source_event is not None
+        source_event.status = "succeeded"
+        session.add(
+            LeadMessageResolution(
+                message_id="source", segment_index=0, status="unassigned"
+            )
+        )
+    second = service.consume(current_id)
+    assert second.lead_id is not None
+    with factory() as session:
+        assert session.scalar(select(func.count(Lead.id))) == 1
+        assert session.scalar(
+            select(func.count(BusinessAuditEvent.id)).where(
+                BusinessAuditEvent.event_type == "quoted_unassigned_message_recovered"
+            )
+        ) == 1
+
+
+def test_quote_recovery_calls_ai_for_each_segment_and_preserves_field_provenance() -> None:
+    """验证 deterministic 字段不阻止两个 segment 的 AI 补充，且来源不串到 source。"""
+    factory = _session_factory()
+    source_id = _persist_message(
+        factory,
+        "source",
+        "sales-1",
+        10,
+        "客户：QA引用测试公司；联系人：张经理；需要视觉检测",
+    )
+    current_id = _persist_message(
+        factory,
+        "current",
+        "sales-1",
+        15,
+        "手机号：13800138000；预算35万；预计年底",
+        quote_text="客户：QA引用测试公司；联系人：张经理；需要视觉检测",
+    )
+    with factory.begin() as session:
+        source_event = session.get(OutboxEvent, source_id)
+        assert source_event is not None
+        source_event.status = "succeeded"
+        session.add(
+            LeadMessageResolution(
+                message_id="source", segment_index=0, status="unassigned"
+            )
+        )
+    responses = [
+        json.dumps(
+            {
+                "intent": "UPDATE_LEAD",
+                "customer_reference": {},
+                "crm_fields": {},
+                "enrichment": {"客户需求/痛点": "需要视觉检测"},
+                "confidence_by_field": {},
+                "conflicts": [],
+                "warnings": [],
+            },
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            {
+                "intent": "UPDATE_LEAD",
+                "customer_reference": {},
+                "crm_fields": {},
+                "enrichment": {"预算": "35万", "特殊要求": "预计年底"},
+                "confidence_by_field": {},
+                "conflicts": [],
+                "warnings": [],
+            },
+            ensure_ascii=False,
+        ),
+    ]
+    provider = MockLLMProvider(responses)
+    service = FirstTextLeadWorkspaceService(
+        factory,
+        _adapter(),
+        ai_gateway=AIGateway(provider),
+    )
+    result = service.consume(current_id)
+    assert result.lead_id is not None
+    assert len(provider.requests) == 2
+    with factory() as session:
+        lead = session.get(Lead, result.lead_id)
+        assert lead is not None
+        assert lead.enrichment_values == {
+            "客户需求/痛点": "需要视觉检测",
+            "预算": "35万",
+            "特殊要求": "预计年底",
+        }
+        provenances = session.scalars(
+            select(LeadFieldProvenance).where(LeadFieldProvenance.lead_id == lead.id)
+        ).all()
+        provenance_by_field = {item.field_name: item.source_message_id for item in provenances}
+        assert provenance_by_field["线索名称"] == "source"
+        assert provenance_by_field["联系人"] == "source"
+        assert provenance_by_field["手机"] == "current"
 
 
 def test_assigned_quote_inherits_same_lead_and_advances_context_to_reply() -> None:
