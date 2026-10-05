@@ -15,7 +15,7 @@ from app.core.failures import (
     TaskFailureCategory,
     classify_task_failure,
 )
-from app.core.logging import JsonFormatter
+from app.core.logging import LOG_CONTEXT, ContextFilter, JsonFormatter
 from app.smart_table.adapter import (
     SmartTableActor,
     SmartTableAdapterConfigurationError,
@@ -1180,11 +1180,12 @@ def test_850005_is_rate_limited_and_query_retries_with_longer_backoff(
 
 def test_rate_limited_query_exhaustion_preserves_850005_cause(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """验证限流重试耗尽后转换为传输错误但保留 850005 原因。"""
     monkeypatch.setattr("app.smart_table.wecom_cli.time.sleep", lambda _delay: None)
     last_error = WecomCliProcessError(
-        "rate limited",
+        "private errmsg docid=private-doc payload=private-body",
         error_code="rate_limited",
         external_error_code=850005,
     )
@@ -1198,13 +1199,68 @@ def test_rate_limited_query_exhaustion_preserves_850005_cause(
             last_error,
         ]
     )
+    caplog.handler.addFilter(ContextFilter())
+    context_token = LOG_CONTEXT.set({"record_id": "must-not-be-logged"})
 
-    with pytest.raises(WecomCliTransportError) as captured:
-        _adapter(fake_cli)._call_query("SELECT RECORD_ID FROM `CRM线索` LIMIT 1")
+    try:
+        with pytest.raises(WecomCliTransportError) as captured:
+            _adapter(fake_cli)._call_query("SELECT RECORD_ID FROM `CRM线索` LIMIT 1")
+    finally:
+        LOG_CONTEXT.reset(context_token)
 
     assert captured.value.__cause__ is last_error
     assert last_error.external_error_code == 850005
     assert len(fake_cli.calls) == 2
+    failure_log = next(
+        record for record in caplog.records if record.message == "wecom_cli_smart_table_failed"
+    )
+    assert failure_log.smart_table_resource == "records"
+    assert failure_log.smart_table_action == "query"
+    assert failure_log.error_code == "rate_limited"
+    assert failure_log.external_error_code == 850005
+    assert failure_log.retry_attempt == 2
+    assert failure_log.record_id is None
+    assert "private errmsg" not in caplog.text
+    assert "private-doc" not in caplog.text
+    assert "private-body" not in caplog.text
+    formatted = JsonFormatter().format(failure_log)
+    assert '"external_error_type": null' in formatted
+    assert '"http_status": null' in formatted
+    assert "must-not-be-logged" not in formatted
+
+
+def test_850003_remains_unknown_remote_business_error_and_is_not_retried(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """验证未证实语义的 850003 保持通用业务错误且只调用一次。"""
+    error = WecomCliProcessError(
+        "private external message",
+        error_code="remote_business_error",
+        external_error_code=850003,
+    )
+    fake_cli = FakeCli([error])
+
+    with pytest.raises(WecomCliProcessError) as captured:
+        _adapter(fake_cli)._call("fields", "list", {})
+
+    assert captured.value.error_code == "remote_business_error"
+    assert captured.value.retryable is False
+    assert len(fake_cli.calls) == 1
+    assert WecomCliSmartTableAdapter._structured_error_category(850003, None, None) == (
+        "remote_business_error"
+    )
+    failure_log = next(
+        record for record in caplog.records if record.message == "wecom_cli_smart_table_failed"
+    )
+    assert failure_log.external_error_code == 850003
+    assert failure_log.external_error_type is None
+    assert failure_log.http_status is None
+    assert failure_log.error_code == "remote_business_error"
+    assert not any(
+        category in caplog.text
+        for category in ("permission_denied", "authentication", "rate_limited")
+    )
+    assert "private external message" not in caplog.text
 
 
 def test_rate_limited_fields_list_retries_once() -> None:

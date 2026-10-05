@@ -68,6 +68,8 @@ services:
       LEAD_CONTEXT_TTL_MINUTES: ${LEAD_CONTEXT_TTL_MINUTES:-30}
       LEAD_MESSAGE_RETRY_COUNT: ${LEAD_MESSAGE_RETRY_COUNT:-1}
       LEAD_OUTBOX_POLL_SECONDS: ${LEAD_OUTBOX_POLL_SECONDS:-10}
+      AUDIT_MIRROR_BATCH_SIZE: ${AUDIT_MIRROR_BATCH_SIZE:-10}
+      SMART_TABLE_READINESS_CACHE_SECONDS: ${SMART_TABLE_READINESS_CACHE_SECONDS:-30}
       LEAD_PROCESSING_TIMEOUT_SECONDS: ${LEAD_PROCESSING_TIMEOUT_SECONDS:-300}
       LLM_PROVIDER: ${LLM_PROVIDER:-qwen}
       QWEN_API_KEY: ${QWEN_API_KEY:-}
@@ -150,7 +152,7 @@ services:
   worker:
     build: .
     environment: *application_environment
-    command: ["celery", "-A", "workers.celery_app:celery_app", "worker", "--loglevel=INFO", "--hostname=worker@%h"]
+    command: ["celery", "-A", "workers.celery_app:celery_app", "worker", "--loglevel=INFO", "--hostname=worker@%h", "--concurrency=${CELERY_WORKER_CONCURRENCY:-4}"]
     # Worker 与应用共用同一可写凭据目录，确保静默刷新后读取同一份凭据。
     volumes:
       - *employee_directory_volume
