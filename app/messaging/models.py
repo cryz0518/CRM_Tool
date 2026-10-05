@@ -13,6 +13,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     UniqueConstraint,
@@ -90,6 +91,8 @@ class IncomingMessage(Base):
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     normalized_text: Mapped[str | None] = mapped_column(String)
+    chat_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    chat_type: Mapped[str | None] = mapped_column(String(32), index=True)
     requires_media_enrichment: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     scrubbed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     retention_policy_version: Mapped[str | None] = mapped_column(String(64))
@@ -191,6 +194,15 @@ class WecomCallbackProcessingStatus(StrEnum):
     DUPLICATED = "duplicated"
     REJECTED = "rejected"
     COMPLETED = "completed"
+
+
+class MessageQuoteResolutionStatus(StrEnum):
+    """集中定义企业微信引用关系的确定性解析终态。"""
+
+    RESOLVED = "resolved"
+    NOT_FOUND = "not_found"
+    AMBIGUOUS = "ambiguous"
+    CONFLICT = "conflict"
 
 
 def new_wecom_action_id() -> str:
@@ -331,6 +343,40 @@ class BusinessAuditEvent(Base):
     )
 
     __table_args__ = (UniqueConstraint("message_id", "event_type"),)
+
+
+class MessageQuoteResolution(Base):
+    """保存当前消息到历史 IncomingMessage 的确定性引用解析结果。
+
+    参数：字段由 SQLAlchemy 映射初始化；current_message_id 是当前消息，
+    quoted_source_message_id 是系统 matcher 解析出的内部历史消息外键。
+    返回值：无。
+    异常：数据库约束异常由会话层抛出。
+    副作用：持久化后形成引用解析审计事实；不保存引用原文副本。
+    """
+
+    __tablename__ = "message_quote_resolutions"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    current_message_id: Mapped[str] = mapped_column(
+        ForeignKey("incoming_messages.message_id"), nullable=False
+    )
+    quoted_source_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("incoming_messages.message_id"), nullable=True
+    )
+    resolution_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    candidate_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    matched_by: Mapped[str | None] = mapped_column(String(32))
+    conflict_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("current_message_id"),
+        Index("ix_message_quote_resolutions_quoted_source", "quoted_source_message_id"),
+    )
 
 
 class AuditMirrorOutbox(Base):

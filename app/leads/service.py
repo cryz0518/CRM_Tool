@@ -32,11 +32,19 @@ from app.leads.models import (
     deserialize_field_value,
     serialize_field_value,
 )
+from app.leads.quote_routing import (
+    QuoteRecoveryExtractionRequest,
+    QuoteRecoverySegment,
+    QuoteResolutionResult,
+    resolve_message_quote,
+)
 from app.leads.review import LeadReviewService, ReviewSyncResult
 from app.messaging.models import (
     BusinessAuditEvent,
     IncomingMessage,
     MessageAttachment,
+    MessageQuoteResolution,
+    MessageQuoteResolutionStatus,
     NotificationRecord,
     OutboxEvent,
     SalesAuthorization,
@@ -68,6 +76,7 @@ class LeadProcessingStatus(StrEnum):
     WAITING_FOR_PREVIOUS = "waiting_for_previous"
     UPDATED = "updated"
     UNASSIGNED = "unassigned"
+    QUOTE_UNRESOLVED = "quote_unresolved"
     SYNC_FAILED = "sync_failed"
 
 
@@ -1254,6 +1263,303 @@ class FirstTextLeadWorkspaceService:
             self._refresh_context(session, message, lead_id)
             self._record_audit(session, event, "company_resolution_completed_before_smart_table")
 
+    def _prepare_quote_route(
+        self,
+        session: Session,
+        event: OutboxEvent,
+        message: IncomingMessage,
+        quote_result: QuoteResolutionResult,
+        extractor: DeterministicFirstTextLeadExtractor,
+    ) -> tuple[Lead | None, bool]:
+        """在当前事务中解析 quote 目标、冲突和 unassigned recovery。
+
+        参数：session 为当前消息消费事务；event/message 为当前消息事实；quote_result 为已幂等
+        写入的引用解析；extractor 只用于服务器侧可靠公司身份判断。
+        返回值：返回可继承的 Lead 和是否应 fail closed；没有目标时二者均为 None/True。
+        异常：数据库错误或 AI 结构化提取错误向调用方传播并回滚整个事务。
+        副作用：可能写入当前/来源消息归属、Lead、字段来源、上下文和恢复审计；不调用 Smart Table。
+        """
+        resolution = quote_result.resolution
+        if resolution.resolution_status != MessageQuoteResolutionStatus.RESOLVED.value:
+            self._finish_quote_unresolved(
+                session,
+                event,
+                resolution,
+                audit_type=(
+                    "quote_routing_not_found"
+                    if resolution.resolution_status
+                    == MessageQuoteResolutionStatus.NOT_FOUND.value
+                    else "quote_routing_ambiguous"
+                ),
+            )
+            return None, True
+
+        source = quote_result.source_message
+        if source is None:
+            self._finish_quote_unresolved(
+                session,
+                event,
+                resolution,
+                conflict_code="QUOTE_SOURCE_MISSING",
+                audit_type="QUOTE_SOURCE_MISSING",
+            )
+            return None, True
+
+        source_resolutions = session.scalars(
+            select(LeadMessageResolution)
+            .where(LeadMessageResolution.message_id == source.message_id)
+            .with_for_update()
+        ).all()
+        distinct_lead_ids = {
+            item.lead_id for item in source_resolutions if item.lead_id is not None
+        }
+        if len(distinct_lead_ids) > 1:
+            self._finish_quote_unresolved(
+                session,
+                event,
+                resolution,
+                conflict_code="QUOTE_TARGET_AMBIGUOUS",
+                audit_type="QUOTE_TARGET_AMBIGUOUS",
+            )
+            return None, True
+
+        if distinct_lead_ids:
+            target_id = next(iter(distinct_lead_ids))
+            target = session.get(Lead, target_id)
+            if target is None or target.lifecycle_state == "discarded":
+                self._finish_quote_unresolved(
+                    session,
+                    event,
+                    resolution,
+                    conflict_code="QUOTE_TARGET_MISSING",
+                    audit_type="QUOTE_TARGET_MISSING",
+                )
+                return None, True
+            if target.smart_table_owner_user_id != message.sales_user_id:
+                # 引用关系只能复用当前销售仍拥有的本地业务事实，不能绕过权限边界。
+                self._finish_quote_unresolved(
+                    session,
+                    event,
+                    resolution,
+                    conflict_code="QUOTE_TARGET_FORBIDDEN",
+                    audit_type="QUOTE_TARGET_FORBIDDEN",
+                )
+                return None, True
+            current_company = self._extract_reliable_company_identity(message, extractor)
+            if current_company is not None and not self._lead_matches_company(
+                target, current_company
+            ):
+                # 只有服务器确定性识别出的当前公司才触发冲突；AI 候选不会改变 quote 路由。
+                self._finish_quote_unresolved(
+                    session,
+                    event,
+                    resolution,
+                    conflict_code="QUOTE_IDENTITY_CONFLICT",
+                    audit_type="QUOTE_IDENTITY_CONFLICT",
+                )
+                return None, True
+            # processing 也是真实的本地 Lead identity；外部投影状态不参与目标判断。
+            self._mark_processing_assignment(session, event, target.id)
+            return target, False
+
+        # source 没有有效 Lead identity 时，quote relationship 固定双片段恢复边界。
+        recovery_request = QuoteRecoveryExtractionRequest(
+            quoted_source=QuoteRecoverySegment(
+                message_id=source.message_id,
+                normalized_text=source.normalized_text or "",
+            ),
+            current_reply=QuoteRecoverySegment(
+                message_id=message.message_id,
+                normalized_text=message.normalized_text or "",
+            ),
+        )
+        fields, enrichment = self._extract_quote_recovery_fields(recovery_request, extractor)
+        company_name = fields.get("线索名称")
+        if not isinstance(company_name, str) or not company_name.strip():
+            self._finish_quote_unresolved(
+                session,
+                event,
+                resolution,
+                conflict_code="QUOTE_RECOVERY_INCOMPLETE",
+                audit_type="QUOTE_RECOVERY_INCOMPLETE",
+            )
+            return None, True
+
+        target = session.scalar(
+            select(Lead)
+            .where(
+                Lead.source_message_id == source.message_id,
+                Lead.source_segment_index == 0,
+            )
+            .with_for_update()
+        )
+        if target is None:
+            # source 原 resolution 只有 unassigned 事实时才会进入这里，避免重复创建 Lead。
+            target = Lead(
+                source_message_id=source.message_id,
+                source_segment_index=0,
+                original_capturing_sales_user_id=message.sales_user_id,
+                smart_table_owner_user_id=message.sales_user_id,
+                field_values={"线索来源": "展会", **fields},
+                enrichment_values=enrichment,
+            )
+            session.add(target)
+            session.flush()
+            session.add(
+                SmartTableSync(
+                    lead_id=target.id,
+                    source_message_id=source.message_id,
+                    source_segment_index=0,
+                )
+            )
+            for field_name, value in fields.items():
+                session.add(
+                    LeadFieldProvenance(
+                        lead_id=target.id,
+                        source_message_id=source.message_id,
+                        field_name=field_name,
+                        value=serialize_field_value(value),
+                        last_ai_synced_value=serialize_field_value(value),
+                    )
+                )
+
+        source_resolution = next(
+            (item for item in source_resolutions if item.segment_index == 0), None
+        )
+        previous_source_status = (
+            source_resolution.status if source_resolution is not None else None
+        )
+        if source_resolution is None:
+            source_resolution = LeadMessageResolution(
+                message_id=source.message_id,
+                segment_index=0,
+                lead_id=target.id,
+                status="assigned",
+            )
+            session.add(source_resolution)
+        else:
+            source_resolution.lead_id = target.id
+            source_resolution.status = "assigned"
+        self._mark_processing_assignment(session, event, target.id)
+        self._refresh_context(session, message, target.id)
+        self._record_audit(
+            session,
+            event,
+            "quoted_unassigned_message_recovered",
+            details={
+                "quoted_source_message_id": source.message_id,
+                "lead_id": target.id,
+                "previous_source_status": previous_source_status or "unassigned",
+                "new_source_status": "assigned",
+            },
+        )
+        return target, False
+
+    def _extract_quote_recovery_fields(
+        self,
+        request: QuoteRecoveryExtractionRequest,
+        extractor: DeterministicFirstTextLeadExtractor,
+    ) -> tuple[dict[str, object], dict[str, str]]:
+        """按两个独立 quote recovery 片段提取字段并保守合并。
+
+        参数：request 明确包含 quoted source 与 current reply 两个片段；extractor 提供本地规则。
+        返回值：合并后的 CRM 字段和备注补充素材；先出现的字段不会被后片段静默覆盖。
+        异常：AI Gateway 结构或传输错误向调用方传播，保证事务回滚而不留半状态。
+        副作用：必要时分别调用 AI Gateway；不向模型传入 Lead 或 quoted source ID。
+        """
+        fields: dict[str, object] = {}
+        enrichment: dict[str, str] = {}
+        for segment in (request.quoted_source, request.current_reply):
+            # 每个片段单独进入提取器，禁止把 quote 原文拼接成没有边界的普通输入。
+            deterministic_fields = extractor.extract_patch(segment.normalized_text)
+            patch = None
+            if (
+                not deterministic_fields
+                and self._ai_gateway is not None
+                and segment.normalized_text
+            ):
+                patch = self._ai_gateway.extract_fields(
+                    segment.normalized_text,
+                    source_message_id=segment.message_id,
+                    lead_id=None,
+                )
+                segment_fields: dict[str, object] = dict(patch.fields)
+                segment_enrichment = patch.enrichment
+            else:
+                segment_fields = dict(deterministic_fields)
+                segment_enrichment = {}
+            for field_name, value in segment_fields.items():
+                if field_name not in fields and (
+                    isinstance(value, str)
+                    or (isinstance(value, list) and all(isinstance(item, str) for item in value))
+                ):
+                    fields[field_name] = value
+            for field_name, value in segment_enrichment.items():
+                enrichment.setdefault(field_name, value)
+        return fields, enrichment
+
+    @staticmethod
+    def _extract_reliable_company_identity(
+        message: IncomingMessage, extractor: DeterministicFirstTextLeadExtractor
+    ) -> str | None:
+        """只从当前消息的服务器确定性解析结果提取公司身份。
+
+        参数：message 为当前 reply；extractor 为既有窄范围确定性解析器。
+        返回值：可靠公司名称；AI 候选、模糊文本和联系方式均返回 None。
+        异常：无。
+        副作用：无，不调用 AI 或外部服务。
+        """
+        fields = extractor.extract_patch(message.normalized_text)
+        company = fields.get("线索名称")
+        if isinstance(company, str) and company.strip():
+            return company.strip()
+        return extractor.extract_leading_company_hint(message.normalized_text)
+
+    @staticmethod
+    def _lead_matches_company(lead: Lead, company_name: str) -> bool:
+        """比较当前可靠公司身份与 quote 目标 Lead 的已知公司名称。
+
+        参数：lead 为 quote 唯一目标；company_name 为当前消息确定性公司名。
+        返回值：当前名称等于 Lead 展示名或标准名时返回 True。
+        异常：无。
+        副作用：无，仅读取本地 Lead 字段。
+        """
+        known_names = {
+            str(lead.field_values.get("线索名称") or "").strip(),
+            str(lead.standard_company_name or "").strip(),
+        }
+        return company_name.strip() in {name for name in known_names if name}
+
+    def _finish_quote_unresolved(
+        self,
+        session: Session,
+        event: OutboxEvent,
+        resolution: object,
+        *,
+        conflict_code: str | None = None,
+        audit_type: str,
+    ) -> None:
+        """原子收敛 quote fail-closed 状态并写入当前消息待归属事实。
+
+        参数：session/event 为当前事务；resolution 为 MessageQuoteResolution；
+        conflict_code 为确定性冲突码；audit_type 为受控审计事件名。
+        返回值：无。
+        异常：数据库错误向调用方传播并回滚 quote、归属和审计写入。
+        副作用：当前消息变为 unassigned，事件越过检查点且不复用 active context。
+        """
+        if not isinstance(resolution, MessageQuoteResolution):
+            raise TypeError("quote resolution 类型非法")
+        if conflict_code is not None:
+            resolution.resolution_status = MessageQuoteResolutionStatus.CONFLICT.value
+            resolution.conflict_code = conflict_code
+        self._mark_unassigned(session, event)
+        self._record_audit(
+            session,
+            event,
+            audit_type,
+            details={"candidate_count": resolution.candidate_count},
+        )
+
     def _consume_once(
         self,
         outbox_event_id: int,
@@ -1276,6 +1582,8 @@ class FirstTextLeadWorkspaceService:
         company_initial_command: CompanyUpsertCommand | None = None
         multi_company_fields: list[dict[str, str]] | None = None
         smart_table_recovery_sync: SmartTableSync | None = None
+        quote_target_lead: Lead | None = None
+        context_lead: Lead | None = None
         try:
             with self._session_factory.begin() as session:
                 event, message = self._load_event_and_message(session, outbox_event_id)
@@ -1315,17 +1623,31 @@ class FirstTextLeadWorkspaceService:
                 if not claimed_for_processing and event.status in terminal_or_unknown_statuses:
                     # ponytail: Adapter 无创建幂等键；未知结果待人工核验，接口提供键后再安全重试。
                     return self._processed_result(session, event)
-                if self._has_unfinished_previous_event(session, event):
-                    # 同一销售只能按持久化 sequence 前进，不能由 Worker 实际完成快慢决定归属。
-                    logger.info("lead_outbox_waiting_for_previous")
-                    return LeadProcessingResult(LeadProcessingStatus.WAITING_FOR_PREVIOUS)
 
-                # Worker 在 T02 之后再次经过权威 Actor Registry，停用 actor 不得继续处理。
+                # Worker 二次校验销售身份后，quote matcher 才能在顺序等待前建立安全目标。
                 if not self._sales_identity_provider.is_active(session, message.sales_user_id):
                     event.status = "unauthorized"
                     self._record_audit(session, event, "lead_actor_inactive")
                     logger.warning("lead_outbox_actor_inactive")
                     return LeadProcessingResult(LeadProcessingStatus.UNAUTHORIZED)
+
+                extractor = DeterministicFirstTextLeadExtractor()
+                quote_result = resolve_message_quote(session, message)
+                if quote_result is not None:
+                    quote_target_lead, quote_unresolved = self._prepare_quote_route(
+                        session, event, message, quote_result, extractor
+                    )
+                    if quote_unresolved:
+                        return LeadProcessingResult(LeadProcessingStatus.QUOTE_UNRESOLVED)
+
+                # 只有无 quote 或 quote 尚未唯一解析时才受旧消息顺序阻塞；
+                # processing Lead 的本地 identity 已可靠固定，不被外部投影失败拖住。
+                if quote_target_lead is None and self._has_unfinished_previous_event(
+                    session, event
+                ):
+                    # 同一销售只能按持久化 sequence 前进，不能由 Worker 实际完成快慢决定归属。
+                    logger.info("lead_outbox_waiting_for_previous")
+                    return LeadProcessingResult(LeadProcessingStatus.WAITING_FOR_PREVIOUS)
 
                 if self._media_enrichment_is_pending(session, message):
                     # 媒体接收与 Outbox 调度并发时，附件可能尚未落库；释放本次认领，
@@ -1335,8 +1657,19 @@ class FirstTextLeadWorkspaceService:
                     logger.info("lead_outbox_waiting_for_media_enrichment")
                     return LeadProcessingResult(LeadProcessingStatus.WAITING_FOR_PREVIOUS)
 
-                extractor = DeterministicFirstTextLeadExtractor()
                 multi_fields = extractor.extract_many(message.normalized_text)
+                if quote_target_lead is not None and len(multi_fields) > 1:
+                    # quote 关系不能替代当前消息明确拆出的多个客户，无法安全选择单一目标。
+                    quote_result = resolve_message_quote(session, message)
+                    assert quote_result is not None
+                    self._finish_quote_unresolved(
+                        session,
+                        event,
+                        quote_result.resolution,
+                        conflict_code="QUOTE_TARGET_AMBIGUOUS",
+                        audit_type="QUOTE_TARGET_AMBIGUOUS",
+                    )
+                    return LeadProcessingResult(LeadProcessingStatus.QUOTE_UNRESOLVED)
                 if len(multi_fields) <= 1 and extractor.has_ambiguous_multiple_companies(
                     message.normalized_text
                 ):
@@ -1385,7 +1718,12 @@ class FirstTextLeadWorkspaceService:
                 )
                 # 明确公司身份可以切换客户；无公司名时先尊重当前会话，再回溯历史联系方式。
                 strong_identity_match = False
-                if smart_table_recovery_sync is not None:
+                if quote_target_lead is not None:
+                    # quote 唯一解析出的 Lead 是服务器事实，不能被 active context、
+                    # 联系方式或 AI 改路由。
+                    context_lead = quote_target_lead
+                    strong_identity_match = True
+                elif smart_table_recovery_sync is not None:
                     # T09 失败重试必须回到原 Lead，随后复用同一来源消息重新取得 AI 补丁。
                     context_lead = session.get(Lead, smart_table_recovery_sync.lead_id)
                 elif multi_request is not None or multi_company_fields is not None:
@@ -1483,14 +1821,33 @@ class FirstTextLeadWorkspaceService:
                         message,
                         context_lead,
                         company_name_hint=leading_company_hint,
+                        quote_target_lead_id=(
+                            quote_target_lead.id if quote_target_lead is not None else None
+                        ),
                     )
                     if ai_result is not None:
+                        if quote_target_lead is not None and ai_result.status in {
+                            LeadProcessingStatus.IGNORED,
+                            LeadProcessingStatus.UNASSIGNED,
+                        }:
+                            # quote 已经确定业务目标；当前文本没有可写补丁时仍必须完成消息归属。
+                            self._mark_assigned(session, event, quote_target_lead.id)
+                            self._refresh_context(session, message, quote_target_lead.id)
+                            self._record_audit(
+                                session, event, "quote_routing_assigned_without_patch"
+                            )
+                            return LeadProcessingResult(
+                                LeadProcessingStatus.UPDATED,
+                                lead_id=quote_target_lead.id,
+                                smart_table_record_id=quote_target_lead.smart_table_record_id,
+                            )
                         return ai_result
                 if (
                     context_lead is not None
                     and not extracted_patch
                     and ai_review is None
                     and not self._is_weak_identity_fragment(message.normalized_text)
+                    and quote_target_lead is None
                 ):
                     # 提前固定的上下文不能把普通问候升级成待归属消息；只有弱补充才继承线索。
                     event.status = "ignored"
@@ -1524,7 +1881,12 @@ class FirstTextLeadWorkspaceService:
                         for field_name, value in extracted_patch.items()
                         if field_name != "线索名称" or temporary_context
                     }
-                    if not context_patch and not same_context_company and not temporary_context:
+                    if (
+                        not context_patch
+                        and not same_context_company
+                        and not temporary_context
+                        and quote_target_lead is None
+                    ):
                         self._mark_unassigned(session, event)
                         return LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
 
@@ -1765,6 +2127,7 @@ class FirstTextLeadWorkspaceService:
         message: IncomingMessage,
         context_lead: Lead | None,
         company_name_hint: str | None = None,
+        quote_target_lead_id: str | None = None,
     ) -> tuple[
         AIReviewRequest | tuple[AIReviewRequest, ...] | None,
         LeadProcessingResult | None,
@@ -1772,7 +2135,8 @@ class FirstTextLeadWorkspaceService:
         """调用 T08 并以确定性规则决定安全的新增、更新或待归属结论。
 
         参数：session、event 和 message 为当前有序消费事实；
-        context_lead 为 T07 已可靠定位的当前线索；company_name_hint 为确定性首段公司身份提示。
+        context_lead 为 T07 已可靠定位的当前线索；company_name_hint 为确定性首段公司身份提示；
+        quote_target_lead_id 为已由服务器 quote relationship 确定的唯一目标。
         返回值：可在提交后执行的 T09 请求，或已完成的消费结果；两者不会同时存在。
         异常：无；T08 失败被转换为明确的失败待审事实。
         副作用：可能创建最小 Lead 草稿、登记审计并将事件置为 processing 或 failed_pending_review。
@@ -1820,6 +2184,25 @@ class FirstTextLeadWorkspaceService:
             return None, LeadProcessingResult(LeadProcessingStatus.SYNC_FAILED)
 
         explicit_new_lead_signal = self._has_explicit_new_lead_signal(message.normalized_text)
+        if quote_target_lead_id is not None and (
+            patch.segments
+            or patch.analysis.intent in {"MULTI_LEAD", "MULTI_LEAD_AMBIGUOUS"}
+        ):
+            # quote 已固定单一 Lead；模型返回多客户结果不能扩展目标或创建其他 Lead。
+            quote_resolution = session.scalar(
+                select(MessageQuoteResolution).where(
+                    MessageQuoteResolution.current_message_id == message.message_id
+                )
+            )
+            if quote_resolution is not None:
+                self._finish_quote_unresolved(
+                    session,
+                    event,
+                    quote_resolution,
+                    conflict_code="QUOTE_TARGET_AMBIGUOUS",
+                    audit_type="QUOTE_TARGET_AMBIGUOUS",
+                )
+            return None, LeadProcessingResult(LeadProcessingStatus.QUOTE_UNRESOLVED)
         if patch.analysis.intent == "MULTI_LEAD_AMBIGUOUS":
             self._mark_unassigned(session, event)
             return None, LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
