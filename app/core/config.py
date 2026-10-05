@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     lead_context_ttl_minutes: int = 30
     lead_message_retry_count: int = 1
     lead_outbox_poll_seconds: int = 10
+    audit_mirror_batch_size: int = 10
+    smart_table_readiness_cache_seconds: int = 30
     lead_processing_timeout_seconds: int = 300
     llm_provider: Literal["mock", "qwen"] = "qwen"
     qwen_api_key: str | None = None
@@ -211,6 +213,22 @@ class Settings(BaseSettings):
         """
         if value <= 0:
             raise ValueError("LEAD_OUTBOX_POLL_SECONDS 必须大于 0")
+        return value
+
+    @field_validator("audit_mirror_batch_size")
+    @classmethod
+    def audit_mirror_batch_size_must_be_positive(cls, value: int) -> int:
+        """拒绝非正审计镜像批量，避免 Beat 扫描失效或无限制投递。"""
+        if value <= 0:
+            raise ValueError("AUDIT_MIRROR_BATCH_SIZE 必须大于 0")
+        return value
+
+    @field_validator("smart_table_readiness_cache_seconds")
+    @classmethod
+    def smart_table_readiness_cache_seconds_must_be_positive(cls, value: int) -> int:
+        """拒绝非正 Smart Table readiness 缓存 TTL，防止退化为无期限缓存。"""
+        if value <= 0:
+            raise ValueError("SMART_TABLE_READINESS_CACHE_SECONDS 必须大于 0")
         return value
 
     @field_validator("lead_processing_timeout_seconds")

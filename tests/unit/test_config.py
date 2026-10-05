@@ -25,6 +25,18 @@ def test_ai_gateway_defaults_use_sixty_second_timeout_and_one_retry(monkeypatch)
     assert settings.ai_gateway_retry_count == 1
 
 
+def test_smart_table_stability_defaults_and_positive_validators() -> None:
+    """验证 hotfix 配置默认值和防止关闭限流保护的正数约束。"""
+    settings = Settings(_env_file=None)
+    assert settings.audit_mirror_batch_size == 10
+    assert settings.smart_table_readiness_cache_seconds == 30
+
+    with pytest.raises(ValueError, match="AUDIT_MIRROR_BATCH_SIZE"):
+        Settings(_env_file=None, audit_mirror_batch_size=0)
+    with pytest.raises(ValueError, match="SMART_TABLE_READINESS_CACHE_SECONDS"):
+        Settings(_env_file=None, smart_table_readiness_cache_seconds=0)
+
+
 def test_ai_gateway_timeout_environment_variable_overrides_default(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """验证环境变量可覆盖 AI Gateway 的默认超时。
 

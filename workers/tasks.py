@@ -11,6 +11,7 @@ from uuid import uuid4
 from sqlalchemy import Engine, and_, create_engine, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.ai.dependencies import get_ai_gateway
 from app.ai.models import ExtractedLeadPatch, LeadAnalysis, SubmissionIntent
@@ -61,6 +62,55 @@ from app.wecom_bot.actions import (
 from workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
+
+
+def audit_retry_delay_seconds(attempts: int) -> int:
+    """按失败次数计算审计镜像的有界指数退避时间。
+
+    参数：attempts 为已经开始的镜像尝试次数。
+    返回值：首次失败后 30 秒起步、最多 300 秒的等待时间。
+    异常：无；零或负数按第一次失败处理。
+    副作用：无。
+    """
+    if attempts <= 1:
+        return 30
+    if attempts == 2:
+        return 60
+    if attempts == 3:
+        return 120
+    return 300
+
+
+def _audit_mirror_retry_due_condition(now: datetime) -> ColumnElement[bool]:
+    """构造按每档退避时间筛选到期 retrying 镜像的 SQL 条件。
+
+    参数：now 为本轮统一使用的当前 UTC 时间。
+    返回值：仅匹配已达到对应 attempts 退避期限的 SQLAlchemy 条件。
+    异常：无。
+    副作用：无；条件仅供只读扫描或原子认领查询使用。
+    """
+    return or_(
+        and_(
+            AuditMirrorOutbox.attempts <= 1,
+            AuditMirrorOutbox.updated_at
+            <= now - timedelta(seconds=audit_retry_delay_seconds(1)),
+        ),
+        and_(
+            AuditMirrorOutbox.attempts == 2,
+            AuditMirrorOutbox.updated_at
+            <= now - timedelta(seconds=audit_retry_delay_seconds(2)),
+        ),
+        and_(
+            AuditMirrorOutbox.attempts == 3,
+            AuditMirrorOutbox.updated_at
+            <= now - timedelta(seconds=audit_retry_delay_seconds(3)),
+        ),
+        and_(
+            AuditMirrorOutbox.attempts >= 4,
+            AuditMirrorOutbox.updated_at
+            <= now - timedelta(seconds=audit_retry_delay_seconds(4)),
+        ),
+    )
 
 
 def _get_retention_policy_or_skip(settings: Settings) -> RetentionPolicy | None:
@@ -114,7 +164,11 @@ def _claim_audit_mirror_outbox(
             .where(
                 AuditMirrorOutbox.id == outbox_id,
                 or_(
-                    AuditMirrorOutbox.status.in_(("pending", "retrying")),
+                    AuditMirrorOutbox.status == "pending",
+                    and_(
+                        AuditMirrorOutbox.status == "retrying",
+                        _audit_mirror_retry_due_condition(now),
+                    ),
                     and_(
                         AuditMirrorOutbox.status == "processing",
                         AuditMirrorOutbox.processing_started_at.is_not(None),
@@ -371,9 +425,10 @@ def consume_pending_audit_mirrors() -> int:
     """
     engine, factory = _session_factory()
     try:
+        settings = get_settings()
         now = utc_now()
         expired_before = now - timedelta(
-            seconds=get_settings().lead_processing_timeout_seconds
+            seconds=settings.lead_processing_timeout_seconds
         )
         with factory() as session:
             outbox_ids = list(
@@ -381,7 +436,11 @@ def consume_pending_audit_mirrors() -> int:
                     select(AuditMirrorOutbox.id)
                     .where(
                         or_(
-                            AuditMirrorOutbox.status.in_(("pending", "retrying")),
+                            AuditMirrorOutbox.status == "pending",
+                            and_(
+                                AuditMirrorOutbox.status == "retrying",
+                                _audit_mirror_retry_due_condition(now),
+                            ),
                             and_(
                                 AuditMirrorOutbox.status == "processing",
                                 AuditMirrorOutbox.processing_started_at.is_not(None),
@@ -390,7 +449,7 @@ def consume_pending_audit_mirrors() -> int:
                         )
                     )
                     .order_by(AuditMirrorOutbox.created_at, AuditMirrorOutbox.id)
-                    .limit(100)
+                    .limit(settings.audit_mirror_batch_size)
                 )
             )
     finally:

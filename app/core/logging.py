@@ -52,6 +52,9 @@ STRUCTURED_EXTRA_FIELDS = (
     "remaining_deadline_ms",
     "callback_total_duration_ms",
 )
+_CLI_FAILURE_NULLABLE_FIELDS = frozenset(
+    {"external_error_code", "external_error_type", "http_status"}
+)
 _CALLBACK_TIMING_FIELDS = frozenset(
     {
         "callback_claim_duration_ms",
@@ -115,7 +118,11 @@ class JsonFormatter(logging.Formatter):
         # 仅白名单化输出业务观测字段，避免将外部响应或敏感 Payload 自动写入日志。
         for field in STRUCTURED_EXTRA_FIELDS:
             value = getattr(record, field, None)
-            if value is not None:
+            # CLI 操作失败需要显式保留“无外部码/类型/HTTP 状态”的空事实。
+            if value is not None or (
+                record.getMessage() == "wecom_cli_smart_table_failed"
+                and field in _CLI_FAILURE_NULLABLE_FIELDS
+            ):
                 # 时序字段只接受非负纯整数，避免外部字符串或 bool 混入结构化日志。
                 if field in _CALLBACK_TIMING_FIELDS and (type(value) is not int or value < 0):
                     continue

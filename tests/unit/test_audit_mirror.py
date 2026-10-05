@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -65,6 +66,30 @@ def _persist_event(factory: sessionmaker[Session]) -> int:
         outbox = session.scalar(select(AuditMirrorOutbox))
         assert outbox is not None
         return outbox.id
+
+
+def _persist_mirror_jobs(factory: sessionmaker[Session], count: int) -> list[int]:
+    """创建指定数量的独立审计镜像任务供扫描退避测试使用。
+
+    参数：factory 为隔离测试会话工厂；count 为需要创建的任务数。
+    返回值：按数据库 ID 排序的镜像任务 ID。
+    异常：数据库约束错误由测试直接报告。
+    副作用：仅写入测试数据库中的业务审计事实及其自动生成的镜像任务。
+    """
+    with factory.begin() as session:
+        for index in range(count):
+            session.add(
+                BusinessAuditEvent(
+                    message_id=f"mirror-message-{index}",
+                    sales_user_id="sales-1",
+                    event_type=f"mirror-event-{index}",
+                    details={"status": "test"},
+                )
+            )
+    with factory() as session:
+        return list(
+            session.scalars(select(AuditMirrorOutbox.id).order_by(AuditMirrorOutbox.id))
+        )
 
 
 def _persist_event_with_message(
@@ -602,7 +627,14 @@ def test_audit_mirror_failure_only_retries_mirror_job(
     session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """验证 Smart Table 镜像失败只更新镜像 Outbox，不回滚业务审计事实。"""
-    outbox_id = _persist_event(session_factory)
+    mirror_ids = _persist_lead_audit_case(
+        session_factory,
+        events=(("message-1", {"lead_id": "lead-1", "status": "succeeded"}),),
+        leads=(("lead-1", "message-1", None),),
+        resolutions=(("message-1", 0, "lead-1"),),
+        source_outbox_status="succeeded",
+    )
+    outbox_id = mirror_ids[0]
 
     class FailingAdapter:
         """只用于证明外部审计子表失败不会改变业务审计状态。"""
@@ -619,12 +651,124 @@ def test_audit_mirror_failure_only_retries_mirror_job(
     assert tasks.consume_audit_mirror_outbox.run(outbox_id) == "retrying"
     with session_factory() as session:
         assert session.scalar(select(BusinessAuditEvent)) is not None
+        lead = session.get(Lead, "lead-1")
+        resolution = session.scalar(select(LeadMessageResolution))
+        business_outbox = session.scalar(select(OutboxEvent))
+        assert lead is not None
+        assert lead.field_values == {}
+        assert resolution is not None and resolution.lead_id == "lead-1"
+        assert business_outbox is not None and business_outbox.status == "succeeded"
         outbox = session.get(AuditMirrorOutbox, outbox_id)
         assert outbox is not None
         assert outbox.status == "retrying"
         assert outbox.claim_token is None
         assert outbox.failure_category == "retryable"
         assert outbox.failure_code == "RuntimeError"
+
+
+@pytest.mark.parametrize(
+    ("attempts", "expected_seconds"),
+    ((1, 30), (2, 60), (3, 120), (4, 300), (20, 300)),
+)
+def test_audit_retry_delay_seconds_is_bounded_exponential(
+    attempts: int, expected_seconds: int
+) -> None:
+    """验证镜像退避每次翻倍并在五分钟封顶。"""
+    assert tasks.audit_retry_delay_seconds(attempts) == expected_seconds
+
+
+def _prepare_scanner(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    now: datetime,
+    batch_size: int,
+) -> list[int]:
+    """将审计扫描器绑定到隔离数据库、固定时钟和只记录参数的投递函数。"""
+    engine = session_factory.kw["bind"]
+    monkeypatch.setattr(engine, "dispose", lambda: None)
+    monkeypatch.setattr(tasks, "_session_factory", lambda: (engine, session_factory))
+    monkeypatch.setattr(tasks, "utc_now", lambda: now)
+    monkeypatch.setattr(
+        tasks,
+        "get_settings",
+        lambda: SimpleNamespace(
+            lead_processing_timeout_seconds=300,
+            audit_mirror_batch_size=batch_size,
+        ),
+    )
+    dispatched: list[int] = []
+    monkeypatch.setattr(tasks.consume_audit_mirror_outbox, "delay", dispatched.append)
+    return dispatched
+
+
+def test_audit_scanner_dispatches_pending_and_due_retries_only(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 pending 立即投递、retrying 按 attempts 到期后才投递。"""
+    ids = _persist_mirror_jobs(session_factory, 9)
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+    with session_factory.begin() as session:
+        rows = [session.get(AuditMirrorOutbox, outbox_id) for outbox_id in ids]
+        assert all(row is not None for row in rows)
+        rows[1].status, rows[1].attempts = "retrying", 1
+        rows[1].updated_at = now - timedelta(seconds=29)
+        rows[2].status, rows[2].attempts = "retrying", 1
+        rows[2].updated_at = now - timedelta(seconds=30)
+        rows[3].status, rows[3].attempts = "retrying", 2
+        rows[3].updated_at = now - timedelta(seconds=59)
+        rows[4].status, rows[4].attempts = "retrying", 2
+        rows[4].updated_at = now - timedelta(seconds=60)
+        rows[5].status, rows[5].attempts = "retrying", 3
+        rows[5].updated_at = now - timedelta(seconds=119)
+        rows[6].status, rows[6].attempts = "retrying", 3
+        rows[6].updated_at = now - timedelta(seconds=120)
+        rows[7].status, rows[7].attempts = "retrying", 5
+        rows[7].updated_at = now - timedelta(seconds=299)
+        rows[8].status, rows[8].attempts = "retrying", 5
+        rows[8].updated_at = now - timedelta(seconds=300)
+
+    dispatched = _prepare_scanner(
+        session_factory, monkeypatch, now=now, batch_size=10
+    )
+    assert tasks.consume_pending_audit_mirrors.run() == 5
+    assert dispatched == [ids[0], ids[2], ids[4], ids[6], ids[8]]
+
+
+def test_audit_scanner_applies_batch_limit_before_dispatch(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证大量 pending 镜像不会让单轮投递超过独立 batch size。"""
+    ids = _persist_mirror_jobs(session_factory, 13)
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+    dispatched = _prepare_scanner(
+        session_factory, monkeypatch, now=now, batch_size=10
+    )
+
+    assert tasks.consume_pending_audit_mirrors.run() == 10
+    assert dispatched == ids[:10]
+
+
+def test_audit_scanner_skips_large_not_due_retry_backlog(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证未到期 retrying backlog 不投递，也不能被直接认领绕过退避。"""
+    ids = _persist_mirror_jobs(session_factory, 25)
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+    with session_factory.begin() as session:
+        for outbox_id in ids:
+            row = session.get(AuditMirrorOutbox, outbox_id)
+            assert row is not None
+            row.status = "retrying"
+            row.attempts = 1
+            row.updated_at = now - timedelta(seconds=29)
+    dispatched = _prepare_scanner(
+        session_factory, monkeypatch, now=now, batch_size=10
+    )
+
+    assert tasks.consume_pending_audit_mirrors.run() == 0
+    assert dispatched == []
+    assert tasks._claim_audit_mirror_outbox(session_factory, ids[0]) is None
 
 
 def test_stale_audit_mirror_worker_cannot_finalize_new_claim(
