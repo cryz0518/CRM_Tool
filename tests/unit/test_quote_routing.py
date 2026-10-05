@@ -629,8 +629,18 @@ def test_processing_quote_inherits_local_lead_when_source_event_failed_pending_r
         current_resolution = session.scalar(
             select(LeadMessageResolution).where(LeadMessageResolution.message_id == "current")
         )
+        quote_resolution = session.scalar(
+            select(MessageQuoteResolution).where(
+                MessageQuoteResolution.current_message_id == "current"
+            )
+        )
         assert current_resolution is not None
         assert current_resolution.lead_id == result.lead_id
+        assert quote_resolution is not None
+        assert quote_resolution.resolution_status == "resolved"
+        assert quote_resolution.quoted_source_message_id == "source"
+        assert quote_resolution.conflict_code is None
+        assert session.scalar(select(func.count(Lead.id))) == 1
 
 
 def test_unassigned_quote_recovery_assigns_source_and_reply_once() -> None:
