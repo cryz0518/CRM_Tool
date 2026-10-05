@@ -23,6 +23,7 @@ from app.messaging.models import (
 )
 from app.smart_table.audit import SmartTableAuditSink, build_mock_audit_schema
 from app.smart_table.mock import MockSmartTableAdapter
+from app.smart_table.wecom_cli import WecomCliProcessError, WecomCliTransportError
 from workers import tasks
 
 
@@ -90,6 +91,18 @@ def _persist_mirror_jobs(factory: sessionmaker[Session], count: int) -> list[int
         return list(
             session.scalars(select(AuditMirrorOutbox.id).order_by(AuditMirrorOutbox.id))
         )
+
+
+def _rate_limited_transport_error() -> WecomCliTransportError:
+    """构造保留 850005 cause 的可重试 CLI transport 错误。"""
+    cause = WecomCliProcessError(
+        "safe rate-limit summary",
+        error_code="rate_limited",
+        external_error_code=850005,
+    )
+    error = WecomCliTransportError("external body must not be persisted")
+    error.__cause__ = cause
+    return error
 
 
 def _persist_event_with_message(
@@ -640,8 +653,8 @@ def test_audit_mirror_failure_only_retries_mirror_job(
         """只用于证明外部审计子表失败不会改变业务审计状态。"""
 
         def get_schema(self):
-            """模拟审计子表外部调用失败。"""
-            raise RuntimeError("external body must not be persisted")
+            """模拟明确可重试的外部 Smart Table 传输失败。"""
+            raise _rate_limited_transport_error()
 
     engine = session_factory.kw["bind"]
     monkeypatch.setattr(engine, "dispose", lambda: None)
@@ -662,8 +675,183 @@ def test_audit_mirror_failure_only_retries_mirror_job(
         assert outbox is not None
         assert outbox.status == "retrying"
         assert outbox.claim_token is None
-        assert outbox.failure_category == "retryable"
+        assert outbox.failure_category == "transient"
+        assert outbox.failure_code == "WecomCliTransportError"
+        assert outbox.attempts == 1
+
+
+def test_audit_mirror_850003_is_permanent_and_not_scanned(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 850003 保持 permanent/manual-review，不会被审计扫描器重投。"""
+    outbox_id = _persist_event(session_factory)
+
+    class PermanentFailureAdapter:
+        """模拟 wecom-cli 返回未经解释的 850003 结构化错误。"""
+
+        def get_schema(self):
+            """抛出适配器已分类的永久业务错误，不包含远端正文。"""
+            raise WecomCliProcessError(
+                "safe error summary",
+                error_code="remote_business_error",
+                external_error_code=850003,
+            )
+
+    assert (
+        _run_worker_with_adapter(
+            session_factory,
+            monkeypatch,
+            outbox_id,
+            PermanentFailureAdapter(),
+        )
+        == "failed_pending_review"
+    )
+    with session_factory.begin() as session:
+        outbox = session.get(AuditMirrorOutbox, outbox_id)
+        assert outbox is not None
+        assert outbox.status == "failed_pending_review"
+        assert outbox.failure_category == "permanent"
+        assert outbox.failure_code == "WecomCliProcessError"
+        outbox.updated_at = utc_now() - timedelta(days=2)
+
+    now = utc_now()
+    dispatched = _prepare_scanner(
+        session_factory, monkeypatch, now=now, batch_size=10
+    )
+    assert tasks.consume_pending_audit_mirrors.run() == 0
+    assert dispatched == []
+
+
+def test_unknown_audit_mirror_failure_requires_review_and_is_not_scanned(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证普通 RuntimeError 分类为 unknown 并永久退出自动扫描。"""
+    outbox_id = _persist_event(session_factory)
+
+    class UnknownFailureAdapter:
+        """模拟未被 failure framework 识别的审计镜像异常。"""
+
+        def get_schema(self):
+            """抛出普通运行时异常，验证 unknown 不自动重试。"""
+            raise RuntimeError("external error text must not be stored")
+
+    assert (
+        _run_worker_with_adapter(
+            session_factory,
+            monkeypatch,
+            outbox_id,
+            UnknownFailureAdapter(),
+        )
+        == "failed_pending_review"
+    )
+    with session_factory.begin() as session:
+        outbox = session.get(AuditMirrorOutbox, outbox_id)
+        assert outbox is not None
+        assert outbox.status == "failed_pending_review"
+        assert outbox.failure_category == "unknown"
         assert outbox.failure_code == "RuntimeError"
+        assert "external error text" not in (outbox.failure_code or "")
+        outbox.updated_at = utc_now() - timedelta(days=2)
+
+    now = utc_now()
+    dispatched = _prepare_scanner(
+        session_factory, monkeypatch, now=now, batch_size=10
+    )
+    assert tasks.consume_pending_audit_mirrors.run() == 0
+    assert dispatched == []
+
+
+def test_deferred_audit_claims_do_not_consume_retry_attempts(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证多次等待 source 不增加外部尝试，随后首次 transient failure 进入 30 秒档。"""
+    outbox_id = _persist_event(session_factory)
+    for _ in range(3):
+        token = tasks._claim_audit_mirror_outbox(session_factory, outbox_id)
+        assert token is not None
+        tasks._defer_audit_mirror(session_factory, outbox_id, token)
+        with session_factory() as session:
+            outbox = session.get(AuditMirrorOutbox, outbox_id)
+            assert outbox is not None
+            assert outbox.status == "pending"
+            assert outbox.attempts == 0
+
+    class TransientFailureAdapter:
+        """模拟首次真正进入镜像调用后发生的可重试传输错误。"""
+
+        def get_schema(self):
+            """抛出真实适配器使用的 transient 标记错误类型。"""
+            raise _rate_limited_transport_error()
+
+    assert (
+        _run_worker_with_adapter(
+            session_factory,
+            monkeypatch,
+            outbox_id,
+            TransientFailureAdapter(),
+        )
+        == "retrying"
+    )
+    with session_factory() as session:
+        outbox = session.get(AuditMirrorOutbox, outbox_id)
+        assert outbox is not None
+        assert outbox.status == "retrying"
+        assert outbox.failure_category == "transient"
+        assert outbox.attempts == 1
+        updated_at = outbox.updated_at
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=UTC)
+
+    dispatched = _prepare_scanner(
+        session_factory,
+        monkeypatch,
+        now=updated_at + timedelta(seconds=29),
+        batch_size=10,
+    )
+    assert tasks.consume_pending_audit_mirrors.run() == 0
+    assert dispatched == []
+    monkeypatch.setattr(tasks, "utc_now", lambda: updated_at + timedelta(seconds=30))
+    assert tasks.consume_pending_audit_mirrors.run() == 1
+    assert dispatched == [outbox_id]
+
+
+def test_deferred_audit_mirrors_do_not_starve_later_pending_batch(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 defer 刷新 updated_at 后，下一轮 batch 能越过原先最老的十条。"""
+    ids = _persist_mirror_jobs(session_factory, 13)
+    now = utc_now()
+    dispatched = _prepare_scanner(
+        session_factory, monkeypatch, now=now, batch_size=10
+    )
+
+    assert tasks.consume_pending_audit_mirrors.run() == 10
+    assert dispatched == ids[:10]
+    original_timestamps: dict[int, tuple[datetime, datetime]] = {}
+    for outbox_id in ids[:10]:
+        with session_factory() as session:
+            row = session.get(AuditMirrorOutbox, outbox_id)
+            assert row is not None
+            original_timestamps[outbox_id] = (row.created_at, row.updated_at)
+        token = tasks._claim_audit_mirror_outbox(session_factory, outbox_id)
+        assert token is not None
+        with session_factory() as session:
+            row = session.get(AuditMirrorOutbox, outbox_id)
+            assert row is not None
+            claimed_updated_at = row.updated_at
+            assert row.attempts == 1
+        tasks._defer_audit_mirror(session_factory, outbox_id, token)
+        with session_factory() as session:
+            row = session.get(AuditMirrorOutbox, outbox_id)
+            assert row is not None
+            assert row.attempts == 0
+            assert row.created_at == original_timestamps[outbox_id][0]
+            assert row.updated_at > claimed_updated_at
+
+    dispatched.clear()
+    assert tasks.consume_pending_audit_mirrors.run() == 10
+    # 新鲜 defer 的十条排到末尾，先投递此前未被选中的三条。
+    assert dispatched == [*ids[10:], *ids[:7]]
 
 
 @pytest.mark.parametrize(
@@ -732,7 +920,7 @@ def test_audit_scanner_dispatches_pending_and_due_retries_only(
         session_factory, monkeypatch, now=now, batch_size=10
     )
     assert tasks.consume_pending_audit_mirrors.run() == 5
-    assert dispatched == [ids[0], ids[2], ids[4], ids[6], ids[8]]
+    assert dispatched == [ids[8], ids[6], ids[4], ids[2], ids[0]]
 
 
 def test_audit_scanner_applies_batch_limit_before_dispatch(

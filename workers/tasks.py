@@ -19,6 +19,7 @@ from app.ai.persistence import DatabaseAIExecutionRecorder
 from app.companies.dependencies import get_tyc_adapter
 from app.companies.service import CompanyLeadService
 from app.core.config import Settings, get_settings
+from app.core.failures import TaskFailureCategory, classify_task_failure
 from app.core.provider_policy import get_provider_policy
 from app.crm.commands import (
     consume_submission_command,
@@ -199,12 +200,12 @@ def _finish_audit_mirror(
     *,
     succeeded: bool,
     error: Exception | None = None,
-) -> None:
+) -> str:
     """以受控状态完成或重置审计镜像任务。
 
     参数：session_factory 为数据库会话工厂；outbox_id 为镜像任务标识；claim_token 为本次认领令牌；
     succeeded 表示远端已确认；error 为失败时仅用于记录异常类型。
-    返回值：无。
+    返回值：succeeded、retrying 或 failed_pending_review；fencing 失败时返回 stale。
     异常：数据库更新错误向 Worker 传播。
     副作用：仅在 ID、processing 状态和 claim token 同时匹配时更新镜像 Outbox，绝不修改原业务对象。
     """
@@ -220,14 +221,31 @@ def _finish_audit_mirror(
             .with_for_update()
         )
         if outbox is None:
-            return
-        outbox.status = "succeeded" if succeeded else "retrying"
+            return "stale"
         outbox.processing_started_at = None
         outbox.claim_token = None
-        if not succeeded and error is not None:
+        if succeeded:
+            outbox.status = "succeeded"
+            outbox.failure_category = None
+            outbox.failure_code = None
+            return outbox.status
+
+        # 只有 failure framework 明确认定为 transient 才进入自动退避重试。
+        category = (
+            classify_task_failure(error)
+            if error is not None
+            else TaskFailureCategory.UNKNOWN
+        )
+        outbox.status = (
+            "retrying"
+            if category is TaskFailureCategory.TRANSIENT
+            else "failed_pending_review"
+        )
+        outbox.failure_category = category.value
+        if error is not None:
             # 只保存受控异常类型，不保存 errmsg、HTTP body 或 traceback。
-            outbox.failure_category = "retryable"
             outbox.failure_code = type(error).__name__[:64]
+        return outbox.status
 
 
 def _resolve_audit_lead_id(session: Session, event: BusinessAuditEvent) -> str | None:
@@ -331,6 +349,8 @@ def _defer_audit_mirror(
         if outbox is None:
             return
         outbox.status = "pending"
+        # 等待 source Lead 的消费没有调用 SmartTable，不应消耗外部镜像尝试额度。
+        outbox.attempts = max(0, outbox.attempts - 1)
         outbox.processing_started_at = None
         outbox.claim_token = None
         outbox.failure_category = None
@@ -377,14 +397,13 @@ def consume_audit_mirror_outbox(outbox_id: int) -> str:
                 else False
             )
         if outbox is None or event is None:
-            _finish_audit_mirror(
+            return _finish_audit_mirror(
                 factory,
                 outbox_id,
                 claim_token,
                 succeeded=False,
                 error=ValueError("audit_event_missing"),
             )
-            return "retrying"
         if should_wait_for_lead:
             _defer_audit_mirror(factory, outbox_id, claim_token)
             return "deferred"
@@ -396,14 +415,25 @@ def consume_audit_mirror_outbox(outbox_id: int) -> str:
                 resolved_lead_id=resolved_lead_id,
             )
         except Exception as error:
-            _finish_audit_mirror(
+            final_status = _finish_audit_mirror(
                 factory, outbox_id, claim_token, succeeded=False, error=error
             )
-            logger.warning(
-                "audit_smart_table_mirror_retrying",
+            logger_method = (
+                logger.warning
+                if final_status in {"retrying", "stale"}
+                else logger.error
+            )
+            logger_method(
+                "audit_smart_table_mirror_retrying"
+                if final_status == "retrying"
+                else (
+                    "audit_smart_table_mirror_stale_finalize"
+                    if final_status == "stale"
+                    else "audit_smart_table_mirror_failed_pending_review"
+                ),
                 extra={"audit_mirror_outbox_id": outbox_id, "error_type": type(error).__name__},
             )
-            return "retrying"
+            return final_status
         _finish_audit_mirror(factory, outbox_id, claim_token, succeeded=True)
         logger.info(
             "audit_smart_table_mirror_succeeded",
@@ -448,7 +478,8 @@ def consume_pending_audit_mirrors() -> int:
                             ),
                         )
                     )
-                    .order_by(AuditMirrorOutbox.created_at, AuditMirrorOutbox.id)
+                    # defer 会刷新 updated_at，较老的等待任务因此让位给后续 pending 项。
+                    .order_by(AuditMirrorOutbox.updated_at, AuditMirrorOutbox.id)
                     .limit(settings.audit_mirror_batch_size)
                 )
             )
