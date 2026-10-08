@@ -21,7 +21,11 @@ from app.leads.models import (
     LeadProgressSession,
     SmartTableSync,
 )
-from app.leads.progress import LeadProgressService, register_progress_message
+from app.leads.progress import (
+    LeadProgressService,
+    register_progress_intent_candidate,
+    register_progress_message,
+)
 from app.leads.service import (
     FirstTextLeadWorkspaceService,
     LeadProcessingResult,
@@ -214,6 +218,21 @@ def seed_message(
             )
 
 
+def register_candidate(
+    context: ProgressTestContext, message_id: str, *, now: datetime
+) -> None:
+    """为测试中已持久化消息登记唯一的进度恢复候选。"""
+    with context.session_factory.begin() as session:
+        message = session.get(IncomingMessage, message_id)
+        assert message is not None
+        assert register_progress_message(
+            session,
+            message,
+            Settings(_env_file=None, lead_progress_enabled=True),
+            now=now,
+        )
+
+
 def full_required_fields(**extra: object) -> dict[str, object]:
     """返回完整性服务要求的八个正式字段，可覆盖单项审核元数据。"""
     fields: dict[str, object] = {
@@ -393,6 +412,34 @@ def test_unassigned_segments_are_not_smart_table_success() -> None:
     assert stats["identified_leads"] == 0
     assert stats["successful_leads"] == 0
     assert stats["unassigned_segments"] == 1
+    assert stats["failed_messages_without_lead"] == 1
+    assert "消息处理失败（无 Lead）：1 条" in (notice.content or "")
+
+
+def test_failed_outbox_without_any_lead_has_separate_message_count() -> None:
+    """AI 或消息处理终态失败且没有 Lead 时按唯一消息单独提示。"""
+    context = progress_context()
+    received_at = datetime(2026, 10, 8, 5, 30, tzinfo=UTC)
+    seed_message(
+        context.session_factory,
+        message_id="failed-without-lead",
+        sales_user_id="sales-a",
+        received_at=received_at,
+        outbox_status="failed_pending_review",
+    )
+    register_candidate(context, "failed-without-lead", now=received_at)
+
+    assert context.service.recover_pending_messages() == 1
+    assert context.service.schedule_due_reports(now=received_at + timedelta(minutes=15)) == 1
+    notice = read_notice(context.session_factory, "sales-a")
+    assert notice is not None and notice.payload is not None
+    stats = notice.payload["stats"]
+    assert isinstance(stats, dict)
+    assert stats["received_messages"] == 1
+    assert stats["identified_leads"] == 0
+    assert stats["successful_leads"] == 0
+    assert stats["sync_failed_leads"] == 0
+    assert stats["failed_messages_without_lead"] == 1
 
 
 def test_retrying_is_processing_while_failed_pending_review_is_sync_failure() -> None:
@@ -425,6 +472,43 @@ def test_retrying_is_processing_while_failed_pending_review_is_sync_failure() ->
     assert stats["sync_failed_leads"] == 1
     assert stats["processing_items"] == 1
     assert stats["successful_leads"] == 0
+    assert stats["failed_messages_without_lead"] == 0
+
+
+def test_repeated_message_to_same_failed_lead_counts_one_sync_failure() -> None:
+    """同一 Lead 被多条消息关联时，同步失败仍按 Lead ID 只统计一次。"""
+    context = progress_context()
+    start = datetime(2026, 10, 8, 6, 30, tzinfo=UTC)
+    for message_id, received_at in (
+        ("same-failed-lead-1", start),
+        ("same-failed-lead-2", start + timedelta(minutes=1)),
+    ):
+        seed_message(
+            context.session_factory,
+            message_id=message_id,
+            sales_user_id="sales-a",
+            received_at=received_at,
+            segments=(
+                SegmentSpec(
+                    "one-failed-lead",
+                    "隆盛科技",
+                    "failed-record",
+                    sync_status="failed_pending_review",
+                ),
+            ),
+            outbox_status="failed_pending_review",
+        )
+        context.service.record_resolved_message(message_id, now=received_at)
+
+    assert context.service.schedule_due_reports(now=start + timedelta(minutes=15)) == 1
+    notice = read_notice(context.session_factory, "sales-a")
+    assert notice is not None and notice.payload is not None
+    stats = notice.payload["stats"]
+    assert isinstance(stats, dict)
+    assert stats["received_messages"] == 2
+    assert stats["identified_leads"] == 1
+    assert stats["sync_failed_leads"] == 1
+    assert stats["failed_messages_without_lead"] == 0
 
 
 def test_unverified_850005_record_and_record_id_mismatch_never_count_success() -> None:
@@ -539,11 +623,142 @@ def test_pending_message_is_counted_before_worker_completion_and_recovered_after
         )
         assert event is not None
         event.status = "succeeded"
+    reads_before_recovery = context.adapter.read_calls
     restarted_service = LeadProgressService(context.session_factory, context.adapter)
     assert restarted_service.recover_pending_messages() == 1
     with context.session_factory() as session:
+        business_snapshot = (
+            session.get(Lead, "crash-lead").smart_table_record_id,
+            session.scalar(
+                select(SmartTableSync.status).where(SmartTableSync.lead_id == "crash-lead")
+            ),
+            session.scalar(
+                select(LeadMessageResolution.status).where(
+                    LeadMessageResolution.message_id == "worker-crash-candidate"
+                )
+            ),
+            session.scalar(select(func.count()).select_from(NotificationRecord)),
+        )
+    assert restarted_service.recover_pending_messages() == 0
+    assert restarted_service.schedule_due_reports(now=start + timedelta(minutes=15)) == 0
+    with context.session_factory() as session:
         progress_message = session.get(LeadProgressMessage, "worker-crash-candidate")
         assert progress_message is not None and progress_message.status == "included"
+        assert business_snapshot == (
+            session.get(Lead, "crash-lead").smart_table_record_id,
+            session.scalar(
+                select(SmartTableSync.status).where(SmartTableSync.lead_id == "crash-lead")
+            ),
+            session.scalar(
+                select(LeadMessageResolution.status).where(
+                    LeadMessageResolution.message_id == "worker-crash-candidate"
+                )
+            ),
+            session.scalar(select(func.count()).select_from(NotificationRecord)),
+        )
+    assert context.adapter.read_calls == reads_before_recovery
+
+
+def test_recovery_scan_skips_first_hundred_active_candidates() -> None:
+    """前 100 条 Outbox 长期活跃时，第 101 条终态候选仍进入本轮扫描。"""
+    context = progress_context()
+    start = datetime(2026, 10, 8, 8, 45, tzinfo=UTC)
+    for index in range(100):
+        message_id = f"pending-{index:03d}"
+        message_time = start + timedelta(seconds=index)
+        seed_message(
+            context.session_factory,
+            message_id=message_id,
+            sales_user_id="sales-a",
+            received_at=message_time,
+            outbox_status="processing",
+        )
+        register_candidate(context, message_id, now=message_time)
+
+    completed_id = "completed-after-pending-window"
+    completed_at = start + timedelta(seconds=100)
+    seed_message(
+        context.session_factory,
+        message_id=completed_id,
+        sales_user_id="sales-a",
+        received_at=completed_at,
+        segments=(SegmentSpec("late-lead", "隆盛科技", "late-record"),),
+        outbox_status="succeeded",
+    )
+    register_candidate(context, completed_id, now=completed_at)
+
+    assert context.service.recover_pending_messages(limit=1) == 1
+    with context.session_factory() as session:
+        recovered = session.get(LeadProgressMessage, completed_id)
+        first_pending = session.get(LeadProgressMessage, "pending-000")
+        assert recovered is not None and recovered.status == "included"
+        assert first_pending is not None and first_pending.status == "processing"
+
+
+def test_interleaved_sales_recovery_does_not_block_on_another_sales() -> None:
+    """交错销售的活跃候选不会占用其他销售的终态恢复名额。"""
+    context = progress_context()
+    start = datetime(2026, 10, 8, 9, 15, tzinfo=UTC)
+    for message_id, sales_user_id, status, lead_id in (
+        ("seller-a-pending-1", "sales-a", "processing", None),
+        ("seller-b-ready-1", "sales-b", "succeeded", "seller-b-lead-1"),
+        ("seller-a-ready-1", "sales-a", "succeeded", "seller-a-lead-1"),
+        ("seller-b-pending-1", "sales-b", "retrying", None),
+        ("seller-b-ready-2", "sales-b", "succeeded", "seller-b-lead-2"),
+    ):
+        message_time = start + timedelta(seconds=len(message_id))
+        seed_message(
+            context.session_factory,
+            message_id=message_id,
+            sales_user_id=sales_user_id,
+            received_at=message_time,
+            segments=(
+                (SegmentSpec(lead_id, "测试公司", f"record-{lead_id}"),)
+                if lead_id is not None
+                else ()
+            ),
+            outbox_status=status,
+        )
+        register_candidate(context, message_id, now=message_time)
+
+    assert context.service.recover_pending_messages(limit=3) == 3
+    with context.session_factory() as session:
+        assert session.get(LeadProgressMessage, "seller-a-pending-1").status == "processing"
+        assert session.get(LeadProgressMessage, "seller-b-pending-1").status == "processing"
+        assert session.get(LeadProgressMessage, "seller-b-ready-1").status == "included"
+        assert session.get(LeadProgressMessage, "seller-a-ready-1").status == "included"
+        assert session.get(LeadProgressMessage, "seller-b-ready-2").status == "included"
+
+
+def test_awaiting_intent_submission_command_is_ignored_by_recovery() -> None:
+    """尚待意图判断的 CRM 提交指令不会建立需求会话或进入统计。"""
+    context = progress_context()
+    received_at = datetime(2026, 10, 8, 10, 0, tzinfo=UTC)
+    seed_message(
+        context.session_factory,
+        message_id="awaiting-submit-command",
+        sales_user_id="sales-a",
+        received_at=received_at,
+        event_type="crm_submission_intent",
+        outbox_status="succeeded",
+    )
+    with context.session_factory.begin() as session:
+        message = session.get(IncomingMessage, "awaiting-submit-command")
+        assert message is not None
+        assert register_progress_intent_candidate(
+            session,
+            message,
+            Settings(_env_file=None, lead_progress_enabled=True),
+            now=received_at,
+        )
+
+    assert context.service.recover_pending_messages() == 1
+    with context.session_factory() as session:
+        candidate = session.get(LeadProgressMessage, "awaiting-submit-command")
+        assert candidate is not None and candidate.status == "ignored"
+        assert candidate.progress_session_id is None
+        assert session.scalar(select(func.count()).select_from(LeadProgressSession)) == 0
+        assert session.scalar(select(func.count()).select_from(NotificationRecord)) == 0
 
 
 def test_progress_update_failure_does_not_block_outbox_checkpoint_recovery(

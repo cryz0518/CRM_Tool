@@ -206,19 +206,25 @@ def _require_isolation(condition: bool, reason: str) -> None:
 
 
 def _validate_local_docker_endpoint(endpoint: str) -> None:
-    """验证 T15 只能连接本机 Docker socket。
+    """验证 T15 只能连接本机 Unix socket 或 Windows named pipe。
 
     参数：endpoint 为 Docker context 的 daemon 地址。
     返回值：无。
-    异常：远程或无法解析为本地 socket 的 endpoint 使测试 fail closed。
+    异常：TCP/HTTP 转发以及无法确认本机 socket 的 endpoint 均 fail closed。
     副作用：无，不访问该 endpoint。
     """
     parsed = urlsplit(endpoint)
-    local_endpoint = parsed.scheme == "npipe" or parsed.scheme == "unix"
-    if parsed.scheme in {"tcp", "http", "https"}:
-        local_endpoint = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    local_endpoint = (
+        parsed.scheme == "unix" and not parsed.netloc and parsed.path.startswith("/")
+    ) or (
+        parsed.scheme == "npipe"
+        and not parsed.netloc
+        and parsed.path.startswith("//./pipe/")
+    )
     if not local_endpoint:
-        pytest.fail("T15 仅允许本机 Docker daemon；当前 Docker context 不是本地 socket")
+        raise RuntimeError(
+            "T15 仅允许本机 Unix socket 或 Windows named pipe；其余 daemon endpoint 均拒绝"
+        )
 
 
 def _resolve_and_validate_compose(
@@ -315,6 +321,31 @@ def test_ticket15_compose_source_is_tmpfs_only_without_docker() -> None:
     ]
     with pytest.raises(RuntimeError):
         _validate_resolved_compose(unsafe, project_name)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    (
+        "tcp://127.0.0.1:2375",
+        "http://localhost:2375",
+        "https://[::1]:2376",
+        "unix://remote-host/run/docker.sock",
+        "ssh://remote-host",
+    ),
+)
+def test_ticket15_rejects_nonlocal_or_forwardable_endpoints(endpoint: str) -> None:
+    """静态安全门拒绝 TCP 转发及无法证明为本机 socket 的 endpoint。"""
+    with pytest.raises(RuntimeError, match="其余 daemon endpoint 均拒绝"):
+        _validate_local_docker_endpoint(endpoint)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ("unix:///var/run/docker.sock", "npipe:////./pipe/docker_engine"),
+)
+def test_ticket15_accepts_local_socket_endpoints(endpoint: str) -> None:
+    """静态安全门仅接受结构明确的本机 socket endpoint。"""
+    _validate_local_docker_endpoint(endpoint)
 
 
 def test_current_migration_chain_reaches_single_head() -> None:

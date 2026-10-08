@@ -204,7 +204,7 @@ def _attach_progress_message(
 
 @dataclass(frozen=True)
 class LeadProgressStats:
-    """承载单个销售会话的去重计数与当前表格完整度。"""
+    """承载单个销售会话按消息、线索和归属分段去重的统计。"""
 
     received_messages: int
     identified_leads: int
@@ -216,6 +216,7 @@ class LeadProgressStats:
     processing_items: int
     unassigned_segments: int
     snapshot_unverified_leads: int
+    failed_messages_without_lead: int
 
 
 class LeadProgressService:
@@ -345,7 +346,11 @@ class LeadProgressService:
             candidates = session.execute(
                 select(LeadProgressMessage.message_id, OutboxEvent.sales_user_id)
                 .join(OutboxEvent, OutboxEvent.message_id == LeadProgressMessage.message_id)
-                .where(LeadProgressMessage.status.in_(("processing", "awaiting_intent")))
+                .where(
+                    LeadProgressMessage.status.in_(("processing", "awaiting_intent")),
+                    # 只把可收敛候选放入扫描窗口，避免前 100 条活跃消息长期占位。
+                    OutboxEvent.status.not_in(_ACTIVE_OUTBOX_STATUSES),
+                )
                 .order_by(OutboxEvent.sales_user_id, LeadProgressMessage.created_at)
                 .limit(limit)
             ).all()
@@ -719,7 +724,7 @@ class LeadProgressService:
             ).all()
         )
         if not message_ids:
-            return LeadProgressStats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            return LeadProgressStats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
         resolutions = session.scalars(
             select(LeadMessageResolution).where(LeadMessageResolution.message_id.in_(message_ids))
@@ -736,6 +741,9 @@ class LeadProgressService:
             else []
         )
         leads_by_id = {lead.id: lead for lead in leads}
+        messages_with_leads = {
+            item.message_id for item in resolutions if item.lead_id in leads_by_id
+        }
         lead_ids = set(leads_by_id)
         syncs = (
             session.scalars(
@@ -773,6 +781,20 @@ class LeadProgressService:
                 )
             ).all()
             if status in _ACTIVE_OUTBOX_STATUSES
+        }
+        failed_messages_without_lead = {
+            message_id
+            for message_id in session.scalars(
+                select(OutboxEvent.message_id).where(
+                    OutboxEvent.message_id.in_(message_ids),
+                    OutboxEvent.sales_user_id == progress.sales_user_id,
+                    OutboxEvent.event_type.in_(
+                        ("message_received", "crm_submission_intent")
+                    ),
+                    OutboxEvent.status == "failed_pending_review",
+                )
+            ).all()
+            if message_id not in messages_with_leads
         }
         covered_messages = {
             item.message_id for item in resolutions if item.lead_id in processing_lead_ids
@@ -816,6 +838,7 @@ class LeadProgressService:
             processing_items=processing_items,
             unassigned_segments=unassigned_segments,
             snapshot_unverified_leads=unverified_ids,
+            failed_messages_without_lead=len(failed_messages_without_lead),
         )
 
 
@@ -837,6 +860,7 @@ def _render_summary(stats: LeadProgressStats, *, final: bool) -> str:
         f"{stats.incomplete_leads} 条（缺字段 {stats.missing_required_leads}，"
         f"AI待确认 {stats.ai_pending_leads}，可重叠）\n"
         f"同步失败：{stats.sync_failed_leads} 条\n"
+        f"消息处理失败（无 Lead）：{stats.failed_messages_without_lead} 条\n"
         f"处理中／等待重试：{stats.processing_items} 项\n"
         f"无法可靠归属客户：{stats.unassigned_segments} 段"
     )
