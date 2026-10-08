@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, BrokenBarrierError, Event, Lock
@@ -13,12 +14,25 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.schema import CreateSchema, DropSchema
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.crm.mock import MockCRMAdapter
 from app.crm.service import CrmSubmissionService, SubmissionCommand
-from app.leads.models import CrmCompanyIdentity, CrmSyncRecord, Lead
+from app.leads.models import (
+    CrmCompanyIdentity,
+    CrmSyncRecord,
+    Lead,
+    LeadMessageResolution,
+    SmartTableSync,
+)
 from app.leads.review import LeadReviewService
-from app.messaging.models import Base, IncomingMessage, SalesAuthorization
+from app.leads.service import FirstTextLeadWorkspaceService
+from app.messaging.models import (
+    Base,
+    IncomingMessage,
+    NotificationRecord,
+    OutboxEvent,
+    SalesAuthorization,
+)
 from app.messaging.service import IncomingMessageCommand, MessageIntakeResult, MessageIntakeService
 from app.smart_table.adapter import SmartTableActor
 from app.smart_table.mock import MockSmartTableAdapter
@@ -323,6 +337,106 @@ def test_concurrent_first_submission_reserves_exactly_one_global_crm_identity(
         and loser_sync.status == "awaiting_duplicate_confirmation"
         and loser_sync.crm_lead_id == identities[0].crm_lead_id
     )
+
+
+def test_concurrent_first_success_workers_issue_one_sales_notice(
+    postgres_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证真实 PostgreSQL 并发成功事务只发行一个销售首次链接通知。"""
+    settings = Settings(
+        _env_file=None,
+        lead_first_success_link_enabled=True,
+        lead_smart_table_url="https://example.test/smart-table",
+    )
+    monkeypatch.setattr("app.leads.service.get_settings", lambda: settings)
+    with postgres_session_factory.begin() as session:
+        session.add(
+            SalesAuthorization(wecom_user_id="sales-first", is_authorized=True, is_active=True)
+        )
+        session.flush()
+        session.add(
+            IncomingMessage(
+                message_id="message-first-success",
+                sales_user_id="sales-first",
+                sequence=1,
+                raw_payload={"text": "客户需求"},
+                normalized_text="客户需求",
+            )
+        )
+        session.flush()
+        event = OutboxEvent(
+            message_id="message-first-success",
+            sales_user_id="sales-first",
+            sequence=1,
+            event_type="message_received",
+        )
+        lead = Lead(
+            id="lead-first-success",
+            source_message_id="message-first-success",
+            original_capturing_sales_user_id="sales-first",
+            smart_table_owner_user_id="sales-first",
+            smart_table_record_id="table-first-success",
+            lifecycle_state="synced",
+            field_values={"线索名称": "公司"},
+        )
+        session.add_all((event, lead))
+        session.flush()
+        session.add_all(
+            (
+                SmartTableSync(
+                    lead_id=lead.id,
+                    source_message_id=event.message_id,
+                    smart_table_record_id=lead.smart_table_record_id,
+                    status="succeeded",
+                ),
+                LeadMessageResolution(
+                    message_id=event.message_id,
+                    segment_index=0,
+                    lead_id=lead.id,
+                    status="assigned",
+                ),
+            )
+        )
+
+    barrier = Barrier(2)
+
+    def queue_notice() -> None:
+        """在独立事务中并发执行真实的销售级首次成功通知门禁。"""
+        barrier.wait(timeout=5)
+        with postgres_session_factory.begin() as session:
+            event = session.scalar(
+                select(OutboxEvent).where(OutboxEvent.message_id == "message-first-success")
+            )
+            message = session.get(IncomingMessage, "message-first-success")
+            lead = session.get(Lead, "lead-first-success")
+            sync = session.scalar(
+                select(SmartTableSync).where(SmartTableSync.lead_id == "lead-first-success")
+            )
+            assert (
+                event is not None
+                and message is not None
+                and lead is not None
+                and sync is not None
+            )
+            FirstTextLeadWorkspaceService._queue_first_success_notification(
+                session, event, message, lead, sync, 0
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(queue_notice) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=10)
+
+    with postgres_session_factory() as session:
+        notices = session.scalars(
+            select(NotificationRecord).where(
+                NotificationRecord.notification_type == "lead_first_smart_table_success"
+            )
+        ).all()
+    assert len(notices) == 1
+    assert notices[0].notification_key == hashlib.sha256(
+        b"lead_first_smart_table_success:sales-first"
+    ).hexdigest()
 
 
 def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(

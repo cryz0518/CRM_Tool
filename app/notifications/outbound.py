@@ -22,6 +22,8 @@ _NON_RETRYABLE_PROVIDER_CODES = frozenset(
 
 _SUPPORTED_NOTIFICATION_TYPES = frozenset(
     {
+        "lead_intake_receipt",
+        "lead_first_smart_table_success",
         "crm_submission_summary",
         "crm_submission_preview",
         "crm_submission_intent_unrecognized",
@@ -69,6 +71,7 @@ class WecomOutboundNotificationSender:
             ).all()
         sent = 0
         for notice in notices:
+            claimed_notice: tuple[str, str | None, dict[str, object] | None] | None = None
             with self._session_factory.begin() as session:
                 current = session.scalar(
                     select(NotificationRecord)
@@ -85,6 +88,11 @@ class WecomOutboundNotificationSender:
                     current.status not in {"pending", "retrying"} and not lease_expired
                 ):
                     continue
+                if current.notification_type == "lead_intake_receipt" and _receipt_is_deferred(
+                    current.payload, utc_now()
+                ):
+                    # 合并窗口内只累加消息数，等窗口结束再发送一次确认。
+                    continue
                 # 先原子认领，避免多个 Bot 循环重复发送同一通知。
                 claim_token = uuid4().hex
                 current.status = "processing"
@@ -93,10 +101,18 @@ class WecomOutboundNotificationSender:
                     current.processing_started_at + _NOTIFICATION_LEASE
                 )
                 current.processing_claim_token = claim_token
+                claimed_notice = (
+                    current.sales_user_id,
+                    current.content,
+                    dict(current.payload) if current.payload is not None else None,
+                )
+            if claimed_notice is None:
+                continue
             try:
                 # AI Bot 主动发送只支持 markdown 或模板卡片；旧通知可能仍保存 text，统一在边界转换。
-                body = _build_supported_body(notice.payload, notice.content)
-                await self._client.send_message(notice.sales_user_id, body)
+                sales_user_id, content, payload = claimed_notice
+                body = _build_supported_body(payload, content)
+                await self._client.send_message(sales_user_id, body)
             except Exception as exc:
                 provider_error_code = _provider_error_code(exc)
                 retryable = provider_error_code not in _NON_RETRYABLE_PROVIDER_CODES
@@ -149,6 +165,24 @@ class WecomOutboundNotificationSender:
 def _as_utc(value: datetime) -> datetime:
     """将数据库返回的时间统一解释为 UTC，以兼容 SQLite 测试存储。"""
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _receipt_is_deferred(payload: dict[str, object] | None, now: datetime) -> bool:
+    """判断接收提示的持久化合并窗口是否尚未到期。
+
+    参数：payload 为通知记录载荷；now 为当前时间。
+    返回值：截止时间有效且晚于当前时间时返回 True。
+    异常：无；损坏或缺失的截止字段按不延迟处理。
+    副作用：无。
+    """
+    until = payload.get("coalesce_until") if isinstance(payload, dict) else None
+    if not isinstance(until, str):
+        return False
+    try:
+        deadline = datetime.fromisoformat(until)
+    except ValueError:
+        return False
+    return _as_utc(deadline) > _as_utc(now)
 
 
 def _build_supported_body(

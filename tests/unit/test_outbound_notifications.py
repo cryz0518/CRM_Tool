@@ -74,6 +74,88 @@ def test_bot_sender_uses_submitting_sales_userid_and_marks_notice_sent() -> None
         assert notice is not None and notice.status == "succeeded"
 
 
+def test_first_smart_table_notice_sends_clickable_markdown_once_across_bot_restart() -> None:
+    """验证首次录入通知以 Markdown 链接单聊发送，成功状态阻止重启后重发。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    factory = sessionmaker(engine)
+    Base.metadata.create_all(engine)
+    content = (
+        "🎉 你的第一条客户需求已成功录入企业微信智能表格！\n\n"
+        "点击下方链接，即可查看和完善客户信息：\n\n"
+        "[📋 打开需求登记智能表格](https://example.test/smart-table?view=leads)\n\n"
+        "后续可继续发送客户需求，我会自动录入并定期汇报处理进度。"
+    )
+    with factory.begin() as session:
+        session.add(
+            NotificationRecord(
+                notification_key="first-success-sales-1",
+                sales_user_id="sales-1",
+                source_message_id="message-1",
+                notification_type="lead_first_smart_table_success",
+                content=content,
+            )
+        )
+    client = FakeClient()
+
+    first_sender = WecomOutboundNotificationSender(factory, client)
+    assert asyncio.run(first_sender.send_pending_once()) == 1
+    restarted_sender = WecomOutboundNotificationSender(factory, client)
+    assert asyncio.run(restarted_sender.send_pending_once()) == 0
+
+    assert client.calls == [
+        (
+            "sales-1",
+            {"msgtype": "markdown", "markdown": {"content": content}},
+        )
+    ]
+    with factory() as session:
+        notice = session.get(NotificationRecord, "first-success-sales-1")
+    assert notice is not None and notice.status == "succeeded"
+
+
+def test_receipt_sender_waits_for_coalesce_window_then_sends_merged_count() -> None:
+    """验证接收通知在持久化窗口内暂缓发送，窗口结束后使用最新累计消息数。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    factory = sessionmaker(engine)
+    Base.metadata.create_all(engine)
+    with factory.begin() as session:
+        session.add(
+            NotificationRecord(
+                notification_key="receipt-sales-1",
+                sales_user_id="sales-1",
+                source_message_id="message-1",
+                notification_type="lead_intake_receipt",
+                content="✅ 已收到你的 2 条消息，正在识别并录入。",
+                payload={
+                    "receipt_count": 2,
+                    "coalesce_until": (utc_now() + timedelta(seconds=30)).isoformat(),
+                },
+            )
+        )
+    client = FakeClient()
+    sender = WecomOutboundNotificationSender(factory, client)
+
+    assert asyncio.run(sender.send_pending_once()) == 0
+    assert client.calls == []
+    with factory.begin() as session:
+        notice = session.get(NotificationRecord, "receipt-sales-1")
+        assert notice is not None and notice.payload is not None
+        expired_payload = dict(notice.payload)
+        expired_payload["coalesce_until"] = (utc_now() - timedelta(seconds=1)).isoformat()
+        notice.payload = expired_payload
+
+    assert asyncio.run(sender.send_pending_once()) == 1
+    assert client.calls == [
+        (
+            "sales-1",
+            {
+                "msgtype": "markdown",
+                "markdown": {"content": "✅ 已收到你的 2 条消息，正在识别并录入。"},
+            },
+        )
+    ]
+
+
 def test_bot_sender_delivers_lead_processing_failure_notice() -> None:
     """验证安全的线索解析失败通知由现有出站器主动发送。"""
     engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)

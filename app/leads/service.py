@@ -4205,14 +4205,19 @@ class FirstTextLeadWorkspaceService:
 
         with self._session_factory.begin() as session:
             event, message = self._load_event_and_message(session, outbox_event_id)
+            lead = session.get(Lead, lead_id)
             sync = session.scalar(select(SmartTableSync).where(SmartTableSync.lead_id == lead_id))
-            if sync is None:
+            if lead is None or sync is None:
                 raise ValueError(f"线索同步事实不存在：{lead_id}")
             sync.status = "succeeded"
             sync.completed_at = utc_now()
             self._mark_assigned(session, event, lead_id, segment_index)
             self._refresh_context(session, message, lead_id)
             self._record_audit(session, event, "smart_table_record_created")
+            # 成功态和唯一首次通知同事务提交；Bot 只会在事务之后消费这条通知。
+            self._queue_first_success_notification(
+                session, event, message, lead, sync, segment_index
+            )
         assert record_id is not None
         bind_log_context(record_id=record_id)
         logger.info("smart_table_first_lead_created")
@@ -4220,6 +4225,96 @@ class FirstTextLeadWorkspaceService:
             LeadProcessingStatus.CREATED,
             lead_id=lead_id,
             smart_table_record_id=record_id,
+        )
+
+    @staticmethod
+    def _queue_first_success_notification(
+        session: Session,
+        event: OutboxEvent,
+        message: IncomingMessage,
+        lead: Lead,
+        sync: SmartTableSync,
+        segment_index: int,
+    ) -> None:
+        """为销售第一次已核实的智能表格写入登记唯一链接通知。
+
+        参数：session 为最终同步事务；event、message、lead、sync 为本次来源事实；
+        segment_index 为已归属分段。
+        返回值：无；不满足首次成功条件或未配置链接时静默跳过。
+        异常：数据库错误向事务传播；事务失败不会把表格写入记为成功。
+        副作用：可能新增一条待发送 NotificationRecord，与 SmartTableSync 成功态原子提交。
+        """
+        settings = get_settings()
+        url = settings.lead_smart_table_url
+        if (
+            not settings.lead_first_success_link_enabled
+            or not isinstance(url, str)
+            or not url.strip().startswith("https://")
+            or event.event_type != "message_received"
+            or event.sales_user_id != message.sales_user_id
+            or lead.original_capturing_sales_user_id != message.sales_user_id
+            or sync.status != "succeeded"
+            or not lead.smart_table_record_id
+            or sync.smart_table_record_id != lead.smart_table_record_id
+        ):
+            return
+
+        # 只有已持久化为 assigned 的消息分段才代表明确线索归属。
+        resolution = session.scalar(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id == message.message_id,
+                LeadMessageResolution.segment_index == segment_index,
+            )
+        )
+        if resolution is None or resolution.status != "assigned" or resolution.lead_id != lead.id:
+            return
+
+        # 锁销售身份行串行化并发成功事务，停用成员只保留表格结果而不发送通知。
+        actor = session.scalar(
+            select(SalesAuthorization)
+            .where(SalesAuthorization.wecom_user_id == message.sales_user_id)
+            .with_for_update()
+        )
+        if actor is None or not actor.is_active:
+            return
+
+        # 固定用户键防止多 Lead、消息重放、重启和并发 Worker 重复发行逻辑通知。
+        notification_key = hashlib.sha256(
+            f"lead_first_smart_table_success:{message.sales_user_id}".encode()
+        ).hexdigest()
+        if session.get(NotificationRecord, notification_key) is not None:
+            return
+
+        # 已有任何有效成功记录的销售按历史用户处理，不因功能上线收到补发。
+        prior_success = session.scalar(
+            select(SmartTableSync.id)
+            .join(Lead, Lead.id == SmartTableSync.lead_id)
+            .where(
+                Lead.original_capturing_sales_user_id == message.sales_user_id,
+                Lead.id != lead.id,
+                Lead.smart_table_record_id.is_not(None),
+                SmartTableSync.status == "succeeded",
+                SmartTableSync.smart_table_record_id.is_not(None),
+            )
+            .limit(1)
+        )
+        if prior_success is not None:
+            return
+
+        content = (
+            "🎉 你的第一条客户需求已成功录入企业微信智能表格！\n\n"
+            "点击下方链接，即可查看和完善客户信息：\n\n"
+            f"[📋 打开需求登记智能表格]({url.strip()})\n\n"
+            "后续可继续发送客户需求，我会自动录入并定期汇报处理进度。"
+        )
+        session.add(
+            NotificationRecord(
+                notification_key=notification_key,
+                sales_user_id=message.sales_user_id,
+                source_message_id=message.message_id,
+                notification_type="lead_first_smart_table_success",
+                content=content,
+            )
         )
 
     def _source_message_id(self, outbox_event_id: int) -> str:

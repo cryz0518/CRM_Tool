@@ -13,7 +13,9 @@ from sqlalchemy.exc import StatementError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+import app.messaging.service as messaging_service
 from app.ai.models import SubmissionIntent
+from app.core.config import Settings
 from app.messaging.models import (
     Base,
     BusinessAuditEvent,
@@ -296,12 +298,13 @@ def test_outbox_persistence_failure_rolls_back_the_raw_message(
     with session_factory() as session:
         assert session.scalars(select(IncomingMessage)).all() == []
         assert session.scalars(select(OutboxEvent)).all() == []
+        assert session.scalars(select(NotificationRecord)).all() == []
 
 
 def test_persisted_message_remains_idempotent_after_sales_authorization_changes(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证已接收消息的重投不受销售后来停用影响，也不会新增权限通知。"""
+    """验证已接收消息重投不受后来停用影响，且接收提示不被重复统计。"""
     authorize_salesperson(session_factory, "sales-1")
     service = MessageIntakeService(session_factory)
     command = IncomingMessageCommand(
@@ -319,7 +322,11 @@ def test_persisted_message_remains_idempotent_after_sales_authorization_changes(
 
     assert result == MessageIntakeResult(accepted=True, duplicate=True)
     with session_factory() as session:
-        assert session.scalars(select(NotificationRecord)).all() == []
+        notices = session.scalars(select(NotificationRecord)).all()
+    assert len(notices) == 1
+    assert notices[0].notification_type == "lead_intake_receipt"
+    assert notices[0].payload is not None
+    assert notices[0].payload["receipt_count"] == 1
 
 
 def test_authorized_messages_receive_monotonic_sales_sequence(
@@ -348,6 +355,97 @@ def test_authorized_messages_receive_monotonic_sales_sequence(
         events = session.scalars(select(OutboxEvent).order_by(OutboxEvent.sequence)).all()
 
     assert [event.sequence for event in events] == [1, 2]
+
+
+def test_receipt_coalesces_per_sales_and_duplicate_message_counts_once(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证接收提示按销售分隔合并，重复 message_id 不增加计数。"""
+    monkeypatch.setattr(
+        messaging_service,
+        "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            lead_receipt_enabled=True,
+            lead_receipt_coalesce_seconds=5,
+        ),
+    )
+    authorize_salesperson(session_factory, "sales-a")
+    authorize_salesperson(session_factory, "sales-b")
+    intake = MessageIntakeService(session_factory)
+    first = IncomingMessageCommand(
+        message_id="receipt-a-1", sales_user_id="sales-a", raw_payload={"text": "客户A"}
+    )
+
+    intake.receive(first)
+    intake.receive(first)
+    intake.receive(
+        IncomingMessageCommand(
+            message_id="receipt-a-2", sales_user_id="sales-a", raw_payload={"text": "客户A补充"}
+        )
+    )
+    intake.receive(
+        IncomingMessageCommand(
+            message_id="receipt-b-1", sales_user_id="sales-b", raw_payload={"text": "客户B"}
+        )
+    )
+
+    with session_factory() as session:
+        notices = session.scalars(
+            select(NotificationRecord)
+            .where(NotificationRecord.notification_type == "lead_intake_receipt")
+            .order_by(NotificationRecord.sales_user_id)
+        ).all()
+
+    assert [(notice.sales_user_id, notice.payload["receipt_count"]) for notice in notices] == [
+        ("sales-a", 2),
+        ("sales-b", 1),
+    ]
+    assert notices[0].content == "✅ 已收到你的 2 条消息，正在识别并录入。"
+
+
+def test_submission_and_action_commands_do_not_create_lead_receipts(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 CRM 提交命令和确定性确认动作不触发线索录入中提示。"""
+    monkeypatch.setattr(
+        messaging_service,
+        "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            lead_receipt_enabled=True,
+            lead_receipt_coalesce_seconds=5,
+        ),
+    )
+    authorize_salesperson(session_factory, "sales-1")
+    intake = MessageIntakeService(session_factory)
+    intake.receive(
+        IncomingMessageCommand(
+            message_id="receipt-submit",
+            sales_user_id="sales-1",
+            raw_payload={"text": "提交今天的线索"},
+            normalized_text="提交今天的线索",
+        )
+    )
+    intake.receive(
+        IncomingMessageCommand(
+            message_id="receipt-action",
+            sales_user_id="sales-1",
+            raw_payload={"text": "t18.discard:lead-1"},
+            normalized_text="t18.discard:lead-1",
+        )
+    )
+
+    with session_factory() as session:
+        event_types = session.scalars(select(OutboxEvent.event_type).order_by(OutboxEvent.id)).all()
+        receipts = session.scalars(
+            select(NotificationRecord).where(
+                NotificationRecord.notification_type == "lead_intake_receipt"
+            )
+        ).all()
+
+    assert event_types == ["crm_submission_command", "wecom_action_command"]
+    assert receipts == []
 
 
 def test_new_actor_is_registered_and_message_enters_processing_work(
@@ -382,7 +480,8 @@ def test_new_actor_is_registered_and_message_enters_processing_work(
     assert actor.next_message_sequence == 1
     assert len(messages) == 1 and messages[0].sequence == 1
     assert len(outbox) == 1 and outbox[0].sequence == 1
-    assert notices == []
+    assert len(notices) == 1
+    assert notices[0].notification_type == "lead_intake_receipt"
 
 
 def test_inactive_actor_is_rejected_without_processing_work(
