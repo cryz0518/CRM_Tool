@@ -610,6 +610,8 @@ def _run_docker(
             f"Error: No such container: {not_found_name}",
             f"Error response from daemon: No such object: {not_found_name}",
             f"Error response from daemon: No such container: {not_found_name}",
+            f"Error: No such network: {not_found_name}",
+            f"Error response from daemon: network {not_found_name} not found",
         }
         if (
             not_found_name is not None

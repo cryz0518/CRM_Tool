@@ -467,6 +467,39 @@ def test_docker_not_found_is_accepted_only_for_exact_cleanup_resource(
         )
 
 
+def test_docker_network_not_found_response_confirms_exact_cleanup_resource(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """网络清理只接受 Docker daemon 针对本轮随机网络的精确 not-found 响应。"""
+    name = "t15-it-net-" + "b" * 32
+
+    def fake_run(
+        arguments: list[str], **_kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        """模拟 Docker Desktop 的网络 not-found 错误格式。"""
+        return subprocess.CompletedProcess(
+            arguments, 1, "", f"Error response from daemon: network {name} not found"
+        )
+
+    monkeypatch.setattr(t15_postgres_docker_test.subprocess, "run", fake_run)
+    assert (
+        t15_postgres_docker_test._run_docker(
+            ["docker", "network", "inspect", name],
+            {},
+            "network_cleanup_verify",
+            not_found_name=name,
+        )
+        == ""
+    )
+    with pytest.raises(t15_postgres_docker_test.T15DockerSafetyError):
+        t15_postgres_docker_test._run_docker(
+            ["docker", "network", "inspect", name],
+            {},
+            "network_cleanup_verify",
+            not_found_name="other-network",
+        )
+
+
 def test_docker_subprocess_boundary_is_fake_and_rejects_non_allowlisted_commands(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
