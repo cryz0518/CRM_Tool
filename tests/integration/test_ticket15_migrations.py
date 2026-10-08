@@ -163,7 +163,7 @@ def test_current_migration_chain_reaches_single_head() -> None:
             heads, ("run", "--rm", "--no-deps", "migrate", "alembic", "heads")
         )
         # 当前最新迁移继续保持单一 migration head。
-        assert heads.stdout.count("0032_wecom_quote_routing") == 1
+        assert heads.stdout.count("0033_lead_progress_sessions") == 1
 
         # 只有 notification payload 的 T18 事实也必须阻止 downgrade，不能因没有 action 行而丢列。
         payload_seed = _run_compose(

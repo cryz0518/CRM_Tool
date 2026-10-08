@@ -18,6 +18,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     select,
+    text,
 )
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
@@ -209,6 +210,56 @@ class LeadMessageResolution(Base):
     )
 
     __table_args__ = (UniqueConstraint("message_id", "segment_index"),)
+
+
+class LeadProgressSession(Base):
+    """保存单个销售一次连续需求录入进度会话及其独立汇报时钟。"""
+
+    __tablename__ = "lead_progress_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_lead_id)
+    sales_user_id: Mapped[str] = mapped_column(
+        ForeignKey("sales_authorizations.wecom_user_id"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(String(16), default="active", nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_activity_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    next_report_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    close_reason: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'closed', 'disabled')", name="ck_lead_progress_session_status"
+        ),
+        Index(
+            "uq_lead_progress_sessions_active_sales_user",
+            "sales_user_id",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+            sqlite_where=text("status = 'active'"),
+        ),
+        Index("ix_lead_progress_sessions_due", "status", "next_report_at"),
+    )
+
+
+class LeadProgressMessage(Base):
+    """把一条已识别的有效需求消息唯一关联到其进度统计窗口。"""
+
+    __tablename__ = "lead_progress_messages"
+
+    message_id: Mapped[str] = mapped_column(
+        ForeignKey("incoming_messages.message_id"), primary_key=True
+    )
+    progress_session_id: Mapped[str] = mapped_column(
+        ForeignKey("lead_progress_sessions.id"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
 
 
 class MessageReassignmentAudit(Base):

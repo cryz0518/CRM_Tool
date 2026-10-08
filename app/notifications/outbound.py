@@ -11,8 +11,9 @@ from uuid import uuid4
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.config import get_settings
 from app.leads.models import Lead, LeadMessageResolution, SmartTableSync
-from app.messaging.models import NotificationRecord, OutboxEvent, utc_now
+from app.messaging.models import NotificationRecord, OutboxEvent, SalesAuthorization, utc_now
 
 logger = logging.getLogger(__name__)
 _NOTIFICATION_LEASE = timedelta(minutes=5)
@@ -27,6 +28,7 @@ _RECEIPT_TERMINAL_OUTBOX_STATUSES = frozenset(
 _SUPPORTED_NOTIFICATION_TYPES = frozenset(
     {
         "lead_intake_receipt",
+        "lead_progress_summary",
         "lead_first_smart_table_success",
         "crm_submission_summary",
         "crm_submission_preview",
@@ -92,6 +94,19 @@ class WecomOutboundNotificationSender:
                     current.status not in {"pending", "retrying"} and not lease_expired
                 ):
                     continue
+                if current.notification_type == "lead_progress_summary":
+                    authorization = session.get(SalesAuthorization, current.sales_user_id)
+                    if (
+                        not get_settings().lead_progress_enabled
+                        or authorization is None
+                        or not authorization.is_active
+                    ):
+                        # 停用销售或功能关闭时不发送排队中的主动进度汇报。
+                        current.status = "suppressed"
+                        current.processing_started_at = None
+                        current.processing_lease_expires_at = None
+                        current.processing_claim_token = None
+                        continue
                 if current.notification_type == "lead_intake_receipt" and _receipt_is_deferred(
                     current.payload, utc_now()
                 ):
