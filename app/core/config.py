@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     lead_outbox_poll_seconds: int = 10
     lead_receipt_enabled: bool = True
     lead_receipt_coalesce_seconds: int = 5
+    lead_progress_enabled: bool = True
+    lead_progress_interval_minutes: int = Field(default=15, gt=0, le=1440)
+    lead_progress_idle_stop_minutes: int = Field(default=60, gt=0, le=10080)
     lead_first_success_link_enabled: bool = True
     lead_smart_table_url: str | None = None
     audit_mirror_batch_size: int = 10

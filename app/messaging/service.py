@@ -145,8 +145,20 @@ class MessageIntakeService:
                         event_type=event_type,
                     )
                 )
-                # 通知记录与消息、Outbox 同事务提交；后台发送器只会看到已提交接收事实。
                 settings = get_settings()
+                # 普通消息原子启动计时；提交式文本只留候选，待确定为需求后再启用计时。
+                if event_type in {"message_received", "crm_submission_intent"}:
+                    session.flush()
+                    from app.leads.progress import (
+                        register_progress_intent_candidate,
+                        register_progress_message,
+                    )
+
+                    if event_type == "message_received":
+                        register_progress_message(session, message, settings)
+                    else:
+                        register_progress_intent_candidate(session, message, settings)
+                # 通知记录与消息、Outbox 同事务提交；后台发送器只会看到已提交接收事实。
                 if event_type == "message_received" and settings.lead_receipt_enabled:
                     self._record_lead_receipt(
                         session, command, settings.lead_receipt_coalesce_seconds

@@ -43,6 +43,12 @@ def build_beat_schedule(settings: Settings) -> dict[str, dict[str, object]]:
             "task": "workers.issue_retention_cleanup_operations",
             "schedule": settings.lead_outbox_poll_seconds,
         }
+    if settings.lead_progress_enabled:
+        # Beat 只负责短周期扫描；每名销售的实际到期时间由数据库会话独立控制。
+        schedule["schedule-lead-progress-reports"] = {
+            "task": "workers.schedule_lead_progress_reports",
+            "schedule": settings.lead_outbox_poll_seconds,
+        }
     return schedule
 
 settings = get_settings()

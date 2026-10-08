@@ -32,6 +32,7 @@ from app.leads.models import (
     deserialize_field_value,
     serialize_field_value,
 )
+from app.leads.progress import LeadProgressService
 from app.leads.quote_routing import (
     QuoteRecoveryExtractionRequest,
     QuoteRecoverySegment,
@@ -353,13 +354,15 @@ class FirstTextLeadWorkspaceService:
         ai_gateway: AIGateway | None = None,
         company_lead_service: CompanyLeadService | None = None,
         robot_submission_confirmation_available: bool | None = None,
+        lead_progress_service: LeadProgressService | None = None,
     ) -> None:
         """注入数据库、表格和销售身份边界，避免业务层依赖真实 CLI 或 Qwen。
 
         参数：session_factory 创建事务；smart_table_adapter 写销售审核表；身份提供器可替换测试实现；
         lead_context_ttl_minutes 可覆盖环境中的上下文有效期；
         ai_gateway 为可替换的 T08 网关；company_lead_service 负责 T10 公司核验与销售内去重；
-        robot_submission_confirmation_available 表示真实卡片回调 capability/readiness。
+        robot_submission_confirmation_available 表示真实卡片回调 capability/readiness；
+        lead_progress_service 为可选的有效需求消息会话登记服务。
         返回值：无。
         异常：无；依赖错误在消费时按其真实类型处理。
         副作用：仅保存依赖引用，不读写数据库或智能表格。
@@ -369,6 +372,7 @@ class FirstTextLeadWorkspaceService:
         self._sales_identity_provider = sales_identity_provider or DatabaseSalesIdentityProvider()
         self._ai_gateway = ai_gateway
         self._company_lead_service = company_lead_service
+        self._lead_progress_service = lead_progress_service
         settings = get_settings()
         self._robot_submission_confirmation_available = (
             settings.wecom_card_callback_ready()
@@ -410,6 +414,32 @@ class FirstTextLeadWorkspaceService:
         # 表格首次同步成功后才应用公司核验和销售内去重，避免失败重试中重放外部写入。
         if not result.company_resolution_applied:
             result = self._apply_company_resolution(outbox_event_id, result)
+        progress_outcomes = {
+            LeadProcessingStatus.CREATED: True,
+            LeadProcessingStatus.UPDATED: True,
+            LeadProcessingStatus.UNASSIGNED: True,
+            LeadProcessingStatus.QUOTE_UNRESOLVED: True,
+            LeadProcessingStatus.SYNC_FAILED: True,
+            LeadProcessingStatus.IGNORED: False,
+            LeadProcessingStatus.UNAUTHORIZED: False,
+            LeadProcessingStatus.INVALID_EVENT: False,
+        }
+        if self._lead_progress_service is not None and result.status in progress_outcomes:
+            # 接收事务已留下候选事实；此处只收敛统计状态，失败由 Scheduler 按 Outbox 恢复。
+            try:
+                with self._session_factory() as session:
+                    event = session.get(OutboxEvent, outbox_event_id)
+                    message_id = event.message_id if event is not None else None
+                if message_id is not None:
+                    self._lead_progress_service.record_resolved_message(
+                        message_id, included=progress_outcomes[result.status]
+                    )
+            except Exception:
+                # 进度模块异常不得阻断本条 Outbox 检查点；候选行仍可由独立 Scheduler 收敛。
+                logger.exception(
+                    "lead_progress_outcome_update_failed",
+                    extra={"outbox_event_id": outbox_event_id},
+                )
         # 只在本事件已越过首次消费检查点后继续，防止 retrying/processing 事件被错误跳过。
         self._consume_next_after_checkpoint(outbox_event_id)
         return result

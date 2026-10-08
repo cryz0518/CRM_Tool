@@ -29,6 +29,7 @@ from app.crm.commands import (
 )
 from app.crm.dependencies import get_crm_adapter
 from app.leads.models import Lead, LeadMessageResolution
+from app.leads.progress import LeadProgressService, activate_progress_intent_candidate
 from app.leads.review import LeadReviewService
 from app.leads.service import COMPLETED_CHECKPOINT_STATUSES, FirstTextLeadWorkspaceService
 from app.media.dependencies import get_media_attachment_service, get_media_storage_provider
@@ -539,8 +540,17 @@ def consume_lead_outbox_event(
                 message.normalized_text or ""
             )
             if intent.intent == "LEAD_CAPTURE":
-                # 正常线索意图必须回到原有抽取管线，不能被当作未识别提交结束。
-                pass
+                # 一旦确定为需求就按原消息接收时刻启用计时；登记故障留待调度器恢复，不阻断线索管线。
+                try:
+                    with factory.begin() as session:
+                        activate_progress_intent_candidate(
+                            session, message.message_id, get_settings()
+                        )
+                except Exception:
+                    logger.exception(
+                        "lead_progress_intent_activation_failed",
+                        extra={"outbox_event_id": outbox_event_id},
+                    )
             elif intent.intent == "UNKNOWN" or not is_explicit_submission_request(
                 message.normalized_text or ""
             ):
@@ -600,6 +610,11 @@ def consume_lead_outbox_event(
                 factory, smart_table_adapter, get_tyc_adapter()
             ),
             robot_submission_confirmation_available=get_settings().wecom_card_callback_ready(),
+            lead_progress_service=(
+                LeadProgressService(factory, smart_table_adapter)
+                if get_settings().lead_progress_enabled
+                else None
+            ),
         )
         if recover_expired_lease:
             # 失联处理只进入既有人工复核路径，绝不重放媒体、模型或智能表格调用。
@@ -615,6 +630,26 @@ def consume_lead_outbox_event(
         return service.consume(outbox_event_id, claimed_for_processing=True).status.value
     finally:
         # 每个短任务释放独立连接池，避免 Beat 持续扫描时堆积空闲连接。
+        engine.dispose()
+
+
+@celery_app.task(name="workers.schedule_lead_progress_reports")  # type: ignore[untyped-decorator]
+def schedule_lead_progress_reports() -> int:
+    """排程当前到期的销售需求进度通知，不触发 AI、智能表格写入或 CRM。
+
+    参数：无。
+    返回值：本轮新建的逻辑汇总通知数量。
+    异常：数据库错误传播给 Celery 供任务重试；表格只读错误由进度服务记为待核实。
+    副作用：读取当前智能表格快照并持久化通知，不直接调用 Bot 发送接口。
+    """
+    settings = get_settings()
+    if not settings.lead_progress_enabled:
+        return 0
+    engine, factory = _session_factory()
+    try:
+        service = LeadProgressService(factory, get_smart_table_adapter(), settings)
+        return service.schedule_due_reports()
+    finally:
         engine.dispose()
 
 
