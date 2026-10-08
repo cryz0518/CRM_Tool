@@ -711,7 +711,8 @@ class LeadProgressService:
         """按消息关联与当前同步事实计算互不串线的会话统计。
 
         参数：session 为数据库事务；progress 为统计窗口；fresh_fields 为当前远端字段。
-        返回值：所有消息、Lead、同步和归属指标均按各自主键去重。
+        返回值：消息、Lead、同步和归属指标按各自主键去重；已有待归属结论不重复计为
+        无 Lead 失败，只有持久化了独立失败分类及摘要时才同时计入失败。
         异常：数据库读取失败向调用方传播；不完整字段由 LeadCompletenessService 处理。
         副作用：仅读取数据库快照，不修改 Lead 或 SmartTableSync。
         """
@@ -743,6 +744,11 @@ class LeadProgressService:
         leads_by_id = {lead.id: lead for lead in leads}
         messages_with_leads = {
             item.message_id for item in resolutions if item.lead_id in leads_by_id
+        }
+        messages_with_unassigned_conclusions = {
+            item.message_id
+            for item in resolutions
+            if item.status in _UNASSIGNED_RESOLUTION_STATUSES
         }
         lead_ids = set(leads_by_id)
         syncs = (
@@ -784,8 +790,12 @@ class LeadProgressService:
         }
         failed_messages_without_lead = {
             message_id
-            for message_id in session.scalars(
-                select(OutboxEvent.message_id).where(
+            for message_id, failure_category, failure_summary in session.execute(
+                select(
+                    OutboxEvent.message_id,
+                    OutboxEvent.failure_category,
+                    OutboxEvent.failure_summary,
+                ).where(
                     OutboxEvent.message_id.in_(message_ids),
                     OutboxEvent.sales_user_id == progress.sales_user_id,
                     OutboxEvent.event_type.in_(
@@ -795,6 +805,11 @@ class LeadProgressService:
                 )
             ).all()
             if message_id not in messages_with_leads
+            and (
+                message_id not in messages_with_unassigned_conclusions
+                # 待归属结论只有同时存在分类和摘要时，才另计为独立处理失败。
+                or (failure_category is not None and failure_summary is not None)
+            )
         }
         covered_messages = {
             item.message_id for item in resolutions if item.lead_id in processing_lead_ids
@@ -860,10 +875,13 @@ def _render_summary(stats: LeadProgressStats, *, final: bool) -> str:
         f"{stats.incomplete_leads} 条（缺字段 {stats.missing_required_leads}，"
         f"AI待确认 {stats.ai_pending_leads}，可重叠）\n"
         f"同步失败：{stats.sync_failed_leads} 条\n"
-        f"消息处理失败（无 Lead）：{stats.failed_messages_without_lead} 条\n"
         f"处理中／等待重试：{stats.processing_items} 项\n"
         f"无法可靠归属客户：{stats.unassigned_segments} 段"
     )
+    if stats.failed_messages_without_lead:
+        content += (
+            f"\n独立消息处理失败（无 Lead）：{stats.failed_messages_without_lead} 条"
+        )
     if stats.snapshot_unverified_leads:
         content += f"\n当前表格待核实：{stats.snapshot_unverified_leads} 条"
     return content

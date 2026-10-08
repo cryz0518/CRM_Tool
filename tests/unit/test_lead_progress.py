@@ -390,8 +390,9 @@ def test_success_and_incomplete_counts_use_fresh_fields_and_separate_categories(
     assert "AI待确认 1，可重叠" in (notice.content or "")
 
 
-def test_unassigned_segments_are_not_smart_table_success() -> None:
-    """UNASSIGNED 分段计入无法归属，但不能成为识别或成功 Lead。"""
+@pytest.mark.parametrize("resolution_status", ("unassigned", "quote_unresolved"))
+def test_unassigned_segments_are_not_smart_table_success(resolution_status: str) -> None:
+    """UNASSIGNED 与未解引用分段只计待归属，不重复算作普通消息失败。"""
     context = progress_context()
     start = datetime(2026, 10, 8, 5, 0, tzinfo=UTC)
     seed_message(
@@ -402,6 +403,15 @@ def test_unassigned_segments_are_not_smart_table_success() -> None:
         segments=(SegmentSpec(None, resolution_status="unassigned"),),
         outbox_status="failed_pending_review",
     )
+    if resolution_status == "quote_unresolved":
+        with context.session_factory.begin() as session:
+            resolution = session.scalar(
+                select(LeadMessageResolution).where(
+                    LeadMessageResolution.message_id == "unassigned"
+                )
+            )
+            assert resolution is not None
+            resolution.status = resolution_status
     context.service.record_resolved_message("unassigned", now=start)
 
     assert context.service.schedule_due_reports(now=start + timedelta(minutes=15)) == 1
@@ -412,8 +422,45 @@ def test_unassigned_segments_are_not_smart_table_success() -> None:
     assert stats["identified_leads"] == 0
     assert stats["successful_leads"] == 0
     assert stats["unassigned_segments"] == 1
+    assert stats["failed_messages_without_lead"] == 0
+    assert "无法可靠归属客户：1 段" in (notice.content or "")
+    assert "消息处理失败" not in (notice.content or "")
+
+
+def test_unassigned_message_with_separate_failure_fact_counts_both_dimensions() -> None:
+    """有独立失败分类和摘要时，待归属与消息失败可分别提示。"""
+    context = progress_context()
+    start = datetime(2026, 10, 8, 5, 15, tzinfo=UTC)
+    seed_message(
+        context.session_factory,
+        message_id="unassigned-independent-failure",
+        sales_user_id="sales-a",
+        received_at=start,
+        segments=(SegmentSpec(None, resolution_status="unassigned"),),
+        outbox_status="failed_pending_review",
+    )
+    with context.session_factory.begin() as session:
+        event = session.scalar(
+            select(OutboxEvent).where(
+                OutboxEvent.message_id == "unassigned-independent-failure"
+            )
+        )
+        assert event is not None
+        event.failure_category = "permanent"
+        event.failure_summary = "independent_processing_failure"
+    context.service.record_resolved_message(
+        "unassigned-independent-failure", now=start
+    )
+
+    assert context.service.schedule_due_reports(now=start + timedelta(minutes=15)) == 1
+    notice = read_notice(context.session_factory, "sales-a")
+    assert notice is not None and notice.payload is not None
+    stats = notice.payload["stats"]
+    assert isinstance(stats, dict)
+    assert stats["unassigned_segments"] == 1
     assert stats["failed_messages_without_lead"] == 1
-    assert "消息处理失败（无 Lead）：1 条" in (notice.content or "")
+    assert "无法可靠归属客户：1 段" in (notice.content or "")
+    assert "独立消息处理失败（无 Lead）：1 条" in (notice.content or "")
 
 
 def test_failed_outbox_without_any_lead_has_separate_message_count() -> None:
@@ -440,6 +487,30 @@ def test_failed_outbox_without_any_lead_has_separate_message_count() -> None:
     assert stats["successful_leads"] == 0
     assert stats["sync_failed_leads"] == 0
     assert stats["failed_messages_without_lead"] == 1
+    assert "独立消息处理失败（无 Lead）：1 条" in (notice.content or "")
+
+
+def test_retrying_outbox_without_lead_is_not_a_final_message_failure() -> None:
+    """无 Lead 消息的 Outbox retrying 只计处理中，不提前计为终态失败。"""
+    context = progress_context()
+    received_at = datetime(2026, 10, 8, 5, 45, tzinfo=UTC)
+    seed_message(
+        context.session_factory,
+        message_id="retrying-without-lead",
+        sales_user_id="sales-a",
+        received_at=received_at,
+        outbox_status="retrying",
+    )
+    register_candidate(context, "retrying-without-lead", now=received_at)
+
+    assert context.service.schedule_due_reports(now=received_at + timedelta(minutes=15)) == 1
+    notice = read_notice(context.session_factory, "sales-a")
+    assert notice is not None and notice.payload is not None
+    stats = notice.payload["stats"]
+    assert isinstance(stats, dict)
+    assert stats["processing_items"] == 1
+    assert stats["failed_messages_without_lead"] == 0
+    assert "消息处理失败" not in (notice.content or "")
 
 
 def test_retrying_is_processing_while_failed_pending_review_is_sync_failure() -> None:
