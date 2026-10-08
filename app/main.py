@@ -16,6 +16,7 @@ from app.console.routes import router as console_router
 from app.core.config import get_settings
 from app.core.heartbeat import check_heartbeat
 from app.core.logging import bind_log_context, configure_logging, reset_log_context
+from app.core.migration_readiness import check_migration_readiness
 from app.core.provider_policy import get_provider_policy
 from app.core.readiness import (
     ReadinessComponent,
@@ -123,14 +124,9 @@ def _runtime_readiness_components() -> tuple[ReadinessComponent, ...]:
             return not_ready_component("migration", "migration_unavailable")
         try:
             with engine.connect() as connection:
-                revision = connection.execute(
-                    text("SELECT version_num FROM alembic_version")
-                ).scalar()
+                return check_migration_readiness(connection)
         except Exception:
             return not_ready_component("migration", "migration_unavailable")
-        if revision != "0023_ticket22_storage_retention":
-            return not_ready_component("migration", "migration_pending")
-        return ready_component("migration", "migration_current")
 
     redis_client: Redis | None = None
 
