@@ -21,6 +21,78 @@ _COMPOSE_FILE = Path(__file__).with_name("ticket15-compose.json")
 _COMPOSE_ENV_FILE = Path(__file__).with_name("ticket15-compose.env")
 
 
+class T15ValidationError(RuntimeError):
+    """保留 T15 检查阶段和脱敏诊断字段的安全门异常。"""
+
+    def __init__(
+        self,
+        stage: str,
+        error_code: str,
+        reason: str,
+        *,
+        exit_code: int | None = None,
+        exception_type: str | None = None,
+        external_command_executed: bool,
+    ) -> None:
+        """创建不包含环境变量、命令输出或 Compose 数据的诊断记录。
+
+        参数：stage 和 error_code 标记失败阶段及安全错误码；reason 为固定脱敏原因；
+        其余字段描述退出码、异常类型及失败前是否有外部进程实际运行。
+        返回值：无。
+        异常：无。
+        副作用：设置异常属性，供 pytest 和离线诊断读取。
+        """
+        self.stage = stage
+        self.error_code = error_code
+        self.reason = reason
+        self.exit_code = exit_code
+        self.exception_type = exception_type
+        self.external_command_executed = external_command_executed
+        details = f"T15[{error_code}] stage={stage}: {reason}"
+        if exit_code is not None:
+            details += f" (exit_code={exit_code})"
+        super().__init__(details)
+
+    def to_safe_dict(self) -> dict[str, str | int | bool | None]:
+        """返回仅包含安全诊断字段的结构化记录，不包含命令或配置内容。
+
+        参数：无。
+        返回值：可供日志或测试检查的脱敏字段映射。
+        异常：无。
+        副作用：无。
+        """
+        return {
+            "status": "failed",
+            "stage": self.stage,
+            "error_code": self.error_code,
+            "reason": self.reason,
+            "exit_code": self.exit_code,
+            "exception_type": self.exception_type,
+            "external_command_executed": self.external_command_executed,
+        }
+
+
+def _subprocess_start_error(
+    stage: str, error: OSError, *, prior_command_executed: bool
+) -> T15ValidationError:
+    """把 subprocess 启动异常转换为不泄露本机路径的阶段诊断。
+
+    参数：stage 为待运行的安全检查阶段；error 为启动异常；prior_command_executed
+    表示本轮此前是否已有 subprocess 成功返回。
+    返回值：包含固定错误码和异常类型的安全诊断。
+    异常：无。
+    副作用：无。
+    """
+    missing_cli = isinstance(error, FileNotFoundError)
+    return T15ValidationError(
+        stage,
+        "DOCKER_CLI_NOT_FOUND" if missing_cli else "SUBPROCESS_START_FAILED",
+        "未找到 Docker CLI" if missing_cli else "无法启动检查子进程",
+        exception_type=type(error).__name__,
+        external_command_executed=prior_command_executed,
+    )
+
+
 def _run_compose(
     project_name: str,
     environment: dict[str, str],
@@ -237,39 +309,110 @@ def _resolve_and_validate_compose(
     异常：命令失败、JSON 无效或配置存在持久化资源时测试失败且不启动容器。
     副作用：仅读取 Docker context 与 Compose 配置，不调用 daemon 创建资源。
     """
-    context = subprocess.run(
-        ["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=environment,
-        cwd=_REPOSITORY_ROOT,
+    try:
+        context = subprocess.run(
+            ["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=environment,
+            cwd=_REPOSITORY_ROOT,
+        )
+    except OSError as error:
+        raise _subprocess_start_error(
+            "docker_context", error, prior_command_executed=False
+        ) from None
+    _assert_compose_success(
+        context,
+        ("context", "inspect", "<local-endpoint>"),
+        stage="docker_context",
     )
-    _assert_compose_success(context, ("context", "inspect", "<local-endpoint>"))
-    _validate_local_docker_endpoint(context.stdout.strip())
-    resolved = _run_compose(project_name, environment, "config", "--format", "json")
-    _assert_compose_success(resolved, ("config", "--format", "json"))
-    config = json.loads(resolved.stdout)
-    _validate_resolved_compose(config, project_name)
+    try:
+        _validate_local_docker_endpoint(context.stdout.strip())
+    except Exception as error:
+        raise T15ValidationError(
+            "docker_endpoint",
+            "DOCKER_ENDPOINT_UNSUPPORTED",
+            "Docker endpoint 不在本机 socket 白名单",
+            exception_type=type(error).__name__,
+            external_command_executed=True,
+        ) from None
+    try:
+        resolved = _run_compose(project_name, environment, "config", "--format", "json")
+    except OSError as error:
+        raise _subprocess_start_error(
+            "compose_config", error, prior_command_executed=True
+        ) from None
+    _assert_compose_success(
+        resolved, ("config", "--format", "json"), stage="compose_config"
+    )
+    try:
+        config = json.loads(resolved.stdout)
+    except (json.JSONDecodeError, TypeError) as error:
+        raise T15ValidationError(
+            "compose_json",
+            "COMPOSE_JSON_INVALID",
+            "Compose JSON 格式无效",
+            exit_code=resolved.returncode,
+            exception_type=type(error).__name__,
+            external_command_executed=True,
+        ) from None
+    try:
+        _validate_resolved_compose(config, project_name)
+    except Exception as error:
+        prefix = "T15 isolation check failed: "
+        message = str(error)
+        reason = (
+            message.removeprefix(prefix)
+            if message.startswith(prefix)
+            else "最终 Compose 配置未通过隔离安全门"
+        )
+        raise T15ValidationError(
+            "compose_safety",
+            "COMPOSE_ISOLATION_FAILED",
+            reason,
+            exception_type=type(error).__name__,
+            external_command_executed=True,
+        ) from None
     return config
 
 
 def _assert_compose_success(
-    completed: subprocess.CompletedProcess[str], arguments: tuple[str, ...]
+    completed: subprocess.CompletedProcess[str],
+    arguments: tuple[str, ...],
+    *,
+    stage: str | None = None,
 ) -> None:
-    """断言 Docker Compose 命令成功，并在失败时保留可排查的命令摘要。
+    """检查子进程退出状态，并以脱敏阶段信息报告非零退出。
 
-    参数：completed 为 Compose 命令结果；arguments 为不含凭据的命令参数。
-    返回值：无。
-    异常：命令非零退出时抛出 pytest 断言失败。
+    参数：completed 为命令结果；arguments 只用于确定安全阶段；stage 可显式指定阶段。
+    返回值：命令成功时无。
+    异常：命令非零退出时抛出不包含 stdout/stderr 的 T15ValidationError。
     副作用：无。
     """
     if completed.returncode != 0:
-        raise RuntimeError(
-            f"docker compose {' '.join(arguments)} failed with exit {completed.returncode}\n"
-            f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+        failure_stage = stage or (
+            "docker_context"
+            if arguments[:1] == ("context",)
+            else "compose_config"
+            if arguments[:1] == ("config",)
+            else "compose_runtime"
+        )
+        failure_reason = {
+            "docker_context": "Docker context 检查命令退出非零",
+            "compose_config": "Compose 配置解析命令退出非零",
+        }.get(failure_stage, "Compose 检查命令退出非零")
+        raise T15ValidationError(
+            failure_stage,
+            {
+                "docker_context": "DOCKER_CONTEXT_EXIT_NONZERO",
+                "compose_config": "COMPOSE_CONFIG_EXIT_NONZERO",
+            }.get(failure_stage, "COMPOSE_COMMAND_EXIT_NONZERO"),
+            failure_reason,
+            exit_code=completed.returncode,
+            external_command_executed=True,
         )
 
 
@@ -346,6 +489,298 @@ def test_ticket15_rejects_nonlocal_or_forwardable_endpoints(endpoint: str) -> No
 def test_ticket15_accepts_local_socket_endpoints(endpoint: str) -> None:
     """静态安全门仅接受结构明确的本机 socket endpoint。"""
     _validate_local_docker_endpoint(endpoint)
+
+
+def _resolved_compose_for_offline_test() -> tuple[str, dict[str, object]]:
+    """从专用测试定义构造通过安全门的最终配置，不调用 Compose。
+
+    参数：无。
+    返回值：随机格式项目名及其隔离配置。
+    异常：Compose 定义无法读取或替换时向调用方抛出解析异常。
+    副作用：只读取仓库中的测试 JSON 文件。
+    """
+    run_id = "b" * 32
+    project_name = f"t15-migration-{run_id}"
+    serialized = json.dumps(json.loads(_COMPOSE_FILE.read_text(encoding="utf-8")))
+    resolved = json.loads(serialized.replace("${T15_RUN_ID:?T15_RUN_ID required}", run_id))
+    resolved["name"] = project_name
+    resolved["services"]["migrate"]["build"]["context"] = str(_REPOSITORY_ROOT)
+    resolved["networks"] = {
+        "default": {"name": f"{project_name}_default", "external": False}
+    }
+    return project_name, resolved
+
+
+def _mock_ticket15_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+    context_result: subprocess.CompletedProcess[str] | OSError,
+    compose_result: subprocess.CompletedProcess[str] | OSError | None = None,
+) -> list[tuple[str, ...]]:
+    """用记录调用的替身取代 subprocess.run，确保离线用例不启动外部程序。
+
+    参数：monkeypatch 为 pytest 替换器；context_result 和 compose_result 为预置结果或启动异常。
+    返回值：替身接收到的参数记录，可断言真实命令路径从未执行。
+    异常：意外的第三次调用或缺少 Compose 结果时抛出断言错误。
+    副作用：仅替换当前测试进程中的 subprocess.run。
+    """
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(arguments: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        """返回预置结果并只记录参数，不创建进程。"""
+        calls.append(tuple(arguments))
+        result: subprocess.CompletedProcess[str] | OSError | None = (
+            context_result if len(calls) == 1 else compose_result
+        )
+        if isinstance(result, OSError):
+            raise result
+        if result is None or len(calls) > 2:
+            raise AssertionError("offline subprocess fake received an unexpected call")
+        return result
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return calls
+
+
+def _assert_safe_t15_diagnostic(
+    error: T15ValidationError,
+    *,
+    stage: str,
+    error_code: str,
+    external_command_executed: bool,
+    forbidden: tuple[str, ...] = (),
+) -> None:
+    """验证失败阶段、错误码及诊断内容脱敏。"""
+    assert error.stage == stage
+    assert error.error_code == error_code
+    assert error.external_command_executed is external_command_executed
+    record = error.to_safe_dict()
+    assert record["status"] == "failed"
+    safe_text = f"{error} {json.dumps(record, ensure_ascii=False)}"
+    assert all(secret not in safe_text for secret in forbidden)
+
+
+def test_ticket15_offline_diagnostic_when_docker_cli_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Docker CLI 缺失时报告启动阶段，且不暴露启动异常文本。"""
+    project_name, _ = _resolved_compose_for_offline_test()
+    calls = _mock_ticket15_subprocess(
+        monkeypatch, FileNotFoundError("POSTGRES_PASSWORD=do-not-log")
+    )
+
+    with pytest.raises(T15ValidationError) as caught:
+        _resolve_and_validate_compose(project_name, {"T15_RUN_ID": "b" * 32})
+
+    error = caught.value
+    _assert_safe_t15_diagnostic(
+        error,
+        stage="docker_context",
+        error_code="DOCKER_CLI_NOT_FOUND",
+        external_command_executed=False,
+        forbidden=("POSTGRES_PASSWORD=do-not-log",),
+    )
+    assert error.exception_type == "FileNotFoundError"
+    assert len(calls) == 1
+
+
+def test_ticket15_offline_diagnostic_when_subprocess_cannot_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """普通 subprocess 启动错误与 Docker CLI 缺失使用不同安全错误码。"""
+    project_name, _ = _resolved_compose_for_offline_test()
+    calls = _mock_ticket15_subprocess(
+        monkeypatch, PermissionError("private host path and DATABASE_URL=hidden")
+    )
+
+    with pytest.raises(T15ValidationError) as caught:
+        _resolve_and_validate_compose(project_name, {})
+
+    error = caught.value
+    _assert_safe_t15_diagnostic(
+        error,
+        stage="docker_context",
+        error_code="SUBPROCESS_START_FAILED",
+        external_command_executed=False,
+        forbidden=("private host path", "DATABASE_URL=hidden"),
+    )
+    assert error.exception_type == "PermissionError"
+    assert len(calls) == 1
+
+
+def test_ticket15_offline_diagnostic_when_context_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """context 命令非零退出时保留退出码并隐藏标准输出和错误。"""
+    project_name, _ = _resolved_compose_for_offline_test()
+    calls = _mock_ticket15_subprocess(
+        monkeypatch,
+        subprocess.CompletedProcess(
+            ["docker", "context", "inspect"],
+            17,
+            "DATABASE_URL=hidden",
+            "POSTGRES_PASSWORD=hidden",
+        ),
+    )
+
+    with pytest.raises(T15ValidationError) as caught:
+        _resolve_and_validate_compose(project_name, {})
+
+    error = caught.value
+    _assert_safe_t15_diagnostic(
+        error,
+        stage="docker_context",
+        error_code="DOCKER_CONTEXT_EXIT_NONZERO",
+        external_command_executed=True,
+        forbidden=("DATABASE_URL=hidden", "POSTGRES_PASSWORD=hidden"),
+    )
+    assert error.exit_code == 17
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("endpoint", ("npipe:////./pipe/docker_engine", "unix:///run/docker.sock"))
+def test_ticket15_offline_accepts_local_endpoints_and_valid_compose(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str
+) -> None:
+    """模拟支持的本机 endpoint 与安全 Compose 配置完整通过只读检查链路。"""
+    project_name, expected = _resolved_compose_for_offline_test()
+    calls = _mock_ticket15_subprocess(
+        monkeypatch,
+        subprocess.CompletedProcess(["docker", "context", "inspect"], 0, endpoint, ""),
+        subprocess.CompletedProcess(
+            ["docker", "compose", "config"], 0, json.dumps(expected), ""
+        ),
+    )
+
+    actual = _resolve_and_validate_compose(project_name, {"T15_RUN_ID": "b" * 32})
+
+    assert actual == expected
+    assert len(calls) == 2
+    assert calls[0][1:3] == ("context", "inspect")
+    assert calls[1][0:3] == ("docker", "compose", "--env-file")
+    assert calls[1][-3:] == ("config", "--format", "json")
+
+
+def test_ticket15_offline_rejects_tcp_endpoint_before_compose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """拒绝 TCP endpoint，并确认 Compose 解析没有被调用。"""
+    project_name, _ = _resolved_compose_for_offline_test()
+    calls = _mock_ticket15_subprocess(
+        monkeypatch,
+        subprocess.CompletedProcess(
+            ["docker", "context", "inspect"], 0, "tcp://192.0.2.10:2375", ""
+        ),
+    )
+
+    with pytest.raises(T15ValidationError) as caught:
+        _resolve_and_validate_compose(project_name, {})
+
+    error = caught.value
+    _assert_safe_t15_diagnostic(
+        error,
+        stage="docker_endpoint",
+        error_code="DOCKER_ENDPOINT_UNSUPPORTED",
+        external_command_executed=True,
+    )
+    assert "192.0.2.10" not in str(error)
+    assert len(calls) == 1
+
+
+def test_ticket15_offline_diagnostic_when_compose_command_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compose config 非零退出被定位到配置阶段且不打印命令输出。"""
+    project_name, _ = _resolved_compose_for_offline_test()
+    calls = _mock_ticket15_subprocess(
+        monkeypatch,
+        subprocess.CompletedProcess(
+            ["docker", "context", "inspect"], 0, "unix:///run/docker.sock", ""
+        ),
+        subprocess.CompletedProcess(
+            ["docker", "compose", "config"],
+            23,
+            "DATABASE_URL=hidden",
+            "POSTGRES_PASSWORD=hidden",
+        ),
+    )
+
+    with pytest.raises(T15ValidationError) as caught:
+        _resolve_and_validate_compose(project_name, {})
+
+    error = caught.value
+    _assert_safe_t15_diagnostic(
+        error,
+        stage="compose_config",
+        error_code="COMPOSE_CONFIG_EXIT_NONZERO",
+        external_command_executed=True,
+        forbidden=("DATABASE_URL=hidden", "POSTGRES_PASSWORD=hidden"),
+    )
+    assert error.exit_code == 23
+    assert len(calls) == 2
+
+
+def test_ticket15_offline_diagnostic_when_compose_json_is_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compose JSON 解析错误返回独立阶段码，不泄露原始内容。"""
+    project_name, _ = _resolved_compose_for_offline_test()
+    calls = _mock_ticket15_subprocess(
+        monkeypatch,
+        subprocess.CompletedProcess(
+            ["docker", "context", "inspect"], 0, "unix:///run/docker.sock", ""
+        ),
+        subprocess.CompletedProcess(
+            ["docker", "compose", "config"],
+            0,
+            '{"POSTGRES_PASSWORD":"json-secret", invalid}',
+            "",
+        ),
+    )
+
+    with pytest.raises(T15ValidationError) as caught:
+        _resolve_and_validate_compose(project_name, {})
+
+    error = caught.value
+    _assert_safe_t15_diagnostic(
+        error,
+        stage="compose_json",
+        error_code="COMPOSE_JSON_INVALID",
+        external_command_executed=True,
+        forbidden=("json-secret", "POSTGRES_PASSWORD"),
+    )
+    assert error.exception_type == "JSONDecodeError"
+    assert error.exit_code == 0
+    assert len(calls) == 2
+
+
+def test_ticket15_offline_diagnostic_when_compose_has_named_volume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """最终配置含危险 named volume 时在安全门阶段 fail closed。"""
+    project_name, unsafe = _resolved_compose_for_offline_test()
+    unsafe["volumes"] = {"legacy": {"name": "crm_t21_final_postgres_data"}}
+    unsafe_text = json.dumps(unsafe)
+    calls = _mock_ticket15_subprocess(
+        monkeypatch,
+        subprocess.CompletedProcess(
+            ["docker", "context", "inspect"], 0, "unix:///run/docker.sock", ""
+        ),
+        subprocess.CompletedProcess(["docker", "compose", "config"], 0, unsafe_text, ""),
+    )
+
+    with pytest.raises(T15ValidationError) as caught:
+        _resolve_and_validate_compose(project_name, {})
+
+    error = caught.value
+    _assert_safe_t15_diagnostic(
+        error,
+        stage="compose_safety",
+        error_code="COMPOSE_ISOLATION_FAILED",
+        external_command_executed=True,
+        forbidden=("crm_t21_final_postgres_data", "POSTGRES_PASSWORD"),
+    )
+    assert error.reason == "包含 Compose named volume"
+    assert len(calls) == 2
 
 
 def test_current_migration_chain_reaches_single_head() -> None:
