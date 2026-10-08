@@ -207,68 +207,6 @@ class DeterministicFirstTextLeadExtractor:
         "备注": "备注",
     }
     _process_values = PROCESS_OPTIONS
-    _leading_contact_pattern = re.compile(
-        r"^(?P<company>[\u4e00-\u9fff（）()·&\-]{2,80}?)\s*"
-        r"(?P<contact>[\u4e00-\u9fff](?:总监|经理|主任|博士|老师|先生|女士|总))$"
-    )
-    _natural_leading_company_contact_pattern = re.compile(
-        r"^(?P<company>[^，,；;。\n]{2,80}?)的\s*"
-        r"(?:(?:采购负责人|采购经理|技术负责人|项目负责人|销售负责人|负责人|"
-        r"总经理|副总经理|董事长|CIO|CEO|CTO|COO|CFO|CMO|CPO|VP|Director|Manager|President)\s*)?"
-        r"(?P<contact>[\u4e00-\u9fff]{1,4}(?:总监|经理|主任|博士|老师|先生|女士|总))"
-        r"(?=\s*(?:$|[，,；;。]|想|对|有|要|是|做|希望|计划|正在|目前|预计|感兴趣))",
-        re.IGNORECASE,
-    )
-    _natural_company_contact_without_de_pattern = re.compile(
-        r"^(?:(?:另外|此外)\s*)?(?P<company>[^，,；;。\n]{2,80})"
-        r"(?:(?:采购负责人|采购经理|技术负责人|项目负责人|销售负责人|负责人|"
-        r"总经理|副总经理|董事长|CIO|CEO|CTO|COO|CFO|CMO|CPO|VP|Director|Manager|President)\s*)?"
-        r"(?P<contact>[\u4e00-\u9fff]{1,4}(?:总监|经理|主任|博士|老师|先生|女士|总))"
-        r"(?=\s*(?:$|[，,；;。]|想|对|有|要|是|做|希望|计划|正在|目前|预计|感兴趣))",
-        re.IGNORECASE,
-    )
-    _contact_segment_pattern = re.compile(
-        r"^[\u4e00-\u9fff]{1,4}(?:总监|经理|主任|博士|老师|先生|女士|总)$"
-    )
-    _company_legal_suffixes = ("有限责任公司", "有限公司", "集团", "公司")
-    _leading_negative_keywords = (
-        "今天",
-        "昨天",
-        "上午",
-        "下午",
-        "刚刚",
-        "刚才",
-        "刚见了",
-        "最近见了",
-        "前几天见了",
-        "见了",
-        "见到",
-        "拜访了",
-        "接触到",
-        "遇到",
-        "碰到",
-        "我对",
-        "客户需要",
-        "需求",
-        "预算",
-        "报价",
-        "项目",
-        "采购",
-        "检测",
-        "视觉",
-        "机器人",
-        "机械臂",
-        "双臂",
-        "产品",
-        "方案",
-        "联系",
-        "缺陷",
-        "上下料",
-        "焊接",
-        "装配",
-        "喷涂",
-        "贴标",
-    )
 
     def extract(self, text: str | None) -> dict[str, str] | None:
         """从显式中文标签文本提取首条可审核线索的安全字段补丁。
@@ -324,113 +262,15 @@ class DeterministicFirstTextLeadExtractor:
 
     @staticmethod
     def extract_leading_company_hint(text: str | None) -> str | None:
-        """从窄范围“公司主体+联系人称谓”格式提取公司身份提示。
+        """只从显式客户/公司标签提取公司身份提示。
 
         参数：text 为销售发送的自由文本消息。
-        返回值：可靠首段公司名；不满足公司主体与称谓结构时返回 None。
+        返回值：存在显式线索名称时返回该名称，否则返回 None。
         异常：无。
-        副作用：仅做本地字符串解析，不调用模型或外部服务。
+        副作用：仅读取当前文本，不调用模型或外部服务。
         """
-        hint = DeterministicFirstTextLeadExtractor.extract_leading_company_contact_hint(text)
-        if hint is not None:
-            return hint["线索名称"]
-        return DeterministicFirstTextLeadExtractor._extract_separated_company_hint(text)
-
-    @classmethod
-    def extract_leading_company_contact_hint(cls, text: str | None) -> dict[str, str] | None:
-        """从首段窄格式中提取公司主体和单姓联系人称谓。
-
-        参数：text 为销售发送的自由文本消息。
-        返回值：同时包含“线索名称”和“联系人”的确定性补丁；无法安全确认时返回 None。
-        异常：无；不调用 LLM 或外部服务。
-        副作用：无，仅执行本地正则与注册枚举负向校验。
-        """
-        if not text:
-            return None
-        segments = [segment.strip() for segment in re.split(r"[\r\n；;，,、]+", text)]
-        if not segments:
-            return None
-        first = segments[0]
-        if not first or ":" in first or "：" in first:
-            return None
-        match = cls._leading_contact_pattern.fullmatch(first)
-        if match is not None and not match.group("company").strip().endswith("的"):
-            company = match.group("company").strip()
-            contact = match.group("contact").strip()
-        else:
-            # 只识别“公司名的[明确职位]联系人称谓”结构，职位必须来自受控词表。
-            natural_match = cls._natural_leading_company_contact_pattern.match(first)
-            without_de_match = cls._natural_company_contact_without_de_pattern.match(first)
-            separated_match = re.fullmatch(
-                r"(?P<company>[\u4e00-\u9fff（）()·&\-]{2,80})[～~]"
-                r"(?P<contact>[\u4e00-\u9fff]{2,4})",
-                first,
-            )
-            if natural_match is not None:
-                company = natural_match.group("company").strip()
-                contact = natural_match.group("contact").strip()
-            elif without_de_match is not None:
-                company = without_de_match.group("company").strip()
-                contact = without_de_match.group("contact").strip()
-            elif separated_match is not None:
-                company = separated_match.group("company").strip()
-                contact = separated_match.group("contact").strip()
-            else:
-                return None
-        if not cls._is_reliable_leading_company_prefix(company):
-            return None
-        return {"线索名称": company, "联系人": contact}
-
-    @classmethod
-    def _extract_separated_company_hint(cls, text: str | None) -> str | None:
-        """识别“公司，联系人称谓”格式，不再把手机号单独当作公司证据。
-
-        参数：text 为销售发送的自由文本消息。
-        返回值：首段可靠公司名；联系人段缺少明确称谓时返回 None。
-        异常：无；不调用 LLM 或外部服务。
-        副作用：无，仅执行本地结构校验。
-        """
-        if not text:
-            return None
-        segments = [segment.strip() for segment in re.split(r"[\r\n；;，,、]+", text)]
-        if len(segments) < 2:
-            return None
-        company = segments[0]
-        if not company or ":" in company or "：" in company:
-            return None
-        if cls._contact_segment_pattern.fullmatch(segments[1]) is None:
-            return None
-        return company if cls._is_reliable_leading_company_prefix(company) else None
-
-    @classmethod
-    def _is_reliable_leading_company_prefix(cls, company: str) -> bool:
-        """校验首段公司主体不是明显需求或工艺片段。
-
-        参数：company 为已匹配联系人称谓前缀的候选公司文本。
-        返回值：主体长度合理且没有明显需求负向证据时返回 True。
-        异常：无。
-        副作用：无，仅读取本类注册的工艺枚举。
-        """
-        if not 2 <= len(company) <= 80:
-            return False
-        has_legal_suffix = company.endswith(cls._company_legal_suffixes)
-        if re.fullmatch(
-            r"(?:CIO|CEO|CTO|COO|CFO|CMO|CPO|VP|Director|Manager|President|"
-            r"[\u4e00-\u9fff]{1,4}(?:总监|经理|主任|博士|老师|先生|女士|总))",
-            company,
-            re.IGNORECASE,
-        ):
-            return False
-        if company in cls._process_values:
-            return False
-        if not has_legal_suffix and company.startswith(cls._leading_negative_keywords):
-            return False
-        if not has_legal_suffix and any(
-            company.startswith(keyword)
-            for keyword in (*cls._process_values, *cls._leading_negative_keywords)
-        ):
-            return False
-        return True
+        company = DeterministicFirstTextLeadExtractor().extract_patch(text).get("线索名称")
+        return company.strip() if isinstance(company, str) and company.strip() else None
 
     def extract_many(self, text: str | None) -> list[dict[str, str]]:
         """从明确客户标签分段中提取一条或多条独立字段补丁。
@@ -1626,7 +1466,7 @@ class FirstTextLeadWorkspaceService:
         company = fields.get("线索名称")
         if isinstance(company, str) and company.strip():
             return company.strip()
-        return extractor.extract_leading_company_hint(message.normalized_text)
+        return None
 
     @staticmethod
     def _lead_matches_company(lead: Lead, company_name: str) -> bool:
@@ -1820,16 +1660,9 @@ class FirstTextLeadWorkspaceService:
                 else:
                     multi_request = None
                 extracted_patch = extractor.extract_patch(message.normalized_text)
-                leading_company_contact_hint = extractor.extract_leading_company_contact_hint(
+                # 自由表达的公司身份由 AI 按语义提议；本地快速路径只读显式标签。
+                leading_company_hint = extractor.extract_leading_company_hint(
                     message.normalized_text
-                )
-                if leading_company_contact_hint is not None:
-                    # 首段公司+称谓是确定性身份事实，优先于后续 AI 字段；显式标签仍可覆盖同名字段。
-                    extracted_patch = {**leading_company_contact_hint, **extracted_patch}
-                leading_company_hint = (
-                    leading_company_contact_hint["线索名称"]
-                    if leading_company_contact_hint is not None
-                    else extractor.extract_leading_company_hint(message.normalized_text)
                 )
                 explicit_new_lead_signal = self._has_explicit_new_lead_signal(
                     message.normalized_text
@@ -1859,6 +1692,15 @@ class FirstTextLeadWorkspaceService:
                             session, message, {"线索名称": incoming_company_name}
                         )
                         strong_identity_match = context_lead is not None
+                        if context_lead is None:
+                            active_context = self._get_active_context_lead(session, message)
+                            if active_context is not None and (
+                                active_context.lifecycle_state == "temporary"
+                                and active_context.standard_company_name is None
+                                or self._lead_matches_company(active_context, incoming_company_name)
+                            ):
+                                # 只升级无公司临时草稿，或恢复同公司但表格建行失败的 Lead。
+                                context_lead = active_context
                     elif not explicit_new_lead_signal and not explicit_company_identity_evidence:
                         active_context = self._get_active_context_lead(session, message)
                         if active_context is not None:
@@ -1931,29 +1773,18 @@ class FirstTextLeadWorkspaceService:
                 if (
                     multi_request is None
                     and multi_company_fields is None
-                    and (
-                        not extracted_patch
-                        or (
-                            leading_company_contact_hint is not None
-                            and self._company_lead_service is None
-                        )
-                    )
+                    and (not extracted_patch or leading_company_hint is None)
                     and message.normalized_text
                     and self._ai_gateway is not None
                     and not quote_recovery_completed
                 ):
-                    # 显式标签和多客户仍走既有确定性路径；仅自由文本在归属判定后进入 T08。
+                    # 显式公司标签和多客户走确定性路径；无公司标签的自由/混合文本交由 T08 理解身份。
                     ai_review, ai_result = self._prepare_ai_review(
                         session,
                         event,
                         message,
                         context_lead,
                         company_name_hint=leading_company_hint,
-                        contact_name_hint=(
-                            leading_company_contact_hint.get("联系人")
-                            if leading_company_contact_hint is not None
-                            else None
-                        ),
                         quote_target_lead_id=(
                             quote_target_lead.id if quote_target_lead is not None else None
                         ),
@@ -2260,7 +2091,6 @@ class FirstTextLeadWorkspaceService:
         message: IncomingMessage,
         context_lead: Lead | None,
         company_name_hint: str | None = None,
-        contact_name_hint: str | None = None,
         quote_target_lead_id: str | None = None,
     ) -> tuple[
         AIReviewRequest | tuple[AIReviewRequest, ...] | None,
@@ -2269,7 +2099,7 @@ class FirstTextLeadWorkspaceService:
         """调用 T08 并以确定性规则决定安全的新增、更新或待归属结论。
 
         参数：session、event 和 message 为当前有序消费事实；
-        context_lead 为 T07 已可靠定位的当前线索；公司和联系人提示来自确定性原文解析；
+        context_lead 为 T07 已可靠定位的当前线索；公司提示仅来自显式公司标签；
         quote_target_lead_id 为已由服务器 quote relationship 确定的唯一目标。
         返回值：可在提交后执行的 T09 请求，或已完成的消费结果；两者不会同时存在。
         异常：无；T08 失败被转换为明确的失败待审事实。
@@ -2286,6 +2116,7 @@ class FirstTextLeadWorkspaceService:
                 lead_id=active_context_lead.id if active_context_lead is not None else None,
                 context_fields=self._context_fields_for_ai(active_context_lead),
             )
+            company_identity_claimed = self._ai_company_identity_claimed(patch)
             if company_name_hint:
                 # 确定性原文公司身份始终优先，模型的 UPDATE_LEAD 或冲突候选不能改写客户边界。
                 fields = {**patch.fields, "线索名称": company_name_hint}
@@ -2302,22 +2133,7 @@ class FirstTextLeadWorkspaceService:
                     }
                 )
                 patch = replace(patch, analysis=analysis, fields=fields)
-            if contact_name_hint:
-                # 确定性原文联系人称谓也优先于模型遗漏或冲突候选。
-                fields = {**patch.fields, "联系人": contact_name_hint}
-                analysis = patch.analysis.model_copy(
-                    update={
-                        "crm_fields": {
-                            **patch.analysis.crm_fields,
-                            "联系人": contact_name_hint,
-                        },
-                        "confidence_by_field": {
-                            **patch.analysis.confidence_by_field,
-                            "联系人": 1.0,
-                        },
-                    }
-                )
-                patch = replace(patch, analysis=analysis, fields=fields)
+                company_identity_claimed = True
             patch = self._ground_source_identity_patch(patch, message.normalized_text)
         except AIGatewayError as error:
             # 网关已完成自身传输重试；此处绝不伪造建档成功，也不能阻塞该销售的后续消息。
@@ -2331,6 +2147,21 @@ class FirstTextLeadWorkspaceService:
                 "ai_gateway_first_text_failed", extra={"error_type": type(error).__name__}
             )
             return None, LeadProcessingResult(LeadProcessingStatus.SYNC_FAILED)
+
+        if (
+            quote_target_lead_id is None
+            and company_identity_claimed
+            and not patch.fields.get("线索名称")
+        ):
+            # AI 提出了公司身份但当前消息无法验证时，不能把失败候选退化成 active context 补充。
+            self._record_audit(
+                session,
+                event,
+                "lead_company_identity_unverified_fail_closed",
+                details={"reason": "company_candidate_not_grounded"},
+            )
+            self._mark_unassigned(session, event)
+            return None, LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
 
         explicit_new_lead_signal = self._has_explicit_new_lead_signal(message.normalized_text)
         if quote_target_lead_id is not None and (
@@ -2386,7 +2217,7 @@ class FirstTextLeadWorkspaceService:
             return None, LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
         has_reliable_company_evidence = (
             company_name_hint is not None
-            or self._has_explicit_company_identity_evidence(message.normalized_text)
+            or bool(incoming_company_candidate)
         )
         if (
             active_context_lead is not None
@@ -2434,10 +2265,13 @@ class FirstTextLeadWorkspaceService:
             if field_name != "线索名称" and isinstance(value, str)
         }
         strong_identity_lead = None
-        if media_context_continuation or (
+        if (
+            quote_target_lead_id is not None and active_context_lead is not None
+        ) or media_context_continuation or (
             active_context_lead is not None
             and not explicit_new_lead_signal
             and not incoming_company_name
+            and patch.analysis.intent == "UPDATE_LEAD"
         ):
             # 名片/OCR 或普通无公司名补充优先沿用当前客户，联系方式不再抢占路由。
             assert active_context_lead is not None
@@ -2469,7 +2303,11 @@ class FirstTextLeadWorkspaceService:
                 session, message, {"线索名称": incoming_company_name}
             )
             context_lead = strong_identity_lead
-        elif not explicit_new_lead_signal and contact_identity_fields:
+        elif (
+            not explicit_new_lead_signal
+            and patch.analysis.intent == "UPDATE_LEAD"
+            and contact_identity_fields
+        ):
             # 没有有效上下文时，联系方式才允许回溯当前销售历史线索。
             strong_identity_lead = self._get_strong_identity_lead(
                 session, message, contact_identity_fields
@@ -2492,6 +2330,14 @@ class FirstTextLeadWorkspaceService:
                     "ai_company_identity_overrode_active_context",
                     {"active_context_present": True, "new_company_identity_present": True},
                 )
+            context_lead = None
+        elif (
+            active_context_lead is not None
+            and quote_target_lead_id is None
+            and not explicit_new_lead_signal
+            and patch.analysis.intent != "IGNORE"
+        ):
+            # AI 已判为新客户但没有可靠公司身份时不能降级成旧客户补充。
             context_lead = None
         else:
             # 显式新客户但没有可核验公司身份时，不继承旧客户上下文。
@@ -3232,25 +3078,38 @@ class FirstTextLeadWorkspaceService:
 
     @staticmethod
     def _has_explicit_company_identity_evidence(text: str | None) -> bool:
-        """判断文本中是否存在足以支持新线索的明确公司身份证据。
+        """判断文本是否包含可确定解析的显式公司标签。
 
         参数：text 为当前消息标准化文本。
-        返回值：出现公司标签或企业名称后缀时返回 True。
+        返回值：显式标签解析出线索名称时返回 True。
         异常：无。
-        副作用：无；仅进行本地正则判断。
+        副作用：无；仅运行显式标签解析。
         """
-        if not text:
-            return False
-        return bool(
-            re.search(r"(?:客户|公司|企业)\s*[:：]", text)
-            or re.search(r"(?:有限公司|有限责任公司|集团)", text)
-            or DeterministicFirstTextLeadExtractor.extract_leading_company_contact_hint(text)
-            is not None
-            or re.search(
-                r"(?:客户|公司|企业)[\u4e00-\u9fffA-Za-z0-9（）()·&._-]{1,60}的"
-                r"[\u4e00-\u9fff](?:总监|经理|主任|博士|老师|先生|女士|总)",
-                text,
-            )
+        return bool(DeterministicFirstTextLeadExtractor().extract_patch(text).get("线索名称"))
+
+    @staticmethod
+    def _ai_company_identity_claimed(patch: ExtractedLeadPatch) -> bool:
+        """判断 AI 是否尝试给当前消息指定公司身份，包括未通过字段置信度的候选。
+
+        参数：patch 为 AI Gateway 返回并尚未做来源 grounding 的字段补丁。
+        返回值：正式线索名称字段或 company 类 customer_reference 非空时返回 True。
+        异常：无。
+        副作用：无；仅检查本次分析结果，不访问上下文或数据库。
+        """
+        if patch.fields.get("线索名称") or patch.analysis.crm_fields.get("线索名称"):
+            return True
+        company_reference_keys = {
+            "company",
+            "company_name",
+            "企业",
+            "企业名称",
+            "公司",
+            "公司名称",
+            "线索名称",
+        }
+        return any(
+            key.strip().lower() in company_reference_keys and value.strip()
+            for key, value in patch.analysis.customer_reference.items()
         )
 
     @staticmethod
@@ -3292,25 +3151,14 @@ class FirstTextLeadWorkspaceService:
     def validate_company_candidate_against_source(
         cls, candidate: str | None, normalized_text: str | None
     ) -> bool:
-        """仅接受被标签、自然语言公司称谓或工商主体后缀支撑的公司候选。
+        """验证 AI 语义公司字段的候选文本确实来自当前消息。
 
-        参数：candidate 为 AI 返回的公司名；normalized_text 为当前消息原文。
-        返回值：候选与强原文身份边界一致时返回 True。
+        参数：candidate 为 AI 已按公司主体语义提取的候选；normalized_text 为当前消息原文。
+        返回值：候选逐字存在于当前消息时返回 True；调用方还校验 AI 语义字段及字段间冲突。
         异常：无。
-        副作用：无；只运行本地确定性解析。
+        副作用：无；只做来源字符串核验。
         """
-        if not candidate or not normalized_text or candidate.strip() not in normalized_text:
-            return False
-        extractor = DeterministicFirstTextLeadExtractor()
-        labeled_company = extractor.extract_patch(normalized_text).get("线索名称")
-        natural_company = extractor.extract_leading_company_hint(normalized_text)
-        candidate_value = candidate.strip()
-        if candidate_value in {labeled_company, natural_company}:
-            return True
-        if candidate_value.endswith(("有限公司", "有限责任公司", "集团", "公司")):
-            return True
-        # 语义分段会带前导时间词；候选本身仍须精确出现，且不能是需求、工艺或职位词。
-        return extractor._is_reliable_leading_company_prefix(candidate_value)
+        return bool(candidate and normalized_text and candidate.strip() in normalized_text)
 
     @classmethod
     def _ground_source_identity_patch(
@@ -3322,13 +3170,62 @@ class FirstTextLeadWorkspaceService:
         confidences = dict(patch.analysis.confidence_by_field)
         pending = tuple(patch.pending_confirmation_fields)
         low_candidates = dict(patch.low_confidence_candidates)
+        semantic_company = patch.analysis.crm_fields.get("线索名称")
+        identity_details = [
+            value
+            for field_name, value in (*fields.items(), *crm_fields.items())
+            if field_name != "线索名称" and isinstance(value, str) and value.strip()
+        ]
+        identity_details.extend(
+            value
+            for value in patch.analysis.customer_reference.values()
+            if isinstance(value, str) and value.strip()
+        )
+        business_details = [
+            value
+            for value in (*patch.enrichment.values(), *patch.analysis.enrichment.values())
+            if isinstance(value, str) and value.strip()
+        ]
+        # ponytail: 当前用 4 字重叠差量拦截拼接候选；模型提供来源跨度后可替换该长度启发式。
+        ambiguous_company_values = {
+            candidate.strip()
+            for candidate in (fields.get("线索名称"), crm_fields.get("线索名称"))
+            if isinstance(candidate, str)
+            and (
+                any(
+                    detail != candidate.strip()
+                    and detail in candidate
+                    and len(candidate) - len(detail) >= 4
+                    for detail in identity_details
+                )
+                or any(
+                    detail != candidate.strip()
+                    and (
+                        detail in candidate
+                        and len(candidate) - len(detail) >= 4
+                        or candidate.strip() in detail
+                        and len(detail) - len(candidate.strip()) >= 4
+                    )
+                    for detail in business_details
+                )
+            )
+        }
         for field_name in ("线索名称", "联系人"):
             field_value = fields.get(field_name)
+            company_is_ambiguous = (
+                field_name == "线索名称"
+                and isinstance(field_value, str)
+                and field_value.strip() in ambiguous_company_values
+            )
             valid_source_value = (
-                cls.validate_company_candidate_against_source(field_value, normalized_text)
+                not company_is_ambiguous
+                and isinstance(semantic_company, str)
+                and isinstance(field_value, str)
+                and field_value.strip() == semantic_company.strip()
+                and cls.validate_company_candidate_against_source(field_value, normalized_text)
                 if field_name == "线索名称" and isinstance(field_value, str)
                 else isinstance(field_value, str)
-                and bool(normalized_text)
+                and normalized_text is not None
                 and field_value.strip() in normalized_text
             )
             if isinstance(field_value, str) and not valid_source_value:
@@ -3337,10 +3234,15 @@ class FirstTextLeadWorkspaceService:
                 low_candidates.pop(field_name, None)
             crm_value = crm_fields.get(field_name)
             valid_crm_source_value = (
-                cls.validate_company_candidate_against_source(crm_value, normalized_text)
+                not (
+                    field_name == "线索名称"
+                    and isinstance(crm_value, str)
+                    and crm_value.strip() in ambiguous_company_values
+                )
+                and cls.validate_company_candidate_against_source(crm_value, normalized_text)
                 if field_name == "线索名称" and isinstance(crm_value, str)
                 else isinstance(crm_value, str)
-                and bool(normalized_text)
+                and normalized_text is not None
                 and crm_value.strip() in normalized_text
             )
             if isinstance(crm_value, str) and not valid_crm_source_value:

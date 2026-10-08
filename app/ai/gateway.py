@@ -84,25 +84,6 @@ _PHONE_SEARCH_PATTERN = re.compile(
 )
 _PHONE_SOURCE_PATTERN = re.compile(r"(?<!\d)(?:\+|00)?\d(?:[ \t().-]*\d){6,18}(?!\d)")
 _EMAIL_SEARCH_PATTERN = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])")
-_NATURAL_COMPANY_CONTACT_PATTERN = re.compile(
-    r"(?P<company>[^，,；;。\n]{2,80}?)的"
-    r"(?P<contact>[\u4e00-\u9fffA-Za-z·]{1,6}"
-    r"(?:总|经理|工|先生|女士|老师|主任|老板|主管))"
-    r"(?=\s*(?:[，,；;。]|手机号|手机|电话|邮箱|是|做|想|主要|他们|找我|沟通|联系|对接|交流|事项|预计|计划|实施))"
-)
-_NATURAL_ROLE_PREFIXES = (
-    "副总经理",
-    "总经理",
-    "采购负责人",
-    "技术负责人",
-    "项目负责人",
-    "销售负责人",
-    "负责人",
-    "副总监",
-    "总监",
-    "项目经理",
-    "产品经理",
-)
 _COMMUNICATION_EVIDENCE = (
     ("线上会议", "线上会议"),
     ("电话", "打电话"),
@@ -694,26 +675,9 @@ class AIGateway:
         reference_fields = AIGateway._verified_customer_reference_fields(
             analysis.customer_reference, source_text
         )
-        # 标签或明确“公司-联系人”句式是比模型引用更强的原文证据；模型误把两者
-        # 拼接后放进 company 时，不能让 customer_reference 再次覆盖确定性拆分结果。
+        # 显式标签和 AI 的语义引用只作为结构化候选；自由文本不再靠固定公司/职位句式拆分。
         for field_name, value in reference_fields.items():
             recovered.setdefault(field_name, value)
-        # 联系人与职位在自然语言中经常连写；仅在原文明确出现职位并紧邻模型核验联系人时补回职务。
-        contact = recovered.get("联系人")
-        # 若模型把联系人放在正式字段而不是 customer_reference，仅借用该已输出值判断相邻职位，
-        # 不提升其原有置信度，也不改变人工/低置信度分级结果。
-        contact_candidate = analysis.crm_fields.get("联系人")
-        if (
-            not contact
-            and isinstance(contact_candidate, str)
-            and contact_candidate.strip() in source_text
-        ):
-            contact = contact_candidate.strip()
-        if contact:
-            recovered_title = AIGateway._extract_verified_title(source_text, contact)
-            if recovered_title:
-                recovered["职务"] = recovered_title
-
         if not recovered:
             return analysis
         fields = dict(analysis.crm_fields)
@@ -785,59 +749,6 @@ class AIGateway:
         return fields
 
     @staticmethod
-    def _extract_verified_title(source_text: str, contact: str) -> str | None:
-        """从联系人附近的明确职位表达中恢复职务字段。
-
-        参数：source_text 为脱敏后的当前消息文本；contact 为已由模型并经原文核验的联系人。
-        返回值：唯一且有明确职位语义的原文职位；无法确认或出现多个冲突职位时返回 None。
-        异常：无。
-        副作用：无；仅执行本地文本匹配，不覆盖模型已经给出的其他字段。
-        """
-        # 先处理带字段标签的写法，避免把后续联系人、需求等内容误认为职位。
-        labeled_match = re.search(
-            r"(?:职务|职位|岗位|职称|身份)\s*[:：]\s*([^，,；;。\n]+)",
-            source_text,
-        )
-        candidates: set[str] = set()
-        if labeled_match:
-            labeled_title = labeled_match.group(1).strip()
-            if labeled_title:
-                candidates.add(labeled_title)
-
-        # 只识别紧邻已核验联系人之前的常见职位词，支持“总经理张总”“采购负责人李工”等连写形式。
-        title_terms = (
-            "副总经理",
-            "总经理",
-            "执行董事",
-            "董事长",
-            "副总裁",
-            "总裁",
-            "采购负责人",
-            "技术负责人",
-            "项目负责人",
-            "销售负责人",
-            "负责人",
-            "副总监",
-            "总监",
-            "工程师",
-            "采购经理",
-            "项目经理",
-            "产品经理",
-            "经理",
-            "主管",
-            "主任",
-            "厂长",
-            "老板",
-        )
-        title_pattern = "|".join(re.escape(term) for term in title_terms)
-        contact_pattern = re.escape(contact.strip())
-        for match in re.finditer(rf"({title_pattern})\s*{contact_pattern}", source_text):
-            candidates.add(match.group(1))
-
-        # 同一联系人若对应多个不同职位，保守留空，交由模型/销售后续确认。
-        return next(iter(candidates)) if len(candidates) == 1 else None
-
-    @staticmethod
     def _is_combined_identity_value(value: str, company: str, contact: str) -> bool:
         """判断单字段值是否只是公司与联系人被符号或空白拼接后的组合。
 
@@ -905,38 +816,7 @@ class AIGateway:
             match = re.search(pattern, source_text)
             if match and match.group(1).strip():
                 fields[field_name] = match.group(1).strip().rstrip("\\")
-        natural_match = _NATURAL_COMPANY_CONTACT_PATTERN.search(source_text)
-        if natural_match:
-            company = AIGateway._clean_natural_company_candidate(
-                natural_match.group("company")
-            )
-            contact = natural_match.group("contact").strip()
-            # “总经理张总”属于职位+联系人连写，模型已有专门的职务恢复规则；
-            # 此处只接受没有职位前缀的“某公司/某客户的张总”句式。
-            if (
-                company
-                and contact
-                and not contact.startswith(_NATURAL_ROLE_PREFIXES)
-                and "的" not in company
-            ):
-                fields.setdefault("线索名称", company)
-                fields.setdefault("联系人", contact)
         return fields
-
-    @staticmethod
-    def _clean_natural_company_candidate(value: str) -> str:
-        """清除公司前的有限叙述连接词，不改变公司主体文本。
-
-        参数：value 为“公司名的联系人”句式中“的”之前的原文片段。
-        返回值：去掉句首时间或连接关系后的候选公司名；无法形成主体时返回空串。
-        异常：无。
-        副作用：无；不调用模型或外部服务。
-        """
-        candidate = value.strip(" \t，,、")
-        candidate = re.sub(r"^(?:(?:今天|刚才|刚刚)\s*)?(?:和|与|跟)\s*", "", candidate)
-        if not candidate or any(token in candidate for token in ("他们", "我们", "客户的", "主要")):
-            return ""
-        return candidate
 
     @staticmethod
     def _normalize_identity_text(value: str) -> str:
@@ -2096,7 +1976,12 @@ class AIGateway:
                     "NEW_LEAD；名片、OCR、语音转写或碎片补充属于当前客户时返回 "
                     "UPDATE_LEAD；一条消息可靠拆出多个客户时返回 MULTI_LEAD 并填写 segments；"
                     "客户数量或边界不可靠时返回 MULTI_LEAD_AMBIGUOUS，不猜测分段；"
-                    "无法可靠判断时不要伪造公司名。"
+                    "自由语言中的公司身份由你理解并提出：只有当某公司确实是本条消息正在介绍的客户主体时，"
+                    "才可将其写入线索名称及 customer_reference.company；竞品、供应商、历史公司或"
+                    "顺带提及的公司"
+                    "不能作为本条线索身份。客户身份候选、联系人、职务和业务字段必须来自当前消息，"
+                    "上下文仅帮助区分补充还是新客户，不能覆盖当前消息明确介绍的不同客户。"
+                    "不得输出或决定 Lead ID、Smart Table record ID。无法可靠判断时不要伪造公司名。"
                     f"{context_instruction}"
                     f"必须符合此 JSON Schema：{json.dumps(json_schema, ensure_ascii=False)}"
                     f"{self._field_contract_instructions()}"
@@ -2148,8 +2033,7 @@ class AIGateway:
             "必须先按语义区分公司主体与联系人个人，不依赖波浪线、短横线、空格、斜线等特定分隔符；"
             "即使公司名和联系人连写，也只能在语义足够明确时分别输出。"
             "线索名称只能填写公司主体，联系人只能填写个人姓名；禁止把公司和联系人拼接后写入任一单字段。"
-            "职务是与联系人对应的职位或身份称谓，必须独立写入职务字段；"
-            "例如‘总经理张总’应输出职务=总经理、联系人=张总，‘老板李总’应输出职务=老板、联系人=李总；"
+            "职务是与联系人对应的职位或身份称谓，应按当前原文语义独立写入职务字段，不要求固定词表或句式；"
             "仅出现‘张总’等称呼而没有明确职位关系时，不得仅凭‘总’猜测职务。"
             "customer_reference 可使用 company、contact、title、phone、email 五类身份引用，"
             "分别填写已识别的公司、联系人、职务、手机号和邮箱；"
