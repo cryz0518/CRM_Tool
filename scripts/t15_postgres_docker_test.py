@@ -166,7 +166,8 @@ def _postgres_create_argv(identity: _TestIdentity) -> list[str]:
         "--env",
         "PGDATA=/var/lib/postgresql/data/pgdata",
         "--health-cmd",
-        f"pg_isready -U {identity.database_user} -d {identity.database_name}",
+        "grep -qE '^tmpfs /var/lib/postgresql/data tmpfs ' /proc/mounts "
+        f"&& pg_isready -U {identity.database_user} -d {identity.database_name}",
         "--health-interval",
         "2s",
         "--health-timeout",
@@ -219,7 +220,8 @@ def _worker_run_argv(identity: _TestIdentity, image: str) -> list[str]:
     ]
     for key, value in environment:
         arguments.extend(("--env", f"{key}={value}"))
-    arguments.extend((image, "python", "scripts/t15_postgres_test_worker.py"))
+    # 使用模块模式把 /app 放入 sys.path，避免测试 Worker 找不到 tests 包。
+    arguments.extend((image, "python", "-m", "scripts.t15_postgres_test_worker"))
     return arguments
 
 
@@ -485,13 +487,13 @@ def _cleanup_network(identity: _TestIdentity, environment: dict[str, str]) -> No
 def _validate_postgres_inspect(
     container: dict[str, Any], identity: _TestIdentity
 ) -> None:
-    """验证 PostgreSQL 实例身份、网络和实际 Mounts 白名单。
+    """验证 PostgreSQL 实例身份、网络与 tmpfs 配置。
 
     参数：container 为 Docker inspect 的单个对象；identity 为本轮随机身份。
-    必须由 Mounts 明确证明目标 tmpfs，不提供跳过该检查的参数。
+    必须由 HostConfig.Tmpfs 精确匹配 PGDATA；Mounts 若有记录只能是同一路径的 tmpfs。
     返回值：所有检查通过时无。
     异常：存在 bind/volume、端口发布、身份错误或缺少 tmpfs 时抛出安全错误。
-    副作用：无，不连接数据库。
+    副作用：无，不连接数据库；运行期实际挂载由容器健康检查再次确认。
     """
     config = container.get("Config") or {}
     host_config = container.get("HostConfig") or {}
@@ -504,13 +506,19 @@ def _validate_postgres_inspect(
     }
     tmpfs = host_config.get("Tmpfs") or {}
     mounts = container.get("Mounts") or []
-    # 官方镜像 Config.Volumes 只是声明；实际挂载必须由 HostConfig.Tmpfs 覆盖且 Mounts 证明。
+    # 官方镜像 Config.Volumes 只是声明；实际配置由 HostConfig.Tmpfs 决定。
     configured_mounts = host_config.get("Mounts") or []
-    mount_is_safe = (
+    # Docker Desktop 的 inspect 不一定把 tmpfs 列入 Mounts；HostConfig.Tmpfs 精确证明配置。
+    # Mounts 若有返回值，仍只允许目标 tmpfs，拒绝所有持久卷和宿主挂载。
+    mount_is_safe = not mounts or (
         len(mounts) == 1
         and mounts[0].get("Type") == "tmpfs"
         and mounts[0].get("Destination") == "/var/lib/postgresql/data"
     )
+    declared_volumes = config.get("Volumes") or {}
+    expected_tmpfs = {
+        _DATABASE_TMPFS.split(":", 1)[0]: _DATABASE_TMPFS.split(":", 1)[1]
+    }
     if (
         container.get("Name") != f"/{identity.postgres_container_name}"
         or config.get("Image") != _POSTGRES_IMAGE
@@ -520,10 +528,15 @@ def _validate_postgres_inspect(
         or host_config.get("VolumesFrom")
         or configured_mounts
         or host_config.get("PortBindings")
-        or set(tmpfs) != {"/var/lib/postgresql/data"}
+        or tmpfs != expected_tmpfs
+        or not set(declared_volumes) <= {"/var/lib/postgresql/data"}
         or not expected_env <= env_values
         or not mount_is_safe
-        or any(mount.get("Type") != "tmpfs" for mount in mounts)
+        or any(
+            mount.get("Type") != "tmpfs"
+            or mount.get("Destination") != "/var/lib/postgresql/data"
+            for mount in mounts
+        )
     ):
         raise T15DockerSafetyError(
             "postgres_mount_safety",

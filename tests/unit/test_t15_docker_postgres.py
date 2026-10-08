@@ -123,6 +123,7 @@ def test_postgres_and_worker_commands_have_only_expected_tmpfs_mounts() -> None:
     assert "none" not in worker
     assert "postgres:16" in postgres
     assert image in worker
+    assert worker[-4:] == [image, "python", "-m", "scripts.t15_postgres_test_worker"]
     for argv in (postgres, worker):
         assert not any(
             value == flag or value.startswith(f"{flag}=")
@@ -133,6 +134,8 @@ def test_postgres_and_worker_commands_have_only_expected_tmpfs_mounts() -> None:
     assert postgres[postgres.index("--tmpfs") + 1].startswith(
         "/var/lib/postgresql/data:"
     )
+    health_cmd = postgres[postgres.index("--health-cmd") + 1]
+    assert "tmpfs /var/lib/postgresql/data tmpfs" in health_cmd
     assert worker[worker.index("--tmpfs") + 1].startswith("/tmp:")
 
 
@@ -157,10 +160,15 @@ def test_postgres_inspect_accepts_tmpfs_and_rejects_bind_or_named_volume() -> No
         with pytest.raises(t15_postgres_docker_test.T15DockerSafetyError):
             t15_postgres_docker_test._validate_postgres_inspect(unsafe, identity)
 
-    missing_mount = json.loads(json.dumps(safe))
-    missing_mount["Mounts"] = []
+    # Docker Desktop 不在 Mounts 中显示 tmpfs；HostConfig.Tmpfs 仍必须精确匹配。
+    tmpfs_not_listed = json.loads(json.dumps(safe))
+    tmpfs_not_listed["Mounts"] = []
+    t15_postgres_docker_test._validate_postgres_inspect(tmpfs_not_listed, identity)
+
+    wrong_tmpfs_options = json.loads(json.dumps(tmpfs_not_listed))
+    wrong_tmpfs_options["HostConfig"]["Tmpfs"]["/var/lib/postgresql/data"] = "rw"
     with pytest.raises(t15_postgres_docker_test.T15DockerSafetyError):
-        t15_postgres_docker_test._validate_postgres_inspect(missing_mount, identity)
+        t15_postgres_docker_test._validate_postgres_inspect(wrong_tmpfs_options, identity)
 
     configured_volume = json.loads(json.dumps(safe))
     configured_volume["HostConfig"]["Mounts"] = [
