@@ -65,8 +65,16 @@ def _validate_resolved_compose(config: dict[str, object], project_name: str) -> 
     异常：任何卷、宿主挂载、固定资源名或 adapter/凭据继承都会触发断言失败。
     副作用：无，不连接 Docker daemon 或数据库。
     """
+    _require_isolation(
+        re.fullmatch(r"t15-migration-[0-9a-f]{32}", project_name) is not None,
+        "Compose project name 不是本次生成的唯一名称",
+    )
     _require_isolation(config.get("name") == project_name, "项目名不是本次随机项目")
     _require_isolation(not config.get("volumes"), "包含 Compose named volume")
+    _require_isolation(
+        "configs" not in config and "secrets" not in config,
+        "Compose 引用了额外配置或密钥资源",
+    )
     services = config.get("services")
     _require_isolation(isinstance(services, dict), "services 配置结构无效")
     _require_isolation(set(services) == {"postgres", "migrate"}, "服务集合不符合隔离白名单")
@@ -80,6 +88,14 @@ def _validate_resolved_compose(config: dict[str, object], project_name: str) -> 
         _require_isolation(not service.get("ports"), "服务暴露宿主端口")
         _require_isolation(not service.get("container_name"), "服务设置了固定容器名")
         _require_isolation(not service.get("network_mode"), "服务复用了外部网络")
+        _require_isolation(
+            not service.get("configs")
+            and not service.get("secrets")
+            and not service.get("volumes_from")
+            and not service.get("devices"),
+            "服务引用额外配置、密钥或宿主设备",
+        )
+    _require_isolation(postgres.get("image") == "postgres:16-alpine", "PostgreSQL 镜像不匹配")
     _require_isolation(
         postgres.get("tmpfs") == ["/var/lib/postgresql/data:rw,size=1073741824"],
         "PostgreSQL PGDATA 未绑定专用 tmpfs",
@@ -131,6 +147,7 @@ def _validate_resolved_compose(config: dict[str, object], project_name: str) -> 
         "TEST_DATABASE_ID 不是随机 32 位标识",
     )
     expected_db = f"crm_lead_test_{run_id}"
+    _require_isolation(project_name.endswith(str(run_id)), "项目与测试数据库运行标识不一致")
     for key in ("DATABASE_URL", "TEST_DATABASE_URL"):
         try:
             dsn = make_url(str(migrate_env[key]))
@@ -151,6 +168,14 @@ def _validate_resolved_compose(config: dict[str, object], project_name: str) -> 
         and postgres_env["POSTGRES_USER"] == "t15_migration"
         and postgres_env["POSTGRES_PASSWORD"] == f"t15_{run_id}",
         "PostgreSQL 未使用当前随机测试身份",
+    )
+    build = migrate.get("build")
+    _require_isolation(isinstance(build, dict), "迁移服务未使用仓库构建镜像")
+    _require_isolation(
+        set(build) == {"context", "dockerfile"}
+        and Path(str(build["context"])).resolve() == _REPOSITORY_ROOT
+        and build["dockerfile"] == "Dockerfile",
+        "迁移服务构建上下文超出仓库根目录",
     )
 
     networks = config.get("networks", {})
@@ -278,9 +303,10 @@ def test_ticket15_compose_source_is_tmpfs_only_without_docker() -> None:
     assert "media_data" not in serialized
     assert "${T15_RUN_ID:?T15_RUN_ID required}" in serialized
     run_id = "a" * 32
-    project_name = f"t15-static-{run_id}"
+    project_name = f"t15-migration-{run_id}"
     resolved = json.loads(serialized.replace("${T15_RUN_ID:?T15_RUN_ID required}", run_id))
     resolved["name"] = project_name
+    resolved["services"]["migrate"]["build"]["context"] = str(_REPOSITORY_ROOT)
     resolved["networks"] = {"default": {"name": f"{project_name}_default"}}
     _validate_resolved_compose(resolved, project_name)
     unsafe = deepcopy(resolved)
