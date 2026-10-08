@@ -79,27 +79,11 @@ def _enum_option_evidence_terms(field_name: str, option: str) -> tuple[str, ...]
     return tuple(sorted(terms, key=len, reverse=True))
 _PHONE_PATTERN = re.compile(r"^\+?[0-9][0-9 -]{5,24}$")
 _EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
-_PHONE_SEARCH_PATTERN = re.compile(r"(?<!\d)(?:\+?86[ -]?)?(1[3-9]\d{9})(?!\d)")
+_PHONE_SEARCH_PATTERN = re.compile(
+    r"(?<!\d)(?:\+?86[ -]?)?(1[3-9](?:[ -]?\d){9})(?!\d)"
+)
+_PHONE_SOURCE_PATTERN = re.compile(r"(?<!\d)(?:\+|00)?\d(?:[ \t().-]*\d){6,18}(?!\d)")
 _EMAIL_SEARCH_PATTERN = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])")
-_NATURAL_COMPANY_CONTACT_PATTERN = re.compile(
-    r"(?P<company>[^，,；;。\n]{2,80}?)的"
-    r"(?P<contact>[\u4e00-\u9fffA-Za-z·]{1,6}"
-    r"(?:总|经理|工|先生|女士|老师|主任|老板|主管))"
-    r"(?=\s*(?:[，,；;。]|手机号|手机|电话|邮箱|是|做|想|主要|他们|找我|沟通|联系|对接|交流|事项|预计|计划|实施))"
-)
-_NATURAL_ROLE_PREFIXES = (
-    "副总经理",
-    "总经理",
-    "采购负责人",
-    "技术负责人",
-    "项目负责人",
-    "销售负责人",
-    "负责人",
-    "副总监",
-    "总监",
-    "项目经理",
-    "产品经理",
-)
 _COMMUNICATION_EVIDENCE = (
     ("线上会议", "线上会议"),
     ("电话", "打电话"),
@@ -247,7 +231,7 @@ class AIGateway:
         """
         trace_id = str(uuid4())
         # 只将字段提取所需文本交给模型，并在发送前移除无关的高敏感信息。
-        safe_text = _SENSITIVE_PATTERN.sub("[已遮蔽敏感号码]", text)
+        safe_text, _ = self._mask_sensitive_source_text(text)
         safe_context_fields = {
             field_name: _SENSITIVE_PATTERN.sub("[已遮蔽敏感号码]", value)
             for field_name, value in (context_fields or {}).items()
@@ -272,10 +256,12 @@ class AIGateway:
                 low_candidates,
                 validated_enrichment,
                 pending_prefill_allowed,
-            ) = (
-                self._prepare_analysis_patch(analysis, safe_text)
+            ) = self._prepare_analysis_patch(
+                analysis, safe_text, identity_source_text=text
             )
-            segment_patches = self._prepare_segment_patches(analysis, text)
+            segment_patches = self._prepare_segment_patches(
+                analysis, safe_text, identity_source_text=text
+            )
             if segment_patches:
                 analysis = analysis.model_copy(
                     update={
@@ -341,7 +327,11 @@ class AIGateway:
         )
 
     def _prepare_analysis_patch(
-        self, analysis: LeadAnalysis, source_text: str
+        self,
+        analysis: LeadAnalysis,
+        source_text: str,
+        *,
+        identity_source_text: str | None = None,
     ) -> tuple[
         LeadAnalysis,
         dict[str, LeadFieldValue],
@@ -351,8 +341,11 @@ class AIGateway:
         tuple[str, ...],
     ]:
         """对单个消息或单个语义分段复用同一套确定性字段校验。"""
-        # 只把原文可逐字核验的身份引用提升为正式字段，避免自然表达因模型字段放错位置而待归属。
-        analysis = self._recover_verified_identity_fields(analysis, source_text)
+        # PII 仅用于本地证据校验，不能传给模型或日志；模型无原文依据的联系人候选先行移除。
+        identity_text = identity_source_text if identity_source_text is not None else source_text
+        analysis = self._drop_contact_candidates_without_source_evidence(analysis, identity_text)
+        # 通过本地原文恢复被模型遗漏的联系方式，确保 provenance 值也有真实来源。
+        analysis = self._recover_verified_identity_fields(analysis, identity_text)
         # 先将少量可确定映射的沟通自然表达归一化，再执行枚举校验。
         analysis = self._normalize_communication_candidate(analysis, source_text)
         # 模型偶发漏掉原文中明确的合法枚举；仅恢复唯一且有字段语义提示的候选，不做猜测。
@@ -387,8 +380,64 @@ class AIGateway:
             pending_prefill_allowed,
         )
 
+    @staticmethod
+    def _mask_sensitive_source_text(text: str) -> tuple[str, tuple[int | None, ...]]:
+        """遮蔽发给模型的敏感片段，并保留安全的分段位置映射。
+
+        参数：text 为实际来源消息文本。
+        返回值：模型安全文本及每个安全文本边界对应的原文边界；遮蔽符内部边界为 None。
+        异常：无。
+        副作用：无；不记录或返回原文内容以外的外部事实。
+        """
+        placeholder = "[已遮蔽敏感号码]"
+        parts: list[str] = []
+        safe_to_source: list[int | None] = [0]
+        source_cursor = 0
+        for match in _SENSITIVE_PATTERN.finditer(text):
+            visible = text[source_cursor : match.start()]
+            parts.append(visible)
+            safe_to_source.extend(
+                source_cursor + offset for offset in range(1, len(visible) + 1)
+            )
+            parts.append(placeholder)
+            safe_to_source.extend([None] * (len(placeholder) - 1))
+            safe_to_source.append(match.end())
+            source_cursor = match.end()
+        tail = text[source_cursor:]
+        parts.append(tail)
+        safe_to_source.extend(source_cursor + offset for offset in range(1, len(tail) + 1))
+        return "".join(parts), tuple(safe_to_source)
+
+    @classmethod
+    def _source_for_masked_span(
+        cls, span: str, safe_source_text: str, source_text: str
+    ) -> str | None:
+        """将 AI 的单个安全文本分段唯一映射回对应真实来源片段。
+
+        参数：span 为模型返回的可见分段；safe_source_text 为遮蔽后输入；source_text 为真实原文。
+        返回值：边界唯一且未切开遮蔽符时返回对应原文；否则返回 None。
+        异常：无。
+        副作用：无；只在内存中映射现有原文。
+        """
+        expected_safe_text, boundaries = cls._mask_sensitive_source_text(source_text)
+        if expected_safe_text != safe_source_text:
+            return None
+        matches = list(re.finditer(re.escape(span), safe_source_text))
+        if len(matches) != 1:
+            return None
+        match = matches[0]
+        source_start = boundaries[match.start()]
+        source_end = boundaries[match.end()]
+        if source_start is None or source_end is None or source_end < source_start:
+            return None
+        return source_text[source_start:source_end]
+
     def _prepare_segment_patches(
-        self, analysis: LeadAnalysis, source_text: str
+        self,
+        analysis: LeadAnalysis,
+        source_text: str,
+        *,
+        identity_source_text: str | None = None,
     ) -> tuple[ExtractedLeadSegmentPatch, ...]:
         """仅保留能回指原文的语义分段，并逐段执行完整网关校验。"""
         if not analysis.segments:
@@ -400,7 +449,14 @@ class AIGateway:
         if any(segment.source_text_span not in source_text for segment in analysis.segments):
             return ()
         prepared: list[ExtractedLeadSegmentPatch] = []
+        raw_source_text = identity_source_text if identity_source_text is not None else source_text
         for segment in analysis.segments:
+            segment_source_text = self._source_for_masked_span(
+                segment.source_text_span, source_text, raw_source_text
+            )
+            if segment_source_text is None:
+                # 无法唯一映射到真实原文的分段不能共享整条消息中的联系方式。
+                return ()
             segment_analysis = LeadAnalysis(
                 intent="UPDATE_LEAD",
                 customer_reference=segment.customer_reference,
@@ -415,7 +471,11 @@ class AIGateway:
                 low_candidates,
                 enrichment,
                 pending_prefill_allowed,
-            ) = self._prepare_analysis_patch(segment_analysis, segment.source_text_span)
+            ) = self._prepare_analysis_patch(
+                segment_analysis,
+                segment.source_text_span,
+                identity_source_text=segment_source_text,
+            )
             # 公司与联系人候选必须落在该 segment 的原文边界内；模型扩写直接丢弃。
             grounded_fields = dict(fields)
             grounded_crm_fields = dict(segment_analysis.crm_fields)
@@ -516,6 +576,90 @@ class AIGateway:
         return intent.model_copy(update={"company_name": company_name})
 
     @staticmethod
+    def _drop_contact_candidates_without_source_evidence(
+        analysis: LeadAnalysis, source_text: str
+    ) -> LeadAnalysis:
+        """丢弃无法在当前来源文本中验证的手机、电话或邮箱候选。
+
+        参数：analysis 为模型结构化结果；source_text 为当前消息或单一 segment 的真实原文。
+        返回值：移除无来源联系方式及其置信度后的分析结果。
+        异常：无；可选联系方式没有证据时不阻塞其它字段。
+        副作用：为每个被丢弃字段写一条不含联系方式值的结构化诊断日志。
+        """
+        fields = dict(analysis.crm_fields)
+        confidences = dict(analysis.confidence_by_field)
+        contact_fields = {"手机", "电话", "邮箱"}
+        for field_name, value in tuple(fields.items()):
+            canonical_name = AI_FIELD_ALIASES.get(field_name.strip().lower(), field_name)
+            if canonical_name not in contact_fields or not isinstance(value, str):
+                continue
+            if AIGateway._contact_value_has_source_evidence(canonical_name, value, source_text):
+                continue
+            fields.pop(field_name, None)
+            confidences.pop(field_name, None)
+            confidences.pop(canonical_name, None)
+            logger.warning(
+                "ai_contact_source_mismatch",
+                extra={
+                    "field_name": canonical_name,
+                    "reason": "missing_source_evidence",
+                },
+            )
+        if fields == analysis.crm_fields and confidences == analysis.confidence_by_field:
+            return analysis
+        return analysis.model_copy(
+            update={"crm_fields": fields, "confidence_by_field": confidences}
+        )
+
+    @staticmethod
+    def _contact_value_has_source_evidence(
+        field_name: str, value: str, source_text: str
+    ) -> bool:
+        """比较联系方式候选与当前来源原文，不读取会话或其它客户上下文。
+
+        参数：field_name 为规范 CRM 联系方式字段；value 为模型候选；source_text 为当前真实原文。
+        返回值：邮箱或号码在该来源中有相同事实时返回 True。
+        异常：无；非法格式或来源不存在时返回 False。
+        副作用：无。
+        """
+        if field_name == "邮箱":
+            candidate = value.strip().casefold()
+            return bool(candidate) and any(
+                candidate == match.group(0).casefold()
+                for match in _EMAIL_SEARCH_PATTERN.finditer(source_text)
+            )
+        candidate_number = AIGateway._normalize_contact_number(value)
+        if candidate_number is None:
+            return False
+        return any(
+            candidate_number == AIGateway._normalize_contact_number(match.group(0))
+            for match in _PHONE_SOURCE_PATTERN.finditer(source_text)
+        )
+
+    @staticmethod
+    def _normalize_contact_number(value: str) -> str | None:
+        """安全归一化号码分隔符及明确的中国 +86/0086 区号。
+
+        参数：value 为来源文本或模型字段中的号码候选。
+        返回值：7 至 15 位号码数字串；无法安全识别时返回 None。
+        异常：无。
+        副作用：无；不查询电话库或外部服务。
+        """
+        compact = re.sub(r"[ \t().-]", "", value.strip())
+        if not re.fullmatch(r"(?:\+|00)?\d{7,20}", compact):
+            return None
+        digits = re.sub(r"\D", "", compact)
+        if compact.startswith("0086"):
+            digits = digits[4:]
+        elif compact.startswith("+86"):
+            digits = digits[2:]
+        elif compact.startswith("00"):
+            digits = digits[2:]
+        elif digits.startswith("86") and len(digits) == 13 and digits[2] == "1":
+            digits = digits[2:]
+        return digits if 7 <= len(digits) <= 15 else None
+
+    @staticmethod
     def _recover_verified_identity_fields(
         analysis: LeadAnalysis, source_text: str
     ) -> LeadAnalysis:
@@ -531,26 +675,9 @@ class AIGateway:
         reference_fields = AIGateway._verified_customer_reference_fields(
             analysis.customer_reference, source_text
         )
-        # 标签或明确“公司-联系人”句式是比模型引用更强的原文证据；模型误把两者
-        # 拼接后放进 company 时，不能让 customer_reference 再次覆盖确定性拆分结果。
+        # 显式标签和 AI 的语义引用只作为结构化候选；自由文本不再靠固定公司/职位句式拆分。
         for field_name, value in reference_fields.items():
             recovered.setdefault(field_name, value)
-        # 联系人与职位在自然语言中经常连写；仅在原文明确出现职位并紧邻模型核验联系人时补回职务。
-        contact = recovered.get("联系人")
-        # 若模型把联系人放在正式字段而不是 customer_reference，仅借用该已输出值判断相邻职位，
-        # 不提升其原有置信度，也不改变人工/低置信度分级结果。
-        contact_candidate = analysis.crm_fields.get("联系人")
-        if (
-            not contact
-            and isinstance(contact_candidate, str)
-            and contact_candidate.strip() in source_text
-        ):
-            contact = contact_candidate.strip()
-        if contact:
-            recovered_title = AIGateway._extract_verified_title(source_text, contact)
-            if recovered_title:
-                recovered["职务"] = recovered_title
-
         if not recovered:
             return analysis
         fields = dict(analysis.crm_fields)
@@ -622,59 +749,6 @@ class AIGateway:
         return fields
 
     @staticmethod
-    def _extract_verified_title(source_text: str, contact: str) -> str | None:
-        """从联系人附近的明确职位表达中恢复职务字段。
-
-        参数：source_text 为脱敏后的当前消息文本；contact 为已由模型并经原文核验的联系人。
-        返回值：唯一且有明确职位语义的原文职位；无法确认或出现多个冲突职位时返回 None。
-        异常：无。
-        副作用：无；仅执行本地文本匹配，不覆盖模型已经给出的其他字段。
-        """
-        # 先处理带字段标签的写法，避免把后续联系人、需求等内容误认为职位。
-        labeled_match = re.search(
-            r"(?:职务|职位|岗位|职称|身份)\s*[:：]\s*([^，,；;。\n]+)",
-            source_text,
-        )
-        candidates: set[str] = set()
-        if labeled_match:
-            labeled_title = labeled_match.group(1).strip()
-            if labeled_title:
-                candidates.add(labeled_title)
-
-        # 只识别紧邻已核验联系人之前的常见职位词，支持“总经理张总”“采购负责人李工”等连写形式。
-        title_terms = (
-            "副总经理",
-            "总经理",
-            "执行董事",
-            "董事长",
-            "副总裁",
-            "总裁",
-            "采购负责人",
-            "技术负责人",
-            "项目负责人",
-            "销售负责人",
-            "负责人",
-            "副总监",
-            "总监",
-            "工程师",
-            "采购经理",
-            "项目经理",
-            "产品经理",
-            "经理",
-            "主管",
-            "主任",
-            "厂长",
-            "老板",
-        )
-        title_pattern = "|".join(re.escape(term) for term in title_terms)
-        contact_pattern = re.escape(contact.strip())
-        for match in re.finditer(rf"({title_pattern})\s*{contact_pattern}", source_text):
-            candidates.add(match.group(1))
-
-        # 同一联系人若对应多个不同职位，保守留空，交由模型/销售后续确认。
-        return next(iter(candidates)) if len(candidates) == 1 else None
-
-    @staticmethod
     def _is_combined_identity_value(value: str, company: str, contact: str) -> bool:
         """判断单字段值是否只是公司与联系人被符号或空白拼接后的组合。
 
@@ -727,7 +801,9 @@ class AIGateway:
         fields: dict[str, str] = {}
         phone_match = _PHONE_SEARCH_PATTERN.search(source_text)
         if phone_match:
-            fields["手机"] = phone_match.group(1)
+            normalized_phone = AIGateway._normalize_contact_number(phone_match.group(1))
+            if normalized_phone is not None:
+                fields["手机"] = normalized_phone
         email_match = _EMAIL_SEARCH_PATTERN.search(source_text)
         if email_match:
             fields["邮箱"] = email_match.group(0)
@@ -740,38 +816,7 @@ class AIGateway:
             match = re.search(pattern, source_text)
             if match and match.group(1).strip():
                 fields[field_name] = match.group(1).strip().rstrip("\\")
-        natural_match = _NATURAL_COMPANY_CONTACT_PATTERN.search(source_text)
-        if natural_match:
-            company = AIGateway._clean_natural_company_candidate(
-                natural_match.group("company")
-            )
-            contact = natural_match.group("contact").strip()
-            # “总经理张总”属于职位+联系人连写，模型已有专门的职务恢复规则；
-            # 此处只接受没有职位前缀的“某公司/某客户的张总”句式。
-            if (
-                company
-                and contact
-                and not contact.startswith(_NATURAL_ROLE_PREFIXES)
-                and "的" not in company
-            ):
-                fields.setdefault("线索名称", company)
-                fields.setdefault("联系人", contact)
         return fields
-
-    @staticmethod
-    def _clean_natural_company_candidate(value: str) -> str:
-        """清除公司前的有限叙述连接词，不改变公司主体文本。
-
-        参数：value 为“公司名的联系人”句式中“的”之前的原文片段。
-        返回值：去掉句首时间或连接关系后的候选公司名；无法形成主体时返回空串。
-        异常：无。
-        副作用：无；不调用模型或外部服务。
-        """
-        candidate = value.strip(" \t，,、")
-        candidate = re.sub(r"^(?:(?:今天|刚才|刚刚)\s*)?(?:和|与|跟)\s*", "", candidate)
-        if not candidate or any(token in candidate for token in ("他们", "我们", "客户的", "主要")):
-            return ""
-        return candidate
 
     @staticmethod
     def _normalize_identity_text(value: str) -> str:
@@ -1931,7 +1976,12 @@ class AIGateway:
                     "NEW_LEAD；名片、OCR、语音转写或碎片补充属于当前客户时返回 "
                     "UPDATE_LEAD；一条消息可靠拆出多个客户时返回 MULTI_LEAD 并填写 segments；"
                     "客户数量或边界不可靠时返回 MULTI_LEAD_AMBIGUOUS，不猜测分段；"
-                    "无法可靠判断时不要伪造公司名。"
+                    "自由语言中的公司身份由你理解并提出：只有当某公司确实是本条消息正在介绍的客户主体时，"
+                    "才可将其写入线索名称及 customer_reference.company；竞品、供应商、历史公司或"
+                    "顺带提及的公司"
+                    "不能作为本条线索身份。客户身份候选、联系人、职务和业务字段必须来自当前消息，"
+                    "上下文仅帮助区分补充还是新客户，不能覆盖当前消息明确介绍的不同客户。"
+                    "不得输出或决定 Lead ID、Smart Table record ID。无法可靠判断时不要伪造公司名。"
                     f"{context_instruction}"
                     f"必须符合此 JSON Schema：{json.dumps(json_schema, ensure_ascii=False)}"
                     f"{self._field_contract_instructions()}"
@@ -1983,8 +2033,7 @@ class AIGateway:
             "必须先按语义区分公司主体与联系人个人，不依赖波浪线、短横线、空格、斜线等特定分隔符；"
             "即使公司名和联系人连写，也只能在语义足够明确时分别输出。"
             "线索名称只能填写公司主体，联系人只能填写个人姓名；禁止把公司和联系人拼接后写入任一单字段。"
-            "职务是与联系人对应的职位或身份称谓，必须独立写入职务字段；"
-            "例如‘总经理张总’应输出职务=总经理、联系人=张总，‘老板李总’应输出职务=老板、联系人=李总；"
+            "职务是与联系人对应的职位或身份称谓，应按当前原文语义独立写入职务字段，不要求固定词表或句式；"
             "仅出现‘张总’等称呼而没有明确职位关系时，不得仅凭‘总’猜测职务。"
             "customer_reference 可使用 company、contact、title、phone、email 五类身份引用，"
             "分别填写已识别的公司、联系人、职务、手机号和邮箱；"

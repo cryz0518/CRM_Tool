@@ -508,17 +508,17 @@ def test_gateway_drops_unregistered_communication_without_field_evidence() -> No
     assert len(provider.requests) == 1
 
 
-def test_gateway_splits_natural_company_contact_from_activity_sentence() -> None:
-    """验证“公司的人找我沟通事项”不会把整句活动描述写成线索名称。"""
+def test_gateway_uses_ai_company_subject_for_activity_sentence() -> None:
+    """自由表达中的公司主体由 AI 提出，并由当前原文来源校验。"""
     provider = MockLLMProvider(
         responses=[
             valid_analysis(
                 customer_reference={
-                    "company_name": "安生的罗总找我沟通 AISOP 事项",
+                    "company_name": "安生",
                     "contact": "罗总",
                 },
                 crm_fields={
-                    "线索名称": "安生的罗总找我沟通 AISOP 事项",
+                    "线索名称": "安生",
                     "联系人": "罗总",
                 },
                 confidence_by_field={"线索名称": 0.95, "联系人": 0.95},
@@ -601,10 +601,12 @@ def test_gateway_prompt_includes_current_context_only_for_relation_judgment() ->
     assert '"线索名称": "邢总公司"' in prompt
     assert "不是本条消息事实；本条消息没有证据的字段不得从上下文复制" in prompt
     assert "明确介绍另一个客户时返回 NEW_LEAD" in prompt
+    assert "确实是本条消息正在介绍的客户主体" in prompt
+    assert "不得输出或决定 Lead ID、Smart Table record ID" in prompt
 
 
-def test_gateway_recovers_natural_company_when_model_omits_company_confidence() -> None:
-    """验证“公司名的联系人”原文证据可恢复公司，不受模型置信度遗漏影响。
+def test_gateway_recovers_ai_company_reference_when_confidence_is_missing() -> None:
+    """AI 语义识别的公司候选有原文证据时可恢复遗漏的置信度。
 
     参数：无。
     返回值：无。
@@ -615,7 +617,7 @@ def test_gateway_recovers_natural_company_when_model_omits_company_confidence() 
     provider = MockLLMProvider(
         responses=[
             valid_analysis(
-                customer_reference={},
+                customer_reference={"company": "中国动力"},
                 crm_fields={"线索名称": "中国动力", "联系人": "张总"},
                 confidence_by_field={"联系人": 0.95},
             )
@@ -631,14 +633,14 @@ def test_gateway_recovers_natural_company_when_model_omits_company_confidence() 
     assert result.analysis.crm_fields["线索名称"] == "中国动力"
 
 
-def test_gateway_corrects_model_combined_company_contact_value() -> None:
-    """验证模型把“公司名的联系人”整体写入线索名称时由原文确定性纠正。"""
+def test_gateway_corrects_combined_company_contact_from_ai_subject_claim() -> None:
+    """AI 对公司和联系人语义拆分后，可纠正 crm_fields 中拼接的身份值。"""
     source_text = "遨博的张总，手机号19882313122，是做机器人的，想了解涂胶的工艺场景实现"
     provider = MockLLMProvider(
         responses=[
             valid_analysis(
                 customer_reference={
-                    "company": "遨博的张总",
+                    "company": "遨博",
                     "contact": "张总",
                     "phone": "19882313122",
                 },
@@ -818,8 +820,8 @@ def test_gateway_drops_unregistered_enrichment_key_instead_of_creating_field() -
     assert result.enrichment == {}
 
 
-def test_gateway_recovers_explicit_title_adjacent_to_verified_contact() -> None:
-    """验证“总经理张总”连写时，职务不会因模型漏返回而被丢弃。
+def test_gateway_keeps_ai_extracted_title_for_verified_contact() -> None:
+    """自由语言中的职务由 AI 提取，正式值仍受当前原文证据约束。
 
     参数：无。
     返回值：无。
@@ -839,11 +841,13 @@ def test_gateway_recovers_explicit_title_adjacent_to_verified_contact() -> None:
                 crm_fields={
                     "线索名称": "中国动力",
                     "联系人": "张总",
+                    "职务": "总经理",
                     "手机": "13913991399",
                 },
                 confidence_by_field={
                     "线索名称": 0.95,
                     "联系人": 0.95,
+                    "职务": 0.95,
                     "手机": 0.99,
                 },
             )
@@ -853,7 +857,7 @@ def test_gateway_recovers_explicit_title_adjacent_to_verified_contact() -> None:
     result = AIGateway(provider).extract_fields(source_text)
 
     assert result.fields["职务"] == "总经理"
-    assert result.analysis.confidence_by_field["职务"] == 1.0
+    assert result.analysis.confidence_by_field["职务"] == 0.95
 
 
 
@@ -1039,8 +1043,8 @@ def test_gateway_drops_unknown_phone_alias_without_source_evidence() -> None:
     assert len(provider.requests) == 1
 
 
-def test_gateway_accepts_registered_chinese_phone_field() -> None:
-    """验证合法中文注册表字段及其标量值可通过既有确定性校验。
+def test_gateway_drops_registered_chinese_phone_field_without_source_number() -> None:
+    """验证字段名和格式合法仍不足以接受原文没有的电话号码。
 
     参数：无。
     返回：无。
@@ -1054,7 +1058,7 @@ def test_gateway_accepts_registered_chinese_phone_field() -> None:
 
     result = AIGateway(provider).extract_fields("客户电话已提供")
 
-    assert result.fields == {"手机": "13800138000"}
+    assert result.fields == {}
 
 
 def test_gateway_repair_prompt_keeps_crm_field_and_value_type_constraints() -> None:
