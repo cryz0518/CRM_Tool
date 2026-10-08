@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, text
 
 from app.core.config import Settings
 from app.core.heartbeat import check_heartbeat
+from app.core.migration_readiness import check_migration_readiness, migration_graph_component
 from app.core.provider_policy import ProviderPolicy
 from app.core.readiness import (
     ReadinessComponent,
@@ -19,8 +20,6 @@ from app.core.readiness import (
     not_ready_component,
     ready_component,
 )
-
-EXPECTED_MIGRATION_HEAD = "0023_ticket22_storage_retention"
 
 
 def _policy_components(settings: Settings) -> tuple[ReadinessComponent, ...]:
@@ -74,7 +73,7 @@ def _static_setting(component: str, configured: bool) -> ReadinessComponent:
 
 def _static_migration_component() -> ReadinessComponent:
     """检查当前代码声明的 migration head，绝不创建或修改 migration。"""
-    return ready_component("migration", "migration_head_declared")
+    return migration_graph_component()
 
 
 def _runtime_components(settings: Settings) -> ReadinessReport:
@@ -107,11 +106,11 @@ def _runtime_components(settings: Settings) -> ReadinessReport:
 
     def migration_check() -> ReadinessComponent:
         """读取 Alembic 当前版本并与代码 head 比较。"""
-        with engine.connect() as connection:
-            revision = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
-        if revision != EXPECTED_MIGRATION_HEAD:
-            return not_ready_component("migration", "migration_pending")
-        return ready_component("migration", "migration_current")
+        try:
+            with engine.connect() as connection:
+                return check_migration_readiness(connection)
+        except Exception:
+            return not_ready_component("migration", "migration_unavailable")
 
     redis_client: Redis | None = None
 
