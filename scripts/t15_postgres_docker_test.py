@@ -1,7 +1,6 @@
-"""直接 Docker CLI 的 T15 PostgreSQL 集成测试运行器。
+"""直接 Docker CLI 的 T15 隔离测试运行器。
 
-默认只拒绝执行；只有显式传入 --execute 且所有本机、镜像、网络、容器安全门通过后，
-才会创建一次性 PostgreSQL 容器并运行 0033 迁移与 Scheduler 并发测试。
+默认只拒绝执行；--unit 与 --postgres 是两个独立入口，后者才会创建一次性 PostgreSQL。
 """
 
 from __future__ import annotations
@@ -24,6 +23,8 @@ _LOCAL_DOCKER_DESKTOP_ENDPOINTS = {
 _POSTGRES_IMAGE = "postgres:16"
 _DATABASE_TMPFS = "/var/lib/postgresql/data:rw,nosuid,nodev,size=1073741824"
 _WORKER_TMPFS = "/tmp:rw,nosuid,nodev,noexec,size=268435456"
+_DOCKER_CHECK_TIMEOUT_SECONDS = 20
+_TEST_WORKER_TIMEOUT_SECONDS = 900
 _LABEL_KEY = "codex.t15.run_id"
 _REJECTED_DOCKER_OVERRIDES = {
     "DOCKER_HOST",
@@ -222,10 +223,10 @@ def _worker_run_argv(identity: _TestIdentity, image: str) -> list[str]:
     return arguments
 
 
-def _unit_test_run_argv(image: str) -> list[str]:
+def _unit_test_run_argv(identity: _TestIdentity, image: str) -> list[str]:
     """生成无网络、无挂载的只读单元测试容器命令。
 
-    参数：image 必须是本仓库测试镜像的完整 SHA 标签。
+    参数：identity 为本次随机测试身份；image 必须是本仓库测试镜像的完整 SHA 标签。
     返回值：仅运行 tests/unit 的 Docker CLI 参数。
     异常：镜像标签不符合白名单时抛出安全错误。
     副作用：无，不启动容器。
@@ -237,8 +238,12 @@ def _unit_test_run_argv(image: str) -> list[str]:
         "run",
         "--pull=never",
         "--rm",
+        "--name",
+        identity.worker_container_name,
         "--network",
         "none",
+        "--label",
+        f"{_LABEL_KEY}={identity.run_id}",
         "--read-only",
         "--tmpfs",
         _WORKER_TMPFS,
@@ -246,6 +251,8 @@ def _unit_test_run_argv(image: str) -> list[str]:
         "python",
         "-m",
         "pytest",
+        "-p",
+        "no:cacheprovider",
         "tests/unit",
     ]
 
@@ -271,13 +278,217 @@ def _validate_network_inspect(
         )
 
 
+def _validate_worker_inspect(
+    container: dict[str, Any],
+    identity: _TestIdentity,
+    image: str,
+    network_name: str,
+) -> None:
+    """确认待清理 Worker 确属本次运行且无宿主挂载或发布端口。
+
+    参数：container 为 inspect 对象；其余参数为本轮随机身份和预期配置。
+    返回值：身份和挂载均安全时无。
+    异常：容器名称、镜像、标签、网络或挂载不符时抛出安全错误。
+    副作用：无，不停止或删除容器。
+    """
+    host_config = container.get("HostConfig") or {}
+    mounts = container.get("Mounts") or []
+    tmpfs = host_config.get("Tmpfs") or {}
+    config = container.get("Config") or {}
+    if (
+        container.get("Name") != f"/{identity.worker_container_name}"
+        or config.get("Image") != image
+        or (config.get("Labels") or {}).get(_LABEL_KEY) != identity.run_id
+        or config.get("Volumes")
+        or host_config.get("NetworkMode") != network_name
+        or host_config.get("Binds")
+        or host_config.get("VolumesFrom")
+        or host_config.get("PortBindings")
+        or set(tmpfs) != {"/tmp"}
+        or len(mounts) > 1
+        or any(
+            mount.get("Type") != "tmpfs" or mount.get("Destination") != "/tmp"
+            for mount in mounts
+        )
+    ):
+        raise T15DockerSafetyError(
+            "worker_cleanup_identity",
+            "WORKER_CONTAINER_IDENTITY_MISMATCH",
+            "Worker 清理目标身份或挂载未通过安全校验",
+        )
+
+
+def _cleanup_worker(
+    identity: _TestIdentity,
+    image: str,
+    network_name: str,
+    environment: dict[str, str],
+) -> None:
+    """只停止并删除本次身份验证通过的 Worker，随后确认资源已消失。
+
+    参数：identity、image、network_name 与 environment 均来自本次执行。
+    返回值：Worker 已不存在时无。
+    异常：无法验证、停止或确认清理时抛出脱敏安全错误。
+    副作用：可能停止并删除唯一匹配本次随机名称、标签和镜像的 Worker。
+    """
+    inspect_argv = ["docker", "container", "inspect", identity.worker_container_name]
+    initial = _run_docker(
+        inspect_argv,
+        environment,
+        "worker_cleanup_inspect",
+        not_found_name=identity.worker_container_name,
+    )
+    # 正常 --rm 完成的 Worker 已不存在；仅将精确的 Docker not-found 响应视为已清理。
+    if not initial:
+        return
+    container = _inspect_json(initial, "worker_cleanup_inspect")
+    _validate_worker_inspect(container, identity, image, network_name)
+    if (container.get("State") or {}).get("Running") is True:
+        try:
+            _run_docker(
+                [
+                    "docker",
+                    "container",
+                    "stop",
+                    "--time",
+                    "10",
+                    identity.worker_container_name,
+                ],
+                environment,
+                "worker_cleanup_stop",
+                timeout=_DOCKER_CHECK_TIMEOUT_SECONDS,
+            )
+        except T15DockerSafetyError:
+            # stop 客户端超时不代表容器已停止；后续只对已验证身份的名称执行 rm --force。
+            pass
+    try:
+        _run_docker(
+            ["docker", "container", "rm", "--force", identity.worker_container_name],
+            environment,
+            "worker_cleanup_remove",
+            timeout=_DOCKER_CHECK_TIMEOUT_SECONDS,
+        )
+    except T15DockerSafetyError:
+        # rm 超时后需 inspect 证实消失；不能把 CLI 的退出状态当成清理完成。
+        pass
+    remaining = _run_docker(
+        inspect_argv,
+        environment,
+        "worker_cleanup_verify",
+        not_found_name=identity.worker_container_name,
+    )
+    if remaining:
+        still_present = _inspect_json(remaining, "worker_cleanup_verify")
+        _validate_worker_inspect(still_present, identity, image, network_name)
+        raise T15DockerSafetyError(
+            "worker_cleanup_verify",
+            "WORKER_CLEANUP_UNCONFIRMED",
+            "本次 Worker 清理后仍可见，不能确认其已停止",
+        )
+
+
+def _cleanup_postgres(identity: _TestIdentity, environment: dict[str, str]) -> None:
+    """只删除随机身份标签与名称均匹配的本次 PostgreSQL 容器。
+
+    参数：identity 和 environment 来自本次执行。
+    返回值：目标容器已不存在时无。
+    异常：目标身份不符或删除后仍可见时抛出安全错误。
+    副作用：删除本次容器，不删除任何 Docker volume。
+    """
+    inspect_argv = ["docker", "container", "inspect", identity.postgres_container_name]
+    output = _run_docker(
+        inspect_argv,
+        environment,
+        "postgres_cleanup_inspect",
+        not_found_name=identity.postgres_container_name,
+    )
+    if not output:
+        return
+    container = _inspect_json(output, "postgres_cleanup_inspect")
+    if (
+        container.get("Name") != f"/{identity.postgres_container_name}"
+        or (container.get("Config") or {}).get("Image") != _POSTGRES_IMAGE
+        or ((container.get("Config") or {}).get("Labels") or {}).get(_LABEL_KEY)
+        != identity.run_id
+    ):
+        raise T15DockerSafetyError(
+            "postgres_cleanup_identity",
+            "POSTGRES_CLEANUP_IDENTITY_MISMATCH",
+            "PostgreSQL 清理目标不属于本次测试",
+        )
+    try:
+        _run_docker(
+            ["docker", "container", "rm", "--force", identity.postgres_container_name],
+            environment,
+            "postgres_cleanup_remove",
+            timeout=_DOCKER_CHECK_TIMEOUT_SECONDS,
+        )
+    except T15DockerSafetyError:
+        # CLI 超时或报错后仍通过精确名称检查最终状态，不推断容器已停止。
+        pass
+    remaining = _run_docker(
+        inspect_argv,
+        environment,
+        "postgres_cleanup_verify",
+        not_found_name=identity.postgres_container_name,
+    )
+    if remaining:
+        raise T15DockerSafetyError(
+            "postgres_cleanup_verify",
+            "POSTGRES_CLEANUP_UNCONFIRMED",
+            "本次 PostgreSQL 容器清理后仍可见",
+        )
+
+
+def _cleanup_network(identity: _TestIdentity, environment: dict[str, str]) -> None:
+    """只删除本轮随机标签和 internal 属性验证通过的测试网络。
+
+    参数：identity 和 environment 来自本次执行。
+    返回值：目标网络已不存在时无。
+    异常：网络身份不符或删除后仍可见时抛出安全错误。
+    副作用：删除本次创建的唯一测试网络。
+    """
+    inspect_argv = ["docker", "network", "inspect", identity.network_name]
+    output = _run_docker(
+        inspect_argv,
+        environment,
+        "network_cleanup_inspect",
+        not_found_name=identity.network_name,
+    )
+    if not output:
+        return
+    _validate_network_inspect(_inspect_json(output, "network_cleanup_inspect"), identity)
+    try:
+        _run_docker(
+            ["docker", "network", "rm", identity.network_name],
+            environment,
+            "network_cleanup_remove",
+            timeout=_DOCKER_CHECK_TIMEOUT_SECONDS,
+        )
+    except T15DockerSafetyError:
+        # 删除命令状态不明时先 inspect；只有确认为消失才算清理完成。
+        pass
+    remaining = _run_docker(
+        inspect_argv,
+        environment,
+        "network_cleanup_verify",
+        not_found_name=identity.network_name,
+    )
+    if remaining:
+        raise T15DockerSafetyError(
+            "network_cleanup_verify",
+            "NETWORK_CLEANUP_UNCONFIRMED",
+            "本次测试网络清理后仍可见",
+        )
+
+
 def _validate_postgres_inspect(
-    container: dict[str, Any], identity: _TestIdentity, *, require_tmpfs_mount: bool = True
+    container: dict[str, Any], identity: _TestIdentity
 ) -> None:
     """验证 PostgreSQL 实例身份、网络和实际 Mounts 白名单。
 
-    参数：container 为 Docker inspect 的单个对象；identity 为本轮随机身份；
-    require_tmpfs_mount 在启动前后均应为真，要求 Mounts 已明确展示目标 tmpfs。
+    参数：container 为 Docker inspect 的单个对象；identity 为本轮随机身份。
+    必须由 Mounts 明确证明目标 tmpfs，不提供跳过该检查的参数。
     返回值：所有检查通过时无。
     异常：存在 bind/volume、端口发布、身份错误或缺少 tmpfs 时抛出安全错误。
     副作用：无，不连接数据库。
@@ -293,6 +504,8 @@ def _validate_postgres_inspect(
     }
     tmpfs = host_config.get("Tmpfs") or {}
     mounts = container.get("Mounts") or []
+    # 官方镜像 Config.Volumes 只是声明；实际挂载必须由 HostConfig.Tmpfs 覆盖且 Mounts 证明。
+    configured_mounts = host_config.get("Mounts") or []
     mount_is_safe = (
         len(mounts) == 1
         and mounts[0].get("Type") == "tmpfs"
@@ -305,10 +518,11 @@ def _validate_postgres_inspect(
         or host_config.get("NetworkMode") != identity.network_name
         or host_config.get("Binds")
         or host_config.get("VolumesFrom")
+        or configured_mounts
         or host_config.get("PortBindings")
         or set(tmpfs) != {"/var/lib/postgresql/data"}
         or not expected_env <= env_values
-        or (require_tmpfs_mount and not mount_is_safe)
+        or not mount_is_safe
         or any(mount.get("Type") != "tmpfs" for mount in mounts)
     ):
         raise T15DockerSafetyError(
@@ -357,11 +571,17 @@ def _docker_environment() -> dict[str, str]:
 
 
 def _run_docker(
-    arguments: list[str], environment: dict[str, str], stage: str
+    arguments: list[str],
+    environment: dict[str, str],
+    stage: str,
+    *,
+    timeout: int = _DOCKER_CHECK_TIMEOUT_SECONDS,
+    not_found_name: str | None = None,
 ) -> str:
     """执行单条预先构造的 Docker CLI 命令并隐藏原始输出。
 
-    参数：arguments 为直接 Docker 参数；environment 为最小环境；stage 为固定阶段名。
+    参数：arguments 为直接 Docker 参数；environment 为最小环境；stage 为固定阶段名；
+    timeout 为本次命令超时秒数；not_found_name 仅允许精确识别指定资源不存在。
     返回值：成功时返回 stdout，调用方只解析 JSON 或固定状态字段。
     异常：启动失败、超时或非零退出时抛出不含原始输出的安全错误。
     副作用：根据 arguments 执行 Docker CLI；只允许本脚本的白名单命令。
@@ -376,13 +596,24 @@ def _run_docker(
             encoding="utf-8",
             errors="replace",
             env=environment,
-            timeout=60,
+            timeout=timeout,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except subprocess.TimeoutExpired:
+        raise T15DockerSafetyError(stage, "DOCKER_COMMAND_TIMEOUT", "Docker 命令超时") from None
+    except OSError as error:
         raise T15DockerSafetyError(
             stage, "DOCKER_COMMAND_UNAVAILABLE", type(error).__name__
         ) from None
     if completed.returncode != 0:
+        missing_responses = {
+            f"Error: No such object: {not_found_name}",
+            f"Error: No such container: {not_found_name}",
+        }
+        if (
+            not_found_name is not None
+            and str(completed.stderr or "").strip() in missing_responses
+        ):
+            return ""
         raise T15DockerSafetyError(stage, "DOCKER_COMMAND_FAILED", "Docker 命令未成功")
     return completed.stdout
 
@@ -405,24 +636,57 @@ def _validate_direct_docker_argv(arguments: list[str]) -> None:
         ("container", "start"),
         ("container", "run"),
         ("container", "rm"),
+        ("container", "stop"),
     }
     forbidden_flags = (
         "-v", "--volume", "--mount", "-p", "--publish", "--volumes-from",
-        "--privileged", "--device", "--cap-add", "--pid", "--ipc",
+        "--privileged", "--device", "--cap-add", "--pid", "--ipc", "--net",
+        "--userns", "--uts", "--cgroupns", "--security-opt", "--add-host",
+        "--sysctl",
     )
+    operation = tuple(arguments[1:3])
+    # run/create 的 image 之后属于容器命令；例如 pytest 的 -p 不是 Docker 端口参数。
+    option_end = len(arguments)
+    if operation in {("container", "run"), ("container", "create")}:
+        image_index = next(
+            (
+                index
+                for index, argument in enumerate(arguments[3:], start=3)
+                if argument == _POSTGRES_IMAGE
+                or re.fullmatch(r"crm-tool-pr83-test:[0-9a-f]{40}", argument)
+            ),
+            None,
+        )
+        if image_index is None:
+            raise T15DockerSafetyError(
+                "docker_command_safety",
+                "DOCKER_COMMAND_NOT_ALLOWED",
+                "Docker 容器命令缺少固定测试镜像",
+            )
+        option_end = image_index
+    docker_options = arguments[3:option_end]
     if (
         not arguments
         or arguments[0] != "docker"
         or "compose" in arguments
-        or tuple(arguments[1:3]) not in allowed_operations
+        or operation not in allowed_operations
         or any(
             argument == flag
             or argument.startswith(f"{flag}=")
-            or (flag in ("-v", "-p") and argument.startswith(flag) and len(argument) > 2)
-            for argument in arguments
+            or (
+                flag in ("-v", "-p")
+                and argument.startswith(flag)
+                and not argument.startswith("--")
+                and len(argument) > 2
+            )
+            for argument in docker_options
             for flag in forbidden_flags
         )
-        or "--network=host" in arguments
+        or "--network=host" in docker_options
+        or any(
+            docker_options[index : index + 2] == ["--network", "host"]
+            for index in range(len(docker_options) - 1)
+        )
     ):
         raise T15DockerSafetyError(
             "docker_command_safety",
@@ -486,21 +750,20 @@ def _emit(status: str, stage: str, error_code: str, exception_type: str | None) 
     return 0 if status == "passed" else 2 if status == "blocked" else 1
 
 
-def _run_once(image: str) -> tuple[str, str, str | None]:
-    """创建并清理一套随机内部 PostgreSQL 测试资源。
+def _run_unit_once(image: str) -> tuple[str, str, str, str | None]:
+    """只在 --unit 授权下运行一次无网络单元测试容器。
 
-    参数：image 为已构建且固定到提交 SHA 的测试镜像。
-    返回值：status、stage、exception_type 三项脱敏结果。
-    异常：Docker/安全门失败转换为固定 T15DockerSafetyError。
-    副作用：显式执行时创建临时内部网络与 PostgreSQL 容器，运行后只清理本次资源。
+    参数：image 为固定到提交 SHA 的 PR 专用测试镜像。
+    返回值：status、stage、error_code、exception_type 四项脱敏结果。
+    异常：Docker 或安全门错误转换为固定安全错误。
+    副作用：仅启动命令中的一个无网络容器；不创建网络或 PostgreSQL。
     """
     _validate_test_image(image)
     if shutil.which("docker") is None:
         raise T15DockerSafetyError("docker_cli", "DOCKER_CLI_NOT_FOUND", "Docker CLI 不可用")
     identity = _new_test_identity()
     environment = _docker_environment()
-    network_created = False
-    postgres_created = False
+    worker_attempted = False
     failure: T15DockerSafetyError | None = None
     try:
         endpoint = _run_docker(
@@ -509,8 +772,55 @@ def _run_once(image: str) -> tuple[str, str, str | None]:
             "docker_context",
         ).strip()
         _validate_local_docker_desktop_endpoint(endpoint)
+        # 先记录尝试状态，CLI 超时时仍按随机名称和 label 检查/清理可能已启动的容器。
+        worker_attempted = True
+        _run_docker(
+            _unit_test_run_argv(identity, image),
+            environment,
+            "unit_tests",
+            timeout=_TEST_WORKER_TIMEOUT_SECONDS,
+        )
+    except T15DockerSafetyError as error:
+        failure = error
+    finally:
+        if worker_attempted:
+            try:
+                _cleanup_worker(identity, image, "none", environment)
+            except T15DockerSafetyError as error:
+                # 无法证明本轮 Worker 已停止时以清理状态为最终诊断。
+                failure = error
+    if failure is not None:
+        return "failed", failure.stage, failure.error_code, type(failure).__name__
+    return "passed", "unit_tests", "OK", None
+
+
+def _run_once(image: str) -> tuple[str, str, str, str | None]:
+    """创建并清理一套随机内部 PostgreSQL 测试资源。
+
+    参数：image 为已构建且固定到提交 SHA 的测试镜像。
+    返回值：status、stage、error_code、exception_type 四项脱敏结果。
+    异常：Docker/安全门失败转换为固定 T15DockerSafetyError。
+    副作用：显式执行时创建临时内部网络与 PostgreSQL 容器，运行后只清理本次资源。
+    """
+    _validate_test_image(image)
+    if shutil.which("docker") is None:
+        raise T15DockerSafetyError("docker_cli", "DOCKER_CLI_NOT_FOUND", "Docker CLI 不可用")
+    identity = _new_test_identity()
+    environment = _docker_environment()
+    network_may_exist = False
+    postgres_may_exist = False
+    worker_attempted = False
+    failure: T15DockerSafetyError | None = None
+    try:
+        endpoint = _run_docker(
+            ["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"],
+            environment,
+            "docker_context",
+        ).strip()
+        _validate_local_docker_desktop_endpoint(endpoint)
+        # 在发出可能超时的 create 前标记清理目标；清理仍需按名称与 label 实际核验。
+        network_may_exist = True
         _run_docker(_network_create_argv(identity), environment, "network_create")
-        network_created = True
         network = _inspect_json(
             _run_docker(
                 ["docker", "network", "inspect", identity.network_name],
@@ -520,8 +830,8 @@ def _run_once(image: str) -> tuple[str, str, str | None]:
             "network_safety",
         )
         _validate_network_inspect(network, identity)
+        postgres_may_exist = True
         _run_docker(_postgres_create_argv(identity), environment, "postgres_create")
-        postgres_created = True
         created_container = _inspect_json(
             _run_docker(
                 ["docker", "container", "inspect", identity.postgres_container_name],
@@ -570,7 +880,14 @@ def _run_once(image: str) -> tuple[str, str, str | None]:
             "postgres_mount_safety",
         )
         _validate_postgres_inspect(running_container, identity)
-        _run_docker(_worker_run_argv(identity, image), environment, "integration_worker")
+        # Worker CLI 超时时仍可能有容器存活；先记录启动尝试供 finally 定向清理。
+        worker_attempted = True
+        _run_docker(
+            _worker_run_argv(identity, image),
+            environment,
+            "integration_worker",
+            timeout=_TEST_WORKER_TIMEOUT_SECONDS,
+        )
     except T15DockerSafetyError as error:
         failure = error
     except Exception as error:
@@ -578,56 +895,61 @@ def _run_once(image: str) -> tuple[str, str, str | None]:
             "postgres_test", "POSTGRES_TEST_UNEXPECTED", type(error).__name__
         )
     finally:
-        # 清理命令只能引用本次随机生成且已成功创建的容器和网络名。
-        if postgres_created:
+        # 超时或 CLI 失败时，先验证 Worker 标签、名称、镜像、网络和挂载，再定向清理。
+        worker_cleanup_failed = False
+        if worker_attempted:
             try:
-                _run_docker(
-                    [
-                        "docker",
-                        "container",
-                        "rm",
-                        "--force",
-                        identity.postgres_container_name,
-                    ],
-                    environment,
-                    "cleanup_container",
-                )
+                _cleanup_worker(identity, image, identity.network_name, environment)
             except T15DockerSafetyError as error:
-                failure = failure or error
-        if network_created:
+                failure = error
+                worker_cleanup_failed = True
+        # 若 Worker 清理状态未知，保留其所依赖的数据库和网络，避免误拆运行中的任务。
+        if worker_cleanup_failed:
+            postgres_may_exist = False
+            network_may_exist = False
+        # 清理前重新校验资源身份；删除 PostgreSQL 容器时不带 --volumes。
+        postgres_cleanup_failed = False
+        if postgres_may_exist:
             try:
-                _run_docker(
-                    ["docker", "network", "rm", identity.network_name],
-                    environment,
-                    "cleanup_network",
-                )
+                _cleanup_postgres(identity, environment)
             except T15DockerSafetyError as error:
-                failure = failure or error
+                failure = error
+                postgres_cleanup_failed = True
+        if network_may_exist and not postgres_cleanup_failed:
+            try:
+                _cleanup_network(identity, environment)
+            except T15DockerSafetyError as error:
+                failure = error
     if failure is not None:
-        return "failed", failure.stage, type(failure).__name__
-    return "passed", "postgres_migration_and_scheduler", None
+        return "failed", failure.stage, failure.error_code, type(failure).__name__
+    return "passed", "postgres_migration_and_scheduler", "OK", None
 
 
 def main(argv: list[str] | None = None) -> int:
-    """默认拒绝运行；只在显式 --execute 时调用一次 PostgreSQL 测试流程。
+    """默认拒绝运行；--unit 与 --postgres 分别授权单元或 PostgreSQL 测试。
 
     参数：argv 为 CLI 参数；测试可显式传入列表，不传时使用进程命令行。
     返回值：成功为 0；拒绝、失败或缺少执行授权参数时为非零。
     异常：运行错误均转换为脱敏 JSON，不输出原始 stdout/stderr。
-    副作用：仅显式 --execute 时可能创建本脚本拥有的隔离网络和 PostgreSQL 容器。
+    副作用：仅显式 --unit 或 --postgres 时分别启动单元容器或隔离数据库测试资源。
     """
     arguments = sys.argv[1:] if argv is None else argv
-    if len(arguments) != 3 or arguments[0] != "--execute" or arguments[1] != "--image":
-        return _emit("blocked", "arguments", "EXPLICIT_EXECUTE_REQUIRED", None)
-    image = arguments[2]
+    if len(arguments) != 3 or arguments[1] != "--image":
+        return _emit("blocked", "arguments", "EXPLICIT_TEST_MODE_REQUIRED", None)
+    mode, image = arguments[0], arguments[2]
     try:
-        status, stage, exception_type = _run_once(image)
+        if mode == "--unit":
+            status, stage, error_code, exception_type = _run_unit_once(image)
+        elif mode == "--postgres":
+            status, stage, error_code, exception_type = _run_once(image)
+        else:
+            return _emit("blocked", "arguments", "EXPLICIT_TEST_MODE_REQUIRED", None)
     except T15DockerSafetyError as error:
         return _emit("failed", error.stage, error.error_code, type(error).__name__)
     return _emit(
         status,
         stage,
-        "OK" if status == "passed" else "POSTGRES_TEST_FAILED",
+        error_code,
         exception_type,
     )
 

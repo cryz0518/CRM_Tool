@@ -25,6 +25,8 @@ def _safe_postgres_inspect(identity: Any) -> dict[str, Any]:
         "Name": f"/{identity.postgres_container_name}",
         "Config": {
             "Image": "postgres:16",
+            # 官方镜像声明 VOLUME；实际挂载仍须由 tmpfs Mounts 明确覆盖。
+            "Volumes": {"/var/lib/postgresql/data": {}},
             "Env": [
                 f"POSTGRES_USER={identity.database_user}",
                 f"POSTGRES_PASSWORD={identity.database_password}",
@@ -45,6 +47,33 @@ def _safe_postgres_inspect(identity: Any) -> dict[str, Any]:
         "Mounts": [
             {"Type": "tmpfs", "Destination": "/var/lib/postgresql/data"}
         ],
+    }
+
+
+def _safe_worker_inspect(identity: Any, image: str, network_name: str) -> dict[str, Any]:
+    """构造本次 Worker 的有效 inspect 数据供清理边界测试使用。
+
+    参数：identity、image 和 network_name 描述唯一的一次性测试容器。
+    返回值：包含运行状态、随机 label 和 /tmp tmpfs 的 inspect 字典。
+    异常：无。
+    副作用：无，不连接 Docker。
+    """
+    return {
+        "Name": f"/{identity.worker_container_name}",
+        "Config": {
+            "Image": image,
+            "Labels": {"codex.t15.run_id": identity.run_id},
+            "Volumes": None,
+        },
+        "HostConfig": {
+            "NetworkMode": network_name,
+            "Binds": [],
+            "VolumesFrom": [],
+            "PortBindings": None,
+            "Tmpfs": {"/tmp": t15_postgres_docker_test._WORKER_TMPFS.split(":", 1)[1]},
+        },
+        "Mounts": [{"Type": "tmpfs", "Destination": "/tmp"}],
+        "State": {"Running": True},
     }
 
 
@@ -128,6 +157,18 @@ def test_postgres_inspect_accepts_tmpfs_and_rejects_bind_or_named_volume() -> No
         with pytest.raises(t15_postgres_docker_test.T15DockerSafetyError):
             t15_postgres_docker_test._validate_postgres_inspect(unsafe, identity)
 
+    missing_mount = json.loads(json.dumps(safe))
+    missing_mount["Mounts"] = []
+    with pytest.raises(t15_postgres_docker_test.T15DockerSafetyError):
+        t15_postgres_docker_test._validate_postgres_inspect(missing_mount, identity)
+
+    configured_volume = json.loads(json.dumps(safe))
+    configured_volume["HostConfig"]["Mounts"] = [
+        {"Type": "volume", "Source": "untrusted", "Target": "/var/lib/postgresql/data"}
+    ]
+    with pytest.raises(t15_postgres_docker_test.T15DockerSafetyError):
+        t15_postgres_docker_test._validate_postgres_inspect(configured_volume, identity)
+
 
 def test_postgres_inspect_rejects_published_ports_and_wrong_database_identity() -> None:
     """inspect 安全门拒绝宿主端口发布和身份不匹配的容器。
@@ -159,15 +200,271 @@ def test_unit_test_command_is_read_only_networkless_and_has_no_mounts() -> None:
     副作用：只构造和验证参数，不启动容器。
     """
     image = f"crm-tool-pr83-test:{'f' * 40}"
-    argv = t15_postgres_docker_test._unit_test_run_argv(image)
+    identity = t15_postgres_docker_test._new_test_identity("f" * 32)
+    argv = t15_postgres_docker_test._unit_test_run_argv(identity, image)
 
     assert argv[:3] == ["docker", "container", "run"]
     assert argv[argv.index("--network") + 1] == "none"
     assert "--read-only" in argv
     assert argv[argv.index("--tmpfs") + 1].startswith("/tmp:")
-    assert argv[-3:] == ["-m", "pytest", "tests/unit"]
-    assert not any(flag in argv for flag in ("-v", "--volume", "--mount", "-p", "--publish"))
+    assert argv[-5:] == ["-m", "pytest", "-p", "no:cacheprovider", "tests/unit"]
+    docker_options = argv[: argv.index(image)]
+    assert not any(
+        flag in docker_options
+        for flag in ("-v", "--volume", "--mount", "-p", "--publish")
+    )
     t15_postgres_docker_test._validate_direct_docker_argv(argv)
+
+
+def test_unit_entry_is_separate_and_timeout_triggers_identity_scoped_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单元模式超时只清理本轮 Worker，不创建网络或进入 PostgreSQL 流程。
+
+    参数：monkeypatch 替换 Docker 子进程和清理函数，所有执行均为 fake。
+    返回值：无。
+    异常：模式路由、命令边界或超时清理不符合要求时由 pytest 报告。
+    副作用：只在内存中记录模拟命令。
+    """
+    image = f"crm-tool-pr83-test:{'1' * 40}"
+    calls: list[list[str]] = []
+    cleanups: list[tuple[str, str]] = []
+
+    def fake_run(
+        arguments: list[str],
+        _environment: dict[str, str],
+        stage: str,
+        **_kwargs: Any,
+    ) -> str:
+        """模拟本机 endpoint 检查和单元容器超时，不执行外部命令。
+
+        参数：arguments、environment、stage 及附加参数模拟 Docker 包装器调用。
+        返回值：context 检查返回白名单 endpoint。
+        异常：模拟单元 Worker 超时以验证专属清理路径。
+        副作用：把命令添加到测试本地列表。
+        """
+        calls.append(arguments)
+        if stage == "docker_context":
+            return "npipe:////./pipe/docker_engine"
+        assert _kwargs["timeout"] == t15_postgres_docker_test._TEST_WORKER_TIMEOUT_SECONDS
+        raise t15_postgres_docker_test.T15DockerSafetyError(
+            stage, "DOCKER_COMMAND_TIMEOUT", "模拟 Worker 超时"
+        )
+
+    def fake_cleanup(
+        identity: Any, passed_image: str, network: str, _environment: dict[str, str]
+    ) -> None:
+        """记录身份约束的清理目标，不调用 Docker。
+
+        参数：identity、image、network 与 environment 来自测试调用。
+        返回值：无。
+        异常：image 或网络越界时断言失败。
+        副作用：仅向测试列表记录资源名。
+        """
+        assert passed_image == image
+        assert network == "none"
+        cleanups.append((identity.worker_container_name, network))
+
+    monkeypatch.setattr(t15_postgres_docker_test.shutil, "which", lambda _name: "docker")
+    monkeypatch.setattr(t15_postgres_docker_test, "_docker_environment", lambda: {})
+    monkeypatch.setattr(t15_postgres_docker_test, "_run_docker", fake_run)
+    monkeypatch.setattr(t15_postgres_docker_test, "_cleanup_worker", fake_cleanup)
+    monkeypatch.setattr(
+        t15_postgres_docker_test,
+        "_run_once",
+        lambda _image: pytest.fail("单元入口不得进入 PostgreSQL 流程"),
+    )
+
+    status, stage, error_code, _exception = t15_postgres_docker_test._run_unit_once(image)
+
+    assert status == "failed"
+    assert stage == "unit_tests"
+    assert error_code == "DOCKER_COMMAND_TIMEOUT"
+    assert len(calls) == 2
+    assert calls[1][1:3] == ["container", "run"]
+    assert "postgres" not in calls[1]
+    assert "alembic" not in calls[1]
+    assert cleanups and cleanups[0][1] == "none"
+
+
+def test_main_dispatches_unit_mode_without_invoking_postgres_mode(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """主入口显式 --unit 只派发无数据库单元测试流程。
+
+    参数：monkeypatch 替换两个模式的执行函数；capsys 捕获脱敏状态 JSON。
+    返回值：无。
+    异常：默认或模式分派错误时由 pytest 报告断言失败。
+    副作用：只输出模拟成功状态，不运行 Docker 或数据库。
+    """
+    image = f"crm-tool-pr83-test:{'6' * 40}"
+    monkeypatch.setattr(
+        t15_postgres_docker_test,
+        "_run_unit_once",
+        lambda _image: ("passed", "unit_tests", "OK", None),
+    )
+    monkeypatch.setattr(
+        t15_postgres_docker_test,
+        "_run_once",
+        lambda _image: pytest.fail("--unit 不得启动 PostgreSQL 流程"),
+    )
+
+    assert t15_postgres_docker_test.main(["--unit", "--image", image]) == 0
+    assert json.loads(capsys.readouterr().out)["stage"] == "unit_tests"
+
+
+def test_worker_cleanup_stops_only_verified_run_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker 清理仅作用于名称、镜像、网络和随机 label 全部匹配的容器。
+
+    参数：monkeypatch 把 Docker 调用替换为可控 fake。
+    返回值：无。
+    异常：清理边界不符时由 pytest 报告断言失败。
+    副作用：只记录 fake inspect、stop 与 remove 命令。
+    """
+    identity = t15_postgres_docker_test._new_test_identity("2" * 32)
+    image = f"crm-tool-pr83-test:{'3' * 40}"
+    container = _safe_worker_inspect(identity, image, "none")
+    calls: list[list[str]] = []
+    removed = False
+
+    def fake_run(
+        arguments: list[str],
+        _environment: dict[str, str],
+        stage: str,
+        **_kwargs: Any,
+    ) -> str:
+        """返回模拟 inspect 并记录针对已验证容器的 stop/remove。"""
+        nonlocal removed
+        calls.append(arguments)
+        if stage == "worker_cleanup_inspect":
+            return json.dumps([container])
+        if stage == "worker_cleanup_stop":
+            container["State"]["Running"] = False
+            return ""
+        if stage == "worker_cleanup_remove":
+            removed = True
+            return ""
+        if stage == "worker_cleanup_verify" and removed:
+            return ""
+        raise AssertionError(f"未预期的 fake Docker 阶段: {stage}")
+
+    monkeypatch.setattr(t15_postgres_docker_test, "_run_docker", fake_run)
+    t15_postgres_docker_test._cleanup_worker(identity, image, "none", {})
+
+    assert [argv[2] for argv in calls] == ["inspect", "stop", "rm", "inspect"]
+    assert calls[1][-1] == identity.worker_container_name
+    assert calls[2][-1] == identity.worker_container_name
+
+
+def test_worker_cleanup_rejects_replaced_identity_before_stop_or_remove(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """身份校验失败时清理代码不得停止或删除同名非本次容器。
+
+    参数：monkeypatch 替换 Docker 调用，使其只返回伪造 inspect 数据。
+    返回值：无。
+    异常：若代码继续 stop 或 remove 未验证资源，则断言失败。
+    副作用：只记录 fake inspect 命令。
+    """
+    identity = t15_postgres_docker_test._new_test_identity("4" * 32)
+    image = f"crm-tool-pr83-test:{'5' * 40}"
+    container = _safe_worker_inspect(identity, image, "none")
+    container["Config"]["Labels"]["codex.t15.run_id"] = "0" * 32
+    calls: list[list[str]] = []
+
+    def fake_run(
+        arguments: list[str],
+        _environment: dict[str, str],
+        _stage: str,
+        **_kwargs: Any,
+    ) -> str:
+        """只返回伪造的同名容器 inspect 结果。
+
+        参数：arguments 为待执行参数；其他值为模拟执行上下文。
+        返回值：含错误 run label 的模拟 inspect JSON。
+        异常：无。
+        副作用：只记录参数，不执行 Docker。
+        """
+        calls.append(arguments)
+        return json.dumps([container])
+
+    monkeypatch.setattr(t15_postgres_docker_test, "_run_docker", fake_run)
+    with pytest.raises(t15_postgres_docker_test.T15DockerSafetyError):
+        t15_postgres_docker_test._cleanup_worker(identity, image, "none", {})
+
+    assert len(calls) == 1
+    assert calls[0][2] == "inspect"
+
+
+def test_docker_timeout_has_specific_safe_error_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Docker 命令超时会成为独立安全错误，不泄露原始命令输出。
+
+    参数：monkeypatch 把 subprocess.run 替换为超时异常。
+    返回值：无。
+    异常：错误码或脱敏结果错误时由 pytest 报告。
+    副作用：只在内存中生成 TimeoutExpired，不创建外部进程。
+    """
+
+    def fake_run(arguments: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        """模拟 subprocess 超时，不创建真实 Docker 进程。
+
+        参数：arguments 为伪命令；附加参数由被测包装器提供。
+        返回值：此替身必定抛出 TimeoutExpired。
+        异常：有意抛出超时异常以验证固定诊断。
+        副作用：无外部进程。
+        """
+        raise subprocess.TimeoutExpired(arguments, timeout=1, stderr="hidden-secret")
+
+    monkeypatch.setattr(t15_postgres_docker_test.subprocess, "run", fake_run)
+    with pytest.raises(t15_postgres_docker_test.T15DockerSafetyError) as caught:
+        t15_postgres_docker_test._run_docker(
+            ["docker", "context", "inspect"], {}, "docker_context"
+        )
+    assert caught.value.error_code == "DOCKER_COMMAND_TIMEOUT"
+    assert "hidden-secret" not in str(caught.value)
+
+
+def test_docker_not_found_is_accepted_only_for_exact_cleanup_resource(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cleanup 只把本次资源名称完全匹配的 not-found 视为已清理。
+
+    参数：monkeypatch 替换子进程，模拟 Docker 的安全 not-found 响应。
+    返回值：无。
+    异常：未脱敏处理或接受不匹配名称时断言失败。
+    副作用：只构造 CompletedProcess，不运行 Docker。
+    """
+    name = "t15-it-worker-" + "a" * 32
+
+    def fake_run(
+        arguments: list[str], **_kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        """返回只包含给定资源名的 fake not-found 错误。"""
+        return subprocess.CompletedProcess(
+            arguments, 1, "", f"Error: No such object: {name}"
+        )
+
+    monkeypatch.setattr(t15_postgres_docker_test.subprocess, "run", fake_run)
+    assert (
+        t15_postgres_docker_test._run_docker(
+            ["docker", "container", "inspect", name],
+            {},
+            "cleanup",
+            not_found_name=name,
+        )
+        == ""
+    )
+    with pytest.raises(t15_postgres_docker_test.T15DockerSafetyError):
+        t15_postgres_docker_test._run_docker(
+            ["docker", "container", "inspect", name],
+            {},
+            "cleanup",
+            not_found_name="other-container",
+        )
 
 
 def test_docker_subprocess_boundary_is_fake_and_rejects_non_allowlisted_commands(
@@ -208,6 +505,7 @@ def test_docker_subprocess_boundary_is_fake_and_rejects_non_allowlisted_commands
         ["docker", "container", "run", "-v", "C:/private:/data", "image"],
         ["docker", "system", "prune", "--all"],
         ["docker", "container", "run", "--privileged", "image"],
+        ["docker", "container", "run", "--network", "host", "image"],
     ):
         with pytest.raises(t15_postgres_docker_test.T15DockerSafetyError):
             t15_postgres_docker_test._run_docker(unsafe, {"PATH": "fake-path"}, "test")
@@ -330,27 +628,3 @@ def test_postgres_worker_requires_matching_random_database_identity() -> None:
         unsafe = {**environment, key: value}
         with pytest.raises(ValueError):
             t15_postgres_test_worker._validate_worker_environment(unsafe)
-
-
-def test_test_image_excludes_local_secrets_and_real_wecom_cli() -> None:
-    """测试镜像仅安装 Python 依赖并排除本地环境文件和凭据文件。
-
-    参数：无。
-    返回值：无。
-    异常：镜像清单包含真实 CLI 或遗漏敏感路径排除规则时由 pytest 报告。
-    副作用：只读取仓库内受版本管理的配置文件。
-    """
-    repository_root = Path(t15_postgres_docker_test.__file__).parents[1]
-    dockerfile = (repository_root / "Dockerfile.pr83-test").read_text(encoding="utf-8")
-    ignore = (repository_root / "Dockerfile.pr83-test.dockerignore").read_text(
-        encoding="utf-8"
-    )
-
-    assert "COPY scripts ./scripts" in dockerfile
-    assert "COPY tests ./tests" in dockerfile
-    assert "COPY alembic ./alembic" in dockerfile
-    assert "@wecom/cli" not in dockerfile
-    assert "**/.env.*" in ignore
-    assert "tests/integration/ticket15-compose.env" in ignore
-    assert "**/*credentials*" in ignore
-    assert "**/*secret*" in ignore

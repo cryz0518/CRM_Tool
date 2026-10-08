@@ -96,6 +96,8 @@ def _run() -> tuple[str, str, str | None]:
                 exit_code = pytest.main(
                     [
                         "-q",
+                        "-p",
+                        "no:cacheprovider",
                         "tests/integration/test_lead_progress_postgres.py",
                         "-k",
                         "test_concurrent_schedulers_create_one_logical_notification",
