@@ -4317,7 +4317,7 @@ class FirstTextLeadWorkspaceService:
             "🎉 你的第一条客户需求已成功录入企业微信智能表格！\n\n"
             "点击下方链接，即可查看和完善客户信息：\n\n"
             f"[📋 打开需求登记智能表格]({url.strip()})\n\n"
-            "后续可继续发送客户需求，我会自动录入并定期汇报处理进度。"
+            "后续可继续发送客户需求，我会自动录入。你可以随时打开智能表格查看和完善信息。"
         )
         session.add(
             NotificationRecord(

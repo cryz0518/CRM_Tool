@@ -11,7 +11,7 @@ from uuid import uuid4
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.leads.models import LeadMessageResolution
+from app.leads.models import Lead, LeadMessageResolution, SmartTableSync
 from app.messaging.models import NotificationRecord, OutboxEvent, utc_now
 
 logger = logging.getLogger(__name__)
@@ -116,11 +116,11 @@ class WecomOutboundNotificationSender:
                 # AI Bot 主动发送只支持 markdown 或模板卡片；旧通知可能仍保存 text，统一在边界转换。
                 sales_user_id, content, payload = claimed_notice
                 if notice.notification_type == "lead_intake_receipt":
-                    receipt_content, receipt_counts, all_finished = self._receipt_content(
+                    receipt_content, receipt_counts, should_suppress = self._receipt_content(
                         sales_user_id, notice.source_message_id, payload
                     )
-                    if all_finished:
-                        # 消息已在合并窗口内结束时收敛为可审计终态，避免成功后再发过时提示。
+                    if should_suppress:
+                        # 仅在独立失败通知已承担全部反馈时收敛，避免重复刷屏。
                         with self._session_factory.begin() as session:
                             current = session.get(NotificationRecord, notice.notification_key)
                             if (
@@ -131,7 +131,7 @@ class WecomOutboundNotificationSender:
                                 current.payload = {
                                     **(current.payload or {}),
                                     "suppression_reason": (
-                                        "all_associated_messages_finished_before_send"
+                                        "all_failed_messages_have_independent_failure_notice"
                                     ),
                                     "receipt_outcome_counts": receipt_counts,
                                 }
@@ -199,7 +199,7 @@ class WecomOutboundNotificationSender:
         """按接收通知关联的消息读取实时处理状态并生成不误报的提示。
 
         参数：sales_user_id 为收件人；source_message_id 为旧载荷兼容来源；payload 保存消息集合。
-        返回值：准确的 Markdown 文本、按结果分类的数量及是否全部到达终态。
+        返回值：准确的 Markdown 文本、按结果分类的数量及是否可由独立失败通知抑制。
         异常：数据库读取错误向调用方传播，原通知仍由现有失败/重试逻辑管理。
         副作用：仅查询消息 Outbox 与归属结论，不更新业务状态。
         """
@@ -225,11 +225,35 @@ class WecomOutboundNotificationSender:
                     LeadMessageResolution.message_id.in_(message_ids)
                 )
             ).all()
+            syncs = session.scalars(
+                select(SmartTableSync).where(SmartTableSync.source_message_id.in_(message_ids))
+            ).all()
+            failure_notices = session.scalars(
+                select(NotificationRecord).where(
+                    NotificationRecord.sales_user_id == sales_user_id,
+                    NotificationRecord.source_message_id.in_(message_ids),
+                    NotificationRecord.notification_type == "lead_processing_failed",
+                    NotificationRecord.status.in_(
+                        ("pending", "processing", "retrying", "succeeded")
+                    ),
+                )
+            ).all()
+            lead_ids = {resolution.lead_id for resolution in resolutions if resolution.lead_id}
+            leads = (
+                session.scalars(select(Lead).where(Lead.id.in_(lead_ids))).all()
+                if lead_ids
+                else []
+            )
 
         events_by_id = {event.message_id: event for event in events}
-        resolutions_by_id: dict[str, set[str]] = {}
+        resolutions_by_id: dict[str, list[LeadMessageResolution]] = {}
         for resolution in resolutions:
-            resolutions_by_id.setdefault(resolution.message_id, set()).add(resolution.status)
+            resolutions_by_id.setdefault(resolution.message_id, []).append(resolution)
+        syncs_by_segment = {
+            (sync.source_message_id, sync.source_segment_index): sync for sync in syncs
+        }
+        leads_by_id = {lead.id: lead for lead in leads}
+        failed_notice_message_ids = {notice.source_message_id for notice in failure_notices}
 
         counts: dict[str, int] = {}
         all_finished = True
@@ -245,9 +269,14 @@ class WecomOutboundNotificationSender:
                 category = "retrying"
                 all_finished = False
             elif event.status in _RECEIPT_TERMINAL_OUTBOX_STATUSES:
-                states = resolutions_by_id.get(message_id, set())
+                message_resolutions = resolutions_by_id.get(message_id, [])
+                states = {resolution.status for resolution in message_resolutions}
                 if event.status == "failed_pending_review":
-                    category = "failed"
+                    category = (
+                        "failed_notified"
+                        if message_id in failed_notice_message_ids
+                        else "failed"
+                    )
                 elif event.status == "ignored":
                     category = "ignored"
                 elif event.status == "succeeded" and states & {
@@ -256,7 +285,28 @@ class WecomOutboundNotificationSender:
                 }:
                     category = "unassigned"
                 elif event.status == "succeeded" and "assigned" in states:
-                    category = "completed"
+                    assigned = [
+                        resolution
+                        for resolution in message_resolutions
+                        if resolution.status == "assigned"
+                    ]
+                    # Outbox 成功只代表消费结束；只有对应 Lead 与远端同步记录都吻合才报告已录入。
+                    category = (
+                        "recorded"
+                        if assigned
+                        and all(
+                            resolution.lead_id is not None
+                            and (sync := syncs_by_segment.get(
+                                (message_id, resolution.segment_index)
+                            )) is not None
+                            and sync.status == "succeeded"
+                            and bool(sync.smart_table_record_id)
+                            and (lead := leads_by_id.get(resolution.lead_id)) is not None
+                            and lead.smart_table_record_id == sync.smart_table_record_id
+                            for resolution in assigned
+                        )
+                        else "completed"
+                    )
                 else:
                     category = "finished"
             else:
@@ -268,14 +318,20 @@ class WecomOutboundNotificationSender:
         if counts == {"processing": count}:
             return f"✅ 已收到你的 {count} 条消息，正在识别并录入。", counts, False
 
+        # 失败状态已有独立、可重试的通知记录时，整组全失败可抑制重复提醒。
+        if all_finished and counts == {"failed_notified": count}:
+            return "", counts, True
+
         labels = {
             "processing": "仍在识别并录入",
-            "completed": "已完成处理",
-            "unassigned": "待归属",
+            "recorded": "已确认录入智能表格",
+            "completed": "已完成处理，表格录入尚未核实",
+            "unassigned": "无法可靠归属客户，请补充公司信息",
             "retrying": "等待重试",
             "failed": "待人工处理",
-            "ignored": "已忽略",
-            "finished": "处理已结束",
+            "failed_notified": "待人工处理（另有失败通知）",
+            "ignored": "已忽略（未录入）",
+            "finished": "处理已结束，录入状态未核实",
             "unknown": "状态待核实",
         }
         details = "，".join(
@@ -283,7 +339,7 @@ class WecomOutboundNotificationSender:
             for category, amount in counts.items()
             if amount
         )
-        return f"✅ 已收到你的 {count} 条消息：{details}。", counts, all_finished
+        return f"✅ 已收到你的 {count} 条消息：{details}。", counts, False
 
 
 def _as_utc(value: datetime) -> datetime:

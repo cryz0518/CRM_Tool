@@ -9,7 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.leads.models import LeadMessageResolution
+from app.leads.models import Lead, LeadMessageResolution, SmartTableSync
 from app.messaging.models import (
     Base,
     IncomingMessage,
@@ -60,6 +60,7 @@ def add_receipt_message(
     sequence: int,
     status: str,
     resolution_status: str | None = None,
+    verified_smart_table_write: bool = False,
 ) -> None:
     """准备一条接收通知可读取的消息处理状态。
 
@@ -88,13 +89,43 @@ def add_receipt_message(
         )
     )
     if resolution_status is not None:
+        lead_id: str | None = None
+        record_id: str | None = None
+        if resolution_status == "assigned" and verified_smart_table_write:
+            # 只有同时准备 Lead 与 succeeded sync，才能让出站提示宣称已录入。
+            session.flush()
+            lead_id = f"lead-{message_id}"
+            record_id = f"record-{message_id}"
+            session.add(
+                Lead(
+                    id=lead_id,
+                    source_message_id=message_id,
+                    source_segment_index=0,
+                    original_capturing_sales_user_id=sales_user_id,
+                    smart_table_owner_user_id=sales_user_id,
+                    smart_table_record_id=record_id,
+                    field_values={},
+                )
+            )
+            session.flush()
         session.add(
             LeadMessageResolution(
                 message_id=message_id,
                 segment_index=0,
+                lead_id=lead_id,
                 status=resolution_status,
             )
         )
+        if lead_id is not None and record_id is not None:
+            session.add(
+                SmartTableSync(
+                    lead_id=lead_id,
+                    source_message_id=message_id,
+                    source_segment_index=0,
+                    smart_table_record_id=record_id,
+                    status="succeeded",
+                )
+            )
 
 
 def test_bot_sender_uses_submitting_sales_userid_and_marks_notice_sent() -> None:
@@ -151,7 +182,7 @@ def test_first_smart_table_notice_sends_clickable_markdown_once_across_bot_resta
         "🎉 你的第一条客户需求已成功录入企业微信智能表格！\n\n"
         "点击下方链接，即可查看和完善客户信息：\n\n"
         "[📋 打开需求登记智能表格](https://example.test/smart-table?view=leads)\n\n"
-        "后续可继续发送客户需求，我会自动录入并定期汇报处理进度。"
+        "后续可继续发送客户需求，我会自动录入。你可以随时打开智能表格查看和完善信息。"
     )
     with factory.begin() as session:
         session.add(
@@ -239,8 +270,8 @@ def test_receipt_sender_waits_for_coalesce_window_then_sends_merged_count() -> N
     ]
 
 
-def test_finished_receipt_is_suppressed_after_window_with_auditable_reason() -> None:
-    """验证消息在五秒合并窗口内完成时不会收到过时处理中提示，且重启不再处理。"""
+def test_fast_success_receipt_reports_verified_table_write_after_window() -> None:
+    """验证快速完成的既有销售需求收到经同步事实核实的最终反馈。"""
     engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
     factory = sessionmaker(engine)
     Base.metadata.create_all(engine)
@@ -252,6 +283,7 @@ def test_finished_receipt_is_suppressed_after_window_with_auditable_reason() -> 
             sequence=1,
             status="succeeded",
             resolution_status="assigned",
+            verified_smart_table_write=True,
         )
         session.add(
             NotificationRecord(
@@ -270,7 +302,7 @@ def test_finished_receipt_is_suppressed_after_window_with_auditable_reason() -> 
     client = FakeClient()
     sender = WecomOutboundNotificationSender(factory, client)
 
-    # 模拟两秒完成：窗口仍有效时 sender 不发；窗口结束后读取状态并抑制。
+    # 模拟两秒完成：窗口仍有效时 sender 不发；窗口结束后读取已核实的同步结果。
     assert asyncio.run(sender.send_pending_once()) == 0
     with factory.begin() as session:
         notice = session.get(NotificationRecord, "receipt-fast")
@@ -279,20 +311,24 @@ def test_finished_receipt_is_suppressed_after_window_with_auditable_reason() -> 
         expired_payload["coalesce_until"] = (utc_now() - timedelta(seconds=1)).isoformat()
         notice.payload = expired_payload
 
-    assert asyncio.run(sender.send_pending_once()) == 0
+    assert asyncio.run(sender.send_pending_once()) == 1
     assert asyncio.run(WecomOutboundNotificationSender(factory, client).send_pending_once()) == 0
-    assert client.calls == []
+    assert client.calls == [
+        (
+            "sales-fast",
+            {
+                "msgtype": "markdown",
+                "markdown": {"content": "✅ 已收到你的 1 条消息：1 条已确认录入智能表格。"},
+            },
+        )
+    ]
     with factory() as session:
         notice = session.get(NotificationRecord, "receipt-fast")
-    assert notice is not None and notice.status == "suppressed"
-    assert notice.payload is not None
-    assert notice.payload["suppression_reason"] == (
-        "all_associated_messages_finished_before_send"
-    )
+    assert notice is not None and notice.status == "succeeded"
 
 
 def test_mixed_receipt_counts_processing_completed_and_unassigned_separately() -> None:
-    """验证三条合并消息按实时 Outbox 与归属状态准确描述。"""
+    """验证三条合并消息按实时处理及已核实写入状态准确描述。"""
     engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
     factory = sessionmaker(engine)
     Base.metadata.create_all(engine)
@@ -311,6 +347,7 @@ def test_mixed_receipt_counts_processing_completed_and_unassigned_separately() -
             sequence=2,
             status="succeeded",
             resolution_status="assigned",
+            verified_smart_table_write=True,
         )
         add_receipt_message(
             session,
@@ -350,7 +387,8 @@ def test_mixed_receipt_counts_processing_completed_and_unassigned_separately() -
                 "markdown": {
                     "content": (
                         "✅ 已收到你的 3 条消息：1 条仍在识别并录入，"
-                        "1 条已完成处理，1 条待归属。"
+                        "1 条已确认录入智能表格，"
+                        "1 条无法可靠归属客户，请补充公司信息。"
                     )
                 },
             },
@@ -358,8 +396,8 @@ def test_mixed_receipt_counts_processing_completed_and_unassigned_separately() -
     ]
 
 
-def test_failed_and_unassigned_receipts_do_not_claim_success_or_swallow_failure_notice() -> None:
-    """验证失败和待归属只抑制旧接收提示，独立失败通知仍按原机制发送。"""
+def test_mixed_recorded_failed_and_unassigned_receipt_is_accurate() -> None:
+    """验证成功、待人工处理和待归属各自准确反馈，失败通知仍正常投递。"""
     engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
     factory = sessionmaker(engine)
     Base.metadata.create_all(engine)
@@ -380,16 +418,25 @@ def test_failed_and_unassigned_receipts_do_not_claim_success_or_swallow_failure_
             status="succeeded",
             resolution_status="unassigned",
         )
+        add_receipt_message(
+            session,
+            message_id="recorded-message",
+            sales_user_id="sales-outcomes",
+            sequence=3,
+            status="succeeded",
+            resolution_status="assigned",
+            verified_smart_table_write=True,
+        )
         session.add(
             NotificationRecord(
                 notification_key="receipt-failed-unassigned",
                 sales_user_id="sales-outcomes",
                 source_message_id="failed-message",
                 notification_type="lead_intake_receipt",
-                content="✅ 已收到你的 2 条消息，正在识别并录入。",
+                content="✅ 已收到你的 3 条消息，正在识别并录入。",
                 payload={
-                    "receipt_count": 2,
-                    "message_ids": ["failed-message", "unassigned-message"],
+                    "receipt_count": 3,
+                    "message_ids":["failed-message", "unassigned-message", "recorded-message"],
                     "coalesce_until": (utc_now() - timedelta(seconds=1)).isoformat(),
                 },
             )
@@ -405,9 +452,22 @@ def test_failed_and_unassigned_receipts_do_not_claim_success_or_swallow_failure_
         )
     client = FakeClient()
 
-    assert asyncio.run(WecomOutboundNotificationSender(factory, client).send_pending_once()) == 1
+    assert asyncio.run(WecomOutboundNotificationSender(factory, client).send_pending_once()) == 2
 
     assert client.calls == [
+        (
+            "sales-outcomes",
+            {
+                "msgtype": "markdown",
+                "markdown": {
+                    "content": (
+                        "✅ 已收到你的 3 条消息：1 条待人工处理（另有失败通知），"
+                        "1 条无法可靠归属客户，请补充公司信息，"
+                        "1 条已确认录入智能表格。"
+                    )
+                },
+            },
+        ),
         (
             "sales-outcomes",
             {
@@ -419,10 +479,183 @@ def test_failed_and_unassigned_receipts_do_not_claim_success_or_swallow_failure_
     with factory() as session:
         receipt = session.get(NotificationRecord, "receipt-failed-unassigned")
         failure = session.get(NotificationRecord, "failure-for-failed-message")
+    assert receipt is not None and receipt.status == "succeeded"
+    assert failure is not None and failure.status == "succeeded"
+
+
+def test_single_failed_receipt_is_suppressed_when_failure_notice_covers_it() -> None:
+    """验证单条失败已有独立通知时，接收通知收敛而失败通知正常发送。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    factory = sessionmaker(engine)
+    Base.metadata.create_all(engine)
+    with factory.begin() as session:
+        add_receipt_message(
+            session,
+            message_id="only-failed-message",
+            sales_user_id="sales-only-failed",
+            sequence=1,
+            status="failed_pending_review",
+            resolution_status="assigned",
+        )
+        session.add(
+            NotificationRecord(
+                notification_key="only-failed-receipt",
+                sales_user_id="sales-only-failed",
+                source_message_id="only-failed-message",
+                notification_type="lead_intake_receipt",
+                payload={
+                    "message_ids": ["only-failed-message"],
+                    "coalesce_until": (utc_now() - timedelta(seconds=1)).isoformat(),
+                },
+            )
+        )
+        session.add(
+            NotificationRecord(
+                notification_key="only-failed-detail",
+                sales_user_id="sales-only-failed",
+                source_message_id="only-failed-message",
+                notification_type="lead_processing_failed",
+                content="这条消息已进入待人工处理。",
+            )
+        )
+    client = FakeClient()
+
+    assert asyncio.run(WecomOutboundNotificationSender(factory, client).send_pending_once()) == 1
+    assert client.calls == [
+        (
+            "sales-only-failed",
+            {
+                "msgtype": "markdown",
+                "markdown": {"content": "这条消息已进入待人工处理。"},
+            },
+        )
+    ]
+    with factory() as session:
+        receipt = session.get(NotificationRecord, "only-failed-receipt")
+        failure = session.get(NotificationRecord, "only-failed-detail")
     assert receipt is not None and receipt.status == "suppressed"
     assert receipt.payload is not None
-    assert receipt.payload["receipt_outcome_counts"] == {"failed": 1, "unassigned": 1}
+    assert receipt.payload["suppression_reason"] == (
+        "all_failed_messages_have_independent_failure_notice"
+    )
     assert failure is not None and failure.status == "succeeded"
+
+
+def test_fast_unassigned_receipt_requests_company_details_without_success_claim() -> None:
+    """验证快速结束的待归属消息明确请求补充公司信息，不暗示已录入。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    factory = sessionmaker(engine)
+    Base.metadata.create_all(engine)
+    with factory.begin() as session:
+        add_receipt_message(
+            session,
+            message_id="quick-unassigned",
+            sales_user_id="sales-unassigned",
+            sequence=1,
+            status="succeeded",
+            resolution_status="unassigned",
+        )
+        session.add(
+            NotificationRecord(
+                notification_key="quick-unassigned-receipt",
+                sales_user_id="sales-unassigned",
+                source_message_id="quick-unassigned",
+                notification_type="lead_intake_receipt",
+                payload={
+                    "message_ids": ["quick-unassigned"],
+                    "coalesce_until": (utc_now() - timedelta(seconds=1)).isoformat(),
+                },
+            )
+        )
+    client = FakeClient()
+
+    assert asyncio.run(WecomOutboundNotificationSender(factory, client).send_pending_once()) == 1
+    assert client.calls[0][1]["markdown"] == {
+        "content": (
+            "✅ 已收到你的 1 条消息："
+            "1 条无法可靠归属客户，请补充公司信息。"
+        )
+    }
+
+
+def test_outbox_success_without_verified_smart_table_sync_does_not_claim_recorded() -> None:
+    """验证 Outbox 消费成功而缺少表格同步证据时不宣称已录入。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    factory = sessionmaker(engine)
+    Base.metadata.create_all(engine)
+    with factory.begin() as session:
+        add_receipt_message(
+            session,
+            message_id="outbox-only-success",
+            sales_user_id="sales-unverified-write",
+            sequence=1,
+            status="succeeded",
+            resolution_status="assigned",
+        )
+        session.add(
+            NotificationRecord(
+                notification_key="outbox-only-receipt",
+                sales_user_id="sales-unverified-write",
+                source_message_id="outbox-only-success",
+                notification_type="lead_intake_receipt",
+                payload={
+                    "message_ids": ["outbox-only-success"],
+                    "coalesce_until": (utc_now() - timedelta(seconds=1)).isoformat(),
+                },
+            )
+        )
+    client = FakeClient()
+
+    assert asyncio.run(WecomOutboundNotificationSender(factory, client).send_pending_once()) == 1
+    assert client.calls[0][1]["markdown"] == {
+        "content": "✅ 已收到你的 1 条消息：1 条已完成处理，表格录入尚未核实。"
+    }
+
+
+def test_first_success_and_receipt_both_send_accurate_feedback_after_fast_completion() -> None:
+    """验证首次快速录入反馈已确认表格状态，链接通知仍正常发送。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    factory = sessionmaker(engine)
+    Base.metadata.create_all(engine)
+    with factory.begin() as session:
+        add_receipt_message(
+            session,
+            message_id="first-fast-message",
+            sales_user_id="sales-first-fast",
+            sequence=1,
+            status="succeeded",
+            resolution_status="assigned",
+            verified_smart_table_write=True,
+        )
+        session.add(
+            NotificationRecord(
+                notification_key="first-fast-receipt",
+                sales_user_id="sales-first-fast",
+                source_message_id="first-fast-message",
+                notification_type="lead_intake_receipt",
+                payload={
+                    "message_ids": ["first-fast-message"],
+                    "coalesce_until": (utc_now() - timedelta(seconds=1)).isoformat(),
+                },
+            )
+        )
+        session.add(
+            NotificationRecord(
+                notification_key="first-fast-link",
+                sales_user_id="sales-first-fast",
+                source_message_id="first-fast-message",
+                notification_type="lead_first_smart_table_success",
+                content="🎉 已成功录入智能表格：[📋 打开需求登记智能表格](https://example.test/table)",
+            )
+        )
+    client = FakeClient()
+
+    assert asyncio.run(WecomOutboundNotificationSender(factory, client).send_pending_once()) == 2
+    assert len(client.calls) == 2
+    receipt_content = client.calls[0][1]["markdown"]["content"]
+    assert receipt_content == "✅ 已收到你的 1 条消息：1 条已确认录入智能表格。"
+    assert "正在识别并录入" not in receipt_content
+    assert client.calls[1][1]["markdown"]["content"].find("https://example.test/table") >= 0
 
 
 def test_bot_sender_delivers_lead_processing_failure_notice() -> None:

@@ -4222,6 +4222,9 @@ def test_confirmed_first_smart_table_success_queues_one_link_notice(
     assert notice is not None
     assert notice.sales_user_id == "sales-first-link"
     assert "[📋 打开需求登记智能表格](https://example.test/smart-table)" in (notice.content or "")
+    assert "后续可继续发送客户需求，我会自动录入。你可以随时打开智能表格查看和完善信息。" in (
+        notice.content or ""
+    )
 
 
 def test_ai_review_and_deterministic_success_share_one_notice_and_replay_does_not_recreate(
