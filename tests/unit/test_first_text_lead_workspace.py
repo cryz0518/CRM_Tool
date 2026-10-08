@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from unittest.mock import patch
 
 import pytest
@@ -12,16 +12,19 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.ai.gateway import AIGateway
+from app.ai.models import ExtractedLeadPatch, LeadAnalysis
 from app.ai.provider import LLMProviderError, MockLLMProvider
 from app.companies.models import CompanyUpsertCommand, QCCCandidate, QCCLookupResult
 from app.companies.service import CompanyLeadService, MockQCCAdapter, MockTYCAdapter
 from app.core.failures import RetryableTaskFailure
+from app.core.logging import bind_log_context, reset_log_context
 from app.leads.models import (
     Lead,
     LeadFieldProvenance,
     LeadMessageResolution,
     SalesLeadContext,
     SmartTableSync,
+    serialize_field_value,
 )
 from app.leads.service import (
     DeterministicFirstTextLeadExtractor,
@@ -38,8 +41,13 @@ from app.messaging.models import (
     SalesAuthorization,
 )
 from app.smart_table.mock import MockSmartTableAdapter
+from app.smart_table.models import SmartTableRecord
 from app.smart_table.registry import build_required_smart_table_schema
-from app.smart_table.wecom_cli import SmartTableWriteVerificationError, WecomCliProcessError
+from app.smart_table.wecom_cli import (
+    SmartTableWriteVerificationError,
+    WecomCliProcessError,
+    WecomCliTransportError,
+)
 
 
 @pytest.fixture
@@ -70,6 +78,7 @@ def persist_outbox_text(
     message_id: str,
     sales_user_id: str,
     text: str,
+    sequence: int | None = None,
     authorized: bool = True,
 ) -> int:
     """写入已由 T02 持久化的文本消息和待消费发件箱事件。
@@ -90,14 +99,15 @@ def persist_outbox_text(
                     is_active=True,
                 )
             )
-        sequence = (
-            session.scalar(
-                select(func.max(IncomingMessage.sequence)).where(
-                    IncomingMessage.sales_user_id == sales_user_id
+        if sequence is None:
+            sequence = (
+                session.scalar(
+                    select(func.max(IncomingMessage.sequence)).where(
+                        IncomingMessage.sales_user_id == sales_user_id
+                    )
                 )
-            )
-            or 0
-        ) + 1
+                or 0
+            ) + 1
         session.add(
             IncomingMessage(
                 message_id=message_id,
@@ -115,6 +125,45 @@ def persist_outbox_text(
         session.add(event)
         session.flush()
         return event.id
+
+
+class _Synthetic850005Cause(Exception):
+    """表示仅用于隔离测试的企业微信 850005 限流原因。"""
+
+    error_code = "rate_limited"
+    external_error_code = 850005
+    external_error_type = "ApiError"
+    http_status = 429
+
+
+class _ApplyThenRateLimitAdapter(MockSmartTableAdapter):
+    """按测试指定次数模拟远端已写入后收到 850005 的暂态更新结果。"""
+
+    def __init__(self) -> None:
+        """初始化标准内存表格和一次性暂态错误开关。"""
+        super().__init__(schema=build_required_smart_table_schema())
+        self.fail_update_count = 0
+        self.injected_850005_count = 0
+
+    def update_record(
+        self,
+        record_id: str,
+        fields: Mapping[str, object],
+        *,
+        skip_preflight: bool = False,
+    ) -> SmartTableRecord:
+        """写入 Mock 记录后按剩余次数抛出带 850005 的可重试错误。"""
+        updated = super().update_record(
+            record_id, fields, skip_preflight=skip_preflight
+        )
+        if self.fail_update_count:
+            self.fail_update_count -= 1
+            self.injected_850005_count += 1
+            try:
+                raise _Synthetic850005Cause("synthetic rate limit")
+            except _Synthetic850005Cause as cause:
+                raise WecomCliTransportError("synthetic transient") from cause
+        return updated
 
 
 def semantic_segments_json(
@@ -3111,3 +3160,384 @@ def test_controlled_confirmation_matching_existing_record_creates_independent_re
     confirmed_record = adapter.get_record(confirmed.smart_table_record_id or "")
     assert confirmed_record is not None
     assert confirmed_record.fields["手机"] == "13800000001"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("西门子的陈总想了解焊接产品", {"线索名称": "西门子", "联系人": "陈总"}),
+        ("无锡宝通的 CIO 郭总对双臂机器人感兴趣", {"线索名称": "无锡宝通", "联系人": "郭总"}),
+        ("无锡宝通的 cio 郭总对双臂机器人感兴趣", {"线索名称": "无锡宝通", "联系人": "郭总"}),
+        ("隆盛科技的采购负责人张总有上下料需求", {"线索名称": "隆盛科技", "联系人": "张总"}),
+    ],
+)
+def test_natural_company_contact_identity_is_deterministic(
+    text: str, expected: dict[str, str]
+) -> None:
+    """识别公司、受控职位和联系人称谓，不依赖 AI 或 active context。"""
+    extractor = DeterministicFirstTextLeadExtractor()
+
+    assert extractor.extract_leading_company_contact_hint(text) == expected
+    assert extractor.extract_leading_company_hint(text) == expected["线索名称"]
+
+
+@pytest.mark.parametrize(
+    ("field_name", "source_text", "model_value", "expected_value"),
+    [
+        ("手机", "补充联系电话：138 0000 0001", "13900000009", "13800000001"),
+        ("电话", "固定电话：010-12345678", "010-87654321", None),
+        ("邮箱", "邮箱：Alice@example.com", "bob@example.com", "Alice@example.com"),
+    ],
+)
+def test_ai_contact_candidates_require_matching_source_evidence(
+    field_name: str,
+    source_text: str,
+    model_value: str,
+    expected_value: str | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """合法格式的 AI 联系方式若不匹配当前原文，不得进入正式字段或诊断日志。"""
+    gateway = AIGateway(
+        MockLLMProvider(
+            [semantic_single_json(intent="UPDATE_LEAD", crm_fields={field_name: model_value})]
+        )
+    )
+
+    patch = gateway.extract_fields(source_text, source_message_id="contact-source-test")
+
+    assert patch.fields.get(field_name) == expected_value
+    assert patch.analysis.crm_fields.get(field_name) == expected_value
+    assert model_value not in caplog.text
+    assert "ai_contact_source_mismatch" in caplog.text
+    mismatch_records = [
+        record for record in caplog.records
+        if record.getMessage() == "ai_contact_source_mismatch"
+    ]
+    assert mismatch_records
+    assert all(record.field_name == field_name for record in mismatch_records)
+    assert all(record.reason == "missing_source_evidence" for record in mismatch_records)
+
+
+def test_phone_evidence_accepts_safe_formatting_and_explicit_china_prefix() -> None:
+    """空格、连接符与明确的 +86 区号可归一化比较同一号码。"""
+    assert AIGateway._contact_value_has_source_evidence(
+        "手机", "13800000001", "联系电话：+86 (138) 0000-0001"
+    )
+
+
+def test_contact_evidence_is_limited_to_each_ai_segment() -> None:
+    """模型不得把其它客户分段的号码带入当前 segment。"""
+    source_a = "甲公司 联系电话 13800000001"
+    source_b = "乙公司 联系电话 13900000002"
+    response = json.dumps(
+        {
+            "intent": "MULTI_LEAD",
+            "customer_reference": {},
+            "crm_fields": {},
+            "enrichment": {},
+            "confidence_by_field": {},
+            "segments": [
+                {
+                    "segment_index": 0,
+                    "source_text_span": source_a,
+                    "customer_reference": {},
+                    "crm_fields": {"手机": "13900000002"},
+                    "enrichment": {},
+                    "confidence_by_field": {"手机": 0.99},
+                },
+                {
+                    "segment_index": 1,
+                    "source_text_span": source_b,
+                    "customer_reference": {},
+                    "crm_fields": {"手机": "13800000001"},
+                    "enrichment": {},
+                    "confidence_by_field": {"手机": 0.99},
+                },
+            ],
+            "conflicts": [],
+            "warnings": [],
+        },
+        ensure_ascii=False,
+    )
+    gateway = AIGateway(MockLLMProvider([response]))
+
+    patch = gateway.extract_fields(f"{source_a}；{source_b}")
+
+    assert len(patch.segments) == 2
+    assert patch.segments[0].patch.fields["手机"] == "13800000001"
+    assert patch.segments[1].patch.fields["手机"] == "13900000002"
+
+
+def test_ai_update_intent_cannot_override_deterministic_company_boundary(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """模型返回旧公司名和 UPDATE_LEAD 时，服务器仍为确定性新公司建立独立目标。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    seed_event = persist_outbox_text(
+        session_factory,
+        message_id="hotfix-boundary-seed",
+        sales_user_id="sales-1",
+        text="客户：西门子；联系人：陈总",
+    )
+    seed = FirstTextLeadWorkspaceService(session_factory, adapter).consume(seed_event)
+    assert seed.lead_id is not None
+    message_id = "hotfix-boundary-new-company"
+    event_id = persist_outbox_text(
+        session_factory,
+        message_id=message_id,
+        sales_user_id="sales-1",
+        text="无锡宝通的 CIO 郭总对双臂机器人感兴趣",
+    )
+    analysis = LeadAnalysis(
+        intent="UPDATE_LEAD",
+        crm_fields={"线索名称": "西门子", "联系人": "郭总"},
+        confidence_by_field={"线索名称": 0.99, "联系人": 0.99},
+    )
+    stale_patch = ExtractedLeadPatch(
+        trace_id="stub-conflicting-update",
+        analysis=analysis,
+        fields={"线索名称": "西门子", "联系人": "郭总"},
+        pending_confirmation_fields=(),
+        low_confidence_candidates={},
+    )
+
+    class StubGateway:
+        """返回固定冲突建议以隔离验证确定性身份边界。"""
+
+        def extract_fields(self, _text: str, **_kwargs: object) -> ExtractedLeadPatch:
+            """返回测试预置的旧公司 UPDATE_LEAD 候选。"""
+            return stale_patch
+
+    service = FirstTextLeadWorkspaceService(session_factory, adapter, ai_gateway=StubGateway())
+    with session_factory.begin() as session:
+        event = session.get(OutboxEvent, event_id)
+        message = session.get(IncomingMessage, message_id)
+        active_lead = session.get(Lead, seed.lead_id)
+        assert event is not None and message is not None and active_lead is not None
+
+        # 私有评审方法会绑定当前线索日志上下文；直接单测时显式恢复，避免污染后续用例。
+        context_token = bind_log_context()
+        try:
+            request, result = service._prepare_ai_review(
+                session,
+                event,
+                message,
+                active_lead,
+                company_name_hint="无锡宝通",
+            )
+        finally:
+            reset_log_context(context_token)
+
+        assert result is None
+        assert request is not None and not isinstance(request, tuple)
+        assert request.lead_id != seed.lead_id
+        assert request.patch.fields["线索名称"] == "无锡宝通"
+
+
+def test_unresolved_company_identity_fails_closed_instead_of_matching_phone_context(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """公司身份证据无法提取时，即使号码命中旧客户也必须待归属。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    seed_event = persist_outbox_text(
+        session_factory,
+        message_id="hotfix-unresolved-seed",
+        sales_user_id="sales-1",
+        text="客户：西门子；手机：13800000001",
+    )
+    seed = FirstTextLeadWorkspaceService(session_factory, adapter).consume(seed_event)
+    assert seed.lead_id is not None
+    unresolved_event = persist_outbox_text(
+        session_factory,
+        message_id="hotfix-unresolved-company",
+        sales_user_id="sales-1",
+        text="某未确认制造有限公司的联系人补充联系电话 13800000001",
+    )
+    gateway = AIGateway(
+        MockLLMProvider(
+            [semantic_single_json(intent="UPDATE_LEAD", crm_fields={"手机": "13800000001"})]
+        )
+    )
+
+    result = FirstTextLeadWorkspaceService(
+        session_factory, adapter, ai_gateway=gateway
+    ).consume(unresolved_event)
+
+    assert result.status is LeadProcessingStatus.UNASSIGNED
+    assert result.lead_id is None
+    with session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(Lead)) == 1
+        resolution = session.scalar(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id == "hotfix-unresolved-company"
+            )
+        )
+        assert resolution is not None
+        assert resolution.status == "unassigned"
+        assert resolution.lead_id is None
+
+
+def test_incident_four_message_sequence_keeps_three_leads_and_contact_provenance(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """隔离复现事故消息，验证公司边界、联系方式来源、表格 ID 和 850005 检查点。"""
+    phone_a = "13800000001"
+    model_phone_b = "13900000009"
+    phone_b = "13700000002"
+    phone_c = "13600000003"
+    adapter = _ApplyThenRateLimitAdapter()
+    gateway = AIGateway(
+        MockLLMProvider(
+            [
+                semantic_single_json(
+                    intent="NEW_LEAD",
+                    crm_fields={},
+                    enrichment={"客户需求/痛点": "了解焊接产品"},
+                ),
+                semantic_single_json(
+                    intent="UPDATE_LEAD", crm_fields={"手机": model_phone_b}
+                ),
+                semantic_single_json(
+                    intent="NEW_LEAD",
+                    crm_fields={},
+                    enrichment={"客户需求/痛点": "双臂机器人感兴趣"},
+                ),
+                semantic_single_json(
+                    intent="NEW_LEAD",
+                    crm_fields={},
+                    enrichment={"客户需求/痛点": "上下料需求"},
+                ),
+            ]
+        )
+    )
+    service = FirstTextLeadWorkspaceService(session_factory, adapter, ai_gateway=gateway)
+
+    event_a = persist_outbox_text(
+        session_factory,
+        message_id="incident-seq-5",
+        sales_user_id="sales-1",
+        text="西门子的陈总想了解焊接产品，希望展会联系。",
+        sequence=5,
+    )
+    lead_a_result = service.consume(event_a)
+    assert lead_a_result.status is LeadProcessingStatus.CREATED
+
+    # 只在 seq 6 更新时注入远端已应用后返回的 850005，验证同补丁恢复后上下文不串线。
+    adapter.fail_update_count = 1
+    event_a_phone = persist_outbox_text(
+        session_factory,
+        message_id="incident-seq-6",
+        sales_user_id="sales-1",
+        text=f"补充联系电话：{phone_a}",
+        sequence=6,
+    )
+    phone_update = service.consume(event_a_phone)
+    assert phone_update.status is LeadProcessingStatus.UPDATED
+
+    event_b = persist_outbox_text(
+        session_factory,
+        message_id="incident-seq-8",
+        sales_user_id="sales-1",
+        text=f"无锡宝通的 CIO 郭总对双臂机器人感兴趣，手机：{phone_b}",
+        sequence=8,
+    )
+    lead_b_result = service.consume(event_b)
+    assert lead_b_result.status is LeadProcessingStatus.CREATED
+
+    event_c = persist_outbox_text(
+        session_factory,
+        message_id="incident-seq-9",
+        sales_user_id="sales-1",
+        text=f"隆盛科技的采购负责人张总有上下料需求，手机：{phone_c}",
+        sequence=9,
+    )
+    lead_c_result = service.consume(event_c)
+    assert lead_c_result.status is LeadProcessingStatus.CREATED
+
+    with session_factory() as session:
+        leads = session.scalars(select(Lead)).all()
+        assert len(leads) == 3
+        lead_by_source = {lead.source_message_id: lead for lead in leads}
+        lead_a = lead_by_source["incident-seq-5"]
+        lead_b = lead_by_source["incident-seq-8"]
+        lead_c = lead_by_source["incident-seq-9"]
+        assert lead_a_result.lead_id == lead_a.id
+        assert lead_b_result.lead_id == lead_b.id
+        assert lead_c_result.lead_id == lead_c.id
+        assert lead_a.field_values["线索名称"] == "西门子"
+        assert lead_b.field_values["线索名称"] == "无锡宝通"
+        assert lead_c.field_values["线索名称"] == "隆盛科技"
+        assert lead_a.field_values["联系人"] == "陈总"
+        assert lead_b.field_values["联系人"] == "郭总"
+        assert lead_c.field_values["联系人"] == "张总"
+        assert lead_a.field_values["手机"] == phone_a
+        assert lead_b.field_values["手机"] == phone_b
+        assert lead_c.field_values["手机"] == phone_c
+        assert lead_a.enrichment_values["客户需求/痛点"] == "了解焊接产品"
+        assert lead_b.enrichment_values["客户需求/痛点"] == "双臂机器人感兴趣"
+        assert lead_c.enrichment_values["客户需求/痛点"] == "上下料需求"
+        company_names = {"西门子", "无锡宝通", "隆盛科技"}
+        for lead in leads:
+            other_company_names = company_names - {lead.field_values["线索名称"]}
+            assert all(
+                name not in str(lead.enrichment_values) for name in other_company_names
+            )
+        sequence_by_message = {
+            message.message_id: message.sequence
+            for message in session.scalars(select(IncomingMessage)).all()
+        }
+        assert sequence_by_message == {
+            "incident-seq-5": 5,
+            "incident-seq-6": 6,
+            "incident-seq-8": 8,
+            "incident-seq-9": 9,
+        }
+        phone_provenance = session.scalars(
+            select(LeadFieldProvenance).where(
+                LeadFieldProvenance.lead_id.in_([lead_a.id, lead_b.id, lead_c.id])
+            )
+        ).all()
+        provenance_by_lead_field = {
+            (item.lead_id, item.field_name): item for item in phone_provenance
+        }
+        assert (
+            provenance_by_lead_field[(lead_a.id, "线索名称")].source_message_id
+            == "incident-seq-5"
+        )
+        assert (
+            provenance_by_lead_field[(lead_a.id, "联系人")].source_message_id
+            == "incident-seq-5"
+        )
+        assert (
+            provenance_by_lead_field[(lead_a.id, "手机")].source_message_id
+            == "incident-seq-6"
+        )
+        assert (
+            provenance_by_lead_field[(lead_a.id, "手机")].value
+            == serialize_field_value(phone_a)
+        )
+        for lead, message_id, phone in (
+            (lead_b, "incident-seq-8", phone_b),
+            (lead_c, "incident-seq-9", phone_c),
+        ):
+            for field_name in ("线索名称", "联系人", "手机"):
+                provenance = provenance_by_lead_field[(lead.id, field_name)]
+                assert provenance.source_message_id == message_id
+                if field_name == "手机":
+                    assert provenance.value == serialize_field_value(phone)
+        phone_event = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.message_id == "incident-seq-6")
+        )
+        assert phone_event is not None and phone_event.status == "succeeded"
+
+    # Smart Table 已应用更新后返回模拟 850005；既有同补丁恢复成功，下一条公司仍独立建档。
+    assert adapter.injected_850005_count == 1
+
+    records = adapter.get_records()
+    assert len(records) == 3
+    assert len({record.record_id for record in records}) == 3
+    records_by_owner_name = {record.fields["线索名称"]: record for record in records}
+    assert records_by_owner_name["西门子"].fields["手机"] == phone_a
+    assert records_by_owner_name["无锡宝通"].fields["手机"] == phone_b
+    assert records_by_owner_name["隆盛科技"].fields["手机"] == phone_c
+    assert all(record.fields.get("手机") != model_phone_b for record in records)

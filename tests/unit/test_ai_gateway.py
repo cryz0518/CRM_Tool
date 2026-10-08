@@ -1039,8 +1039,8 @@ def test_gateway_drops_unknown_phone_alias_without_source_evidence() -> None:
     assert len(provider.requests) == 1
 
 
-def test_gateway_accepts_registered_chinese_phone_field() -> None:
-    """验证合法中文注册表字段及其标量值可通过既有确定性校验。
+def test_gateway_drops_registered_chinese_phone_field_without_source_number() -> None:
+    """验证字段名和格式合法仍不足以接受原文没有的电话号码。
 
     参数：无。
     返回：无。
@@ -1054,7 +1054,7 @@ def test_gateway_accepts_registered_chinese_phone_field() -> None:
 
     result = AIGateway(provider).extract_fields("客户电话已提供")
 
-    assert result.fields == {"手机": "13800138000"}
+    assert result.fields == {}
 
 
 def test_gateway_repair_prompt_keeps_crm_field_and_value_type_constraints() -> None:
