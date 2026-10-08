@@ -83,6 +83,7 @@ def prepare_pending_create_case(
         {
             "负责人": sales_user_id,
             "创建人": sales_user_id,
+            "提交状态": "未提交",
             "线索名称": f"竞态公司-{suffix}",
             "业务线": "协作机器人",
             "线索来源": "展会",
