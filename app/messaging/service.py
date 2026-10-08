@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.config import get_settings
 from app.core.logging import bind_log_context, reset_log_context
 from app.crm.commands import looks_like_submission_intent, parse_crm_submission_command
 from app.messaging.models import (
@@ -19,6 +21,7 @@ from app.messaging.models import (
     NotificationRecord,
     OutboxEvent,
     SalesAuthorization,
+    utc_now,
 )
 from app.wecom_bot.actions import parse_deterministic_action_command
 
@@ -119,31 +122,35 @@ class MessageIntakeService:
                     requires_media_enrichment=command.requires_media_enrichment,
                 )
                 session.add(message)
+                # 先按既有确定性规则分类，只有普通线索消息会获得录入中的接收提示。
+                event_type = (
+                    "crm_submission_command"
+                    if parse_crm_submission_command(command.normalized_text or "") is not None
+                    else (
+                        "crm_submission_intent"
+                        if looks_like_submission_intent(command.normalized_text or "")
+                        else (
+                            "wecom_action_command"
+                            if parse_deterministic_action_command(command.normalized_text or "")
+                            is not None
+                            else "message_received"
+                        )
+                    )
+                )
                 session.add(
                     OutboxEvent(
                         message_id=command.message_id,
                         sales_user_id=command.sales_user_id,
                         sequence=authorization.next_message_sequence,
-                        # 精确命令保留快速路径；普通文本由 Worker 做结构化意图路由。
-                        event_type=(
-                            "crm_submission_command"
-                            if parse_crm_submission_command(command.normalized_text or "")
-                            is not None
-                            else (
-                                "crm_submission_intent"
-                                if looks_like_submission_intent(command.normalized_text or "")
-                                else (
-                                    "wecom_action_command"
-                                    if parse_deterministic_action_command(
-                                        command.normalized_text or ""
-                                    )
-                                    is not None
-                                    else "message_received"
-                                )
-                            )
-                        ),
+                        event_type=event_type,
                     )
                 )
+                # 通知记录与消息、Outbox 同事务提交；后台发送器只会看到已提交接收事实。
+                settings = get_settings()
+                if event_type == "message_received" and settings.lead_receipt_enabled:
+                    self._record_lead_receipt(
+                        session, command, settings.lead_receipt_coalesce_seconds
+                    )
                 self._record_audit_event(session, command, "message_received")
                 logger.info("有效 actor 消息与发件箱事件已入库")
                 return MessageIntakeResult(accepted=True, duplicate=False)
@@ -154,6 +161,81 @@ class MessageIntakeService:
         finally:
             # 无论事务成功、回滚还是提前返回，都清理当前消息的链路上下文。
             reset_log_context(token)
+
+    @staticmethod
+    def _record_lead_receipt(
+        session: Session, command: IncomingMessageCommand, coalesce_seconds: int
+    ) -> None:
+        """在接收事务内创建或累加同一销售的消息接收提示。
+
+        参数：session 为消息接收事务；command 为去重后的有效消息；coalesce_seconds 为合并窗口。
+        返回值：无。
+        异常：数据库写入失败时由接收事务回滚，避免产生不存在对应 Outbox 的确认。
+        副作用：新增或更新当前销售的 NotificationRecord，不直接调用企业微信。
+        """
+        now = utc_now()
+        notice = session.scalar(
+            select(NotificationRecord)
+            .where(
+                NotificationRecord.sales_user_id == command.sales_user_id,
+                NotificationRecord.notification_type == "lead_intake_receipt",
+                NotificationRecord.status == "pending",
+            )
+            .order_by(NotificationRecord.created_at.desc())
+            .limit(1)
+            .with_for_update()
+        )
+        payload = dict(notice.payload or {}) if notice is not None else {}
+        # 兼容早期通知记录，并以 message_id 集合而不是累加计数作为唯一计数来源。
+        message_ids_value = payload.get("message_ids")
+        message_ids = (
+            list(dict.fromkeys(item for item in message_ids_value if isinstance(item, str)))
+            if isinstance(message_ids_value, list)
+            else []
+        )
+        if notice is not None and not message_ids:
+            message_ids = [notice.source_message_id]
+        until = payload.get("coalesce_until")
+        deadline: datetime | None = None
+        if isinstance(until, str):
+            # 持久化绝对截止时间，Bot 重启后也按原窗口决定何时发送。
+            try:
+                deadline = datetime.fromisoformat(until)
+            except ValueError:
+                deadline = None
+        if deadline is not None and deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=now.tzinfo)
+
+        if notice is not None and deadline is not None and deadline > now:
+            # 重放消息只保留一次；跨销售接收提示按销售行锁分别合并。
+            if command.message_id not in message_ids:
+                message_ids.append(command.message_id)
+            payload["message_ids"] = message_ids
+            payload["receipt_count"] = len(message_ids)
+            notice.payload = payload
+            notice.content = f"✅ 已收到你的 {len(message_ids)} 条消息，正在识别并录入。"
+            return
+
+        # 接收事务持有销售授权行锁，序列化并发消息并隔离不同销售的计数。
+        notification_key = hashlib.sha256(
+            f"lead_intake_receipt:{command.sales_user_id}:{command.message_id}".encode()
+        ).hexdigest()
+        payload = {
+            "receipt_count": 1,
+            "message_ids": [command.message_id],
+            "coalesce_until": (now + timedelta(seconds=coalesce_seconds)).isoformat(),
+        }
+        session.add(
+            NotificationRecord(
+                notification_key=notification_key,
+                sales_user_id=command.sales_user_id,
+                source_message_id=command.message_id,
+                notification_type="lead_intake_receipt",
+                content="✅ 已收到你的 1 条消息，正在识别并录入。",
+                payload=payload,
+                created_at=now,
+            )
+        )
 
     @staticmethod
     def _register_actor(session: Session, command: IncomingMessageCommand) -> SalesAuthorization:

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from threading import Barrier, BrokenBarrierError, Event, Lock
 from uuid import uuid4
 
@@ -13,13 +16,28 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.schema import CreateSchema, DropSchema
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.crm.mock import MockCRMAdapter
 from app.crm.service import CrmSubmissionService, SubmissionCommand
-from app.leads.models import CrmCompanyIdentity, CrmSyncRecord, Lead
+from app.leads.models import (
+    CrmCompanyIdentity,
+    CrmSyncRecord,
+    Lead,
+    LeadMessageResolution,
+    SmartTableSync,
+)
 from app.leads.review import LeadReviewService
-from app.messaging.models import Base, IncomingMessage, SalesAuthorization
+from app.leads.service import FirstTextLeadWorkspaceService
+from app.messaging.models import (
+    Base,
+    IncomingMessage,
+    NotificationRecord,
+    OutboxEvent,
+    SalesAuthorization,
+    utc_now,
+)
 from app.messaging.service import IncomingMessageCommand, MessageIntakeResult, MessageIntakeService
+from app.notifications.outbound import WecomOutboundNotificationSender
 from app.smart_table.adapter import SmartTableActor
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.registry import build_required_smart_table_schema
@@ -323,6 +341,193 @@ def test_concurrent_first_submission_reserves_exactly_one_global_crm_identity(
         and loser_sync.status == "awaiting_duplicate_confirmation"
         and loser_sync.crm_lead_id == identities[0].crm_lead_id
     )
+
+
+def test_concurrent_first_success_workers_issue_one_sales_notice(
+    postgres_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证真实 PostgreSQL 并发成功事务只发行一个销售首次链接通知。"""
+    settings = Settings(
+        _env_file=None,
+        lead_first_success_link_enabled=True,
+        lead_smart_table_url="https://example.test/smart-table",
+    )
+    monkeypatch.setattr("app.leads.service.get_settings", lambda: settings)
+    with postgres_session_factory.begin() as session:
+        session.add(
+            SalesAuthorization(wecom_user_id="sales-first", is_authorized=True, is_active=True)
+        )
+        session.flush()
+        session.add(
+            IncomingMessage(
+                message_id="message-first-success",
+                sales_user_id="sales-first",
+                sequence=1,
+                raw_payload={"text": "客户需求"},
+                normalized_text="客户需求",
+            )
+        )
+        session.flush()
+        event = OutboxEvent(
+            message_id="message-first-success",
+            sales_user_id="sales-first",
+            sequence=1,
+            event_type="message_received",
+        )
+        lead = Lead(
+            id="lead-first-success",
+            source_message_id="message-first-success",
+            original_capturing_sales_user_id="sales-first",
+            smart_table_owner_user_id="sales-first",
+            smart_table_record_id="table-first-success",
+            lifecycle_state="synced",
+            field_values={"线索名称": "公司"},
+        )
+        session.add_all((event, lead))
+        session.flush()
+        session.add_all(
+            (
+                SmartTableSync(
+                    lead_id=lead.id,
+                    source_message_id=event.message_id,
+                    smart_table_record_id=lead.smart_table_record_id,
+                    status="succeeded",
+                ),
+                LeadMessageResolution(
+                    message_id=event.message_id,
+                    segment_index=0,
+                    lead_id=lead.id,
+                    status="assigned",
+                ),
+            )
+        )
+
+    barrier = Barrier(2)
+
+    def queue_notice() -> None:
+        """在独立事务中并发执行真实的销售级首次成功通知门禁。"""
+        barrier.wait(timeout=5)
+        with postgres_session_factory.begin() as session:
+            event = session.scalar(
+                select(OutboxEvent).where(OutboxEvent.message_id == "message-first-success")
+            )
+            message = session.get(IncomingMessage, "message-first-success")
+            lead = session.get(Lead, "lead-first-success")
+            sync = session.scalar(
+                select(SmartTableSync).where(SmartTableSync.lead_id == "lead-first-success")
+            )
+            assert (
+                event is not None
+                and message is not None
+                and lead is not None
+                and sync is not None
+            )
+            FirstTextLeadWorkspaceService._queue_first_success_notification(
+                session, event, message, lead, sync, 0
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(queue_notice) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=10)
+
+    with postgres_session_factory() as session:
+        notices = session.scalars(
+            select(NotificationRecord).where(
+                NotificationRecord.notification_type == "lead_first_smart_table_success"
+            )
+        ).all()
+    assert len(notices) == 1
+    assert notices[0].notification_key == hashlib.sha256(
+        b"lead_first_smart_table_success:sales-first"
+    ).hexdigest()
+
+
+def test_concurrent_receipt_senders_deliver_one_coalesced_notice(
+    postgres_session_factory: sessionmaker[Session],
+) -> None:
+    """验证 PostgreSQL 并发 sender 只投递一次同一条合并接收通知。"""
+    sales_user_id = "sales-parallel-receipt"
+    message_id = "message-parallel-receipt"
+    with postgres_session_factory.begin() as session:
+        session.add(
+            SalesAuthorization(wecom_user_id=sales_user_id, is_authorized=True, is_active=True)
+        )
+        session.flush()
+        session.add(
+            IncomingMessage(
+                message_id=message_id,
+                sales_user_id=sales_user_id,
+                sequence=1,
+                raw_payload={"text": "客户需求"},
+            )
+        )
+        session.flush()
+        session.add_all(
+            (
+                OutboxEvent(
+                    message_id=message_id,
+                    sales_user_id=sales_user_id,
+                    sequence=1,
+                    event_type="message_received",
+                    status="pending",
+                ),
+                NotificationRecord(
+                    notification_key="parallel-receipt",
+                    sales_user_id=sales_user_id,
+                    source_message_id=message_id,
+                    notification_type="lead_intake_receipt",
+                    content="✅ 已收到你的 1 条消息，正在识别并录入。",
+                    payload={
+                        "receipt_count": 1,
+                        "message_ids": [message_id],
+                        "coalesce_until": (utc_now() - timedelta(seconds=1)).isoformat(),
+                    },
+                ),
+            )
+        )
+
+    class BlockingClient:
+        """在首个外部发送期间阻塞，允许第二个 sender 并发尝试认领。"""
+
+        def __init__(self) -> None:
+            """初始化同步闸门和发送调用计数。"""
+            self.entered = Event()
+            self.release = Event()
+            self.lock = Lock()
+            self.calls = 0
+
+        async def send_message(
+            self, userid_or_chatid: str, body: dict[str, object]
+        ) -> dict[str, str]:
+            """阻塞第一次发送，并返回可被 sender 接受的成功回执。"""
+            del userid_or_chatid, body
+            with self.lock:
+                self.calls += 1
+            self.entered.set()
+            assert self.release.wait(timeout=5)
+            return {"msgid": "parallel-receipt-delivered"}
+
+    client = BlockingClient()
+    sender = WecomOutboundNotificationSender(postgres_session_factory, client)
+
+    def send_once() -> int:
+        """在独立 Worker 线程运行一次通知发送循环。"""
+        return asyncio.run(sender.send_pending_once())
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(send_once)
+        assert client.entered.wait(timeout=5)
+        second = executor.submit(send_once)
+        second_result = second.result(timeout=5)
+        client.release.set()
+        first_result = first.result(timeout=5)
+
+    assert sorted((first_result, second_result)) == [0, 1]
+    assert client.calls == 1
+    with postgres_session_factory() as session:
+        notice = session.get(NotificationRecord, "parallel-receipt")
+    assert notice is not None and notice.status == "succeeded"
 
 
 def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(

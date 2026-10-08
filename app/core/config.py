@@ -55,6 +55,10 @@ class Settings(BaseSettings):
     lead_context_ttl_minutes: int = 30
     lead_message_retry_count: int = 1
     lead_outbox_poll_seconds: int = 10
+    lead_receipt_enabled: bool = True
+    lead_receipt_coalesce_seconds: int = 5
+    lead_first_success_link_enabled: bool = True
+    lead_smart_table_url: str | None = None
     audit_mirror_batch_size: int = 10
     smart_table_readiness_cache_seconds: int = 30
     lead_processing_timeout_seconds: int = 300
@@ -199,6 +203,20 @@ class Settings(BaseSettings):
         """
         if value < 0:
             raise ValueError("LEAD_MESSAGE_RETRY_COUNT 不能小于 0")
+        return value
+
+    @field_validator("lead_receipt_coalesce_seconds")
+    @classmethod
+    def lead_receipt_coalesce_seconds_must_not_be_negative(cls, value: int) -> int:
+        """拒绝负数接收反馈窗口，零表示不合并并立即允许发送。
+
+        参数：value 为环境变量解析后的秒数。
+        返回值：通过校验的非负秒数。
+        异常：值小于零时抛出 ValueError，阻止无效的合并窗口配置。
+        副作用：无。
+        """
+        if value < 0:
+            raise ValueError("LEAD_RECEIPT_COALESCE_SECONDS 不能小于 0")
         return value
 
     @field_validator("lead_outbox_poll_seconds")
