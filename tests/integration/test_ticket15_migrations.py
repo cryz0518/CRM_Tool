@@ -379,6 +379,76 @@ def _resolve_and_validate_compose(
     return config
 
 
+def _classify_compose_config_stderr(stderr: str) -> tuple[str, str]:
+    """只按预定义白名单分类 Compose config 错误，永不返回原始 stderr。
+
+    参数：stderr 为仅供内存匹配的子进程错误输出；只检查开头 8 KiB。
+    返回值：固定安全错误码和固定说明；未匹配时返回通用未分类结果。
+    异常：无。
+    副作用：无，不保存、记录或返回任何 stderr 片段。
+    """
+    diagnostic_lines = [
+        line.strip().casefold() for line in stderr[:8192].splitlines() if line.strip()
+    ]
+    if any(
+        line.startswith(marker)
+        for line in diagnostic_lines
+        for marker in (
+            "docker: 'compose' is not a docker command",
+            'docker: "compose" is not a docker command',
+            "docker: unknown command: docker compose",
+            "compose plugin not found",
+            "compose plugin is not available",
+        )
+    ):
+        return "COMPOSE_CLI_PLUGIN_UNAVAILABLE", "Docker Compose CLI 插件不可用"
+    if any(
+        line.startswith(marker)
+        for line in diagnostic_lines
+        for marker in (
+            "unknown flag",
+            "unknown shorthand flag",
+            "unknown option",
+            "flag provided but not defined",
+        )
+    ):
+        return "COMPOSE_ARGUMENT_UNSUPPORTED", "Compose 参数不受当前 CLI 支持"
+    if any(
+        "env file" in line
+        and any(
+            marker in line
+            for marker in (
+                "not found",
+                "no such file",
+                "failed to",
+                "cannot open",
+                "could not read",
+                "error loading",
+            )
+        )
+        for line in diagnostic_lines
+    ):
+        return "COMPOSE_ENV_FILE_UNREADABLE", "专用 Compose 环境文件无法读取"
+    if any(
+        line.startswith("invalid interpolation format")
+        or (
+            line.startswith("required variable ")
+            and "is missing a value" in line
+        )
+        or (line.startswith("variable ") and "is not set" in line)
+        for line in diagnostic_lines
+    ):
+        return "COMPOSE_INTERPOLATION_FAILED", "Compose 配置变量插值失败"
+    if any(
+        line.startswith("unsupported format")
+        or (line.startswith("invalid value") and "--format" in line)
+        or (line.startswith("invalid format") and "json" in line)
+        for line in diagnostic_lines
+    ):
+        return "COMPOSE_CONFIG_FORMAT_UNSUPPORTED", "Compose JSON 输出格式不受当前 CLI 支持"
+    return "COMPOSE_ERROR_UNCLASSIFIED", "Compose config 命令失败；错误未匹配安全分类白名单"
+
+
 def _assert_compose_success(
     completed: subprocess.CompletedProcess[str],
     arguments: tuple[str, ...],
@@ -400,16 +470,21 @@ def _assert_compose_success(
             if arguments[:1] == ("config",)
             else "compose_runtime"
         )
+        failure_code = {
+            "docker_context": "DOCKER_CONTEXT_EXIT_NONZERO",
+            "compose_config": "COMPOSE_CONFIG_EXIT_NONZERO",
+        }.get(failure_stage, "COMPOSE_COMMAND_EXIT_NONZERO")
         failure_reason = {
             "docker_context": "Docker context 检查命令退出非零",
             "compose_config": "Compose 配置解析命令退出非零",
         }.get(failure_stage, "Compose 检查命令退出非零")
+        if failure_stage == "compose_config":
+            failure_code, failure_reason = _classify_compose_config_stderr(
+                completed.stderr or ""
+            )
         raise T15ValidationError(
             failure_stage,
-            {
-                "docker_context": "DOCKER_CONTEXT_EXIT_NONZERO",
-                "compose_config": "COMPOSE_CONFIG_EXIT_NONZERO",
-            }.get(failure_stage, "COMPOSE_COMMAND_EXIT_NONZERO"),
+            failure_code,
             failure_reason,
             exit_code=completed.returncode,
             external_command_executed=True,

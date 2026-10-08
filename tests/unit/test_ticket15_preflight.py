@@ -199,6 +199,101 @@ def test_preflight_failure_is_nonzero_and_diagnostic_is_persisted(
     assert json.loads(saved) == record
 
 
+@pytest.mark.parametrize(
+    ("stderr", "error_code", "reason"),
+    (
+        (
+            "docker: 'compose' is not a docker command.",
+            "COMPOSE_CLI_PLUGIN_UNAVAILABLE",
+            "Docker Compose CLI 插件不可用",
+        ),
+        (
+            "unknown flag: --format",
+            "COMPOSE_ARGUMENT_UNSUPPORTED",
+            "Compose 参数不受当前 CLI 支持",
+        ),
+        (
+            "failed to read env file: C:/private/path",
+            "COMPOSE_ENV_FILE_UNREADABLE",
+            "专用 Compose 环境文件无法读取",
+        ),
+        (
+            "required variable T15_RUN_ID is missing a value",
+            "COMPOSE_INTERPOLATION_FAILED",
+            "Compose 配置变量插值失败",
+        ),
+        (
+            'invalid value "json" for --format',
+            "COMPOSE_CONFIG_FORMAT_UNSUPPORTED",
+            "Compose JSON 输出格式不受当前 CLI 支持",
+        ),
+        (
+            "daemon request failed: secret DATABASE_URL=not-for-output",
+            "COMPOSE_ERROR_UNCLASSIFIED",
+            "Compose config 命令失败；错误未匹配安全分类白名单",
+        ),
+    ),
+)
+def test_preflight_classifies_compose_stderr_without_persisting_it(
+    stderr: str,
+    error_code: str,
+    reason: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """按 stderr 白名单输出固定诊断，并确保原始子进程输出不落盘。
+
+    参数：stderr 为模拟分类文本；error_code 和 reason 为预期固定结果；
+    monkeypatch 替换 subprocess 与临时目录；tmp_path 接收 JSON；capsys 捕获 stdout。
+    返回值：无。
+    异常：分类、退出状态或脱敏断言失败时由 pytest 报告。
+    副作用：模拟 context/config 返回，不启动任何外部进程。
+    """
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(arguments: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        """为只读检查返回本机 endpoint 和模拟 config 错误。
+
+        参数：arguments 和关键字参数为替换的 subprocess 调用参数。
+        返回值：context 成功结果或退出码 125 的 Compose config 结果。
+        异常：无。
+        副作用：记录调用，不启动外部进程。
+        """
+        calls.append(tuple(arguments))
+        if arguments[1:3] == ["context", "inspect"]:
+            return subprocess.CompletedProcess(
+                arguments, 0, "unix:///run/docker.sock", ""
+            )
+        return subprocess.CompletedProcess(
+            arguments,
+            125,
+            "RAW_STDOUT_SECRET=do-not-store",
+            f"{stderr}\nRAW_STDERR_SECRET=do-not-store",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    exit_code = t15_compose_preflight.main([])
+
+    output = capsys.readouterr().out
+    record = json.loads(output)
+    _assert_diagnostic_fields(record)
+    assert exit_code == record["exit_code"] == 1
+    assert record["status"] == "failed"
+    assert record["stage"] == "compose_config"
+    assert record["error_code"] == error_code
+    assert record["reason"] == reason
+    assert record["command_exit_code"] == 125
+    assert record["external_command_executed"] is True
+    assert len(calls) == 2
+    saved = next(tmp_path.glob("t15-compose-preflight-*.json")).read_text(encoding="utf-8")
+    assert json.loads(saved) == record
+    for raw_value in (stderr, "RAW_STDOUT_SECRET=do-not-store", "RAW_STDERR_SECRET=do-not-store"):
+        assert raw_value not in output + saved
+
+
 def test_preflight_isolation_failure_stays_nonzero_and_redacted(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
