@@ -2877,10 +2877,10 @@ def test_grounded_same_company_ai_update_uses_context_without_creating_second_le
     assert record.fields["工艺"] == "装配"
 
 
-def test_ambiguous_quantity_fragment_after_card_is_unassigned(
+def test_new_company_card_does_not_inherit_active_context_and_quantity_is_unassigned(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证无法由身份或安全补充条件归属的数量需求不会继承名片上下文。
+    """验证名片中的新公司不会继承旧上下文，后续无身份需求也不继承新上下文。
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
@@ -2898,7 +2898,7 @@ def test_ambiguous_quantity_fragment_after_card_is_unassigned(
         message_id="message-context-card",
         sales_user_id="sales-1",
         text=(
-            "邢伟伟\n数字化业务中心总监 / 合伙人\nMobile: 158 6169 9724\n"
+            "邢伟伟\n数字化业务中心总监 / 合伙人\nMobile: 155 0000 1234\n"
             "长广溪智能制造（无锡）有限公司"
         ),
     )
@@ -2949,18 +2949,18 @@ def test_ambiguous_quantity_fragment_after_card_is_unassigned(
             ),
             json.dumps(
                 {
-                    "intent": "NEW_LEAD",
+                    "intent": "UPDATE_LEAD",
                     "customer_reference": {
                         "company": "长广溪智能制造（无锡）有限公司",
                         "contact": "邢伟伟",
                         "title": "数字化业务中心总监 / 合伙人",
-                        "phone": "15861699724",
+                        "phone": "15500001234",
                     },
                     "crm_fields": {
                         "线索名称": "长广溪智能制造（无锡）有限公司",
                         "联系人": "邢伟伟",
                         "职务": "数字化业务中心总监 / 合伙人",
-                        "手机": "15861699724",
+                        "手机": "15500001234",
                     },
                     "enrichment": {},
                     "confidence_by_field": {
@@ -2994,7 +2994,7 @@ def test_ambiguous_quantity_fragment_after_card_is_unassigned(
     first_result = service.consume(first_event_id)
 
     assert first_result.status is LeadProcessingStatus.CREATED
-    assert len(adapter.get_records()) == 1
+    assert len(adapter.get_records()) == 2
     with session_factory() as session:
         resolutions = session.scalars(
             select(LeadMessageResolution).where(
@@ -3009,14 +3009,25 @@ def test_ambiguous_quantity_fragment_after_card_is_unassigned(
     ).all()
     resolution_by_message = {resolution.message_id: resolution for resolution in resolutions}
     assert resolution_by_message["message-context-card-first"].lead_id == first_result.lead_id
-    assert resolution_by_message["message-context-card"].lead_id == first_result.lead_id
+    card_lead_id = resolution_by_message["message-context-card"].lead_id
+    assert card_lead_id is not None
+    assert card_lead_id != first_result.lead_id
     assert resolution_by_message["message-context-card-follow-up"].status == "unassigned"
     assert resolution_by_message["message-context-card-follow-up"].lead_id is None
-    record = adapter.get_record(first_result.smart_table_record_id or "")
-    assert record is not None
-    assert record.fields["线索名称"] == "长广溪智能制造（无锡）有限公司"
-    assert "预算100万" in record.fields["备注"]
-    assert "想采购10台左右" not in record.fields["备注"]
+    first_record = adapter.get_record(first_result.smart_table_record_id or "")
+    assert first_record is not None
+    assert first_record.fields["线索名称"] == "邢总公司"
+    assert first_record.fields.get("手机") != "15500001234"
+    card_record_id = next(
+        record.record_id
+        for record in adapter.get_records()
+        if record.fields.get("线索名称") == "长广溪智能制造（无锡）有限公司"
+    )
+    assert card_record_id != first_result.smart_table_record_id
+    card_record = adapter.get_record(card_record_id)
+    assert card_record is not None
+    assert card_record.fields["联系人"] == "邢伟伟"
+    assert card_record.fields["手机"] == "15500001234"
 
 
 def test_controlled_temporary_confirmation_keeps_lifecycle_and_creates_first_record(

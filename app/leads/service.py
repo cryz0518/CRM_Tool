@@ -2298,6 +2298,8 @@ class FirstTextLeadWorkspaceService:
             active_context_lead is not None
             and message.requires_media_enrichment
             and not explicit_new_lead_signal
+            and not patch.fields.get("线索名称")
+            and safe_context_supplement
         )
         if patch.analysis.intent == "IGNORE":
             if (
