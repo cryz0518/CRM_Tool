@@ -246,6 +246,7 @@ def test_concurrent_first_submission_reserves_exactly_one_global_crm_identity(
             record = adapter.create_record(
                 {
                     "负责人": sales_user_id,
+                    "提交状态": "未提交",
                     "线索名称": "公司 Y",
                     "业务线": "协作机器人",
                     "线索来源": "展会",
