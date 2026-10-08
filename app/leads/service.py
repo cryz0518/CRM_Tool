@@ -1807,6 +1807,43 @@ class FirstTextLeadWorkspaceService:
                             )
                         return ai_result
                 if (
+                    ai_review is None
+                    and quote_target_lead is None
+                    and smart_table_recovery_sync is None
+                    and multi_request is None
+                    and multi_company_fields is None
+                    and not extracted_patch.get("线索名称")
+                    and leading_company_hint is None
+                    and (
+                        self._is_weak_identity_fragment(message.normalized_text)
+                        or (context_lead is not None and bool(extracted_patch))
+                    )
+                ):
+                    # 无 AI 结果时也必须使用同一安全门，且只有有效上下文中的原文安全补充可继续。
+                    active_context = self._get_active_context_lead(session, message)
+                    safe_context_supplement = self._is_weak_context_fragment(
+                        message.normalized_text, extracted_patch
+                    )
+                    rejection_reason = self._context_supplement_rejection_reason(
+                        session,
+                        message,
+                        active_context,
+                        context_lead,
+                        extracted_patch,
+                        safe_context_supplement,
+                    )
+                    if rejection_reason is not None:
+                        self._record_audit(
+                            session,
+                            event,
+                            "lead_update_identity_unassigned",
+                            details={"reason": rejection_reason},
+                        )
+                        self._mark_unassigned(session, event)
+                        return LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
+                    # 有效上下文优先；否则仅保留此前唯一联系方式命中的 Lead。
+                    context_lead = active_context or context_lead
+                if (
                     context_lead is not None
                     and not extracted_patch
                     and ai_review is None
@@ -2227,16 +2264,47 @@ class FirstTextLeadWorkspaceService:
         ):
             # 没有原文公司证据时，模型猜出的公司名不能抢占当前销售上下文。
             patch = self._drop_unreliable_company_candidate(patch, message.normalized_text)
-        weak_context_fragment = self._is_weak_context_fragment(
-            message.normalized_text, patch.fields
+        safe_context_supplement = self._is_weak_context_fragment(
+            message.normalized_text, patch.fields, patch.enrichment
         )
+        rejection_reason = (
+            self._context_supplement_rejection_reason(
+                session,
+                message,
+                active_context_lead,
+                context_lead,
+                patch.fields,
+                safe_context_supplement,
+            )
+            if quote_target_lead_id is None and not patch.fields.get("线索名称")
+            else None
+        )
+        if (
+            quote_target_lead_id is None
+            and not patch.fields.get("线索名称")
+            and rejection_reason is not None
+            and patch.analysis.intent in {"UPDATE_LEAD", "IGNORE"}
+        ):
+            # UPDATE/IGNORE 意图都不是归属证据；无公司身份时由同一安全门裁决目标。
+            self._record_audit(
+                session,
+                event,
+                "lead_update_identity_unassigned",
+                details={"reason": rejection_reason},
+            )
+            self._mark_unassigned(session, event)
+            return None, LeadProcessingResult(LeadProcessingStatus.UNASSIGNED)
         media_context_continuation = (
             active_context_lead is not None
             and message.requires_media_enrichment
             and not explicit_new_lead_signal
         )
         if patch.analysis.intent == "IGNORE":
-            if active_context_lead is None or not weak_context_fragment or explicit_new_lead_signal:
+            if (
+                active_context_lead is None
+                or not safe_context_supplement
+                or explicit_new_lead_signal
+            ):
                 event.status = "ignored"
                 self._record_audit(session, event, "lead_text_ignored")
                 logger.info("lead_text_ignored")
@@ -2273,11 +2341,11 @@ class FirstTextLeadWorkspaceService:
             and not incoming_company_name
             and patch.analysis.intent == "UPDATE_LEAD"
         ):
-            # 名片/OCR 或普通无公司名补充优先沿用当前客户，联系方式不再抢占路由。
+            # 只有前置安全门认可的无身份字段补充才能沿用当前客户上下文。
             assert active_context_lead is not None
             context_lead = active_context_lead
             use_active_context = True
-            if weak_context_fragment:
+            if safe_context_supplement:
                 # 弱片段中的“采购10台左右”等伪公司名不是当前消息事实，禁止覆盖真实线索名称。
                 patch = self._drop_unreliable_company_candidate(patch, message.normalized_text)
                 logger.info("ai_context_continuation_selected", extra={"reason": "weak_fragment"})
@@ -2319,7 +2387,7 @@ class FirstTextLeadWorkspaceService:
             if (
                 active_context_lead is not None
                 and incoming_company_name
-                and not weak_context_fragment
+                and not safe_context_supplement
                 and not media_context_continuation
                 and not explicit_new_lead_signal
             ):
@@ -3129,23 +3197,91 @@ class FirstTextLeadWorkspaceService:
         )
 
     def _is_weak_context_fragment(
-        self, text: str | None, fields: Mapping[str, LeadFieldValue]
+        self,
+        text: str | None,
+        fields: Mapping[str, LeadFieldValue],
+        enrichment: Mapping[str, str] | None = None,
     ) -> bool:
-        """判断 AI 提取结果是否只是当前线索的无身份补充片段。
+        """只接受原文完全由联系方式或预算补充组成的上下文续写。
 
-        参数：text 为当前消息文本；fields 为 AI 已通过网关校验的字段补丁。
-        返回值：含需求、预算或采购等弱语义且没有可靠新身份时返回 True。
+        参数：text 为当前来源原文；fields 与 enrichment 为 AI 已校验的本轮增量字段。
+        返回值：字段值能在原文核验且移除字段与通用标签后无其他客户语义时返回 True。
         异常：无；不访问数据库或外部服务。
         副作用：无。
         """
-        if not self._is_weak_identity_fragment(text) or (
-            self._has_explicit_company_identity_evidence(text)
-        ):
+        source = (text or "").strip()
+        if not source or self._has_explicit_company_identity_evidence(source):
             return False
-        # 模型把“采购10台”误放到线索名称时，字段本身含弱语义，仍应回到当前上下文。
-        candidate_name = fields.get("线索名称", "")
-        weak_keywords = ("预算", "需求", "报价", "项目", "采购")
-        return not candidate_name or any(keyword in candidate_name for keyword in weak_keywords)
+        contact_fields = {"手机", "电话", "邮箱"}
+        normalized_enrichment = dict(enrichment or {})
+        if fields and set(fields).issubset(contact_fields) and not normalized_enrichment:
+            source_spans: list[tuple[int, int]] = []
+            for field_name, raw_value in fields.items():
+                if not isinstance(raw_value, str) or not raw_value.strip():
+                    return False
+                if field_name == "邮箱":
+                    value = raw_value.strip()
+                    matches = list(re.finditer(re.escape(value), source, flags=re.IGNORECASE))
+                    if not matches:
+                        return False
+                    source_spans.extend((match.start(), match.end()) for match in matches)
+                else:
+                    normalized_value = AIGateway._normalize_contact_number(raw_value)
+                    if normalized_value is None:
+                        return False
+                    phone_pattern = (
+                        r"(?<![A-Za-z0-9_])(?:\+|00)?\d[\d \t().-]{5,}\d"
+                        r"(?![A-Za-z0-9_])"
+                    )
+                    source_matches = [
+                        match
+                        for match in re.finditer(phone_pattern, source)
+                        if AIGateway._normalize_contact_number(match.group()) == normalized_value
+                    ]
+                    if not source_matches:
+                        return False
+                    # 仅移除与当前候选归一化后相同的号码，其他数字和业务语义保留。
+                    source_spans.extend((match.start(), match.end()) for match in source_matches)
+            remainder = source
+            for start, end in sorted(set(source_spans), reverse=True):
+                remainder = remainder[:start] + remainder[end:]
+            remainder = re.sub(
+                r"补充|联系方式|联系电话|手机号|手机|电话|邮箱|email|e-mail|phone|tel|号码|是|为",
+                "",
+                remainder,
+                flags=re.IGNORECASE,
+            )
+            return not re.sub(r"[\s,，。；;:：、()（）\-]+", "", remainder)
+
+        budget_re = re.compile(r"(?<!\d)\d+(?:\.\d+)?\s*(?:万(?:元)?|千(?:元)?|元|[kKwW])")
+        if fields or set(normalized_enrichment) - {"预算"}:
+            return False
+        source_amounts = [
+            re.sub(r"\s+", "", item.group()).lower() for item in budget_re.finditer(source)
+        ]
+        if not source_amounts:
+            return False
+        if normalized_enrichment:
+            budget = normalized_enrichment.get("预算", "")
+            if not isinstance(budget, str) or not budget.strip():
+                return False
+            candidate_amounts = [
+                re.sub(r"\s+", "", item.group()).lower()
+                for item in budget_re.finditer(budget)
+            ]
+            candidate_remainder = budget_re.sub("", budget)
+            candidate_remainder = re.sub(
+                r"预算|大概|大约|约|左右|补充|金额|是|在", "", candidate_remainder
+            )
+            if (
+                not candidate_amounts
+                or not set(candidate_amounts).issubset(set(source_amounts))
+                or re.sub(r"[\s,，。；;:：、()（）\-~～]+", "", candidate_remainder)
+            ):
+                return False
+        remainder = budget_re.sub("", source)
+        remainder = re.sub(r"预算|大概|大约|约|左右|补充|金额|是|在", "", remainder)
+        return not re.sub(r"[\s,，。；;:：、()（）\-~～]+", "", remainder)
 
     @classmethod
     def validate_company_candidate_against_source(
@@ -3421,6 +3557,38 @@ class FirstTextLeadWorkspaceService:
         # 多条记录命中时宁可保留待归属，也不能猜测应补充给哪一条线索。
         return matches[0] if len(matches) == 1 else None
 
+    def _context_supplement_rejection_reason(
+        self,
+        session: Session,
+        message: IncomingMessage,
+        active_context: Lead | None,
+        candidate_lead: Lead | None,
+        fields: Mapping[str, LeadFieldValue],
+        source_supported: bool,
+    ) -> str | None:
+        """统一裁决无公司身份补充是否可写入当前或唯一强身份目标。
+
+        参数：session/message 为当前消息事实；active_context 为未过期上下文；candidate_lead
+        为前序唯一身份匹配候选；fields 为核验字段；source_supported 为安全补充校验结果。
+        返回值：允许继续时返回 None；否则返回受控审计原因码。
+        异常：数据库读取错误由 SQLAlchemy 抛出。
+        副作用：仅读取当前销售拥有的线索。
+        """
+        if not source_supported:
+            return "no_grounded_identity_or_safe_supplement"
+        if active_context is None and candidate_lead is None:
+            return "no_grounded_identity_or_safe_supplement"
+        contact_fields = {
+            field_name: str(value)
+            for field_name, value in fields.items()
+            if field_name in {"联系人", "手机", "电话", "邮箱"} and isinstance(value, str)
+        }
+        if active_context is not None and contact_fields:
+            historical_match = self._get_strong_identity_lead(session, message, contact_fields)
+            if historical_match is not None and historical_match.id != active_context.id:
+                return "contact_identity_conflicts_with_active_context"
+        return None
+
     def _as_utc(self, value: datetime) -> datetime:
         """将 SQLite 等驱动返回的朴素时间统一视为 UTC 时间。
 
@@ -3435,7 +3603,8 @@ class FirstTextLeadWorkspaceService:
         """判断文本是否像缺少公司身份的客户补充信息。
 
         参数：text 为已标准化文本。
-        返回值：含预算、需求或项目等弱身份关键词时返回 True。
+        返回值：含客户补充语义时返回 True；仅用于识别无法安全归属的待处理消息，
+        绝不能作为沿用 active context 的授权证据。
         异常：无。
         副作用：无。
         """

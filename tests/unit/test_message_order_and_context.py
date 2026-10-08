@@ -218,10 +218,10 @@ def test_later_message_waits_for_earlier_pending_message_from_same_salesperson(
     assert result.status is LeadProcessingStatus.WAITING_FOR_PREVIOUS
 
 
-def test_fragment_within_current_context_safely_updates_the_same_lead(
+def test_unidentified_demand_fragment_is_unassigned_even_with_current_context(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证当前客户上下文内的碎片信息只增量补充同一条线索。
+    """验证只有需求文本、没有身份或安全补充证据时不会沿用当前线索。
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
@@ -241,14 +241,13 @@ def test_fragment_within_current_context_safely_updates_the_same_lead(
     updated = service.consume(second_event_id)
 
     assert created.status is LeadProcessingStatus.CREATED
-    assert updated.status is LeadProcessingStatus.UPDATED
-    assert updated.lead_id == created.lead_id
+    assert updated.status is LeadProcessingStatus.UNASSIGNED
+    assert updated.lead_id is None
     assert created.smart_table_record_id is not None
     record = adapter.get_record(created.smart_table_record_id)
     assert record is not None
     assert record.fields["线索名称"] == "长广溪智造"
-    assert record.fields["工艺"] == ["码垛"]
-    assert "备注" in record.fields
+    assert "工艺" not in record.fields
     with session_factory() as session:
         process_source = session.scalar(
             select(LeadFieldProvenance).where(
@@ -257,8 +256,7 @@ def test_fragment_within_current_context_safely_updates_the_same_lead(
             )
         )
 
-    assert process_source is not None
-    assert process_source.last_ai_synced_value == '["码垛"]'
+    assert process_source is None
 
 
 def test_repeated_current_company_name_updates_instead_of_creating_a_second_lead(
@@ -498,10 +496,10 @@ def test_expired_current_context_keeps_weak_fragment_unassigned(
     assert resolution.lead_id is None
 
 
-def test_expired_context_uses_unique_phone_as_strong_identity(
+def test_expired_context_does_not_route_mixed_phone_and_demand_fragment(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证过期上下文后的唯一手机号仍可安全定位当前销售自己的既有线索。
+    """验证过期上下文不能因为消息里有手机号就把混合需求写入旧线索。
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
@@ -530,18 +528,18 @@ def test_expired_context_uses_unique_phone_as_strong_identity(
 
     updated = service.consume(second_event_id)
 
-    assert updated.status is LeadProcessingStatus.UPDATED
-    assert updated.lead_id == created.lead_id
+    assert updated.status is LeadProcessingStatus.UNASSIGNED
+    assert updated.lead_id is None
     assert created.smart_table_record_id is not None
     record = adapter.get_record(created.smart_table_record_id)
     assert record is not None
-    assert record.fields["工艺"] == ["码垛"]
+    assert "工艺" not in record.fields
 
 
-def test_expired_context_uses_unique_card_contact_as_strong_identity(
+def test_expired_context_does_not_route_card_contact_with_demand_fragment(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证名片联系人在上下文过期后仍能唯一定位其所属线索。
+    """验证过期名片上下文不能把联系人和无身份需求直接归并到旧线索。
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
@@ -584,18 +582,18 @@ def test_expired_context_uses_unique_card_contact_as_strong_identity(
 
     updated = service.consume(second_event_id)
 
-    assert updated.status is LeadProcessingStatus.UPDATED
-    assert updated.lead_id == created.lead_id
+    assert updated.status is LeadProcessingStatus.UNASSIGNED
+    assert updated.lead_id is None
     assert created.smart_table_record_id is not None
     record = adapter.get_record(created.smart_table_record_id)
     assert record is not None
-    assert record.fields["工艺"] == ["码垛"]
+    assert "工艺" not in record.fields
 
 
-def test_audio_transcript_then_text_updates_the_same_lead(
+def test_audio_context_does_not_route_unidentified_demand_text(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证销售先发语音、转写完成后再发文字时仍归并为同一线索。
+    """验证语音上下文不能单独授权无身份需求文本写入旧线索。
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
@@ -629,12 +627,12 @@ def test_audio_transcript_then_text_updates_the_same_lead(
 
     updated = service.consume(second_event_id)
 
-    assert updated.status is LeadProcessingStatus.UPDATED
-    assert updated.lead_id == created.lead_id
+    assert updated.status is LeadProcessingStatus.UNASSIGNED
+    assert updated.lead_id is None
     assert created.smart_table_record_id is not None
     record = adapter.get_record(created.smart_table_record_id)
     assert record is not None
-    assert record.fields["工艺"] == ["码垛"]
+    assert "工艺" not in record.fields
 
 
 def test_explicit_new_customer_does_not_inherit_active_card_context(
@@ -668,10 +666,10 @@ def test_explicit_new_customer_does_not_inherit_active_card_context(
     assert len(adapter.get_records()) == 2
 
 
-def test_active_context_beats_historical_phone_match(
+def test_active_context_phone_conflicting_with_historical_lead_is_unassigned(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证有效销售上下文优先于无公司名消息中的历史手机号匹配。
+    """验证已知属于其他线索的手机号不能被有效上下文抢归到当前客户。
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
@@ -697,19 +695,19 @@ def test_active_context_beats_historical_phone_match(
     third_event_id = persist_outbox_texts(
         session_factory,
         "sales-1",
-        ["手机号：13800000001；需求：码垛机器人"],
+        ["手机号：13800000001"],
     )[0]
 
     updated = service.consume(third_event_id)
 
-    assert updated.status is LeadProcessingStatus.UPDATED
-    assert updated.lead_id == second.lead_id
+    assert updated.status is LeadProcessingStatus.UNASSIGNED
+    assert updated.lead_id is None
 
 
-def test_ai_active_context_beats_historical_phone_match(
+def test_ai_contact_matching_other_lead_does_not_update_active_context(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证 AI 补丁中的历史手机号也不能劫持有效当前上下文。
+    """验证 AI 提取到属于另一线索的手机号时不能更新当前上下文线索。
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
@@ -728,7 +726,7 @@ def test_ai_active_context_beats_historical_phone_match(
                         "intent": "UPDATE_LEAD",
                         "customer_reference": {},
                         "crm_fields": {"手机": "13800000001"},
-                        "enrichment": {"预算": "预算38万"},
+                        "enrichment": {},
                         "confidence_by_field": {"手机": 0.99},
                         "conflicts": [],
                         "warnings": [],
@@ -745,14 +743,14 @@ def test_ai_active_context_beats_historical_phone_match(
     )[0]
     second = service.consume(second_event_id)
     third_event_id = persist_outbox_texts(
-        session_factory, "sales-1", ["预算38万，联系电话为13800000001"]
+        session_factory, "sales-1", ["联系电话为13800000001"]
     )[0]
     updated = service.consume(third_event_id)
 
     assert first.lead_id is not None
     assert second.lead_id is not None
-    assert updated.status is LeadProcessingStatus.UPDATED
-    assert updated.lead_id == second.lead_id
+    assert updated.status is LeadProcessingStatus.UNASSIGNED
+    assert updated.lead_id is None
 
 
 def test_no_context_allows_historical_phone_fallback(
@@ -777,7 +775,7 @@ def test_no_context_allows_historical_phone_fallback(
         session.delete(context)
 
     second_event_id = persist_outbox_texts(
-        session_factory, "sales-1", ["手机号：13800000001；需求：码垛机器人"]
+        session_factory, "sales-1", ["手机号：13800000001"]
     )[0]
     updated = service.consume(second_event_id)
 
