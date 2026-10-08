@@ -443,9 +443,9 @@ def test_docker_not_found_is_accepted_only_for_exact_cleanup_resource(
     def fake_run(
         arguments: list[str], **_kwargs: Any
     ) -> subprocess.CompletedProcess[str]:
-        """返回只包含给定资源名的 fake not-found 错误。"""
+        """模拟 Docker daemon 返回的精确 not-found 响应。"""
         return subprocess.CompletedProcess(
-            arguments, 1, "", f"Error: No such object: {name}"
+            arguments, 1, "", f"Error response from daemon: No such container: {name}"
         )
 
     monkeypatch.setattr(t15_postgres_docker_test.subprocess, "run", fake_run)

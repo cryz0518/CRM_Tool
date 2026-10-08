@@ -608,6 +608,8 @@ def _run_docker(
         missing_responses = {
             f"Error: No such object: {not_found_name}",
             f"Error: No such container: {not_found_name}",
+            f"Error response from daemon: No such object: {not_found_name}",
+            f"Error response from daemon: No such container: {not_found_name}",
         }
         if (
             not_found_name is not None
