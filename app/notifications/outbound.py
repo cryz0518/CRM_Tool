@@ -11,13 +11,17 @@ from uuid import uuid4
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.messaging.models import NotificationRecord, utc_now
+from app.leads.models import LeadMessageResolution
+from app.messaging.models import NotificationRecord, OutboxEvent, utc_now
 
 logger = logging.getLogger(__name__)
 _NOTIFICATION_LEASE = timedelta(minutes=5)
 _SDK_ERROR_CODE = re.compile(r"errcode=(\d+)")
 _NON_RETRYABLE_PROVIDER_CODES = frozenset(
     {f"420{code}" for code in range(27, 52)}
+)
+_RECEIPT_TERMINAL_OUTBOX_STATUSES = frozenset(
+    {"succeeded", "ignored", "unauthorized", "invalid", "failed_pending_review"}
 )
 
 _SUPPORTED_NOTIFICATION_TYPES = frozenset(
@@ -111,6 +115,31 @@ class WecomOutboundNotificationSender:
             try:
                 # AI Bot 主动发送只支持 markdown 或模板卡片；旧通知可能仍保存 text，统一在边界转换。
                 sales_user_id, content, payload = claimed_notice
+                if notice.notification_type == "lead_intake_receipt":
+                    receipt_content, receipt_counts, all_finished = self._receipt_content(
+                        sales_user_id, notice.source_message_id, payload
+                    )
+                    if all_finished:
+                        # 消息已在合并窗口内结束时收敛为可审计终态，避免成功后再发过时提示。
+                        with self._session_factory.begin() as session:
+                            current = session.get(NotificationRecord, notice.notification_key)
+                            if (
+                                current is not None
+                                and current.processing_claim_token == claim_token
+                            ):
+                                current.status = "suppressed"
+                                current.payload = {
+                                    **(current.payload or {}),
+                                    "suppression_reason": (
+                                        "all_associated_messages_finished_before_send"
+                                    ),
+                                    "receipt_outcome_counts": receipt_counts,
+                                }
+                                current.processing_started_at = None
+                                current.processing_lease_expires_at = None
+                                current.processing_claim_token = None
+                        continue
+                    content = receipt_content
                 body = _build_supported_body(payload, content)
                 await self._client.send_message(sales_user_id, body)
             except Exception as exc:
@@ -160,6 +189,101 @@ class WecomOutboundNotificationSender:
                     )
             sent += 1
         return sent
+
+    def _receipt_content(
+        self,
+        sales_user_id: str,
+        source_message_id: str,
+        payload: dict[str, object] | None,
+    ) -> tuple[str, dict[str, int], bool]:
+        """按接收通知关联的消息读取实时处理状态并生成不误报的提示。
+
+        参数：sales_user_id 为收件人；source_message_id 为旧载荷兼容来源；payload 保存消息集合。
+        返回值：准确的 Markdown 文本、按结果分类的数量及是否全部到达终态。
+        异常：数据库读取错误向调用方传播，原通知仍由现有失败/重试逻辑管理。
+        副作用：仅查询消息 Outbox 与归属结论，不更新业务状态。
+        """
+        raw_ids = payload.get("message_ids") if isinstance(payload, dict) else None
+        message_ids = (
+            list(dict.fromkeys(item for item in raw_ids if isinstance(item, str)))
+            if isinstance(raw_ids, list)
+            else []
+        )
+        if not message_ids:
+            message_ids = [source_message_id]
+
+        with self._session_factory() as session:
+            events = session.scalars(
+                select(OutboxEvent).where(
+                    OutboxEvent.message_id.in_(message_ids),
+                    OutboxEvent.sales_user_id == sales_user_id,
+                    OutboxEvent.event_type == "message_received",
+                )
+            ).all()
+            resolutions = session.scalars(
+                select(LeadMessageResolution).where(
+                    LeadMessageResolution.message_id.in_(message_ids)
+                )
+            ).all()
+
+        events_by_id = {event.message_id: event for event in events}
+        resolutions_by_id: dict[str, set[str]] = {}
+        for resolution in resolutions:
+            resolutions_by_id.setdefault(resolution.message_id, set()).add(resolution.status)
+
+        counts: dict[str, int] = {}
+        all_finished = True
+        for message_id in message_ids:
+            event = events_by_id.get(message_id)
+            if event is None:
+                category = "unknown"
+                all_finished = False
+            elif event.status in {"pending", "processing"}:
+                category = "processing"
+                all_finished = False
+            elif event.status == "retrying":
+                category = "retrying"
+                all_finished = False
+            elif event.status in _RECEIPT_TERMINAL_OUTBOX_STATUSES:
+                states = resolutions_by_id.get(message_id, set())
+                if event.status == "failed_pending_review":
+                    category = "failed"
+                elif event.status == "ignored":
+                    category = "ignored"
+                elif event.status == "succeeded" and states & {
+                    "unassigned",
+                    "quote_unresolved",
+                }:
+                    category = "unassigned"
+                elif event.status == "succeeded" and "assigned" in states:
+                    category = "completed"
+                else:
+                    category = "finished"
+            else:
+                category = "unknown"
+                all_finished = False
+            counts[category] = counts.get(category, 0) + 1
+
+        count = len(message_ids)
+        if counts == {"processing": count}:
+            return f"✅ 已收到你的 {count} 条消息，正在识别并录入。", counts, False
+
+        labels = {
+            "processing": "仍在识别并录入",
+            "completed": "已完成处理",
+            "unassigned": "待归属",
+            "retrying": "等待重试",
+            "failed": "待人工处理",
+            "ignored": "已忽略",
+            "finished": "处理已结束",
+            "unknown": "状态待核实",
+        }
+        details = "，".join(
+            f"{amount} 条{labels[category]}"
+            for category, amount in counts.items()
+            if amount
+        )
+        return f"✅ 已收到你的 {count} 条消息：{details}。", counts, all_finished
 
 
 def _as_utc(value: datetime) -> datetime:

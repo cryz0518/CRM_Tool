@@ -186,6 +186,15 @@ class MessageIntakeService:
             .with_for_update()
         )
         payload = dict(notice.payload or {}) if notice is not None else {}
+        # 兼容早期通知记录，并以 message_id 集合而不是累加计数作为唯一计数来源。
+        message_ids_value = payload.get("message_ids")
+        message_ids = (
+            list(dict.fromkeys(item for item in message_ids_value if isinstance(item, str)))
+            if isinstance(message_ids_value, list)
+            else []
+        )
+        if notice is not None and not message_ids:
+            message_ids = [notice.source_message_id]
         until = payload.get("coalesce_until")
         deadline: datetime | None = None
         if isinstance(until, str):
@@ -198,11 +207,13 @@ class MessageIntakeService:
             deadline = deadline.replace(tzinfo=now.tzinfo)
 
         if notice is not None and deadline is not None and deadline > now:
-            count = payload.get("receipt_count", 1)
-            count = count if isinstance(count, int) and count > 0 else 1
-            payload["receipt_count"] = count + 1
+            # 重放消息只保留一次；跨销售接收提示按销售行锁分别合并。
+            if command.message_id not in message_ids:
+                message_ids.append(command.message_id)
+            payload["message_ids"] = message_ids
+            payload["receipt_count"] = len(message_ids)
             notice.payload = payload
-            notice.content = f"✅ 已收到你的 {count + 1} 条消息，正在识别并录入。"
+            notice.content = f"✅ 已收到你的 {len(message_ids)} 条消息，正在识别并录入。"
             return
 
         # 接收事务持有销售授权行锁，序列化并发消息并隔离不同销售的计数。
@@ -211,6 +222,7 @@ class MessageIntakeService:
         ).hexdigest()
         payload = {
             "receipt_count": 1,
+            "message_ids": [command.message_id],
             "coalesce_until": (now + timedelta(seconds=coalesce_seconds)).isoformat(),
         }
         session.add(

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from threading import Barrier, BrokenBarrierError, Event, Lock
 from uuid import uuid4
 
@@ -32,8 +34,10 @@ from app.messaging.models import (
     NotificationRecord,
     OutboxEvent,
     SalesAuthorization,
+    utc_now,
 )
 from app.messaging.service import IncomingMessageCommand, MessageIntakeResult, MessageIntakeService
+from app.notifications.outbound import WecomOutboundNotificationSender
 from app.smart_table.adapter import SmartTableActor
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.registry import build_required_smart_table_schema
@@ -437,6 +441,93 @@ def test_concurrent_first_success_workers_issue_one_sales_notice(
     assert notices[0].notification_key == hashlib.sha256(
         b"lead_first_smart_table_success:sales-first"
     ).hexdigest()
+
+
+def test_concurrent_receipt_senders_deliver_one_coalesced_notice(
+    postgres_session_factory: sessionmaker[Session],
+) -> None:
+    """验证 PostgreSQL 并发 sender 只投递一次同一条合并接收通知。"""
+    sales_user_id = "sales-parallel-receipt"
+    message_id = "message-parallel-receipt"
+    with postgres_session_factory.begin() as session:
+        session.add(
+            SalesAuthorization(wecom_user_id=sales_user_id, is_authorized=True, is_active=True)
+        )
+        session.flush()
+        session.add(
+            IncomingMessage(
+                message_id=message_id,
+                sales_user_id=sales_user_id,
+                sequence=1,
+                raw_payload={"text": "客户需求"},
+            )
+        )
+        session.flush()
+        session.add_all(
+            (
+                OutboxEvent(
+                    message_id=message_id,
+                    sales_user_id=sales_user_id,
+                    sequence=1,
+                    event_type="message_received",
+                    status="pending",
+                ),
+                NotificationRecord(
+                    notification_key="parallel-receipt",
+                    sales_user_id=sales_user_id,
+                    source_message_id=message_id,
+                    notification_type="lead_intake_receipt",
+                    content="✅ 已收到你的 1 条消息，正在识别并录入。",
+                    payload={
+                        "receipt_count": 1,
+                        "message_ids": [message_id],
+                        "coalesce_until": (utc_now() - timedelta(seconds=1)).isoformat(),
+                    },
+                ),
+            )
+        )
+
+    class BlockingClient:
+        """在首个外部发送期间阻塞，允许第二个 sender 并发尝试认领。"""
+
+        def __init__(self) -> None:
+            """初始化同步闸门和发送调用计数。"""
+            self.entered = Event()
+            self.release = Event()
+            self.lock = Lock()
+            self.calls = 0
+
+        async def send_message(
+            self, userid_or_chatid: str, body: dict[str, object]
+        ) -> dict[str, str]:
+            """阻塞第一次发送，并返回可被 sender 接受的成功回执。"""
+            del userid_or_chatid, body
+            with self.lock:
+                self.calls += 1
+            self.entered.set()
+            assert self.release.wait(timeout=5)
+            return {"msgid": "parallel-receipt-delivered"}
+
+    client = BlockingClient()
+    sender = WecomOutboundNotificationSender(postgres_session_factory, client)
+
+    def send_once() -> int:
+        """在独立 Worker 线程运行一次通知发送循环。"""
+        return asyncio.run(sender.send_pending_once())
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(send_once)
+        assert client.entered.wait(timeout=5)
+        second = executor.submit(send_once)
+        second_result = second.result(timeout=5)
+        client.release.set()
+        first_result = first.result(timeout=5)
+
+    assert sorted((first_result, second_result)) == [0, 1]
+    assert client.calls == 1
+    with postgres_session_factory() as session:
+        notice = session.get(NotificationRecord, "parallel-receipt")
+    assert notice is not None and notice.status == "succeeded"
 
 
 def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(

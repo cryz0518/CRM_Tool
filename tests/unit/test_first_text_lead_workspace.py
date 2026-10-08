@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Generator, Mapping
 from datetime import timedelta
@@ -13,6 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.ai.gateway import AIGateway
+from app.ai.models import ExtractedLeadPatch, LeadAnalysis
 from app.ai.provider import LLMProviderError, MockLLMProvider
 from app.companies.models import CompanyUpsertCommand, QCCCandidate, QCCLookupResult
 from app.companies.service import CompanyLeadService, MockQCCAdapter, MockTYCAdapter
@@ -27,8 +29,10 @@ from app.leads.models import (
     serialize_field_value,
 )
 from app.leads.service import (
+    AIReviewRequest,
     DeterministicFirstTextLeadExtractor,
     FirstTextLeadWorkspaceService,
+    LeadProcessingResult,
     LeadProcessingStatus,
 )
 from app.messaging.models import (
@@ -40,6 +44,7 @@ from app.messaging.models import (
     OutboxEvent,
     SalesAuthorization,
 )
+from app.notifications.outbound import WecomOutboundNotificationSender
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.models import SmartTableRecord
 from app.smart_table.registry import build_required_smart_table_schema
@@ -244,6 +249,63 @@ def configure_first_success_notice(
         lead_smart_table_url=url,
     )
     monkeypatch.setattr("app.leads.service.get_settings", lambda: settings)
+
+
+def sync_ai_review_for_new_lead(
+    session_factory: sessionmaker[Session],
+    adapter: MockSmartTableAdapter,
+    *,
+    message_id: str,
+    sales_user_id: str,
+    lead_id: str,
+) -> tuple[int, LeadProcessingResult]:
+    """通过 AI 审核最终同步路径创建一条测试线索及其已核实表格记录。
+
+    参数：session_factory 为隔离数据库；adapter 为表格边界；其余参数标识来源消息、销售和线索。
+    返回值：Outbox 事件标识及 AI 审核消费结果。
+    异常：数据库或表格同步失败时由被测业务服务转换或传播。
+    副作用：创建测试消息、Lead、SmartTableSync，并调用 AI 审核表格路径。
+    """
+    event_id = persist_outbox_text(
+        session_factory,
+        message_id=message_id,
+        sales_user_id=sales_user_id,
+        text="客户：AI审核客户；联系人：审核联系人",
+    )
+    with session_factory.begin() as session:
+        session.add(
+            Lead(
+                id=lead_id,
+                source_message_id=message_id,
+                original_capturing_sales_user_id=sales_user_id,
+                smart_table_owner_user_id=sales_user_id,
+                lifecycle_state="pending_create",
+                field_values={"线索名称": "AI审核客户"},
+            )
+        )
+        session.add(
+            SmartTableSync(
+                lead_id=lead_id,
+                source_message_id=message_id,
+                status="pending",
+            )
+        )
+    request = AIReviewRequest(
+        source_message_id=message_id,
+        sales_user_id=sales_user_id,
+        lead_id=lead_id,
+        outbox_event_id=event_id,
+        patch=ExtractedLeadPatch(
+            trace_id=f"trace-{message_id}",
+            analysis=LeadAnalysis(intent="NEW_LEAD"),
+            fields={"线索名称": "AI审核客户"},
+            pending_confirmation_fields=(),
+            low_confidence_candidates={},
+        ),
+        creates_lead=True,
+    )
+    result = FirstTextLeadWorkspaceService(session_factory, adapter)._sync_ai_review(request)
+    return event_id, result
 
 
 class _Synthetic850005Cause(Exception):
@@ -4160,6 +4222,178 @@ def test_confirmed_first_smart_table_success_queues_one_link_notice(
     assert notice is not None
     assert notice.sales_user_id == "sales-first-link"
     assert "[📋 打开需求登记智能表格](https://example.test/smart-table)" in (notice.content or "")
+
+
+def test_ai_review_and_deterministic_success_share_one_notice_and_replay_does_not_recreate(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 AI 与确定性建档共用首次通知，并在通知重试和消息重放后保持表格建档幂等。"""
+    configure_first_success_notice(monkeypatch)
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    deterministic_event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-deterministic-first-success",
+        sales_user_id="sales-cross-path",
+        text="客户：确定性首次客户；联系人：确定性联系人；需求：码垛机器人",
+    )
+    deterministic_result = FirstTextLeadWorkspaceService(session_factory, adapter).consume(
+        deterministic_event_id
+    )
+    assert deterministic_result.status is LeadProcessingStatus.CREATED
+
+    ai_event_id, ai_result = sync_ai_review_for_new_lead(
+        session_factory,
+        adapter,
+        message_id="message-ai-second-success",
+        sales_user_id="sales-cross-path",
+        lead_id="lead-ai-second-success",
+    )
+    assert ai_result.status is LeadProcessingStatus.CREATED
+    assert ai_result.smart_table_record_id is not None
+    record_ids_before_recovery = {record.record_id for record in adapter.get_records()}
+
+    class FailOnceClient:
+        """首次发送失败、重启后的第二次发送成功。"""
+
+        def __init__(self) -> None:
+            """初始化一次失败计数。"""
+            self.calls = 0
+
+        async def send_message(
+            self, userid_or_chatid: str, body: dict[str, object]
+        ) -> dict[str, str]:
+            """模拟可靠通知的暂时失败及恢复。"""
+            del userid_or_chatid, body
+            self.calls += 1
+            if self.calls == 1:
+                raise ConnectionError("temporary")
+            return {"msgid": "notice-delivered"}
+
+    client = FailOnceClient()
+    sender = WecomOutboundNotificationSender(session_factory, client)
+    assert asyncio.run(sender.send_pending_once()) == 0
+    replay = FirstTextLeadWorkspaceService(session_factory, adapter).consume(ai_event_id)
+    assert replay.status is LeadProcessingStatus.ALREADY_PROCESSED
+    restarted_sender = WecomOutboundNotificationSender(session_factory, client)
+    assert asyncio.run(restarted_sender.send_pending_once()) == 1
+
+    with session_factory() as session:
+        notices = session.scalars(
+            select(NotificationRecord).where(
+                NotificationRecord.notification_type == "lead_first_smart_table_success"
+            )
+        ).all()
+        sync = session.scalar(
+            select(SmartTableSync).where(SmartTableSync.lead_id == "lead-ai-second-success")
+        )
+        receipt_or_command_events = session.scalars(
+            select(OutboxEvent).where(
+                OutboxEvent.message_id.in_(
+                    ["message-ai-second-success", "message-deterministic-first-success"]
+                )
+            )
+        ).all()
+    assert len(notices) == 1 and notices[0].status == "succeeded"
+    assert sync is not None and sync.status == "succeeded"
+    assert len(receipt_or_command_events) == 2
+    assert {record.record_id for record in adapter.get_records()} == record_ids_before_recovery
+
+
+def test_ai_review_patch_failure_does_not_issue_first_success_notice(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 AI 审核字段补丁失败时保留可恢复同步事实且不发行首次链接。"""
+    configure_first_success_notice(monkeypatch)
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    with patch.object(adapter, "update_record", side_effect=RuntimeError("patch failed")):
+        _, result = sync_ai_review_for_new_lead(
+            session_factory,
+            adapter,
+            message_id="message-ai-patch-failed",
+            sales_user_id="sales-ai-patch-failed",
+            lead_id="lead-ai-patch-failed",
+        )
+
+    assert result.status is LeadProcessingStatus.SYNC_FAILED
+    with session_factory() as session:
+        sync = session.scalar(
+            select(SmartTableSync).where(SmartTableSync.lead_id == "lead-ai-patch-failed")
+        )
+        notices = session.scalars(
+            select(NotificationRecord).where(
+                NotificationRecord.notification_type == "lead_first_smart_table_success"
+            )
+        ).all()
+    assert sync is not None and sync.status == "retrying"
+    assert len(adapter.get_records()) == 1
+    assert notices == []
+
+
+def test_ai_review_unverified_remote_create_does_not_issue_first_success_notice(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 AI 建档的远端 ACK 尚未核实时不发行首次链接。"""
+    configure_first_success_notice(monkeypatch)
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    unverified = SmartTableWriteVerificationError(
+        ["线索名称"], remote_record_id="remote-unverified-record"
+    )
+    with patch.object(adapter, "create_record", side_effect=unverified):
+        _, result = sync_ai_review_for_new_lead(
+            session_factory,
+            adapter,
+            message_id="message-ai-unverified-create",
+            sales_user_id="sales-ai-unverified",
+            lead_id="lead-ai-unverified",
+        )
+
+    assert result.status is LeadProcessingStatus.SYNC_FAILED
+    with session_factory() as session:
+        lead = session.get(Lead, "lead-ai-unverified")
+        sync = session.scalar(
+            select(SmartTableSync).where(SmartTableSync.lead_id == "lead-ai-unverified")
+        )
+        notices = session.scalars(
+            select(NotificationRecord).where(
+                NotificationRecord.notification_type == "lead_first_smart_table_success"
+            )
+        ).all()
+    assert lead is not None and lead.smart_table_record_id == "remote-unverified-record"
+    assert sync is not None and sync.status == "retrying"
+    assert notices == []
+
+
+def test_ai_review_first_success_queues_one_link_notice(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 AI 审核路径首次核实表格记录后与成功事务一同登记链接通知。"""
+    configure_first_success_notice(monkeypatch)
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+
+    _, result = sync_ai_review_for_new_lead(
+        session_factory,
+        adapter,
+        message_id="message-ai-first-only-success",
+        sales_user_id="sales-ai-first-only",
+        lead_id="lead-ai-first-only",
+    )
+
+    assert result.status is LeadProcessingStatus.CREATED
+    with session_factory() as session:
+        notice = session.scalar(
+            select(NotificationRecord).where(
+                NotificationRecord.notification_type == "lead_first_smart_table_success"
+            )
+        )
+        sync = session.scalar(
+            select(SmartTableSync).where(SmartTableSync.lead_id == "lead-ai-first-only")
+        )
+    assert notice is not None and notice.sales_user_id == "sales-ai-first-only"
+    assert "[📋 打开需求登记智能表格](https://example.test/smart-table)" in (
+        notice.content or ""
+    )
+    assert sync is not None and sync.status == "succeeded"
+    assert sync.smart_table_record_id == result.smart_table_record_id
 
 
 def test_failed_first_sync_then_success_and_multiple_leads_issue_per_user_once(

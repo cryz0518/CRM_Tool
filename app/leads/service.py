@@ -2652,15 +2652,25 @@ class FirstTextLeadWorkspaceService:
             sync = session.scalar(select(SmartTableSync).where(SmartTableSync.lead_id == lead.id))
             if request.creates_lead and sync is None:
                 raise ValueError(f"AI 审核同步事实不存在：{lead.id}")
+            first_success = (
+                sync is not None
+                and sync.status != "succeeded"
+                and sync.completed_at is None
+            )
             if sync is not None and sync.status != "succeeded":
                 sync.status = "succeeded"
-                sync.completed_at = utc_now()
+                sync.completed_at = sync.completed_at or utc_now()
             if sync is not None:
                 sync.error_summary = None
             self._mark_assigned(session, event, lead.id, request.segment_index)
             if refresh_context:
                 self._refresh_context(session, message, lead.id)
             self._record_audit(session, event, "ai_review_fields_synced")
+            # AI 审核只有在远端字段补丁和本地成功事实同事务完成后才可发行首次链接。
+            if first_success and sync is not None:
+                self._queue_first_success_notification(
+                    session, event, message, lead, sync, request.segment_index
+                )
         return LeadProcessingResult(
             LeadProcessingStatus.CREATED if request.creates_lead else LeadProcessingStatus.UPDATED,
             lead_id=request.lead_id,
@@ -4209,15 +4219,17 @@ class FirstTextLeadWorkspaceService:
             sync = session.scalar(select(SmartTableSync).where(SmartTableSync.lead_id == lead_id))
             if lead is None or sync is None:
                 raise ValueError(f"线索同步事实不存在：{lead_id}")
+            first_success = sync.status != "succeeded" and sync.completed_at is None
             sync.status = "succeeded"
-            sync.completed_at = utc_now()
+            sync.completed_at = sync.completed_at or utc_now()
             self._mark_assigned(session, event, lead_id, segment_index)
             self._refresh_context(session, message, lead_id)
             self._record_audit(session, event, "smart_table_record_created")
-            # 成功态和唯一首次通知同事务提交；Bot 只会在事务之后消费这条通知。
-            self._queue_first_success_notification(
-                session, event, message, lead, sync, segment_index
-            )
+            if first_success:
+                # 首次成功态和唯一通知同事务提交；已有历史成功时间时不补发上线通知。
+                self._queue_first_success_notification(
+                    session, event, message, lead, sync, segment_index
+                )
         assert record_id is not None
         bind_log_context(record_id=record_id)
         logger.info("smart_table_first_lead_created")

@@ -401,6 +401,8 @@ def test_receipt_coalesces_per_sales_and_duplicate_message_counts_once(
         ("sales-a", 2),
         ("sales-b", 1),
     ]
+    assert notices[0].payload["message_ids"] == ["receipt-a-1", "receipt-a-2"]
+    assert notices[1].payload["message_ids"] == ["receipt-b-1"]
     assert notices[0].content == "✅ 已收到你的 2 条消息，正在识别并录入。"
 
 
