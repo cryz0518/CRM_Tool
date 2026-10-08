@@ -31,11 +31,13 @@ from app.messaging.models import (
 from app.smart_table.models import SmartTableRecord
 
 
-def _validated_test_database_url(environment: dict[str, str] | None = None) -> tuple[str, str]:
+def _validated_test_database_url(
+    environment: dict[str, str] | None = None,
+) -> tuple[str, str, str]:
     """解析并验证本轮随机的一次性测试 DSN。
 
-    参数：environment 为显式测试环境映射；省略时仅读取当前进程环境中的 TEST_DATABASE_*。
-    返回值：通过验证的 TEST_DATABASE_URL 和 32 位运行标识。
+    参数：environment 为显式测试环境映射；省略时只读取测试 DSN、身份及匹配的 DATABASE_URL。
+    返回值：通过验证的 TEST_DATABASE_URL、32 位运行标识和随机数据库用户名。
     异常：缺少变量、URL 不合法或身份与 T15 隔离约定不符时抛出 ValueError。
     副作用：无，不建立连接或执行 SQL。
     """
@@ -50,17 +52,23 @@ def _validated_test_database_url(environment: dict[str, str] | None = None) -> t
         url = make_url(raw_url)
     except Exception as error:
         raise ValueError("必须显式提供有效的 TEST_DATABASE_URL") from error
+    # 若应用连接变量同时存在，必须指向完全相同的测试库，避免迁移误用 DATABASE_URL。
+    database_url = values.get("DATABASE_URL")
+    database_user = values.get("TEST_DATABASE_USER", url.username or "")
+    allowed_users = {"t15_migration", f"t15_{run_id}"}
     if (
         url.drivername != "postgresql+psycopg"
         or url.host != "postgres"
         or url.port != 5432
-        or url.username != "t15_migration"
+        or database_user not in allowed_users
+        or url.username != database_user
         or url.password != f"t15_{run_id}"
         or url.database != f"crm_lead_test_{run_id}"
         or url.query
+        or (database_url is not None and database_url != raw_url)
     ):
         raise ValueError("TEST_DATABASE_URL 未指向本次随机的一次性 T15 PostgreSQL")
-    return raw_url, run_id
+    return raw_url, run_id, database_user
 
 
 class ConcurrentSnapshotAdapter:
@@ -87,14 +95,14 @@ class ConcurrentSnapshotAdapter:
 def postgres_session_factory() -> Generator[sessionmaker[Session], None, None]:
     """仅在一次性 tmpfs 数据库中建独占 schema，并在清理前重验数据库身份。"""
     try:
-        test_database_url, run_id = _validated_test_database_url()
+        test_database_url, run_id, expected_database_user = _validated_test_database_url()
     except ValueError as error:
         pytest.fail(str(error))
     engine = create_engine(test_database_url, pool_pre_ping=True)
     schema_name = f"progress_test_{run_id}"
     try:
         with engine.connect() as connection:
-            database_name, database_user, data_directory = connection.execute(
+            database_name, actual_database_user, data_directory = connection.execute(
                 text(
                     "SELECT current_database(), current_user, current_setting('data_directory')"
                 )
@@ -104,7 +112,7 @@ def postgres_session_factory() -> Generator[sessionmaker[Session], None, None]:
         pytest.fail(f"无法只读验证 PostgreSQL 测试实例身份：{type(error).__name__}")
     if (
         database_name != f"crm_lead_test_{run_id}"
-        or database_user != "t15_migration"
+        or actual_database_user != expected_database_user
         or not str(data_directory).startswith("/var/lib/postgresql/data/")
     ):
         engine.dispose()
@@ -145,14 +153,14 @@ def postgres_session_factory() -> Generator[sessionmaker[Session], None, None]:
         schema_engine.dispose()
         try:
             with engine.begin() as connection:
-                database_name, database_user, data_directory = connection.execute(
+                database_name, actual_database_user, data_directory = connection.execute(
                     text(
                         "SELECT current_database(), current_user, current_setting('data_directory')"
                     )
                 ).one()
                 if (
                     database_name != f"crm_lead_test_{run_id}"
-                    or database_user != "t15_migration"
+                    or actual_database_user != expected_database_user
                     or not str(data_directory).startswith("/var/lib/postgresql/data/")
                 ):
                     raise RuntimeError("拒绝清理：PostgreSQL 实例身份与创建时不一致")
@@ -173,18 +181,30 @@ def test_test_database_guard_rejects_default_and_reused_database_names() -> None
             }
         )
     run_id = "1" * 32
-    url, identity = _validated_test_database_url(
+    test_url = (
+        f"postgresql+psycopg://t15_migration:t15_{run_id}@postgres:5432/"
+        f"crm_lead_test_{run_id}"
+    )
+    url, identity, database_user = _validated_test_database_url(
         {
             "TEST_DATABASE_ID": run_id,
-            "TEST_DATABASE_URL": (
-                f"postgresql+psycopg://t15_migration:t15_{run_id}@postgres:5432/"
-                f"crm_lead_test_{run_id}"
-            ),
-            "DATABASE_URL": "postgresql+psycopg://ignored",
+            "TEST_DATABASE_USER": "t15_migration",
+            "TEST_DATABASE_URL": test_url,
+            "DATABASE_URL": test_url,
         }
     )
     assert identity == run_id
+    assert database_user == "t15_migration"
     assert url.endswith(f"crm_lead_test_{run_id}")
+    with pytest.raises(ValueError):
+        _validated_test_database_url(
+            {
+                "TEST_DATABASE_ID": run_id,
+                "TEST_DATABASE_USER": "t15_migration",
+                "TEST_DATABASE_URL": test_url,
+                "DATABASE_URL": "postgresql+psycopg://unexpected",
+            }
+        )
 
 
 def test_concurrent_schedulers_create_one_logical_notification(
