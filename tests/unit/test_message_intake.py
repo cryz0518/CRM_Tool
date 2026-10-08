@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -16,6 +16,8 @@ from sqlalchemy.pool import StaticPool
 import app.messaging.service as messaging_service
 from app.ai.models import SubmissionIntent
 from app.core.config import Settings
+from app.leads.models import LeadProgressMessage, LeadProgressSession
+from app.leads.progress import activate_progress_intent_candidate
 from app.messaging.models import (
     Base,
     BusinessAuditEvent,
@@ -52,11 +54,28 @@ def authorize_salesperson(session_factory: sessionmaker[Session], user_id: str) 
 
 
 def test_authorized_message_persists_message_and_pending_outbox_together(
-    session_factory: sessionmaker[Session],
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """验证授权销售的消息在一次接收后同时形成原始消息和待处理事件。"""
+    """验证普通需求、Outbox 与从首条接收时刻起算的进度候选原子提交。"""
     authorize_salesperson(session_factory, "sales-1")
-    result = MessageIntakeService(session_factory).receive(
+    settings = Settings(
+        _env_file=None,
+        lead_progress_enabled=True,
+        lead_progress_interval_minutes=15,
+        lead_progress_idle_stop_minutes=60,
+    )
+    monkeypatch.setattr(messaging_service, "get_settings", lambda: settings)
+    started_before = datetime.now(UTC)
+    intake = MessageIntakeService(session_factory)
+    result = intake.receive(
+        IncomingMessageCommand(
+            message_id="message-1",
+            sales_user_id="sales-1",
+            raw_payload={"text": "客户需要码垛机器人"},
+            normalized_text="客户需要码垛机器人",
+        )
+    )
+    duplicate = intake.receive(
         IncomingMessageCommand(
             message_id="message-1",
             sales_user_id="sales-1",
@@ -67,6 +86,7 @@ def test_authorized_message_persists_message_and_pending_outbox_together(
 
     assert result.accepted is True
     assert result.duplicate is False
+    assert duplicate.accepted is True and duplicate.duplicate is True
     with session_factory() as session:
         message = session.scalar(
             select(IncomingMessage).where(IncomingMessage.message_id == "message-1")
@@ -75,6 +95,8 @@ def test_authorized_message_persists_message_and_pending_outbox_together(
         audit = session.scalar(
             select(BusinessAuditEvent).where(BusinessAuditEvent.event_type == "message_received")
         )
+        progress = session.scalar(select(LeadProgressSession))
+        progress_message = session.get(LeadProgressMessage, "message-1")
 
     assert message is not None
     assert message.sequence == 1
@@ -82,13 +104,59 @@ def test_authorized_message_persists_message_and_pending_outbox_together(
     assert event.status == "pending"
     assert event.sequence == message.sequence
     assert audit is not None
+    assert progress is not None and progress_message is not None
+    assert progress_message.status == "processing"
+    assert progress.started_at == progress_message.received_at == message.received_at
+    assert progress.next_report_at == progress.started_at + timedelta(minutes=15)
+    assert progress.started_at.replace(tzinfo=UTC) >= started_before
+    with session_factory() as session:
+        assert session.scalar(select(LeadProgressMessage)) is not None
+        assert len(session.scalars(select(LeadProgressMessage)).all()) == 1
+
+
+def test_progress_registration_failure_rolls_back_message_and_outbox(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证首条进度候选与消息入库同事务，失败不会留下半套接收事实。"""
+    authorize_salesperson(session_factory, "sales-1")
+    monkeypatch.setattr(
+        messaging_service,
+        "get_settings",
+        lambda: Settings(_env_file=None, lead_progress_enabled=True),
+    )
+
+    def fail_registration(*_args: object, **_kwargs: object) -> bool:
+        """模拟进度登记 DML 错误。"""
+        raise RuntimeError("isolated progress write failure")
+
+    monkeypatch.setattr("app.leads.progress.register_progress_message", fail_registration)
+    with pytest.raises(RuntimeError):
+        MessageIntakeService(session_factory).receive(
+            IncomingMessageCommand(
+                message_id="progress-atomic-failure",
+                sales_user_id="sales-1",
+                raw_payload={"text": "客户需求"},
+                normalized_text="客户需求",
+            )
+        )
+    with session_factory() as session:
+        assert session.get(IncomingMessage, "progress-atomic-failure") is None
+        assert session.scalar(select(OutboxEvent)) is None
+        assert session.scalar(select(LeadProgressSession)) is None
 
 
 def test_submission_like_natural_language_enters_async_intent_classification(
-    session_factory: sessionmaker[Session],
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """验证非固定命令先进入模型意图分类，不会被普通线索处理静默忽略。"""
+    """验证提交式文本先等待意图，确认需求后从原接收时间启动计时。"""
     authorize_salesperson(session_factory, "sales-1")
+    settings = Settings(
+        _env_file=None,
+        lead_progress_enabled=True,
+        lead_progress_interval_minutes=15,
+        lead_progress_idle_stop_minutes=60,
+    )
+    monkeypatch.setattr(messaging_service, "get_settings", lambda: settings)
 
     MessageIntakeService(session_factory).receive(
         IncomingMessageCommand(
@@ -103,9 +171,23 @@ def test_submission_like_natural_language_enters_async_intent_classification(
         event = session.scalar(
             select(OutboxEvent).where(OutboxEvent.message_id == "message-submit-intent")
         )
+        message = session.get(IncomingMessage, "message-submit-intent")
+        candidate = session.get(LeadProgressMessage, "message-submit-intent")
+        assert session.scalar(select(LeadProgressSession)) is None
 
     assert event is not None
     assert event.event_type == "crm_submission_intent"
+    assert message is not None and candidate is not None
+    assert candidate.status == "awaiting_intent" and candidate.progress_session_id is None
+    with session_factory.begin() as session:
+        assert activate_progress_intent_candidate(session, message.message_id, settings)
+    with session_factory() as session:
+        candidate = session.get(LeadProgressMessage, "message-submit-intent")
+        progress = session.scalar(select(LeadProgressSession))
+    assert candidate is not None and candidate.status == "processing"
+    assert progress is not None
+    assert progress.started_at == candidate.received_at
+    assert progress.next_report_at == candidate.received_at + timedelta(minutes=15)
 
 
 def test_plain_resubmit_enters_intent_router_and_abandoned_phrase_keeps_priority(
@@ -140,9 +222,11 @@ def test_plain_resubmit_enters_intent_router_and_abandoned_phrase_keeps_priority
                 OutboxEvent.message_id == "message-abandoned-fast-path"
             )
         )
+        command_progress = session.get(LeadProgressMessage, "message-abandoned-fast-path")
 
     assert retry is not None and retry.event_type == "crm_submission_intent"
     assert abandoned is not None and abandoned.event_type == "crm_submission_command"
+    assert command_progress is None
     assert tasks._submission_command_text(
         SubmissionIntent(intent="SUBMIT_RETRY_INCOMPLETE")
     ) == "重新提交待完善的线索"

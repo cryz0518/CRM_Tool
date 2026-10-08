@@ -61,8 +61,14 @@ def upgrade() -> None:
     op.create_table(
         "lead_progress_messages",
         sa.Column("message_id", sa.String(length=128), nullable=False),
-        sa.Column("progress_session_id", sa.String(length=36), nullable=False),
+        sa.Column("progress_session_id", sa.String(length=36), nullable=True),
+        sa.Column("status", sa.String(length=16), server_default="processing", nullable=False),
+        sa.Column("received_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.CheckConstraint(
+            "status IN ('awaiting_intent', 'processing', 'included', 'ignored')",
+            name="ck_lead_progress_message_status",
+        ),
         sa.ForeignKeyConstraint(["message_id"], ["incoming_messages.message_id"]),
         sa.ForeignKeyConstraint(["progress_session_id"], ["lead_progress_sessions.id"]),
         sa.PrimaryKeyConstraint("message_id"),

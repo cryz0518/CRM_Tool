@@ -414,19 +414,32 @@ class FirstTextLeadWorkspaceService:
         # 表格首次同步成功后才应用公司核验和销售内去重，避免失败重试中重放外部写入。
         if not result.company_resolution_applied:
             result = self._apply_company_resolution(outbox_event_id, result)
-        if self._lead_progress_service is not None and result.status in {
-            LeadProcessingStatus.CREATED,
-            LeadProcessingStatus.UPDATED,
-            LeadProcessingStatus.UNASSIGNED,
-            LeadProcessingStatus.QUOTE_UNRESOLVED,
-            LeadProcessingStatus.SYNC_FAILED,
-        }:
-            # 只在本条消息已产生归属分段后登记；提交命令和确认动作不经过此入口。
-            with self._session_factory() as session:
-                event = session.get(OutboxEvent, outbox_event_id)
-                message_id = event.message_id if event is not None else None
-            if message_id is not None:
-                self._lead_progress_service.record_resolved_message(message_id)
+        progress_outcomes = {
+            LeadProcessingStatus.CREATED: True,
+            LeadProcessingStatus.UPDATED: True,
+            LeadProcessingStatus.UNASSIGNED: True,
+            LeadProcessingStatus.QUOTE_UNRESOLVED: True,
+            LeadProcessingStatus.SYNC_FAILED: True,
+            LeadProcessingStatus.IGNORED: False,
+            LeadProcessingStatus.UNAUTHORIZED: False,
+            LeadProcessingStatus.INVALID_EVENT: False,
+        }
+        if self._lead_progress_service is not None and result.status in progress_outcomes:
+            # 接收事务已留下候选事实；此处只收敛统计状态，失败由 Scheduler 按 Outbox 恢复。
+            try:
+                with self._session_factory() as session:
+                    event = session.get(OutboxEvent, outbox_event_id)
+                    message_id = event.message_id if event is not None else None
+                if message_id is not None:
+                    self._lead_progress_service.record_resolved_message(
+                        message_id, included=progress_outcomes[result.status]
+                    )
+            except Exception:
+                # 进度模块异常不得阻断本条 Outbox 检查点；候选行仍可由独立 Scheduler 收敛。
+                logger.exception(
+                    "lead_progress_outcome_update_failed",
+                    extra={"outbox_event_id": outbox_event_id},
+                )
         # 只在本事件已越过首次消费检查点后继续，防止 retrying/processing 事件被错误跳过。
         self._consume_next_after_checkpoint(outbox_event_id)
         return result

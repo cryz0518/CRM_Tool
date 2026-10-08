@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from unittest.mock import Mock
 
 import pytest
 from pydantic import ValidationError
@@ -20,7 +21,12 @@ from app.leads.models import (
     LeadProgressSession,
     SmartTableSync,
 )
-from app.leads.progress import LeadProgressService
+from app.leads.progress import LeadProgressService, register_progress_message
+from app.leads.service import (
+    FirstTextLeadWorkspaceService,
+    LeadProcessingResult,
+    LeadProcessingStatus,
+)
 from app.messaging.models import (
     Base,
     IncomingMessage,
@@ -492,6 +498,108 @@ def test_first_message_anchors_due_timer_and_late_scans_do_not_catch_up() -> Non
         assert session.scalar(select(func.count()).select_from(NotificationRecord)) == 1
 
 
+def test_pending_message_is_counted_before_worker_completion_and_recovered_after_restart() -> None:
+    """接收时持久化的处理中候选在 Worker 重启后由 Outbox 终态收敛。"""
+    context = progress_context()
+    start = datetime(2026, 10, 8, 8, 30, tzinfo=UTC)
+    seed_message(
+        context.session_factory,
+        message_id="worker-crash-candidate",
+        sales_user_id="sales-a",
+        received_at=start,
+        segments=(SegmentSpec("crash-lead", "西门子", "crash-record"),),
+        outbox_status="processing",
+    )
+    with context.session_factory.begin() as session:
+        message = session.get(IncomingMessage, "worker-crash-candidate")
+        event = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.message_id == "worker-crash-candidate")
+        )
+        assert message is not None and event is not None
+        register_progress_message(
+            session,
+            message,
+            Settings(
+                _env_file=None,
+                lead_progress_enabled=True,
+                lead_progress_interval_minutes=15,
+            ),
+            now=start,
+        )
+
+    assert context.service.schedule_due_reports(now=start + timedelta(minutes=15)) == 1
+    notice = read_notice(context.session_factory, "sales-a")
+    assert notice is not None
+    assert "收到消息：1 条" in (notice.content or "")
+    assert "处理中／等待重试：1 项" in (notice.content or "")
+
+    with context.session_factory.begin() as session:
+        event = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.message_id == "worker-crash-candidate")
+        )
+        assert event is not None
+        event.status = "succeeded"
+    restarted_service = LeadProgressService(context.session_factory, context.adapter)
+    assert restarted_service.recover_pending_messages() == 1
+    with context.session_factory() as session:
+        progress_message = session.get(LeadProgressMessage, "worker-crash-candidate")
+        assert progress_message is not None and progress_message.status == "included"
+
+
+def test_progress_update_failure_does_not_block_outbox_checkpoint_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """进度收敛异常不阻止同销售检查点推进，持久候选可由 Scheduler 修复。"""
+    context = progress_context()
+    start = datetime(2026, 10, 8, 9, 30, tzinfo=UTC)
+    seed_message(
+        context.session_factory,
+        message_id="progress-update-failure",
+        sales_user_id="sales-a",
+        received_at=start,
+        segments=(SegmentSpec("progress-failure-lead", "隆盛科技", "progress-record"),),
+        outbox_status="succeeded",
+    )
+    with context.session_factory.begin() as session:
+        message = session.get(IncomingMessage, "progress-update-failure")
+        event = session.scalar(
+            select(OutboxEvent).where(OutboxEvent.message_id == "progress-update-failure")
+        )
+        assert message is not None and event is not None
+        event_id = event.id
+        register_progress_message(
+            session,
+            message,
+            Settings(_env_file=None, lead_progress_enabled=True),
+            now=start,
+        )
+
+    class FailingProgressService:
+        """模拟进度数据库故障，但保留接收事务已写入的候选事实。"""
+
+        def record_resolved_message(self, *_args: object, **_kwargs: object) -> bool:
+            """抛出进度更新错误，验证其不会逃逸到 Outbox 检查点。"""
+            raise RuntimeError("isolated progress update failure")
+
+    result = LeadProcessingResult(status=LeadProcessingStatus.UPDATED)
+    workspace = FirstTextLeadWorkspaceService(
+        context.session_factory,
+        object(),  # type: ignore[arg-type]
+        lead_progress_service=FailingProgressService(),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(workspace, "_consume_once", lambda *_args, **_kwargs: result)
+    monkeypatch.setattr(workspace, "_apply_company_resolution", lambda *_args: result)
+    checkpoint = Mock()
+    monkeypatch.setattr(workspace, "_consume_next_after_checkpoint", checkpoint)
+
+    assert workspace.consume(event_id) is result
+    checkpoint.assert_called_once_with(event_id)
+    assert context.service.recover_pending_messages() == 1
+    with context.session_factory() as session:
+        progress_message = session.get(LeadProgressMessage, "progress-update-failure")
+        assert progress_message is not None and progress_message.status == "included"
+
+
 def test_scheduler_restart_preserves_session_and_retries_only_notification() -> None:
     """重建服务后复用持久化 due 与通知，发送失败只重试 Bot 通知。"""
     context = progress_context()
@@ -625,6 +733,40 @@ def test_commands_and_messages_without_resolution_do_not_enter_progress() -> Non
     with context.session_factory() as session:
         assert session.scalar(select(func.count()).select_from(LeadProgressSession)) == 0
         assert session.scalar(select(func.count()).select_from(LeadProgressMessage)) == 0
+
+
+def test_ignored_demand_candidate_closes_without_emitting_a_progress_report() -> None:
+    """AI 最终忽略的普通文本不会留下空汇报或占用下一次会话。"""
+    context = progress_context()
+    received_at = datetime(2026, 10, 8, 12, 30, tzinfo=UTC)
+    seed_message(
+        context.session_factory,
+        message_id="ignored-candidate",
+        sales_user_id="sales-a",
+        received_at=received_at,
+        outbox_status="ignored",
+    )
+    with context.session_factory.begin() as session:
+        message = session.get(IncomingMessage, "ignored-candidate")
+        assert message is not None
+        register_progress_message(
+            session,
+            message,
+            Settings(_env_file=None, lead_progress_enabled=True),
+            now=received_at,
+        )
+    assert context.service.record_resolved_message(
+        "ignored-candidate", included=False, now=received_at + timedelta(minutes=1)
+    )
+
+    assert context.service.schedule_due_reports(now=received_at + timedelta(minutes=15)) == 0
+    with context.session_factory() as session:
+        progress = session.scalar(select(LeadProgressSession))
+        candidate = session.get(LeadProgressMessage, "ignored-candidate")
+        assert progress is not None and progress.status == "closed"
+        assert progress.close_reason == "no_valid_demand"
+        assert candidate is not None and candidate.status == "ignored"
+        assert session.scalar(select(func.count()).select_from(NotificationRecord)) == 0
 
 
 def test_old_message_recovery_does_not_start_a_historical_timer() -> None:

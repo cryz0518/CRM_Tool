@@ -1,0 +1,37 @@
+{
+  "services": {
+    "postgres": {
+      "image": "postgres:16-alpine",
+      "environment": {
+        "PGDATA": "/var/lib/postgresql/data/pgdata",
+        "POSTGRES_DB": "crm_lead_test_${T15_RUN_ID:?T15_RUN_ID required}",
+        "POSTGRES_PASSWORD": "t15_${T15_RUN_ID:?T15_RUN_ID required}",
+        "POSTGRES_USER": "t15_migration"
+      },
+      "tmpfs": ["/var/lib/postgresql/data:rw,size=1073741824"],
+      "healthcheck": {
+        "test": ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"],
+        "interval": "2s",
+        "timeout": "2s",
+        "retries": 30
+      }
+    },
+    "migrate": {
+      "build": {
+        "context": "../..",
+        "dockerfile": "Dockerfile"
+      },
+      "environment": {
+        "APP_ENV": "test",
+        "CRM_ADAPTER": "unconfigured",
+        "DATABASE_URL": "postgresql+psycopg://t15_migration:t15_${T15_RUN_ID:?T15_RUN_ID required}@postgres:5432/crm_lead_test_${T15_RUN_ID:?T15_RUN_ID required}",
+        "LLM_PROVIDER": "mock",
+        "MEDIA_STORAGE_PROVIDER": "fake",
+        "SMART_TABLE_ADAPTER": "mock",
+        "TEST_DATABASE_ID": "${T15_RUN_ID:?T15_RUN_ID required}",
+        "TEST_DATABASE_URL": "postgresql+psycopg://t15_migration:t15_${T15_RUN_ID:?T15_RUN_ID required}@postgres:5432/crm_lead_test_${T15_RUN_ID:?T15_RUN_ID required}",
+        "TYC_PROVIDER": "unconfigured"
+      }
+    }
+  }
+}

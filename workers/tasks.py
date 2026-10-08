@@ -29,7 +29,7 @@ from app.crm.commands import (
 )
 from app.crm.dependencies import get_crm_adapter
 from app.leads.models import Lead, LeadMessageResolution
-from app.leads.progress import LeadProgressService
+from app.leads.progress import LeadProgressService, activate_progress_intent_candidate
 from app.leads.review import LeadReviewService
 from app.leads.service import COMPLETED_CHECKPOINT_STATUSES, FirstTextLeadWorkspaceService
 from app.media.dependencies import get_media_attachment_service, get_media_storage_provider
@@ -540,8 +540,17 @@ def consume_lead_outbox_event(
                 message.normalized_text or ""
             )
             if intent.intent == "LEAD_CAPTURE":
-                # 正常线索意图必须回到原有抽取管线，不能被当作未识别提交结束。
-                pass
+                # 一旦确定为需求就按原消息接收时刻启用计时；登记故障留待调度器恢复，不阻断线索管线。
+                try:
+                    with factory.begin() as session:
+                        activate_progress_intent_candidate(
+                            session, message.message_id, get_settings()
+                        )
+                except Exception:
+                    logger.exception(
+                        "lead_progress_intent_activation_failed",
+                        extra={"outbox_event_id": outbox_event_id},
+                    )
             elif intent.intent == "UNKNOWN" or not is_explicit_submission_request(
                 message.normalized_text or ""
             ):

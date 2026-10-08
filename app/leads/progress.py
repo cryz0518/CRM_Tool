@@ -37,6 +37,171 @@ _UNASSIGNED_RESOLUTION_STATUSES = frozenset({"unassigned", "quote_unresolved"})
 _SCHEDULER_BATCH_SIZE = 100
 
 
+def register_progress_message(
+    session: Session,
+    message: IncomingMessage,
+    settings: Settings,
+    *,
+    now: datetime | None = None,
+    anchor_at: datetime | None = None,
+) -> bool:
+    """在来源消息事务中登记已确定走线索管线的需求消息。
+
+    参数：session 为来源消息接收事务；message 为已持久化消息；settings 为功能开关与计时配置；
+    now 为登记时间；anchor_at 可用于安全恢复时覆盖统计窗口锚点。
+    返回值：首次登记返回 True，功能关闭、销售停用或消息已登记时返回 False。
+    异常：数据库读取或写入异常向事务调用方传播并回滚消息接收。
+    副作用：在同一事务中创建销售会话和 processing 候选，不调用外部服务。
+    """
+    if not settings.lead_progress_enabled or session.get(
+        LeadProgressMessage, message.message_id
+    ) is not None:
+        return False
+    if not _active_sales_authorization(session, message.sales_user_id):
+        return False
+
+    received_at = _as_utc(anchor_at or message.received_at)
+    progress_message = LeadProgressMessage(
+        message_id=message.message_id,
+        status="processing",
+        received_at=received_at,
+        created_at=_as_utc(now or utc_now()),
+    )
+    session.add(progress_message)
+    session.flush()
+    _attach_progress_message(session, progress_message, message.sales_user_id, settings)
+    return True
+
+
+def register_progress_intent_candidate(
+    session: Session,
+    message: IncomingMessage,
+    settings: Settings,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """持久化待分类的提交式文本，但在确认是客户需求前不建立会话。
+
+    参数：session 为消息接收事务；message 为输入文本；settings 控制进度功能；now 为登记时间。
+    返回值：首次登记候选返回 True，功能关闭、销售停用或消息已存在时返回 False。
+    异常：数据库写入异常向接收事务传播，防止候选事实半提交。
+    副作用：新增无会话关联的 awaiting_intent 候选；不会将潜在 CRM 命令计入统计。
+    """
+    if not settings.lead_progress_enabled or session.get(
+        LeadProgressMessage, message.message_id
+    ) is not None:
+        return False
+    if not _active_sales_authorization(session, message.sales_user_id):
+        return False
+    session.add(
+        LeadProgressMessage(
+            message_id=message.message_id,
+            progress_session_id=None,
+            status="awaiting_intent",
+            received_at=_as_utc(message.received_at),
+            created_at=_as_utc(now or utc_now()),
+        )
+    )
+    return True
+
+
+def activate_progress_intent_candidate(
+    session: Session,
+    message_id: str,
+    settings: Settings,
+) -> bool:
+    """把意图模型确认的客户需求接入销售进度会话。
+
+    参数：session 为当前数据库事务；message_id 为接收时登记的意图候选；settings 控制计时。
+    返回值：候选首次从 awaiting_intent 转为 processing 时返回 True，否则为 False。
+    异常：数据库读取或写入异常向调用方传播；调用方可继续主线索流程并保留候选供恢复。
+    副作用：锁定销售授权并创建或复用其会话，due_at 使用原消息接收时间。
+    """
+    progress_message = session.get(LeadProgressMessage, message_id)
+    message = session.get(IncomingMessage, message_id)
+    if (
+        not settings.lead_progress_enabled
+        or progress_message is None
+        or progress_message.status != "awaiting_intent"
+        or message is None
+        or not _active_sales_authorization(session, message.sales_user_id)
+    ):
+        return False
+    _attach_progress_message(session, progress_message, message.sales_user_id, settings)
+    return True
+
+
+def _active_sales_authorization(session: Session, sales_user_id: str) -> bool:
+    """锁定销售授权行并读取启用状态。
+
+    参数：session 为当前数据库事务；sales_user_id 为企微成员标识。
+    返回值：仅存在且启用的销售返回 True。
+    异常：数据库读取错误向事务调用方传播。
+    副作用：对授权行加锁，统一接收与调度操作的串行顺序。
+    """
+    authorization = session.scalar(
+        select(SalesAuthorization)
+        .where(SalesAuthorization.wecom_user_id == sales_user_id)
+        .with_for_update()
+    )
+    return authorization is not None and authorization.is_active
+
+
+def _attach_progress_message(
+    session: Session,
+    progress_message: LeadProgressMessage,
+    sales_user_id: str,
+    settings: Settings,
+) -> LeadProgressSession:
+    """把已确认候选挂入销售活跃会话。
+
+    参数：session 为当前数据库事务；progress_message 为唯一消息候选；sales_user_id 为销售；
+    settings 为该会话的汇报间隔配置。
+    返回值：创建或复用的活跃会话。
+    异常：唯一约束或数据库错误向事务调用方传播。
+    副作用：必要时新增会话，并更新消息候选状态为 processing。
+    """
+    progress = session.scalar(
+        select(LeadProgressSession)
+        .where(
+            LeadProgressSession.sales_user_id == sales_user_id,
+            LeadProgressSession.status == "active",
+        )
+        .with_for_update()
+    )
+    received_at = _as_utc(progress_message.received_at)
+    if progress is None:
+        progress = LeadProgressSession(
+            sales_user_id=sales_user_id,
+            status="active",
+            started_at=received_at,
+            last_activity_at=received_at,
+            next_report_at=received_at
+            + timedelta(minutes=settings.lead_progress_interval_minutes),
+        )
+        session.add(progress)
+        session.flush()
+    else:
+        progress.last_activity_at = max(_as_utc(progress.last_activity_at), received_at)
+        if received_at < _as_utc(progress.started_at):
+            prior_notice = session.scalar(
+                select(NotificationRecord.notification_key)
+                .where(
+                    NotificationRecord.source_message_id == progress.id,
+                    NotificationRecord.notification_type == "lead_progress_summary",
+                )
+                .limit(1)
+            )
+            if prior_notice is None:
+                progress.started_at = received_at
+                progress.next_report_at = received_at + timedelta(
+                    minutes=settings.lead_progress_interval_minutes
+                )
+    progress_message.progress_session_id = progress.id
+    progress_message.status = "processing"
+    return progress
+
+
 @dataclass(frozen=True)
 class LeadProgressStats:
     """承载单个销售会话的去重计数与当前表格完整度。"""
@@ -75,13 +240,19 @@ class LeadProgressService:
         self._settings = settings or get_settings()
         self._completeness = LeadCompletenessService()
 
-    def record_resolved_message(self, message_id: str, *, now: datetime | None = None) -> bool:
-        """将有归属结论的有效需求消息登记到当前销售会话且保持幂等。
+    def record_resolved_message(
+        self,
+        message_id: str,
+        *,
+        included: bool = True,
+        now: datetime | None = None,
+    ) -> bool:
+        """收敛已持久化的消息候选为有效需求或忽略项。
 
-        参数：message_id 为已完成一次有效线索处理的来源消息；now 可注入时钟供测试使用。
-        返回值：首次登记或已登记时返回 True；不属于有效需求、销售停用或功能关闭时为 False。
+        参数：message_id 为来源消息；included 表示消息属于有效需求；now 可注入测试时钟。
+        返回值：成功收敛既有候选或修复已完成归属的旧候选时返回 True。
         异常：数据库约束或读取错误向调用方传播。
-        副作用：可能创建销售会话并新增唯一消息关联，不调用模型、CRM 或消息通道。
+        副作用：更新候选状态；仅兼容修复既有已归属消息，不调用模型、CRM 或消息通道。
         """
         if not self._settings.lead_progress_enabled:
             return False
@@ -98,65 +269,197 @@ class LeadProgressService:
             )
             if authorization is None or not authorization.is_active:
                 return False
-            event = session.scalar(
-                select(OutboxEvent).where(
-                    OutboxEvent.message_id == message_id,
-                    OutboxEvent.sales_user_id == message.sales_user_id,
-                    OutboxEvent.event_type == "message_received",
+            progress_message = session.get(LeadProgressMessage, message_id)
+            if progress_message is None and included:
+                event = session.scalar(
+                    select(OutboxEvent).where(
+                        OutboxEvent.message_id == message_id,
+                        OutboxEvent.sales_user_id == message.sales_user_id,
+                        OutboxEvent.event_type.in_(
+                            ("message_received", "crm_submission_intent")
+                        ),
+                    )
                 )
-            )
-            resolution_exists = session.scalar(
-                select(LeadMessageResolution.id)
-                .where(LeadMessageResolution.message_id == message_id)
-                .limit(1)
-            )
-            if event is None or resolution_exists is None:
-                # 命令、确认动作、闲聊和仅收到但未完成识别的消息都不会进入进度会话。
+                resolution_exists = session.scalar(
+                    select(LeadMessageResolution.id)
+                    .where(LeadMessageResolution.message_id == message_id)
+                    .limit(1)
+                )
+                if event is None or resolution_exists is None:
+                    return False
+                received_at = _as_utc(message.received_at)
+                idle_window = timedelta(minutes=self._settings.lead_progress_idle_stop_minutes)
+                anchor_at = (
+                    current_time
+                    if received_at < current_time - idle_window
+                    else received_at
+                )
+                register_progress_message(
+                    session,
+                    message,
+                    self._settings,
+                    now=current_time,
+                    anchor_at=anchor_at,
+                )
+                progress_message = session.get(LeadProgressMessage, message_id)
+            if progress_message is None:
                 return False
-            if session.get(LeadProgressMessage, message_id) is not None:
-                return True
+            if included and progress_message.status == "awaiting_intent":
+                _attach_progress_message(
+                    session, progress_message, message.sales_user_id, self._settings
+                )
 
-            progress = session.scalar(
-                select(LeadProgressSession)
-                .where(
-                    LeadProgressSession.sales_user_id == message.sales_user_id,
-                    LeadProgressSession.status == "active",
+            progress_message.status = "included" if included else "ignored"
+            progress = (
+                session.scalar(
+                    select(LeadProgressSession)
+                    .where(LeadProgressSession.id == progress_message.progress_session_id)
+                    .with_for_update()
                 )
-                .with_for_update()
+                if progress_message.progress_session_id is not None
+                else None
             )
-            received_at = _as_utc(message.received_at)
-            idle_window = timedelta(minutes=self._settings.lead_progress_idle_stop_minutes)
-            # 超过一个空闲周期才被恢复处理的旧消息从当前处理时刻起计，避免启动后补发历史窗口。
-            activity_at = current_time if received_at < current_time - idle_window else received_at
-            if progress is None:
-                progress = LeadProgressSession(
-                    sales_user_id=message.sales_user_id,
-                    status="active",
-                    started_at=activity_at,
-                    last_activity_at=activity_at,
-                    next_report_at=activity_at
-                    + timedelta(minutes=self._settings.lead_progress_interval_minutes),
-                )
-                session.add(progress)
-                session.flush()
-            elif activity_at > _as_utc(progress.last_activity_at):
-                progress.last_activity_at = activity_at
-
-            session.add(
-                LeadProgressMessage(
-                    message_id=message_id,
-                    progress_session_id=progress.id,
-                    created_at=current_time,
-                )
-            )
+            if progress is not None and not included and progress.status == "active":
+                self._reanchor_or_close_empty_session(session, progress, current_time)
             logger.info(
                 "lead_progress_message_recorded",
                 extra={
-                    "progress_session_id": progress.id,
+                    "progress_session_id": progress_message.progress_session_id,
                     "event": "lead_progress_message_recorded",
                 },
             )
         return True
+
+    def recover_pending_messages(self, *, limit: int = _SCHEDULER_BATCH_SIZE) -> int:
+        """按持久化 Outbox 终态恢复 Worker 崩溃前未收敛的消息候选。
+
+        参数：limit 为单轮最大扫描候选数。
+        返回值：本次状态收敛的候选行数。
+        异常：数据库故障向独立 Scheduler 传播，以便任务重试。
+        副作用：只更新进度候选与会话，不调用模型、智能表格写入或 CRM。
+        """
+        if not self._settings.lead_progress_enabled:
+            return 0
+        recovered = 0
+        with self._session_factory.begin() as session:
+            candidates = session.execute(
+                select(LeadProgressMessage.message_id, OutboxEvent.sales_user_id)
+                .join(OutboxEvent, OutboxEvent.message_id == LeadProgressMessage.message_id)
+                .where(LeadProgressMessage.status.in_(("processing", "awaiting_intent")))
+                .order_by(OutboxEvent.sales_user_id, LeadProgressMessage.created_at)
+                .limit(limit)
+            ).all()
+            for message_id, sales_user_id in candidates:
+                # 先按销售锁定，再锁候选和 Outbox，保持与消息接收及结果收敛的加锁顺序。
+                authorization = session.scalar(
+                    select(SalesAuthorization)
+                    .where(SalesAuthorization.wecom_user_id == sales_user_id)
+                    .with_for_update()
+                )
+                progress_message = session.scalar(
+                    select(LeadProgressMessage)
+                    .where(LeadProgressMessage.message_id == message_id)
+                    .with_for_update()
+                )
+                event = session.scalar(
+                    select(OutboxEvent)
+                    .where(OutboxEvent.message_id == message_id)
+                    .with_for_update()
+                )
+                if (
+                    authorization is None
+                    or progress_message is None
+                    or progress_message.status not in {"processing", "awaiting_intent"}
+                    or event is None
+                ):
+                    continue
+                if event.status in _ACTIVE_OUTBOX_STATUSES:
+                    continue
+                has_resolution = session.scalar(
+                    select(LeadMessageResolution.id)
+                    .where(LeadMessageResolution.message_id == event.message_id)
+                    .limit(1)
+                ) is not None
+                if progress_message.status == "awaiting_intent":
+                    if (
+                        event.status in {"ignored", "unauthorized", "invalid"}
+                        or not has_resolution
+                    ):
+                        progress_message.status = "ignored"
+                    else:
+                        message = session.get(IncomingMessage, event.message_id)
+                        if message is None or not authorization.is_active:
+                            progress_message.status = "ignored"
+                        else:
+                            _attach_progress_message(
+                                session, progress_message, message.sales_user_id, self._settings
+                            )
+                            progress_message.status = "included"
+                    recovered += 1
+                    continue
+                ignored = event.status in {"ignored", "unauthorized", "invalid"} or (
+                    event.status == "succeeded" and not has_resolution
+                )
+                progress_message.status = "ignored" if ignored else "included"
+                if ignored:
+                    progress = (
+                        session.scalar(
+                            select(LeadProgressSession)
+                            .where(LeadProgressSession.id == progress_message.progress_session_id)
+                            .with_for_update()
+                        )
+                        if progress_message.progress_session_id is not None
+                        else None
+                    )
+                    if progress is not None and progress.status == "active":
+                        self._reanchor_or_close_empty_session(session, progress, utc_now())
+                recovered += 1
+        return recovered
+
+    def _reanchor_or_close_empty_session(
+        self, session: Session, progress: LeadProgressSession, now: datetime
+    ) -> None:
+        """忽略消息后重算窗口锚点，避免闲聊启动的空会话继续通知。
+
+        参数：session 为当前写事务；progress 为被更新的会话；now 为忽略结论时间。
+        返回值：无。
+        异常：数据库读取错误向事务调用方传播。
+        副作用：有剩余候选时按最早接收时间重算 due；没有时关闭会话且不生成通知。
+        """
+        remaining = session.execute(
+            select(LeadProgressMessage.received_at)
+            .where(
+                LeadProgressMessage.progress_session_id == progress.id,
+                LeadProgressMessage.status != "ignored",
+            )
+            .order_by(LeadProgressMessage.received_at)
+        ).all()
+        prior_notice = session.scalar(
+            select(NotificationRecord.notification_key)
+            .where(
+                NotificationRecord.source_message_id == progress.id,
+                NotificationRecord.notification_type == "lead_progress_summary",
+            )
+            .limit(1)
+        )
+        if not remaining:
+            if prior_notice is not None:
+                # 已有汇报不可撤回，保留会话供 Scheduler 在空闲后发出最终更正汇总。
+                return
+            progress.status = "closed"
+            progress.closed_at = now
+            progress.close_reason = "no_valid_demand"
+            return
+        first = _as_utc(remaining[0][0])
+        last = max(_as_utc(item[0]) for item in remaining)
+        if prior_notice is not None:
+            progress.last_activity_at = last
+            return
+        progress.started_at = first
+        progress.last_activity_at = last
+        progress.next_report_at = first + timedelta(
+            minutes=self._settings.lead_progress_interval_minutes
+        )
 
     def schedule_due_reports(self, *, now: datetime | None = None) -> int:
         """扫描到期会话，创建唯一汇总通知并在空闲完成后发送最终汇总。
@@ -169,6 +472,8 @@ class LeadProgressService:
         if not self._settings.lead_progress_enabled:
             return 0
         current_time = _as_utc(now or utc_now())
+        # 消息接收时已原子登记候选；定时恢复只收敛处理结果，不重放业务副作用。
+        self.recover_pending_messages()
         idle_before = current_time - timedelta(
             minutes=self._settings.lead_progress_idle_stop_minutes
         )
@@ -372,7 +677,8 @@ class LeadProgressService:
         副作用：仅读取消息归属、线索和同步事实。
         """
         message_ids = select(LeadProgressMessage.message_id).where(
-            LeadProgressMessage.progress_session_id == progress.id
+            LeadProgressMessage.progress_session_id == progress.id,
+            LeadProgressMessage.status != "ignored",
         )
         lead_ids = select(LeadMessageResolution.lead_id).where(
             LeadMessageResolution.message_id.in_(message_ids),
@@ -407,7 +713,8 @@ class LeadProgressService:
         message_ids = tuple(
             session.scalars(
                 select(LeadProgressMessage.message_id).where(
-                    LeadProgressMessage.progress_session_id == progress.id
+                    LeadProgressMessage.progress_session_id == progress.id,
+                    LeadProgressMessage.status != "ignored",
                 )
             ).all()
         )

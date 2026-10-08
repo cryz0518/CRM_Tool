@@ -247,18 +247,29 @@ class LeadProgressSession(Base):
 
 
 class LeadProgressMessage(Base):
-    """把一条已识别的有效需求消息唯一关联到其进度统计窗口。"""
+    """把待处理或已确认的需求消息唯一关联到其进度统计窗口。"""
 
     __tablename__ = "lead_progress_messages"
 
     message_id: Mapped[str] = mapped_column(
         ForeignKey("incoming_messages.message_id"), primary_key=True
     )
-    progress_session_id: Mapped[str] = mapped_column(
-        ForeignKey("lead_progress_sessions.id"), nullable=False, index=True
+    progress_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("lead_progress_sessions.id"), index=True
     )
+    status: Mapped[str] = mapped_column(
+        String(16), default="processing", server_default="processing", nullable=False
+    )
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('awaiting_intent', 'processing', 'included', 'ignored')",
+            name="ck_lead_progress_message_status",
+        ),
     )
 
 
