@@ -504,8 +504,15 @@ class CrmSubmissionService:
                     reasons[lead_id] = "candidate_state_changed"
                     continue
                 sync = latest_crm_create_sync(session, lead_id)
-                if sync is not None and sync.status in {"succeeded", "abandoned"}:
-                    reasons[lead_id] = "already_submitted"
+                if sync is not None and sync.status == "succeeded":
+                    reasons[lead_id] = (
+                        "request_succeeded"
+                        if sync.request_message_id == command.request_message_id
+                        else "already_submitted"
+                    )
+                    continue
+                if sync is not None and sync.status == "abandoned":
+                    reasons[lead_id] = "candidate_state_changed"
                     continue
                 if lead.lifecycle_state not in {"temporary", "pending_create"}:
                     reasons[lead_id] = "candidate_state_changed"
@@ -520,15 +527,26 @@ class CrmSubmissionService:
         result = SubmissionBatchResult()
         for lead_id in selected:
             if lead_id in eligible:
-                outcome = self._submit_create(
-                    lead_id,
-                    SubmissionCommand(
-                        "提交指定线索",
-                        command.sales_user_id,
-                        command.request_message_id,
-                        target_lead_id=lead_id,
-                    ),
-                )
+                try:
+                    outcome = self._submit_create(
+                        lead_id,
+                        SubmissionCommand(
+                            "提交指定线索",
+                            command.sales_user_id,
+                            command.request_message_id,
+                            target_lead_id=lead_id,
+                        ),
+                    )
+                except Exception as error:
+                    # 单条快照/依赖异常不能中断其它线索；未知结果按人工检查点反馈。
+                    _LOGGER.warning(
+                        "crm_incomplete_retry_item_failed",
+                        extra={"lead_id": lead_id, "error_type": type(error).__name__},
+                    )
+                    outcome = _create_outcome("failed_pending_review")
+            elif reasons.get(lead_id) == "request_succeeded":
+                # 同一命令重放时保留真实成功；其它请求只报告已提交，绝不重复创建。
+                outcome = _create_outcome("succeeded")
             else:
                 outcome = _create_outcome(
                     "not_submitted",

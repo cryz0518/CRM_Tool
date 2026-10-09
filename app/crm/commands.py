@@ -6,6 +6,7 @@ import hashlib
 import logging
 import re
 from collections.abc import Mapping
+from dataclasses import asdict
 from datetime import UTC
 from zoneinfo import ZoneInfo
 
@@ -15,10 +16,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import get_settings
 from app.crm.adapter import CRMAdapter
 from app.crm.service import (
+    CreateSubmissionOutcome,
     CrmSubmissionService,
     SubmissionBatchResult,
     SubmissionCommand,
     SubmissionItemResult,
+    _append_create_result,
 )
 from app.leads.models import CrmSyncRecord, Lead, latest_crm_create_sync, new_lead_id
 from app.leads.review import LeadReviewService
@@ -35,8 +38,10 @@ from app.smart_table.models import SmartTableRecord
 from app.wecom_bot.actions import (
     ACTION_TYPE_CRM_BATCH_SUBMISSION,
     ACTION_TYPE_CRM_COMPANY_CONFIRMATION,
+    SUBMISSION_PREVIEW_FIELDS,
     CardCapabilityUnavailable,
     WecomActionService,
+    _split_result_notifications,
     build_batch_submission_markdown,
 )
 
@@ -75,25 +80,6 @@ _NEGATIVE_SUBMISSION_MARKERS = (
     "先别",
     "禁止",
     "取消",
-)
-_PREVIEW_FIELD_NAMES = (
-    "业务线",
-    "线索名称",
-    "线索来源",
-    "联系人",
-    "职务",
-    "沟通方式",
-    "手机",
-    "电话",
-    "邮箱",
-    "客户行业",
-    "客户级别",
-    "工艺",
-    "下次联系时间",
-    "备注",
-    "是否为国际客户",
-    "负责人",
-    "提交状态",
 )
 
 
@@ -278,9 +264,33 @@ def consume_submission_command(
         return reply
     if command.text == "重新提交待完善的线索":
         try:
-            targets, labels = _latest_incomplete_submission_targets(
-                session_factory, command.sales_user_id
-            )
+            key = notification_key_for_message(command.request_message_id)
+            with session_factory.begin() as session:
+                notice = session.get(NotificationRecord, key)
+                if notice is None:
+                    targets, labels = _latest_incomplete_submission_targets(
+                        session_factory, command.sales_user_id
+                    )
+                    # 外部调用前冻结本命令目标；重放不能换成后来发行或选择的候选。
+                    notice = NotificationRecord(
+                        notification_key=key,
+                        sales_user_id=command.sales_user_id,
+                        source_message_id=command.request_message_id,
+                        notification_type="crm_submission_retry_summary",
+                        status="preparing",
+                        payload={"target_lead_ids": list(targets), "lead_labels": labels},
+                    )
+                    session.add(notice)
+                saved = dict(notice.payload or {})
+                if saved.get("finished"):
+                    # 已结算命令只回显冻结结果；CRM 和发送均由各自原有幂等边界保护。
+                    return str(saved["reply"])
+                targets = tuple(saved.get("target_lead_ids", ()))
+                labels = saved.get("lead_labels", {})
+                item_results = {
+                    item["lead_id"]: item for item in saved.get("item_results", [])
+                }
+            pending = False
             if not targets:
                 reply = "当前没有上次已选择且待完善的线索需要重新提交。"
             else:
@@ -292,8 +302,27 @@ def consume_submission_command(
                     crm_adapter,
                     robot_submission_confirmation_available=get_settings().wecom_card_callback_ready(),
                 )
-                result = service.submit_incomplete_retry(command, targets)
+                # 重放仅继续未完成项；成功、待完善和终态失败的原结果不能被后续轮次改写。
+                retry_targets = tuple(
+                    lead_id for lead_id in targets
+                    if lead_id not in item_results
+                    or item_results[lead_id]["status"] in {"retrying", "processing"}
+                )
+                result = service.submit_incomplete_retry(command, retry_targets)
                 _issue_duplicate_confirmation_card(command, result, session_factory)
+                item_results.update({item.lead_id: asdict(item) for item in result.items})
+                result = SubmissionBatchResult()
+                for lead_id in targets:
+                    # 复用已有逐条汇总转换，保持缺项、诊断和真实状态来自同一服务结果。
+                    item = dict(item_results[lead_id])
+                    item.pop("lead_id")
+                    if item["status"] == "created":
+                        item["status"] = "succeeded"
+                    item["missing_fields"] = tuple(item["missing_fields"])
+                    result = _append_create_result(
+                        result, lead_id, CreateSubmissionOutcome(**item)
+                    )
+                pending = bool(result.retrying or result.processing)
                 reply = format_submission_reply(
                     result, lead_labels=labels, selected_count=len(targets)
                 ).replace(
@@ -306,26 +335,42 @@ def consume_submission_command(
         with session_factory.begin() as session:
             event = session.get(OutboxEvent, outbox_event_id)
             if event is not None:
-                pending = session.scalar(
-                    select(CrmSyncRecord.id)
-                    .where(
-                        CrmSyncRecord.request_message_id == command.request_message_id,
-                        CrmSyncRecord.status.in_(("retrying", "processing")),
-                    )
-                    .limit(1)
-                )
-                event.status = "retrying" if pending is not None else "succeeded"
-            key = notification_key_for_message(command.request_message_id)
-            if session.get(NotificationRecord, key) is None:
-                session.add(
-                    NotificationRecord(
-                        notification_key=key,
-                        sales_user_id=command.sales_user_id,
-                        source_message_id=command.request_message_id,
-                        notification_type="crm_submission_retry_summary",
-                        content=reply,
-                    )
-                )
+                # 复用其它请求的冻结同步任务时，也必须等实际逐条结果进入终态。
+                event.status = "retrying" if pending else "succeeded"
+            notice = session.get(NotificationRecord, key)
+            if notice is None:
+                raise ValueError("重提命令缺少冻结通知")
+            saved = dict(notice.payload or {})
+            was_pending = bool(saved.get("awaiting_final_result"))
+            # 进度和最终结果各发一次；通知重试只重发原正文，不重新触发 CRM。
+            phase = "final" if was_pending and not pending else "initial"
+            if notice.status == "preparing" or (was_pending and not pending):
+                for index, content in enumerate(_split_result_notifications(reply)):
+                    chunk_key = key if phase == "initial" and index == 0 else hashlib.sha256(
+                        f"crm_submission_retry:{command.request_message_id}:{phase}:{index}".encode()
+                    ).hexdigest()
+                    chunk = session.get(NotificationRecord, chunk_key)
+                    if chunk is None:
+                        chunk = NotificationRecord(
+                            notification_key=chunk_key,
+                            sales_user_id=command.sales_user_id,
+                            source_message_id=command.request_message_id,
+                            notification_type="crm_submission_retry_summary",
+                            content=content,
+                            status="pending",
+                        )
+                        session.add(chunk)
+                    elif chunk_key == key and notice.status == "preparing":
+                        # 仅首次启用冻结通知；已发送或已认领的分片绝不能重置为 pending。
+                        chunk.content = content
+                        chunk.status = "pending"
+            notice.payload = {
+                **saved,
+                "reply": reply,
+                "awaiting_final_result": pending,
+                "finished": not pending,
+                "item_results": list(item_results.values()),
+            }
         return reply
     if crm_adapter is None:
         raise ValueError("批量 CRM 命令缺少 CRM Adapter")
@@ -525,7 +570,7 @@ def prepare_company_submission_preview(
     command: SubmissionCommand,
     company_name: str,
 ) -> str:
-    """按公司名称精确或包含匹配定位线索并发行全字段确认卡，不调用 CRM。
+    """按公司名称精确或包含匹配定位线索并发行精简确认卡，不调用 CRM。
 
     参数：command 提供销售身份和消息幂等键；company_name 为固定句式解析结果。
     返回值：可直接回复销售的定位状态文本。
@@ -616,20 +661,8 @@ def prepare_company_submission_preview(
     record, lead = eligible[0]
     display_fields = {
         name: record.fields.get(name)
-        for name in _PREVIEW_FIELD_NAMES
+        for name in SUBMISSION_PREVIEW_FIELDS
     }
-    display_fields.update(
-        {
-            name: value
-            for name, value in record.fields.items()
-            if name not in display_fields
-        }
-    )
-    # 成员字段的 userId 仍保留在业务快照中；确认卡只展示同一响应附带的真实成员显示名。
-    for member_field in ("负责人", "创建人"):
-        display_name = record.member_names.get(member_field)
-        if isinstance(display_name, str) and display_name.strip():
-            display_fields[member_field] = display_name.strip()
     try:
         action_service.issue_company_submission_confirmation_action(
             actor_user_id=command.sales_user_id,
@@ -643,7 +676,7 @@ def prepare_company_submission_preview(
         return "已精确找到线索，但当前机器人卡片能力未就绪；请先完成卡片配置后再确认提交。"
     match_description = "按名称包含关系找到候选" if contains_match else "精确找到线索"
     return (
-        f"已{match_description}，已发送包含全部字段的确认卡；"
+        f"已{match_description}，已发送提交前确认卡；"
         "如需修改，请先编辑智能表格后再点击确认提交。"
     )
 
@@ -934,6 +967,7 @@ def _latest_incomplete_submission_targets(
     for group in groups.values():
         labels: dict[str, str] = {}
         incomplete_ids: list[str] = []
+        has_completed_selection = False
         for action in group:
             context = action.context
             display_text = context.get("display_text")
@@ -953,15 +987,24 @@ def _latest_incomplete_submission_targets(
             saved_results = context.get("submission_results")
             if not isinstance(saved_results, list):
                 continue
+            # 批量只接受服务端已勾选目标，单条只接受服务端最终选择的目标。
+            selected = context.get("selected_lead_ids", [])
+            if action.action_type == ACTION_TYPE_CRM_COMPANY_CONFIRMATION:
+                selected = [context.get("selected_lead_id", action.target_id)]
+            if not isinstance(selected, list) or not selected:
+                continue
+            has_completed_selection = True
             for item in saved_results:
                 if (
                     isinstance(item, dict)
                     and item.get("status") == "incomplete"
                     and isinstance(item.get("lead_id"), str)
+                    and item["lead_id"] in selected
                     and item["lead_id"] not in incomplete_ids
                 ):
                     incomplete_ids.append(item["lead_id"])
-        if incomplete_ids:
+        if has_completed_selection:
+            # 最近实际选择已无待完善项时，不回退到更早的提交组扩大重提范围。
             for lead_id in incomplete_ids:
                 labels.setdefault(lead_id, "线索")
             return tuple(incomplete_ids), labels

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Generator, Mapping
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy import create_engine, func, select
@@ -53,6 +55,7 @@ from app.messaging.models import (
     WecomAction,
     utc_now,
 )
+from app.notifications.outbound import WecomOutboundNotificationSender
 from app.smart_table.adapter import SmartTableActor
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.models import SmartTableRecord
@@ -1164,7 +1167,261 @@ def test_retry_command_aggregates_incomplete_results_from_all_pages(
         )
         for action in prior_actions
     )
-    assert retry_notification is not None and retry_notification.content == reply
+    assert retry_notification is not None and retry_notification.payload["reply"] == reply
+
+
+def _retry_command_event(
+    session_factory: sessionmaker[Session], lead_ids: tuple[str, ...],
+    *, message_id: str = "retry-feedback", sequence: int = 2,
+) -> int:
+    """持久化本人实际选择且待完善的历史及重提命令，返回事件标识。
+
+    参数：lead_ids 为服务端选择目标；message_id/sequence 限定本次来源消息。
+    返回值：可交给现有命令消费者的 Outbox 标识。
+    异常：数据库错误向测试传播。副作用：仅写入内存测试库。
+    """
+    with session_factory.begin() as session:
+        session.add(WecomAction(
+            task_id=f"prior-{message_id}",
+            action_type="crm_batch_submission",
+            bound_actor_wecom_user_id="sales-1",
+            target_type="crm_batch_submission",
+            target_id=f"prior-{message_id}",
+            expected_action_key="crm.batch_submission.confirm",
+            status="succeeded",
+            expires_at=utc_now() + timedelta(minutes=5),
+            context={
+                "request_message_id": f"prior-{message_id}",
+                "selected_lead_ids": list(lead_ids),
+                "candidate_leads": [
+                    {"lead_id": lead_id, "company_name": f"反馈线索{index}"}
+                    for index, lead_id in enumerate(lead_ids, start=1)
+                ],
+                "submission_results": [
+                    {"lead_id": lead_id, "status": "incomplete"}
+                    for lead_id in lead_ids
+                ],
+            },
+        ))
+        session.add(IncomingMessage(
+            message_id=message_id, sales_user_id="sales-1", sequence=sequence,
+            raw_payload={}, normalized_text="重新提交",
+        ))
+        session.flush()
+        event = OutboxEvent(
+            message_id=message_id, sales_user_id="sales-1", sequence=sequence,
+            event_type="crm_submission_intent", status="processing",
+        )
+        session.add(event)
+        session.flush()
+        return event.id
+
+
+@pytest.mark.parametrize("failure", ["none", "once", "always", "business", "missing"])
+def test_retry_feedback_covers_real_results_and_is_idempotent(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    """验证重提成功、缺项、暂时/终态失败，命令重放及通知重试均无重复业务调用。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    event_id = _retry_command_event(session_factory, (lead_id,))
+    if failure == "missing":
+        adapter.update_record(adapter.get_records()[0].record_id, {"职务": ""})
+    crm = MockCRMAdapter()
+    create = crm.create_lead
+    attempts: list[str] = []
+
+    def create_with_failure(
+        payload: Mapping[str, object], *, idempotency_key: str, crm_user_id: str,
+    ) -> CRMCreateResult:
+        """按场景制造受控失败并记录幂等键，成功时复用原 Mock。"""
+        attempts.append(idempotency_key)
+        if failure == "always" or (failure == "once" and len(attempts) == 1):
+            raise ConnectionError("isolated failure")
+        if failure == "business":
+            raise SopCRMError("business", http_status=400, error_code="40001")
+        return create(payload, idempotency_key=idempotency_key, crm_user_id=crm_user_id)
+
+    monkeypatch.setattr(crm, "create_lead", create_with_failure)
+    # 仅使用伪 SDK，覆盖通知失败、租约重试与发送完成后的再次扫描。
+    client = Mock()
+    client.send_message = AsyncMock(side_effect=ConnectionError("isolated send failure"))
+    sender = WecomOutboundNotificationSender(session_factory, client)
+    first = consume_submission_command(
+        session_factory, adapter, crm, event_id, command_text="重新提交待完善的线索",
+    )
+    if failure in {"once", "always"}:
+        assert "🔄 重试中 1 条" in first and "✅ 创建成功 0 条" in first
+        with session_factory() as session:
+            assert session.get(OutboxEvent, event_id).status == "retrying"
+    assert asyncio.run(sender.send_pending_once()) == 0
+    client.send_message = AsyncMock(return_value={"msgid": "isolated"})
+    assert asyncio.run(sender.send_pending_once()) > 0
+    for _ in range(4):
+        reply = consume_submission_command(
+            session_factory, adapter, crm, event_id, command_text="重新提交待完善的线索",
+        )
+        with session_factory() as session:
+            if session.get(OutboxEvent, event_id).status == "succeeded":
+                break
+    assert asyncio.run(sender.send_pending_once()) == (1 if failure in {"once", "always"} else 0)
+    assert asyncio.run(sender.send_pending_once()) == 0
+    if failure in {"none", "once"}:
+        assert "✅ 创建成功 1 条" in reply and crm.calls == 1
+    elif failure == "missing":
+        assert "反馈线索1：缺少「职务」" in reply and crm.calls == crm.search_calls == 0
+    else:
+        assert "需人工处理 1 条" in reply and "✅ 创建成功 0 条" in reply
+    call_count = len(attempts)
+    assert consume_submission_command(
+        session_factory, adapter, crm, event_id, command_text="重新提交待完善的线索",
+    ) == reply
+    assert len(attempts) == call_count and len(set(attempts)) <= 1
+    with session_factory() as session:
+        assert session.get(OutboxEvent, event_id).status == "succeeded"
+        notices = session.scalars(select(NotificationRecord)).all()
+    assert all(notice.status == "succeeded" and len(notice.content) <= 512 for notice in notices)
+    delivered = "\n".join(
+        call.args[1]["markdown"]["content"] for call in client.send_message.call_args_list
+    )
+    assert reply in delivered
+
+
+@pytest.mark.parametrize("failure", ["once", "business", "snapshot"])
+def test_retry_freezes_scope_and_preserves_partial_success(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    """验证多条部分成功继续处理，重放不扩大范围且最终保留已成功条目。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    first_id = _lead(session_factory, adapter)
+    first_record = adapter.get_records()[0]
+    second_record = adapter.create_record(
+        {**first_record.fields, "线索名称": "第二家反馈公司"}, actor=SmartTableActor.ROBOT,
+    )
+    with session_factory.begin() as session:
+        second = Lead(
+            source_message_id="message-12", source_segment_index=1,
+            original_capturing_sales_user_id="sales-1",
+            smart_table_owner_user_id="sales-1", smart_table_record_id=second_record.record_id,
+            lifecycle_state="pending_create", standard_company_name="第二家反馈公司",
+            field_values=dict(second_record.fields),
+        )
+        session.add(second)
+        session.flush()
+        second_id = second.id
+    event_id = _retry_command_event(session_factory, (first_id, second_id))
+    crm = MockCRMAdapter()
+    create = crm.create_lead
+    failed = False
+
+    def create_with_second_failure(
+        payload: Mapping[str, object], *, idempotency_key: str, crm_user_id: str,
+    ) -> CRMCreateResult:
+        """仅让第二家公司首次创建暂时失败，验证首条不被后续重放覆盖。"""
+        nonlocal failed
+        if failure == "business" and payload["name"] == "人工最终公司":
+            raise SopCRMError("isolated rejection")
+        if failure == "once" and payload["name"] == "第二家反馈公司" and not failed:
+            failed = True
+            raise ConnectionError("isolated")
+        return create(payload, idempotency_key=idempotency_key, crm_user_id=crm_user_id)
+
+    monkeypatch.setattr(crm, "create_lead", create_with_second_failure)
+    if failure == "snapshot":
+        get_record = adapter.get_record
+
+        def get_record_with_failure(record_id: str) -> SmartTableRecord | None:
+            """仅让第一条快照读取失败，验证后续条目依然创建。"""
+            if record_id == first_record.record_id:
+                raise ValueError("isolated snapshot failure")
+            return get_record(record_id)
+
+        monkeypatch.setattr(adapter, "get_record", get_record_with_failure)
+    first = consume_submission_command(
+        session_factory, adapter, crm, event_id, command_text="重新提交待完善的线索",
+    )
+    assert "✅ 创建成功 1 条" in first
+    assert ("🔄 重试中 1 条" if failure == "once" else "需人工处理 1 条") in first
+    # 重放期间历史选择改变；冻结目标仍须继续原来的第二条，而不能回退/扩大。
+    _retry_command_event(
+        session_factory, ("unselected-later-lead",), message_id="later", sequence=3,
+    )
+    final = consume_submission_command(
+        session_factory, adapter, crm, event_id, command_text="重新提交待完善的线索",
+    )
+    succeeded = 2 if failure == "once" else 1
+    assert f"✅ 创建成功 {succeeded} 条" in final
+    assert "反馈线索1" in final and "反馈线索2" in final
+    assert "unselected-later-lead" not in final and crm.calls == succeeded
+    with session_factory() as session:
+        expected_syncs = 1 if failure == "snapshot" else 2
+        assert session.scalar(select(func.count()).select_from(CrmSyncRecord)) == expected_syncs
+
+
+def test_retry_recovers_committed_success_and_new_command_reports_already_submitted(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证提交成功后崩溃的 Worker 恢复真实成功，新命令明确反馈已提交。"""
+    from app.ai.models import SubmissionIntent
+    from workers import tasks
+
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    event_id = _retry_command_event(session_factory, (lead_id,))
+    crm = MockCRMAdapter()
+    result = CrmSubmissionService(session_factory, adapter, crm).submit_incomplete_retry(
+        SubmissionCommand("重新提交待完善的线索", "sales-1", "retry-feedback"), (lead_id,),
+    )
+    assert result.succeeded == 1 and crm.calls == 1
+    # 通过真实 Worker 意图映射进入消费者；依赖均为测试库和 Mock，无外部副作用。
+    engine = session_factory.kw["bind"]
+    gateway = Mock()
+    gateway.classify_submission_intent.return_value = SubmissionIntent(
+        intent="SUBMIT_RETRY_INCOMPLETE",
+    )
+    monkeypatch.setattr(engine, "dispose", lambda: None)
+    monkeypatch.setattr(tasks, "_session_factory", lambda: (engine, session_factory))
+    monkeypatch.setattr(tasks, "_take_lead_outbox_claim", lambda *_args: True)
+    monkeypatch.setattr(tasks, "get_smart_table_adapter", lambda: adapter)
+    monkeypatch.setattr(tasks, "get_crm_adapter", lambda: crm)
+    monkeypatch.setattr(tasks, "get_ai_gateway", lambda: gateway)
+    reply = tasks.consume_lead_outbox_event.run(event_id, utc_now().isoformat())
+    assert "✅ 创建成功 1 条" in reply and crm.calls == 1
+    gateway.classify_submission_intent.assert_called_once_with("重新提交")
+    # 使用新的来源消息重复发命令时仍沿用历史选择，明确返回已提交而不创建新 generation。
+    next_event = _retry_command_event(
+        session_factory, (lead_id,), message_id="repeated-command", sequence=3,
+    )
+    repeated = consume_submission_command(
+        session_factory, adapter, crm, next_event, command_text="重新提交待完善的线索",
+    )
+    assert "该线索已完成提交，本次未重复创建" in repeated
+    assert "✅ 创建成功 0 条" in repeated and crm.calls == 1
+
+
+def test_retry_history_uses_latest_selection_and_excludes_unselected_results(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证最近选择已成功时不回溯旧组，伪造未勾选的待完善结果不进入重提。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    _retry_command_event(session_factory, (lead_id,))
+    event_id = _retry_command_event(session_factory, (lead_id,), message_id="latest", sequence=3)
+    with session_factory.begin() as session:
+        action = session.scalar(select(WecomAction).where(WecomAction.task_id == "prior-latest"))
+        action.context = {
+            **action.context,
+            "submission_results": [
+                {"lead_id": lead_id, "status": "created"},
+                {"lead_id": "unselected", "status": "incomplete"},
+            ],
+        }
+    crm = MockCRMAdapter()
+    reply = consume_submission_command(
+        session_factory, adapter, crm, event_id, command_text="重新提交待完善的线索",
+    )
+    assert reply == "当前没有上次已选择且待完善的线索需要重新提交。"
+    assert crm.calls == crm.search_calls == 0
 
 
 def test_retry_command_without_prior_incomplete_selection_is_safe_noop(
@@ -1644,8 +1901,8 @@ def test_company_preview_exactly_matches_table_and_does_not_call_crm(
         )
         assert preview is not None
         preview_content = str(preview.payload["markdown"]["content"])
-        assert "张华杰(JJ)" in preview_content
-        assert "杨康鑫" in preview_content
+        assert "负责人" not in preview_content and "创建人" not in preview_content
+        assert "客户行业：**未填写**" in preview_content
         assert "sales-1" not in preview_content
 
 
@@ -1883,10 +2140,10 @@ def test_batch_submission_sends_full_snapshot_markdown_before_short_selection_ca
     markdown = str(preview.payload["markdown"]["content"])
     options = card.payload["template_card"]["checkbox"]["option_list"]  # type: ignore[index]
     assert "**待提交线索明细（第 1/1 页）**" in markdown
-    assert "- 客户行业：机械加工" in markdown
-    assert "- 状态：待完善" in markdown
+    assert "客户行业：机械加工" in markdown
+    assert "提交状态：未提交" in markdown
     assert "- 缺少：职务" in markdown
-    assert "- AI待确认：[\"职务\"]" in markdown
+    assert "AI待确认" not in markdown
     assert [option["id"] for option in options] == [
         "batch-detail-lead-0",
         "batch-detail-lead-1",
