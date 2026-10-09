@@ -29,6 +29,7 @@ from app.smart_table.models import (
     SmartTableRecord,
     SmartTableSchema,
 )
+from app.smart_table.registry import READ_ONLY_SYSTEM_TIME_FIELDS, writable_smart_table_fields
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +209,7 @@ class WecomCliSmartTableAdapter:
     def get_schema(self) -> SmartTableSchema:
         """分页读取真实字段、类型和枚举选项。
 
-        返回：保留企业微信字段标识和选项标识的结构快照。
+        返回：保留可写字段标识和选项标识的结构快照；系统时间列不参与类型绑定。
         异常：字段类型不受冻结契约支持或 CLI 调用失败时抛出异常。
         副作用：调用 wecom-cli 的 fields list 接口。
         """
@@ -217,6 +218,10 @@ class WecomCliSmartTableAdapter:
             return self._schema
         fields: list[SmartTableField] = []
         for item in self._list_pages("fields"):
+            title = item.get("field_title")
+            if isinstance(title, str) and title.removeprefix("*") in READ_ONLY_SYSTEM_TIME_FIELDS:
+                # 原生只读列的真实类型尚未在 CLI 契约确认，按管理员确认名称排除，不猜测 DATE。
+                continue
             fields.append(self._parse_field(item))
         self._schema = SmartTableSchema(fields=tuple(fields))
         return self._schema
@@ -1299,7 +1304,7 @@ class WecomCliSmartTableAdapter:
         副作用：无。
         """
         converted: dict[str, object] = {}
-        for canonical_name, value in fields.items():
+        for canonical_name, value in writable_smart_table_fields(fields).items():
             field = schema.get_field(canonical_name)
             if field is None:
                 raise WecomCliProtocolError(f"智能表格未配置字段：{canonical_name}")

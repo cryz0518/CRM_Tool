@@ -14,6 +14,7 @@ from app.smart_table.models import (
     SmartTableRecord,
     SmartTableSchema,
 )
+from app.smart_table.registry import READ_ONLY_SYSTEM_TIME_FIELDS
 
 
 class MockSmartTableAdapter:
@@ -101,9 +102,12 @@ class MockSmartTableAdapter:
 
         参数：fields 为待写入字段；actor 为发起操作的主体；member_names 为可选的成员显示名快照。
         返回：创建后的不可变记录快照。
-        异常：销售无新增权限时抛出 SmartTablePermissionError；机器人未写负责人时抛出 ValueError。
+        异常：销售无权限或写只读时间时抛出 SmartTablePermissionError；缺负责人抛出 ValueError。
         副作用：向内存记录集新增记录并递增记录编号。
         """
+        # Mock 同样拒绝系统时间写入，让业务路径测试发现错误补丁而非静默吞掉。
+        if any(name.removeprefix("*") in READ_ONLY_SYSTEM_TIME_FIELDS for name in fields):
+            raise SmartTablePermissionError("系统创建时间字段只读，不能新增写值")
         # 销售关闭新增权限时，只有机器人或管理员能进入正式记录创建路径。
         if actor is SmartTableActor.SALES and not self._permissions.sales_can_create_records:
             raise SmartTablePermissionError("普通销售没有智能表格新增记录权限")
@@ -142,9 +146,12 @@ class MockSmartTableAdapter:
         参数：record_id 为目标记录标识；fields 为本轮增量字段补丁；skip_preflight 表示调用方已持有
         刚读取或刚创建的记录快照，可跳过重复预读。
         返回：更新后的不可变记录快照。
-        异常：记录不存在时抛出 SmartTableRecordNotFoundError。
+        异常：记录缺失抛出 SmartTableRecordNotFoundError；写只读时间抛出 SmartTablePermissionError。
         副作用：替换内存记录集中的目标记录快照。
         """
+        # 更新与新增同样拒绝系统时间，失败恢复也不能夹带旧后台审计值。
+        if any(name.removeprefix("*") in READ_ONLY_SYSTEM_TIME_FIELDS for name in fields):
+            raise SmartTablePermissionError("系统创建时间字段只读，不能更新写值")
         # 调用方持有新鲜快照时直接使用内存索引，模拟跳过适配器内重复预读。
         record = self._records.get(record_id) if skip_preflight else self.get_record(record_id)
         if record is None:

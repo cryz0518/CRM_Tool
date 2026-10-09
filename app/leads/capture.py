@@ -22,7 +22,7 @@ def initialize_lead_capture(session: Session, lead: Lead) -> None:
         session.get(IncomingMessage, lead.source_message_id) if lead.source_message_id else None
     )
     received_at = message.received_at if message is not None else lead.created_at
-    # SQLite 无时区读数按 UTC 解释，表格统一存秒级上海时间，后续不再改写。
+    # SQLite 无时区读数按 UTC 解释，后台独立保留秒级接收时间，不写入表格系统创建时间列。
     if received_at.tzinfo is None:
         received_at = received_at.replace(tzinfo=UTC)
     values["录入时间"] = received_at.astimezone(ZoneInfo("Asia/Shanghai")).strftime(

@@ -24,6 +24,7 @@ from app.leads.remarks import RemarksBuilder
 from app.messaging.models import BusinessAuditEvent, IncomingMessage
 from app.smart_table.adapter import SmartTableAdapter, SmartTableRecordNotFoundError
 from app.smart_table.models import SmartTableRecord
+from app.smart_table.registry import READ_ONLY_SYSTEM_TIME_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -354,8 +355,8 @@ class LeadReviewService:
                     candidate_fields.setdefault(field_name, pending_value)
             # T08 已完成结构和业务校验；本层仅决定是否可安全写入，不重新解释 AI 内容。
             for field_name, value in candidate_fields.items():
-                if field_name == "录入时间":
-                    # 接收时间属于系统元数据，AI、后续消息或重试都不得改写。
+                if field_name.removeprefix("*") in READ_ONLY_SYSTEM_TIME_FIELDS:
+                    # 后台接收时间与原生行创建时间独立，AI、后续消息或重试都不得写入系统列。
                     continue
                 if field_name == "备注":
                     # 备注只由本关口在正式字段保护完成后按冻结模板生成。
@@ -706,6 +707,9 @@ class LeadReviewService:
         """
         protected: set[str] = set()
         for field_name, source in provenance.items():
+            if field_name.removeprefix("*") in READ_ONLY_SYSTEM_TIME_FIELDS:
+                # 历史时间来源不参与人工修改判断，也不能覆盖后台首次接收时间。
+                continue
             if source.is_user_modified:
                 protected.add(field_name)
                 continue
