@@ -25,32 +25,16 @@ from app.ai.models import (
 from app.ai.persistence import AIExecutionRecorder, AIExecutionRecorderEvent
 from app.ai.provider import LLMProvider, LLMProviderError
 from app.core.failures import PermanentTaskFailure, RetryableTaskFailure
+from app.smart_table.enums import EnumSnapshotService, enum_snapshot_operation
 from app.smart_table.models import SmartTableFieldType
 from app.smart_table.registry import (
     AI_FIELD_ALIASES,
-    BUSINESS_LINE_OPTIONS,
-    COMMUNICATION_METHOD_OPTIONS,
     CRM_BUSINESS_FIELD_NAMES,
-    CUSTOMER_INDUSTRY_OPTIONS,
-    CUSTOMER_LEVEL_OPTIONS,
-    ENUM_FIELDS_WITH_OTHER,
-    INTERNATIONAL_CUSTOMER_OPTIONS,
-    LEAD_SOURCE_OPTIONS,
-    PROCESS_OPTIONS,
     REQUIRED_SMART_TABLE_FIELDS,
 )
 
 logger = logging.getLogger(__name__)
 
-_ENUM_OPTIONS = {
-    "业务线": BUSINESS_LINE_OPTIONS,
-    "线索来源": LEAD_SOURCE_OPTIONS,
-    "沟通方式": COMMUNICATION_METHOD_OPTIONS,
-    "客户行业": CUSTOMER_INDUSTRY_OPTIONS,
-    "客户级别": CUSTOMER_LEVEL_OPTIONS,
-    "工艺": PROCESS_OPTIONS,
-    "是否为国际客户": INTERNATIONAL_CUSTOMER_OPTIONS,
-}
 _FIELD_TYPES = {field.name: field.field_type for field in REQUIRED_SMART_TABLE_FIELDS}
 _PURCHASE_INTENT_PATTERN = re.compile(r"(?:采购|购买|买|想要|需要|计划采购|准备采购)")
 _PRODUCT_CATEGORY_TERMS = ("主营产品", "主要产品", "产品为", "产品是", "产品包括", "主营为")
@@ -64,6 +48,9 @@ def _enum_option_evidence_terms(field_name: str, option: str) -> tuple[str, ...]
     异常：无。
     副作用：无；不进行模糊匹配或外部查询。
     """
+    # 保留已有协作焊接场景的明确产品语义，但只映射到当前仍合法的协作机器人选项。
+    if field_name == "业务线" and option == "协作机器人":
+        return (option, "协作焊接机器人")
     if field_name != "工艺":
         return (option,)
     terms = {option}
@@ -114,7 +101,6 @@ _SENSITIVE_PATTERN = re.compile(
 _ENRICHMENT_ONLY_FIELD_NAMES = frozenset(
     {"城市/地区", "主营产品", "年销售额", "客户需求/痛点", "预算", "特殊要求"}
 )
-_ENRICHMENT_FIELD_NAMES = _ENRICHMENT_ONLY_FIELD_NAMES | ENUM_FIELDS_WITH_OTHER
 _MODEL_FIELD_ALIASES = AI_FIELD_ALIASES
 _FORBIDDEN_AI_CRM_FIELD_NAMES = frozenset({"备注"})
 _NON_QUARANTINABLE_AI_FIELD_NAMES = frozenset(
@@ -195,6 +181,7 @@ class AIGateway:
         high_confidence_threshold: float = 0.85,
         medium_confidence_threshold: float = 0.60,
         execution_recorder: AIExecutionRecorder | None = None,
+        enum_snapshots: EnumSnapshotService | None = None,
     ) -> None:
         """注入 Provider 与冻结为配置的调用、置信度参数。
 
@@ -212,7 +199,30 @@ class AIGateway:
         self._high_confidence_threshold = high_confidence_threshold
         self._medium_confidence_threshold = medium_confidence_threshold
         self._execution_recorder = execution_recorder
+        # 未显式注入时也读取部署选择的适配器，生产不能静默回退到 Mock 的静态选项。
+        if enum_snapshots is None:
+            from app.smart_table.dependencies import get_smart_table_adapter
+            from app.smart_table.enums import get_enum_snapshot_service
 
+            enum_snapshots = get_enum_snapshot_service(get_smart_table_adapter())
+        self._enum_snapshots = enum_snapshots
+
+    @property
+    def _enum_options(self) -> Mapping[str, tuple[str, ...]]:
+        """读取本次处理快照的合法选项；配置错误传播，不调用模型或修改记录。"""
+        return self._enum_snapshots.get_snapshot().options
+
+    @property
+    def _enum_fields_with_other(self) -> frozenset[str]:
+        """取得当前实际包含其他选项的业务字段；返回只读集合，不推断或添加表格选项。"""
+        return frozenset(name for name, options in self._enum_options.items() if "其他" in options)
+
+    @property
+    def _enrichment_field_names(self) -> frozenset[str]:
+        """返回固定备注素材字段与当前其他说明字段；不放行管理员新建列。"""
+        return _ENRICHMENT_ONLY_FIELD_NAMES | self._enum_fields_with_other
+
+    @enum_snapshot_operation
     def extract_fields(
         self,
         text: str,
@@ -907,8 +917,7 @@ class AIGateway:
                     raise AIGatewayTransportError("ai_transport_failed") from error
         raise AssertionError("不可达：循环在成功或耗尽时结束")
 
-    @staticmethod
-    def _output_json_schema() -> dict[str, object]:
+    def _output_json_schema(self) -> dict[str, object]:
         """构造仅供模型输出使用的受限 schema，不改变领域模型或业务校验。
 
         参数：无。
@@ -927,7 +936,7 @@ class AIGateway:
         for field_name, allowed_names in (
             ("crm_fields", allowed_crm_fields),
             ("confidence_by_field", allowed_crm_fields),
-            ("enrichment", tuple(_ENRICHMENT_FIELD_NAMES)),
+            ("enrichment", tuple(self._enrichment_field_names)),
         ):
             value_type = "number" if field_name == "confidence_by_field" else "string"
             properties[field_name] = {
@@ -940,15 +949,22 @@ class AIGateway:
                             else value_type
                         ),
                         **(
-                            {"items": {"type": "string", "enum": list(_ENUM_OPTIONS[name])}}
+                            {
+                                "items": {"type": "string", "enum": list(self._enum_options[name])},
+                                # 兼容旧单字符串输出时也必须限定合法选项，不能只约束数组项。
+                                "anyOf": [
+                                    {"type": "string", "enum": list(self._enum_options[name])},
+                                    {"type": "array"},
+                                ],
+                            }
                             if field_name == "crm_fields" and name == "工艺"
                             else {}
                         ),
                         # 仅 CRM 枚举字段附加当前注册表选项，其他字段维持字符串契约。
                         **(
-                            {"enum": list(_ENUM_OPTIONS[name])}
+                            {"enum": list(self._enum_options[name])}
                             if field_name == "crm_fields"
-                            and name in _ENUM_OPTIONS
+                            and name in self._enum_options
                             and name != "工艺"
                             else {}
                         ),
@@ -972,6 +988,11 @@ class AIGateway:
             }
             for field_name in allowed_crm_fields
         ]
+        # 多客户分段复用同一白名单、置信度与动态枚举版本，不能借通用字典绕过输出契约。
+        segment_schema = schema["$defs"]["LeadSegmentAnalysis"]
+        for name in ("crm_fields", "confidence_by_field", "enrichment"):
+            segment_schema["properties"][name] = properties[name]
+        segment_schema["allOf"] = schema["allOf"]
         return schema
 
     def _parse_schema_or_repair(
@@ -1020,8 +1041,8 @@ class AIGateway:
                     response.content, repaired_response.content, str(error)
                 ) from error
 
-    @staticmethod
     def _drop_invalid_enum_candidates(
+        self,
         analysis: LeadAnalysis,
     ) -> tuple[LeadAnalysis, dict[str, LeadFieldValue]]:
         """将不属于受控选项的枚举候选移出正式字段并标记待确认。
@@ -1035,7 +1056,7 @@ class AIGateway:
         confidences = dict(analysis.confidence_by_field)
         candidates: dict[str, LeadFieldValue] = {}
         for field_name, value in tuple(fields.items()):
-            options = _ENUM_OPTIONS.get(field_name)
+            options = self._enum_options.get(field_name)
             if options is None:
                 continue
             values = value if isinstance(value, list) else [value]
@@ -1075,10 +1096,11 @@ class AIGateway:
             if isinstance(value, list) and field_name != "工艺":
                 raise BusinessValidationError(f"字段不支持多值：{field_name}")
             # 枚举字段必须使用管理员配置的合法选项，失败后不再调用模型修正。
-            if field_name in _ENUM_OPTIONS:
+            if field_name in self._enum_options:
                 values = value if isinstance(value, list) else [value]
                 if not values or not all(
-                    isinstance(item, str) and item in _ENUM_OPTIONS[field_name] for item in values
+                    isinstance(item, str) and item in self._enum_options[field_name]
+                    for item in values
                 ):
                     raise BusinessValidationError(f"枚举值不合法：{field_name}")
             # 联系方式格式由确定性规则校验，避免模型用猜测值绕过约束。
@@ -1096,11 +1118,11 @@ class AIGateway:
                 raise BusinessValidationError(f"置信度缺失或不合法：{field_name}")
         for field_name in analysis.enrichment:
             # 补充信息只能是冻结备注模板可消费、且要求模型保留原文证据的键。
-            if field_name not in _ENRICHMENT_FIELD_NAMES:
+            if field_name not in self._enrichment_field_names:
                 raise BusinessValidationError(f"未知补充信息字段：{field_name}")
 
-    @staticmethod
     def _normalize_communication_candidate(
+        self,
         analysis: LeadAnalysis, source_text: str
     ) -> LeadAnalysis:
         """在枚举校验前归一化或丢弃不可靠的沟通方式候选。
@@ -1111,14 +1133,15 @@ class AIGateway:
         副作用：记录被丢弃候选的字段类型，不记录客户原文或候选值。
         """
         candidate = analysis.crm_fields.get("沟通方式")
-        if candidate is None or candidate in COMMUNICATION_METHOD_OPTIONS:
+        if candidate is None or candidate in self._enum_options["沟通方式"]:
             return analysis
         if candidate not in _COMMUNICATION_ALIASES:
             # 未注册且不属于有限别名集合的值仍由统一业务校验拦截，避免静默猜测。
             return analysis
 
         matched_values = {
-            expected for keyword, expected in _COMMUNICATION_EVIDENCE if keyword in source_text
+            expected for keyword, expected in _COMMUNICATION_EVIDENCE
+            if keyword in source_text and expected in self._enum_options["沟通方式"]
         }
         fields = dict(analysis.crm_fields)
         confidences = dict(analysis.confidence_by_field)
@@ -1150,7 +1173,7 @@ class AIGateway:
         fields = dict(analysis.crm_fields)
         confidences = dict(analysis.confidence_by_field)
         recovered_fields: list[str] = []
-        for field_name, options in _ENUM_OPTIONS.items():
+        for field_name, options in self._enum_options.items():
             matched = [
                 option
                 for option in options
@@ -1205,8 +1228,8 @@ class AIGateway:
             update={"crm_fields": fields, "confidence_by_field": confidences}
         )
 
-    @staticmethod
     def _drop_enum_candidates_without_evidence(
+        self,
         analysis: LeadAnalysis, source_text: str
     ) -> LeadAnalysis:
         """删除没有原文语义证据的枚举候选，阻止模型臆造业务属性。
@@ -1219,7 +1242,7 @@ class AIGateway:
         fields = dict(analysis.crm_fields)
         confidences = dict(analysis.confidence_by_field)
         dropped_fields: list[str] = []
-        for field_name in _ENUM_OPTIONS:
+        for field_name in self._enum_options:
             # 非法枚举只有在原文明确带字段语义时才交给业务校验；无语义证据的
             # 模型臆造直接丢弃，避免一个错误枚举阻断同一消息的可靠身份字段。
             if field_name not in analysis.crm_fields:
@@ -1234,11 +1257,22 @@ class AIGateway:
                 # 行业和级别即使是合法选项，也不能从普通叙述或产品常识反推。
                 evidence_ok = all(
                     AIGateway._has_explicit_enum_evidence(field_name, item, source_text)
-                    or (field_name == "客户行业" and item in source_text)
                     for item in values
                 )
-            elif all(item in _ENUM_OPTIONS[field_name] for item in values):
-                continue
+            elif all(item in self._enum_options[field_name] for item in values):
+                # 合法名称也不能凭空猜测；保留原文选项及受控别名证据，置信度不绕过来源检查。
+                evidence_ok = all(
+                    any(
+                        term in source_text
+                        for term in _enum_option_evidence_terms(field_name, item)
+                    )
+                    or (
+                        field_name == "沟通方式"
+                        and self._has_explicit_communication_evidence(source_text, item)
+                    )
+                    or field_name == "是否为国际客户"
+                    for item in values
+                )
             else:
                 evidence_ok = all(
                     AIGateway._has_explicit_enum_evidence(field_name, item, source_text)
@@ -1289,6 +1323,12 @@ class AIGateway:
                 rf"业务线\s*[:：是为]?\s*{escaped}",
                 rf"(?:想|计划|准备|考虑|希望|打算)(?:要)?(?:上|用|采用|引入|部署|采购|购买)?"
                 rf"[^。；，,\n]{{0,16}}{escaped}",
+            )
+        elif field_name == "客户行业":
+            # 公司名或产品中出现行业词不算行业结论，须有明确从事该行业的语义。
+            patterns = (
+                rf"(?:客户行业|所属行业)\s*[:：是为]?\s*{escaped}",
+                rf"(?:主要)?(?:从事|经营|主营)[^。；，,\n]{{0,16}}{escaped}",
             )
         else:
             # 其他枚举只接受明确字段标签，避免普通叙述被擅自提升为业务字段。
@@ -1359,8 +1399,8 @@ class AIGateway:
             isinstance(item, str) and item.strip() and item in source_text for item in values
         )
 
-    @staticmethod
     def _normalize_enum_candidate(
+        self,
         field_name: str, value: LeadFieldValue, source_text: str
     ) -> tuple[LeadFieldValue | None, str | None]:
         """将枚举候选归一化为合法选项，必要时落到“其他”并保留原文。
@@ -1370,7 +1410,7 @@ class AIGateway:
         异常：无；不合法候选不会抛出业务异常。
         副作用：无；不修改传入对象。
         """
-        options = _ENUM_OPTIONS.get(field_name)
+        options = self._enum_options.get(field_name)
         if options is None:
             return value, None
         raw_values = value if isinstance(value, list) else [value]
@@ -1380,7 +1420,7 @@ class AIGateway:
         unknown_values = [
             item for item in raw_values if item not in options and item in source_text
         ]
-        if len(known_values) != len(raw_values) and field_name not in ENUM_FIELDS_WITH_OTHER:
+        if len(known_values) != len(raw_values) and field_name not in self._enum_fields_with_other:
             return None, None
         if unknown_values:
             if "其他" not in options:
@@ -1398,8 +1438,8 @@ class AIGateway:
             None,
         )
 
-    @staticmethod
     def _normalize_enrichment_field_placement(
+        self,
         analysis: LeadAnalysis, source_text: str
     ) -> LeadAnalysis:
         """把模型误放入错误位置的备注素材安全归入 enrichment。
@@ -1460,7 +1500,7 @@ class AIGateway:
                 elif existing_value != text_value:
                     conflicted_fields.append(alias)
                 continue
-            normalized_value, detail = AIGateway._normalize_enum_candidate(
+            normalized_value, detail = self._normalize_enum_candidate(
                 target_field, value, source_text
             )
             if normalized_value is None:
@@ -1492,7 +1532,7 @@ class AIGateway:
                 elif existing_value != value:
                     conflicted_fields.append(alias)
                 continue
-            normalized_value, detail = AIGateway._normalize_enum_candidate(
+            normalized_value, detail = self._normalize_enum_candidate(
                 target_field, value, source_text
             )
             if normalized_value is None:
@@ -1560,7 +1600,7 @@ class AIGateway:
         # Provider 可能绕过输出 schema，将未知键直接放入 enrichment；未知键不能
         # 进入任何业务字段，也不能被当作新的字段契约，只能安全丢弃。
         for field_name in tuple(enrichment):
-            if field_name in _ENRICHMENT_FIELD_NAMES:
+            if field_name in self._enrichment_field_names:
                 continue
 
             value = enrichment.pop(field_name)
@@ -1629,8 +1669,8 @@ class AIGateway:
             }
         )
 
-    @staticmethod
     def _recover_explicit_enrichment_fields(
+        self,
         analysis: LeadAnalysis, source_text: str
     ) -> LeadAnalysis:
         """从明确自然语言短语恢复主营产品与客户需求备注素材。
@@ -1663,7 +1703,7 @@ class AIGateway:
                 demand = re.split(r"[，,；;](?=预算|投入金额|项目金额)", demand, maxsplit=1)[0]
                 demand = demand.strip(" ，,；;")
                 has_specific_intent = _PURCHASE_INTENT_PATTERN.search(demand) is not None or any(
-                    option in demand for option in PROCESS_OPTIONS
+                    option in demand for option in self._enum_options["工艺"]
                 )
                 if demand and has_specific_intent:
                     enrichment["客户需求/痛点"] = demand
@@ -1707,7 +1747,7 @@ class AIGateway:
         for field_name, value in tuple(fields.items()):
             confidence = analysis.confidence_by_field.get(field_name)
             field_type = _FIELD_TYPES.get(field_name)
-            options = _ENUM_OPTIONS.get(field_name)
+            options = self._enum_options.get(field_name)
             if (
                 confidence is None
                 or confidence >= self._medium_confidence_threshold
@@ -1749,8 +1789,8 @@ class AIGateway:
             return analysis
         return analysis.model_copy(update={"crm_fields": fields, "enrichment": enrichment})
 
-    @staticmethod
     def _can_prefill_low_confidence_enum(
+        self,
         field_name: str, value: LeadFieldValue
     ) -> bool:
         """判断低置信度枚举候选是否满足单选或多选预填数量限制。
@@ -1761,7 +1801,7 @@ class AIGateway:
         副作用：无。
         """
         field_type = _FIELD_TYPES.get(field_name)
-        options = _ENUM_OPTIONS.get(field_name)
+        options = self._enum_options.get(field_name)
         if field_type is SmartTableFieldType.SINGLE_SELECT:
             return isinstance(value, str) and value in (options or ())
         if field_type is SmartTableFieldType.MULTI_SELECT:
@@ -1838,8 +1878,8 @@ class AIGateway:
                 low_candidates[field_name] = value
         return fields, tuple(pending), low_candidates, tuple(pending_prefill_allowed)
 
-    @staticmethod
     def _validate_enrichment_evidence(
+        self,
         analysis: LeadAnalysis, source_text: str
     ) -> dict[str, str]:
         """确认并筛选可由当前原文逐字定位的补充信息事实。
@@ -1858,7 +1898,7 @@ class AIGateway:
             else:
                 candidate_values = [candidate_value]
             if (
-                field_name in ENUM_FIELDS_WITH_OTHER
+                field_name in self._enum_fields_with_other
                 and "其他" not in candidate_values
             ):
                 # 枚举实际说明只能附着在同名“其他”字段上，避免无关文本进入备注。
@@ -1946,7 +1986,7 @@ class AIGateway:
         异常：无。
         副作用：无。
         """
-        return any(
+        return AIGateway._has_explicit_enum_evidence("沟通方式", value, text) or any(
             keyword in text and value == expected
             for keyword, expected in _COMMUNICATION_EVIDENCE
         )
@@ -2007,8 +2047,7 @@ class AIGateway:
             f"{json.dumps(dict(context_fields), ensure_ascii=False)}。"
         )
 
-    @staticmethod
-    def _field_contract_instructions() -> str:
+    def _field_contract_instructions(self) -> str:
         """返回初始提取与结构修复共用的冻结 CRM 字段输出约束。
 
         参数：无。
@@ -2018,7 +2057,8 @@ class AIGateway:
         """
         allowed_names = "、".join(CRM_BUSINESS_FIELD_NAMES)
         enum_options = "；".join(
-            f"{field_name}：{'、'.join(options)}" for field_name, options in _ENUM_OPTIONS.items()
+            f"{field_name}：{'、'.join(options)}"
+            for field_name, options in self._enum_options.items()
         )
         return (
             "crm_fields 的 key 只能是以下 CRM 注册表中的中文原名："
@@ -2045,9 +2085,9 @@ class AIGateway:
             "不能带字段标签、解释文字、其他字段值或整句原文。"
             "业务线、客户行业、工艺、客户级别和沟通方式必须根据上下文映射到注册表合法选项；"
             "语义不足以区分候选时省略，不得用相邻字段或关键词强行推断。"
-            "例如‘做电气自动化’属于客户行业；若不在行业枚举中，客户行业填写‘其他’，"
+            "例如‘做电气自动化’属于客户行业；若不在行业枚举且当前提供‘其他’选项，客户行业填写‘其他’，"
             "并将连续原文‘电气自动化’放入 enrichment 的‘客户行业’，禁止输出‘业务领域’字段。"
-            "例如‘主要想做喷涂方面’属于工艺，工艺填写合法选项‘喷涂’，不得创建新的工艺字段。"
+            "例如‘主要想做喷涂方面’属于工艺，工艺仅在当前选项含‘喷涂’时填写该值，不得创建新的工艺字段。"
             "手机号、电话、邮箱、日期和地点分别按各自格式识别，不能把姓名、职位、公司名或说明文字混入。"
             "主营产品、客户需求/痛点、预算、年销售额和特殊要求属于 enrichment，"
             "按语义归类但 value 必须保留当前原文中的连续事实片段；模型摘要或扩写不得写入。"
@@ -2066,7 +2106,7 @@ class AIGateway:
             "并使用相同中文字段名。"
             f"枚举字段只能使用以下注册表选项：{enum_options}。"
             "enrichment 的 key 只能是城市/地区、主营产品、年销售额、客户需求/痛点、预算、特殊要求，"
-            f"以及取值为“其他”的枚举字段（{'、'.join(sorted(ENUM_FIELDS_WITH_OTHER))}）；"
+            f"以及取值为“其他”的枚举字段（{'、'.join(sorted(self._enum_fields_with_other))}）；"
             "当枚举字段取值为“其他”且原文存在明确实际内容时，必须使用同名 key 保存原文连续片段；"
             "实际内容无法确定时省略该 enrichment，由备注生成器写入“字段名：其他（请补充）”；"
             "每个 value 必须是当前原文中连续出现的单个字符串片段，没有证据时省略。"

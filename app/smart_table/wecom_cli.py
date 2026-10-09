@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
+from app.core.config import get_settings
 from app.core.failures import PermanentTaskFailure, RetryableTaskFailure
 from app.core.logging import LOG_CONTEXT
 from app.smart_table.adapter import (
@@ -21,6 +22,7 @@ from app.smart_table.adapter import (
     SmartTablePermissionError,
     SmartTableRecordNotFoundError,
 )
+from app.smart_table.enums import BUSINESS_ENUM_FIELDS, EnumSnapshotService
 from app.smart_table.models import (
     SmartTableField,
     SmartTableFieldType,
@@ -29,7 +31,12 @@ from app.smart_table.models import (
     SmartTableRecord,
     SmartTableSchema,
 )
-from app.smart_table.registry import READ_ONLY_SYSTEM_TIME_FIELDS, writable_smart_table_fields
+from app.smart_table.registry import (
+    CRM_BUSINESS_FIELD_NAMES,
+    READ_ONLY_SYSTEM_TIME_FIELDS,
+    REQUIRED_SMART_TABLE_FIELDS,
+    writable_smart_table_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +211,10 @@ class WecomCliSmartTableAdapter:
         self._require_owner_field = require_owner_field
         self._runner = runner or self._run_subprocess
         self._schema: SmartTableSchema | None = None
+        # 单一 TTL 由快照服务负责，写入和 AI 可固定同一处理版本。
+        self._enum_snapshots = EnumSnapshotService(
+            self._load_schema, get_settings().smart_table_enum_cache_seconds
+        )
         self._recent_written_records: dict[str, tuple[float, SmartTableRecord]] = {}
 
     def get_schema(self) -> SmartTableSchema:
@@ -213,9 +224,11 @@ class WecomCliSmartTableAdapter:
         异常：字段类型不受冻结契约支持或 CLI 调用失败时抛出异常。
         副作用：调用 wecom-cli 的 fields list 接口。
         """
-        if self._schema is not None:
-            # 字段绑定在进程生命周期内保持同一快照，避免一次读写的显示名映射发生漂移。
-            return self._schema
+        self._schema = self._enum_snapshots.get_schema()
+        return self._schema
+
+    def _load_schema(self) -> SmartTableSchema:
+        """分页重新读取真实结构；返回不可变快照，CLI 异常传播，不写记录或修改管理员配置。"""
         fields: list[SmartTableField] = []
         for item in self._list_pages("fields"):
             title = item.get("field_title")
@@ -223,8 +236,7 @@ class WecomCliSmartTableAdapter:
                 # 原生只读列的真实类型尚未在 CLI 契约确认，按管理员确认名称排除，不猜测 DATE。
                 continue
             fields.append(self._parse_field(item))
-        self._schema = SmartTableSchema(fields=tuple(fields))
-        return self._schema
+        return SmartTableSchema(fields=tuple(fields))
 
     def get_permissions(self) -> SmartTablePermissions:
         """返回管理员已核验并通过环境变量注入的销售权限快照。
@@ -1305,9 +1317,23 @@ class WecomCliSmartTableAdapter:
         """
         converted: dict[str, object] = {}
         for canonical_name, value in writable_smart_table_fields(fields).items():
+            # 规范名称冲突不得按顺序选择列，防止写错管理员重建的同名字段。
+            if sum(
+                field.name.removeprefix("*") == canonical_name.removeprefix("*")
+                for field in schema.fields
+            ) > 1:
+                raise ValueError(f"字段同名冲突：{canonical_name}")
             field = schema.get_field(canonical_name)
             if field is None:
                 raise WecomCliProtocolError(f"智能表格未配置字段：{canonical_name}")
+            if canonical_name in BUSINESS_ENUM_FIELDS:
+                # 六个业务列的类型固定，管理员改成文本不能绕过选择值校验。
+                expected = next(
+                    item.field_type for item in REQUIRED_SMART_TABLE_FIELDS
+                    if item.name == canonical_name
+                )
+                if field.field_type is not expected:
+                    raise ValueError(f"字段类型不匹配：{canonical_name}")
             # 地理位置必须包含企业微信地图对象；普通地址字符串不能伪造地图标识。
             # 无法构造地图对象时跳过该字段，留给人工补充。
             if field.field_type is SmartTableFieldType.LOCATION and not self._is_writable_location(
@@ -1397,13 +1423,23 @@ class WecomCliSmartTableAdapter:
                 if not isinstance(item, str) or not item:
                     raise ValueError(f"选择字段必须传入非空文本列表：{canonical_name}")
                 values.append(item)
+            if canonical_name == "AI待确认" and any(
+                item not in CRM_BUSINESS_FIELD_NAMES for item in values
+            ):
+                raise ValueError("AI待确认只能包含固定 CRM 字段名称")
             if field.field_type is SmartTableFieldType.SINGLE_SELECT and len(values) != 1:
                 raise ValueError(f"单选字段必须恰好传入一个合法选项：{canonical_name}")
             if not field.options:
-                # 兼容旧测试替身缺少 options 的响应；真实表结构 readiness 会拒绝缺少选项。
-                cli_value = value
+                # 真实写入不能以测试兼容为由绕过合法选项校验。
+                raise ValueError(f"字段枚举选项为空：{canonical_name}")
             else:
                 options = {option.name.removeprefix("*"): option for option in field.options}
+                if len(options) != len(field.options):
+                    raise ValueError(f"字段枚举同名冲突：{canonical_name}")
+                if any(
+                    not name.strip() or not option.option_id for name, option in options.items()
+                ):
+                    raise ValueError(f"字段枚举选项为空：{canonical_name}")
                 try:
                     cli_value = [
                         {"id": options[item].option_id, "text": options[item].name}

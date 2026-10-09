@@ -8,8 +8,8 @@ from time import monotonic, perf_counter
 
 from app.core.config import get_settings
 from app.smart_table.adapter import SmartTableAdapter, SmartTableAdapterConfigurationError
+from app.smart_table.enums import schema_configuration_issues
 from app.smart_table.models import SmartTableReadinessReport
-from app.smart_table.registry import REQUIRED_SMART_TABLE_FIELDS
 
 logger = logging.getLogger(__name__)
 _readiness_cache_lock = Lock()
@@ -82,28 +82,8 @@ class SmartTableReadinessChecker:
             self._log_report(adapter_name, started_at, report)
             return report
 
-        issues: list[str] = []
-
-        for requirement in REQUIRED_SMART_TABLE_FIELDS:
-            # 只读系统时间不在必需写入注册表；业务字段仍按名称、类型严格校验。
-            field = schema.get_field(requirement.name)
-            if field is None:
-                issues.append(f"缺少必需字段：{requirement.name}")
-                continue
-            if field.field_type is not requirement.field_type:
-                issues.append(
-                    "字段类型不匹配："
-                    f"{requirement.name}，期望 {requirement.field_type.value}，"
-                    f"实际 {field.field_type.value}"
-                )
-                continue
-
-            # 仅要求项目依赖的选项存在，允许管理员保留不影响业务的额外选项。
-            # AI待确认的选项复用管理员字段展示名；必填字段的 `*` 前缀不参与匹配。
-            configured_option_names = {option.name.removeprefix("*") for option in field.options}
-            for option in requirement.required_options:
-                if option not in configured_option_names:
-                    issues.append(f"字段枚举选项缺失：{requirement.name}，缺少 {option}")
+        # 六个业务字段动态校验；默认值、系统枚举与固定类型仍是 readiness 硬约束。
+        issues = list(schema_configuration_issues(schema))
 
         # 普通销售只能经机器人创建或废弃记录，权限偏差会破坏审计和记录级隔离。
         if permissions.sales_can_create_records:

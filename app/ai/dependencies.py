@@ -7,6 +7,8 @@ from app.ai.persistence import AIExecutionRecorder
 from app.ai.provider import MockLLMProvider, QwenLLMProvider
 from app.core.config import get_settings
 from app.core.provider_policy import get_provider_policy
+from app.smart_table.dependencies import get_smart_table_adapter
+from app.smart_table.enums import get_enum_snapshot_service
 
 
 def get_ai_gateway(*, execution_recorder: AIExecutionRecorder | None = None) -> AIGateway:
@@ -38,4 +40,5 @@ def get_ai_gateway(*, execution_recorder: AIExecutionRecorder | None = None) -> 
         high_confidence_threshold=settings.ai_high_confidence_threshold,
         medium_confidence_threshold=settings.ai_medium_confidence_threshold,
         execution_recorder=execution_recorder,
+        enum_snapshots=get_enum_snapshot_service(get_smart_table_adapter()),
     )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Generator, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -14,6 +15,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+import app.smart_table.enums as enum_module
 from app.ai.gateway import AIGateway
 from app.ai.models import ExtractedLeadPatch, LeadAnalysis
 from app.ai.provider import LLMProviderError, MockLLMProvider
@@ -46,14 +48,180 @@ from app.messaging.models import (
     SalesAuthorization,
 )
 from app.notifications.outbound import WecomOutboundNotificationSender
+from app.smart_table.adapter import SmartTableActor
+from app.smart_table.enums import EnumSnapshotService
 from app.smart_table.mock import MockSmartTableAdapter
-from app.smart_table.models import SmartTableRecord
+from app.smart_table.models import SmartTableOption, SmartTableRecord
 from app.smart_table.registry import DEFAULT_LEAD_BUSINESS_VALUES, build_required_smart_table_schema
 from app.smart_table.wecom_cli import (
     SmartTableWriteVerificationError,
     WecomCliProcessError,
     WecomCliTransportError,
 )
+
+
+def test_dynamic_industry_and_process_write_then_preserve_user_edit_after_refresh(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """新增行业与多选工艺走完整录入链路，刷新改名后仍永久保护销售人工修改。"""
+    schema = build_required_smart_table_schema()
+    additions = {"客户行业": "半导体", "工艺": "激光切割"}
+    schema = replace(schema, fields=tuple(
+        replace(field, options=(*field.options, SmartTableOption("new-" + field.name, additions[
+            field.name
+        ]))) if field.name in additions else field for field in schema.fields
+    ))
+    adapter = MockSmartTableAdapter(schema=schema)
+    provider = MockLLMProvider([
+        json.dumps({
+            "intent": "NEW_LEAD", "customer_reference": {"company": "测试制造公司"},
+            "crm_fields": {"线索名称": "测试制造公司", "客户行业": "半导体", "工艺": ["激光切割"]},
+            "confidence_by_field": {"线索名称": 0.99, "客户行业": 0.99, "工艺": 0.99},
+            "enrichment": {}, "conflicts": [], "warnings": [],
+        }, ensure_ascii=False),
+        json.dumps({
+            "intent": "UPDATE_LEAD", "customer_reference": {"company": "测试制造公司"},
+            "crm_fields": {"客户行业": "芯片制造"}, "confidence_by_field": {"客户行业": 0.99},
+            "enrichment": {}, "conflicts": [], "warnings": [],
+        }, ensure_ascii=False),
+    ])
+    service = FirstTextLeadWorkspaceService(
+        session_factory, adapter, ai_gateway=AIGateway(provider)
+    )
+    event_id = persist_outbox_text(
+        session_factory, message_id="dynamic-first", sales_user_id="sales-dynamic",
+        text="测试制造公司，客户行业：半导体，工艺：激光切割",
+    )
+    first = service.consume(event_id)
+    assert first.status is LeadProcessingStatus.CREATED
+    record = adapter.get_records()[0]
+    assert record.fields["客户行业"] == "半导体" and record.fields["工艺"] == ["激光切割"]
+    adapter.update_record(record.record_id, {"客户行业": "医疗"})
+    adapter._schema = replace(schema, fields=tuple(
+        replace(field, options=tuple(
+            replace(option, name="芯片制造") if option.name == "半导体" else option
+            for option in field.options
+        )) if field.name == "客户行业" else field for field in schema.fields
+    ))
+    service._enum_snapshots._deadline = 0
+    next_id = persist_outbox_text(
+        session_factory, message_id="dynamic-next", sales_user_id="sales-dynamic",
+        text="测试制造公司补充，客户行业：芯片制造",
+    )
+    assert service.consume(next_id).status is LeadProcessingStatus.UPDATED
+    assert len(adapter.get_records()) == 1
+    assert adapter.get_record(record.record_id).fields["客户行业"] == "医疗"
+    with session_factory() as session:
+        provenance = session.scalar(select(LeadFieldProvenance).where(
+            LeadFieldProvenance.lead_id == first.lead_id,
+            LeadFieldProvenance.field_name == "客户行业",
+        ))
+        assert provenance is not None and provenance.is_user_modified
+
+
+def test_sequential_messages_refresh_enum_snapshot_after_ttl_expiry(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """连续消费间 TTL 到期后刷新选项；保留销售顺序、模型重试及重复消费幂等。"""
+    now = [10.0]
+    monkeypatch.setattr(enum_module, "monotonic", lambda: now[0])
+    original_schema = build_required_smart_table_schema()
+    updated_schema = replace(
+        original_schema,
+        fields=tuple(
+            replace(
+                field,
+                options=(*field.options, SmartTableOption("industry-semiconductor", "半导体")),
+            )
+            if field.name == "客户行业"
+            else field
+            for field in original_schema.fields
+        ),
+    )
+    adapter = MockSmartTableAdapter(schema=original_schema)
+    snapshots = EnumSnapshotService(adapter.get_schema, ttl_seconds=300)
+    adapter._enum_snapshots = snapshots
+
+    def response(company: str, industry: str) -> str:
+        """构造包含原文行业候选的单线索响应；不调用外部模型。"""
+        return json.dumps(
+            {
+                "intent": "NEW_LEAD",
+                "customer_reference": {"company": company},
+                "crm_fields": {"线索名称": company, "客户行业": industry},
+                "confidence_by_field": {"线索名称": 0.99, "客户行业": 0.99},
+                "enrichment": {},
+                "conflicts": [],
+                "warnings": [],
+            },
+            ensure_ascii=False,
+        )
+
+    provider = MockLLMProvider(
+        [
+            LLMProviderError("temporary"),
+            response("甲公司", "医疗"),
+            response("西安芯汇半导体", "半导体"),
+        ]
+    )
+    original_create = adapter.create_record
+    created_count = 0
+
+    def create_and_change_options(
+        fields: Mapping[str, object],
+        *,
+        actor: SmartTableActor,
+        member_names: Mapping[str, str] | None = None,
+    ) -> SmartTableRecord:
+        """在首条消息写入后模拟管理员改表，并令共享 TTL 到期。"""
+        nonlocal created_count
+        record = original_create(fields, actor=actor, member_names=member_names)
+        created_count += 1
+        if created_count == 1:
+            adapter._schema = updated_schema
+            now[0] = 310.0
+        return record
+
+    monkeypatch.setattr(adapter, "create_record", create_and_change_options)
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        ai_gateway=AIGateway(provider, enum_snapshots=snapshots),
+    )
+    first_event_id = persist_outbox_text(
+        session_factory,
+        message_id="enum-refresh-first",
+        sales_user_id="enum-refresh-sales",
+        text="甲公司，客户行业：医疗",
+    )
+    second_event_id = persist_outbox_text(
+        session_factory,
+        message_id="enum-refresh-second",
+        sales_user_id="enum-refresh-sales",
+        text="西安芯汇半导体，客户行业：半导体",
+    )
+
+    first = service.consume(first_event_id)
+
+    assert first.status is LeadProcessingStatus.CREATED
+    assert [record.fields["客户行业"] for record in adapter.get_records()] == ["医疗", "半导体"]
+    industry_schema = provider.requests[0].json_schema["properties"]["crm_fields"]["properties"][
+        "客户行业"
+    ]
+    refreshed_industry_schema = provider.requests[2].json_schema["properties"]["crm_fields"]
+    assert "半导体" not in industry_schema["enum"]
+    assert provider.requests[0].json_schema == provider.requests[1].json_schema
+    assert "半导体" in refreshed_industry_schema["properties"]["客户行业"]["enum"]
+    assert len(provider.requests) == 3
+    with session_factory() as session:
+        events = list(session.scalars(select(OutboxEvent).order_by(OutboxEvent.sequence)))
+    assert [event.id for event in events] == [first_event_id, second_event_id]
+    assert [event.sequence for event in events] == [1, 2]
+    assert [event.status for event in events] == ["succeeded", "succeeded"]
+
+    service.consume(first_event_id)
+    assert len(provider.requests) == 3
+    assert len(adapter.get_records()) == 2
 
 
 @pytest.fixture
@@ -1618,7 +1786,7 @@ def test_same_lead_three_messages_create_once_and_merge_incremental_fields(
         session_factory,
         message_id="message-three-step-third",
         sales_user_id="sales-1",
-        text="公司三补充工艺，预算16万",
+        text="公司三补充工艺：视觉检测，预算16万",
     )
     third = service.consume(third_event_id)
 

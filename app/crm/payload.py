@@ -11,6 +11,16 @@ class CrmPayloadError(ValueError):
     """表示 CRM 字段映射、字典值或格式校验失败。"""
 
 
+class CrmEnumMappingError(CrmPayloadError):
+    """表示表格选项尚无确定 CRM 字典映射，不能使用企业微信选项标识代替。"""
+
+    def __init__(self, field_name: str, value: object) -> None:
+        """保存字段与候选并生成中文缺映射提示；返回无，仅初始化本地异常。"""
+        self.field_name = field_name
+        self.value = value
+        super().__init__(f"{field_name} 缺少 CRM 字典映射：{value}")
+
+
 CRM_FIELD_NAMES = {
     "业务线": "businessLine",
     "线索名称": "name",
@@ -180,7 +190,7 @@ class CrmPayloadBuilder:
         副作用：无。
         """
         if not isinstance(value, str) or value not in options:
-            raise CrmPayloadError(f"{field_name} 的 CRM 字典值未确认：{value}")
+            raise CrmEnumMappingError(field_name, value)
         return options[value]
 
     @staticmethod

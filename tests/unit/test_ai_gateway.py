@@ -760,7 +760,6 @@ def test_gateway_normalizes_registered_field_aliases_without_creating_fields() -
 
     assert result.fields == {
         "线索名称": "长广溪智造",
-        "业务线": "协作机器人",
         "客户行业": "其他",
         "工艺": ["喷涂"],
     }
@@ -1234,7 +1233,7 @@ def test_gateway_drops_enrichment_without_verbatim_source_evidence() -> None:
 
     result = AIGateway(provider).extract_fields("客户希望后续沟通")
 
-    assert result.fields == {"线索名称": "长广溪智造", "业务线": "协作机器人"}
+    assert result.fields == {"线索名称": "长广溪智造"}
     assert result.enrichment == {}
     assert len(provider.requests) == 1
 
@@ -1370,7 +1369,6 @@ def test_gateway_extracts_multiple_fields_from_unstructured_message() -> None:
                     "联系人": "沈秋冰",
                     "手机": "18959247813",
                     "业务线": "协作机器人",
-                    "客户行业": "汽车",
                     "工艺": "其他",
                 },
                 enrichment={
@@ -1383,7 +1381,6 @@ def test_gateway_extracts_multiple_fields_from_unstructured_message() -> None:
                     "联系人": 0.95,
                     "手机": 0.99,
                     "业务线": 0.90,
-                    "客户行业": 0.90,
                     "工艺": 0.80,
                 },
             )
@@ -1397,7 +1394,6 @@ def test_gateway_extracts_multiple_fields_from_unstructured_message() -> None:
         "联系人": "沈秋冰",
         "手机": "18959247813",
         "业务线": "协作机器人",
-        "客户行业": "汽车",
         "工艺": "其他",
     }
     assert result.enrichment == {

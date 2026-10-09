@@ -1274,6 +1274,7 @@ def format_submission_reply(
         "not_submitted": "⚪ 未提交",
     }
     reason_text = {
+        "crm_enum_mapping_missing": "智能表格选项缺少 CRM 字典映射，请联系管理员配置后重新提交",
         "duplicate_confirmation_required": "CRM 已存在同公司线索，请在后续确认卡决定是否覆盖",
         "crm_user_mapping_missing": "当前负责人无法映射 CRM 用户，请联系管理员",
         "company_identity_conflict": "公司身份与 CRM 查重结果不一致，需要人工处理",

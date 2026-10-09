@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Mapping
 
-from app.smart_table.registry import ENUM_FIELDS_WITH_OTHER
+from app.smart_table.enums import BUSINESS_ENUM_FIELDS
 
 
 class RemarksBuilder:
@@ -51,7 +51,7 @@ class RemarksBuilder:
         副作用：无。
         """
         details: list[str] = []
-        for field_name in sorted(ENUM_FIELDS_WITH_OTHER):
+        for field_name in sorted(BUSINESS_ENUM_FIELDS):
             selected = fields.get(field_name)
             selected_values = selected if isinstance(selected, list) else [selected]
             if "其他" not in selected_values:

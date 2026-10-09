@@ -58,10 +58,13 @@ from app.smart_table.adapter import (
     SmartTableAdapter,
     SmartTableRecordNotFoundError,
 )
+from app.smart_table.enums import (
+    get_enum_snapshot_service,
+    isolated_enum_snapshot_operation,
+)
 from app.smart_table.models import SmartTableRecord
 from app.smart_table.registry import (
     DEFAULT_SMART_TABLE_FIELD_VALUES,
-    PROCESS_OPTIONS,
     writable_smart_table_fields,
 )
 
@@ -212,7 +215,10 @@ class DeterministicFirstTextLeadExtractor:
         "业务线": "业务线",
         "备注": "备注",
     }
-    _process_values = PROCESS_OPTIONS
+
+    def __init__(self, process_options: tuple[str, ...] = ()) -> None:
+        """注入当前合法工艺；返回无，仅保存选项，身份提示解析不需要访问外部表格。"""
+        self._process_values = process_options
 
     def extract(self, text: str | None) -> dict[str, str] | None:
         """从显式中文标签文本提取首条可审核线索的安全字段补丁。
@@ -374,8 +380,12 @@ class FirstTextLeadWorkspaceService:
         """
         self._session_factory = session_factory
         self._smart_table_adapter = smart_table_adapter
+        self._enum_snapshots = get_enum_snapshot_service(smart_table_adapter)
         self._sales_identity_provider = sales_identity_provider or DatabaseSalesIdentityProvider()
         self._ai_gateway = ai_gateway
+        if ai_gateway is not None:
+            # AI 与真实表写入绑定同一个适配器快照，不使用测试网关的默认 Mock 枚举。
+            ai_gateway._enum_snapshots = self._enum_snapshots
         self._company_lead_service = company_lead_service
         self._lead_progress_service = lead_progress_service
         settings = get_settings()
@@ -396,6 +406,7 @@ class FirstTextLeadWorkspaceService:
         self._lead_message_retry_count = settings.lead_message_retry_count
         self._lead_processing_timeout = timedelta(seconds=settings.lead_processing_timeout_seconds)
 
+    @isolated_enum_snapshot_operation
     def consume(
         self,
         outbox_event_id: int,
@@ -449,6 +460,7 @@ class FirstTextLeadWorkspaceService:
         self._consume_next_after_checkpoint(outbox_event_id)
         return result
 
+    @isolated_enum_snapshot_operation
     def retry_failed_message(
         self,
         message_id: str,
@@ -678,7 +690,9 @@ class FirstTextLeadWorkspaceService:
                 )
             else:
                 # 只重新解析这一条原始消息，不调用 consume 或重放其后的历史消息。
-                fields = DeterministicFirstTextLeadExtractor().extract_segment_patch(
+                fields = DeterministicFirstTextLeadExtractor(
+                    self._enum_snapshots.get_snapshot().options["工艺"]
+                ).extract_segment_patch(
                     message_text, segment_index
                 )
                 # 自由文本只重新调用已注入的 T08 网关；不读取其他消息上下文。
@@ -1395,7 +1409,7 @@ class FirstTextLeadWorkspaceService:
                 source_segment_index=0,
                 original_capturing_sales_user_id=message.sales_user_id,
                 smart_table_owner_user_id=message.sales_user_id,
-                field_values={"线索来源": "展会", **fields},
+                field_values={**self._enum_snapshots.source_defaults(), **fields},
                 enrichment_values=enrichment,
             )
             session.add(target)
@@ -1617,7 +1631,9 @@ class FirstTextLeadWorkspaceService:
                     logger.warning("lead_outbox_actor_inactive")
                     return LeadProcessingResult(LeadProcessingStatus.UNAUTHORIZED)
 
-                extractor = DeterministicFirstTextLeadExtractor()
+                extractor = DeterministicFirstTextLeadExtractor(
+                    self._enum_snapshots.get_snapshot().options["工艺"]
+                )
                 quote_result = resolve_message_quote(session, message)
                 if quote_result is not None:
                     quote_decision = self._prepare_quote_route(
@@ -2040,7 +2056,7 @@ class FirstTextLeadWorkspaceService:
                     company_initial_command = CompanyUpsertCommand(
                         source_message_id=message.message_id,
                         sales_user_id=message.sales_user_id,
-                        fields={**extracted_patch, "线索来源": "展会"},
+                        fields={**self._enum_snapshots.source_defaults(), **extracted_patch},
                         existing_lead_id=(
                             context_lead.id
                             if strong_identity_match and context_lead is not None
@@ -2091,7 +2107,7 @@ class FirstTextLeadWorkspaceService:
                             source_message_id=message.message_id,
                             original_capturing_sales_user_id=message.sales_user_id,
                             smart_table_owner_user_id=message.sales_user_id,
-                            field_values={**fields, "线索来源": "展会"},
+                            field_values={**self._enum_snapshots.source_defaults(), **fields},
                         )
                         session.add(lead)
                         session.flush()
@@ -2508,7 +2524,10 @@ class FirstTextLeadWorkspaceService:
                 source_message_id=message.message_id,
                 original_capturing_sales_user_id=message.sales_user_id,
                 smart_table_owner_user_id=message.sales_user_id,
-                field_values={"线索来源": "展会"},
+                field_values={
+                    **self._enum_snapshots.source_defaults(),
+                    **({"线索来源": fields["线索来源"]} if fields.get("线索来源") else {}),
+                },
             )
             session.add(lead)
             session.flush()
@@ -2589,7 +2608,13 @@ class FirstTextLeadWorkspaceService:
                         source_segment_index=segment.segment_index,
                         original_capturing_sales_user_id=message.sales_user_id,
                         smart_table_owner_user_id=message.sales_user_id,
-                        field_values={"线索来源": "展会"},
+                        field_values={
+                            **self._enum_snapshots.source_defaults(),
+                            **(
+                                {"线索来源": segment_fields["线索来源"]}
+                                if segment_fields.get("线索来源") else {}
+                            ),
+                        },
                     )
                     session.add(target)
                     session.flush()
@@ -2796,8 +2821,8 @@ class FirstTextLeadWorkspaceService:
             old_record_id = lead.smart_table_record_id
             fields: dict[str, object] = {
                 **DEFAULT_SMART_TABLE_FIELD_VALUES,
+                **self._enum_snapshots.source_defaults(),
                 **lead.field_values,
-                "线索来源": lead.field_values.get("线索来源", "展会"),
                 # 机器人重建审核记录代表重新产生待提交变更，状态必须从头开始。
                 "提交状态": "未提交",
                 "创建人": lead.smart_table_owner_user_id,
@@ -2904,8 +2929,8 @@ class FirstTextLeadWorkspaceService:
             # 创建人和负责人只使用接入层已授权的销售身份，模型无法影响权限关键字段。
             record_fields: dict[str, object] = {
                 **DEFAULT_SMART_TABLE_FIELD_VALUES,
+                **self._enum_snapshots.source_defaults(),
                 **lead.field_values,
-                "线索来源": "展会",
                 "创建人": request.sales_user_id,
                 "负责人": request.sales_user_id,
             }
@@ -3019,7 +3044,7 @@ class FirstTextLeadWorkspaceService:
                 source_message_id=source_message_id,
                 source_segment_index=segment_index,
                 sales_user_id=sales_user_id,
-                fields={**fields, "线索来源": "展会"},
+                fields={**self._enum_snapshots.source_defaults(), **fields},
                 region_evidence=CompanyRegionEvidence(
                     message_text=message_text,
                     company_name=fields.get("线索名称"),
@@ -3084,7 +3109,7 @@ class FirstTextLeadWorkspaceService:
                     source_segment_index=segment_index,
                     original_capturing_sales_user_id=message.sales_user_id,
                     smart_table_owner_user_id=message.sales_user_id,
-                    field_values={**fields, "线索来源": "展会"},
+                    field_values={**self._enum_snapshots.source_defaults(), **fields},
                 )
                 session.add(lead)
                 session.flush()
@@ -4192,9 +4217,9 @@ class FirstTextLeadWorkspaceService:
         # 创建人和负责人共同写为当前销售，绝不使用机器人、管理员或公共账号。
         record_fields: dict[str, object] = {
             **DEFAULT_SMART_TABLE_FIELD_VALUES,
+            **self._enum_snapshots.source_defaults(),
             **existing_lead.field_values,
             **fields,
-            "线索来源": "展会",
             # 每次机器人首次写入审核行都从未提交开始，CRM 成功后再改为已提交。
             "提交状态": "未提交",
             "创建人": sales_user_id,
