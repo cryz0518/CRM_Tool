@@ -20,6 +20,7 @@ from app.messaging.models import NotificationRecord, SalesAuthorization, utc_now
 logger = logging.getLogger(__name__)
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _REMINDER_TYPE = "daily_unsubmitted_lead_reminder"
+DAILY_UNSUBMITTED_REMINDER_CONTENT = "⏰ 今天仍有未提交线索，请完成审核后提交 CRM。"
 _UNSUBMITTED_LEAD_STATES = ("temporary", "pending_create")
 
 
@@ -94,9 +95,7 @@ class DailyUnsubmittedLeadReminderService:
                 notification_key = hashlib.sha256(
                     f"daily_unsubmitted_leads:{sales_user_id}:{local_now.date().isoformat()}".encode()
                 ).hexdigest()
-                content = (
-                    f"⏰ 今天还有 {lead_count} 条线索未提交 CRM，请完成审核后提交。"
-                )
+                content = DAILY_UNSUBMITTED_REMINDER_CONTENT
                 values = {
                     "notification_key": notification_key,
                     "sales_user_id": sales_user_id,
@@ -225,18 +224,23 @@ def _unsubmitted_lead_count(
     day_start: datetime,
     day_end: datetime,
 ) -> int:
-    """统计销售在上海当日采集且尚无成功 CRM 创建记录的线索。
+    """统计销售在上海当日采集且最新 CRM 创建代次未成功或放弃的线索。
 
     参数：session 为当前数据库会话；sales_user_id 为当前负责人；day_start/day_end 为 UTC 区间。
     返回值：符合条件的线索数量。
     异常：数据库读取错误向调用方传播。
-    副作用：仅读取线索及 CRM 同步状态；消息接收和草稿状态不会被当作提交成功。
+    副作用：仅读取线索及最新 CRM create generation；仅 succeeded/abandoned 视为已处理。
     """
-    # 只有 CRM create 的成功记录代表提交完成；消息和 Smart Table 状态均不参与判断。
-    successful_create = select(CrmSyncRecord.id).where(
-        CrmSyncRecord.lead_id == Lead.id,
-        CrmSyncRecord.operation == "create",
-        CrmSyncRecord.status == "succeeded",
+    # 与“提交今天的线索”复核规则一致，只检查最新 create generation。
+    latest_create_status = (
+        select(CrmSyncRecord.status)
+        .where(
+            CrmSyncRecord.lead_id == Lead.id,
+            CrmSyncRecord.operation == "create",
+        )
+        .order_by(CrmSyncRecord.generation.desc().nullslast(), CrmSyncRecord.id.desc())
+        .limit(1)
+        .scalar_subquery()
     )
     return int(
         session.scalar(
@@ -245,7 +249,7 @@ def _unsubmitted_lead_count(
                 Lead.created_at >= day_start,
                 Lead.created_at < day_end,
                 Lead.lifecycle_state.in_(_UNSUBMITTED_LEAD_STATES),
-                ~successful_create.exists(),
+                func.coalesce(latest_create_status, "").not_in(("succeeded", "abandoned")),
             )
         )
         or 0

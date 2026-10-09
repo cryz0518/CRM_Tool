@@ -13,7 +13,10 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.leads.models import Lead, LeadMessageResolution, SmartTableSync
-from app.leads.reminders import daily_reminder_is_current
+from app.leads.reminders import (
+    DAILY_UNSUBMITTED_REMINDER_CONTENT,
+    daily_reminder_is_current,
+)
 from app.messaging.models import NotificationRecord, OutboxEvent, SalesAuthorization, utc_now
 
 logger = logging.getLogger(__name__)
@@ -174,7 +177,15 @@ class WecomOutboundNotificationSender:
                                 current.processing_claim_token = None
                         continue
                     content = receipt_content
-                body = _build_supported_body(payload, content)
+                body: dict[str, object]
+                if notice.notification_type == "daily_unsubmitted_lead_reminder":
+                    # 每日提醒仅发送固定 Markdown 正文，不把审计载荷字段交给 SDK。
+                    body = {
+                        "msgtype": "markdown",
+                        "markdown": {"content": DAILY_UNSUBMITTED_REMINDER_CONTENT},
+                    }
+                else:
+                    body = _build_supported_body(payload, content)
                 await self._client.send_message(sales_user_id, body)
             except Exception as exc:
                 provider_error_code = _provider_error_code(exc)

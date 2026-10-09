@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from pathlib import Path
 from typing import Iterator
 from zoneinfo import ZoneInfo
@@ -15,7 +15,10 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import Settings
 from app.leads.models import CrmSyncRecord, Lead
-from app.leads.reminders import DailyUnsubmittedLeadReminderService
+from app.leads.reminders import (
+    DAILY_UNSUBMITTED_REMINDER_CONTENT,
+    DailyUnsubmittedLeadReminderService,
+)
 from app.messaging.models import (
     Base,
     IncomingMessage,
@@ -82,7 +85,7 @@ def seed_lead(
     created_at: datetime,
     *,
     lifecycle_state: str = "pending_create",
-    crm_sync_status: str | None = None,
+    crm_sync_status: str | tuple[str, ...] | None = None,
     message_received: bool = False,
 ) -> None:
     """创建线索及可选 CRM 或消息处理状态。
@@ -126,21 +129,26 @@ def seed_lead(
             )
         )
         if crm_sync_status is not None:
-            # 明确写入 CRM 创建状态，只有 succeeded 才能排除提醒。
-            session.add(
-                CrmSyncRecord(
-                    lead_id=lead_id,
-                    operation="create",
-                    generation=1,
-                    smart_table_record_id=f"record-{lead_id}",
-                    idempotency_key=f"idempotency-{lead_id}",
-                    canonical_payload={},
-                    snapshot_hash="0" * 64,
-                    request_message_id=f"submit-{lead_id}",
-                    submitting_sales_user_id=sales_user_id,
-                    status=crm_sync_status,
-                )
+            # 按 generation 保存 CRM 创建状态，用于验证只有最新状态决定提醒资格。
+            sync_statuses = (
+                (crm_sync_status,) if isinstance(crm_sync_status, str) else crm_sync_status
             )
+            for generation, sync_status in enumerate(sync_statuses, start=1):
+                # 旧 generation 保留，服务查询应只使用最新一代状态。
+                session.add(
+                    CrmSyncRecord(
+                        lead_id=lead_id,
+                        operation="create",
+                        generation=generation,
+                        smart_table_record_id=f"record-{lead_id}",
+                        idempotency_key=f"idempotency-{lead_id}-{generation}",
+                        canonical_payload={},
+                        snapshot_hash=(str(generation) * 64)[:64],
+                        request_message_id=f"submit-{lead_id}-{generation}",
+                        submitting_sales_user_id=sales_user_id,
+                        status=sync_status,
+                    )
+                )
 
 
 def notification_count(session_factory: sessionmaker[Session]) -> int:
@@ -199,10 +207,10 @@ def test_1959_waits_2000_queues_once_and_ignores_message_receipt(
     assert notification_count(session_factory) == 1
 
 
-def test_only_successful_crm_create_suppresses_reminder(
+def test_latest_succeeded_or_abandoned_generation_suppresses_reminder(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证仅成功 CRM create 排除提醒，处理中记录和草稿仍按未提交处理。
+    """验证只有最新 create generation 的 succeeded/abandoned 会排除提醒。
 
     参数：session_factory 为隔离 SQLite 会话工厂。
     返回值：断言只为待提交线索生成提醒并正确统计数量。
@@ -225,6 +233,20 @@ def test_only_successful_crm_create_suppresses_reminder(
         lifecycle_state="temporary",
         crm_sync_status="processing",
     )
+    seed_lead(
+        session_factory,
+        "newer-processing-lead",
+        "sales-a",
+        datetime(2026, 10, 9, 10, 10, tzinfo=UTC),
+        crm_sync_status=("succeeded", "processing"),
+    )
+    seed_lead(
+        session_factory,
+        "abandoned-lead",
+        "sales-a",
+        datetime(2026, 10, 9, 10, 15, tzinfo=UTC),
+        crm_sync_status=("processing", "abandoned"),
+    )
 
     assert (
         DailyUnsubmittedLeadReminderService(session_factory).schedule_due_reminders(
@@ -234,7 +256,8 @@ def test_only_successful_crm_create_suppresses_reminder(
     )
     with session_factory() as session:
         notice = session.scalar(select(NotificationRecord))
-    assert notice is not None and "1 条线索" in (notice.content or "")
+    assert notice is not None and notice.payload is not None
+    assert notice.payload["lead_count"] == 2
 
 
 def test_shanghai_midnight_and_next_day_are_independent(
@@ -380,36 +403,46 @@ def test_failed_send_retries_only_notification_outbox(
     business_date = now.astimezone(_SHANGHAI).date()
     seed_sales(session_factory, "sales-a")
     seed_lead(session_factory, "retry-lead", "sales-a", now, crm_sync_status="processing")
-    with session_factory.begin() as session:
-        session.add(
-            NotificationRecord(
-                notification_key="a" * 64,
-                sales_user_id="sales-a",
-                source_message_id="a" * 64,
-                notification_type="daily_unsubmitted_lead_reminder",
-                content="提醒",
-                payload={
-                    "msgtype": "markdown",
-                    "markdown": {"content": "提醒"},
-                    "business_date": business_date.isoformat(),
-                },
-            )
+    seed_lead(session_factory, "completed-lead", "sales-a", now, crm_sync_status="processing")
+    scheduled_at = datetime.combine(business_date, time(20, 0), tzinfo=_SHANGHAI).astimezone(UTC)
+    assert (
+        DailyUnsubmittedLeadReminderService(session_factory).schedule_due_reminders(
+            now=scheduled_at
         )
+        == 1
+    )
 
     first_client = RecordingClient(fail=True)
     assert asyncio.run(
         WecomOutboundNotificationSender(session_factory, first_client).send_pending_once()
     ) == 0
+    # 失败后其中一条已提交，Outbox 保留原审计数量，但发送文案不再暴露旧数量。
+    with session_factory.begin() as session:
+        completed_sync = session.scalar(
+            select(CrmSyncRecord).where(CrmSyncRecord.lead_id == "completed-lead")
+        )
+        assert completed_sync is not None
+        completed_sync.status = "succeeded"
     second_client = RecordingClient()
     assert asyncio.run(
         WecomOutboundNotificationSender(session_factory, second_client).send_pending_once()
     ) == 1
 
     with session_factory() as session:
-        notice = session.get(NotificationRecord, "a" * 64)
+        notice = session.scalar(
+            select(NotificationRecord).where(
+                NotificationRecord.notification_type == "daily_unsubmitted_lead_reminder"
+            )
+        )
         lead = session.get(Lead, "retry-lead")
         sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == "retry-lead"))
     assert notice is not None and notice.status == "succeeded" and notice.attempts == 2
+    assert notice.content == DAILY_UNSUBMITTED_REMINDER_CONTENT
+    assert notice.payload is not None and notice.payload["lead_count"] == 2
     assert lead is not None and lead.lifecycle_state == "pending_create"
     assert sync is not None and sync.status == "processing"
     assert first_client.calls[0][0] == second_client.calls[0][0] == "sales-a"
+    assert second_client.calls[0][1] == {
+        "msgtype": "markdown",
+        "markdown": {"content": DAILY_UNSUBMITTED_REMINDER_CONTENT},
+    }
