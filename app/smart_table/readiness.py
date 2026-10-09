@@ -85,7 +85,7 @@ class SmartTableReadinessChecker:
         issues: list[str] = []
 
         for requirement in REQUIRED_SMART_TABLE_FIELDS:
-            # 按名称绑定管理员维护的字段，缺失或类型偏差均不允许静默降级。
+            # 只读系统时间不在必需写入注册表；业务字段仍按名称、类型严格校验。
             field = schema.get_field(requirement.name)
             if field is None:
                 issues.append(f"缺少必需字段：{requirement.name}")

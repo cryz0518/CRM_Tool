@@ -59,7 +59,11 @@ from app.smart_table.adapter import (
     SmartTableRecordNotFoundError,
 )
 from app.smart_table.models import SmartTableRecord
-from app.smart_table.registry import DEFAULT_SMART_TABLE_FIELD_VALUES, PROCESS_OPTIONS
+from app.smart_table.registry import (
+    DEFAULT_SMART_TABLE_FIELD_VALUES,
+    PROCESS_OPTIONS,
+    writable_smart_table_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2800,7 +2804,9 @@ class FirstTextLeadWorkspaceService:
                 "负责人": lead.smart_table_owner_user_id,
             }
 
-        record = self._smart_table_adapter.create_record(fields, actor=SmartTableActor.ROBOT)
+        record = self._smart_table_adapter.create_record(
+            writable_smart_table_fields(fields), actor=SmartTableActor.ROBOT
+        )
         with self._session_factory.begin() as session:
             lead = session.get(Lead, request.lead_id)
             sync = session.scalar(
@@ -2908,7 +2914,7 @@ class FirstTextLeadWorkspaceService:
                 # 避免新行的空值被 T09 误判为销售清空而保护掉。
                 record_fields.update(request.patch.fields)
             record = self._smart_table_adapter.create_record(
-                record_fields,
+                writable_smart_table_fields(record_fields),
                 actor=SmartTableActor.ROBOT,
             )
         except Exception as error:
@@ -4199,7 +4205,7 @@ class FirstTextLeadWorkspaceService:
         try:
             if record_id is None:
                 record = self._smart_table_adapter.create_record(
-                    record_fields, actor=SmartTableActor.ROBOT
+                    writable_smart_table_fields(record_fields), actor=SmartTableActor.ROBOT
                 )
                 record_id = record.record_id
         except Exception as error:

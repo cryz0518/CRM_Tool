@@ -34,7 +34,7 @@ from app.leads.models import (
 )
 from app.messaging.models import BusinessAuditEvent, IncomingMessage
 from app.smart_table.adapter import SmartTableActor, SmartTableAdapter
-from app.smart_table.registry import DEFAULT_SMART_TABLE_FIELD_VALUES
+from app.smart_table.registry import DEFAULT_SMART_TABLE_FIELD_VALUES, writable_smart_table_fields
 
 logger = logging.getLogger(__name__)
 
@@ -809,9 +809,11 @@ class CompanyLeadService:
             if lead is None:
                 raise ValueError(f"线索不存在：{lead_id}")
             record_id = lead.smart_table_record_id
-            fields = dict(lead.field_values)
+            fields = writable_smart_table_fields(lead.field_values)
             owner = lead.smart_table_owner_user_id
             has_standard_company_name = lead.standard_company_name is not None
+        # 后台接收时间不属于表格补丁，恢复时也不能将其作为人工冲突或写入候选。
+        patch = writable_smart_table_fields(patch)
         if record_id is None and has_standard_company_name:
             logger.info("company_smart_table_create_started", extra={"lead_id": lead_id})
             try:

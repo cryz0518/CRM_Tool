@@ -20,7 +20,7 @@ from app.smart_table.adapter import (
     SmartTableDefiniteRemoteFailure,
 )
 from app.smart_table.models import SmartTableRecord
-from app.smart_table.registry import DEFAULT_SMART_TABLE_FIELD_VALUES
+from app.smart_table.registry import DEFAULT_SMART_TABLE_FIELD_VALUES, writable_smart_table_fields
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +134,7 @@ class AdminLeadCreationService:
         # retry 必须使用持久化 Lead 快照，不能信任重放请求中被篡改的字段或 owner。
         persisted_owner, persisted_fields = self._creation_facts(lead_id)
         table_fields = {
-            **persisted_fields,
+            **writable_smart_table_fields(persisted_fields),
             "创建人": persisted_owner,
             "负责人": persisted_owner,
         }
@@ -279,7 +279,7 @@ class AdminLeadCreationService:
             ):
                 raise PermissionError("只有活跃管理员可以恢复管理员补建")
             expected = {
-                **lead.field_values,
+                **writable_smart_table_fields(lead.field_values),
                 "创建人": snapshot.owner_user_id,
                 "负责人": snapshot.owner_user_id,
             }

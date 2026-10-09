@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import TypeVar
 
 from app.smart_table.models import (
     SmartTableField,
@@ -162,8 +164,25 @@ DEFAULT_LEAD_BUSINESS_VALUES = {
     "客户行业": "其他",
 }
 DEFAULT_SMART_TABLE_FIELD_VALUES = {"是否为国际客户": "国内", "提交状态": "未提交"}
+# 原生创建时间只读；旧后台“录入时间”仅保留审计，不要求表格存在或映射其原生类型。
+READ_ONLY_SYSTEM_TIME_FIELDS = frozenset({"创建时间", "录入时间"})
+_FieldValue = TypeVar("_FieldValue")
+
+
+def writable_smart_table_fields(fields: Mapping[str, _FieldValue]) -> dict[str, _FieldValue]:
+    """剔除系统时间后生成可写补丁，保留后台审计值。
+
+    参数：fields 为草稿或本轮补丁。返回：不含创建时间及旧录入时间的副本。
+    异常：无。副作用：无，不修改输入或真实表格。
+    """
+    return {
+        name: value
+        for name, value in fields.items()
+        if name.removeprefix("*") not in READ_ONLY_SYSTEM_TIME_FIELDS
+    }
+
+
 REQUIRED_SMART_TABLE_FIELDS = (
-    RequiredSmartTableField("录入时间", SmartTableFieldType.DATE),
     RequiredSmartTableField("业务线", SmartTableFieldType.SINGLE_SELECT, BUSINESS_LINE_OPTIONS),
     RequiredSmartTableField("线索名称", SmartTableFieldType.TEXT),
     RequiredSmartTableField(
@@ -201,7 +220,7 @@ ENUM_FIELDS_WITH_OTHER = frozenset(
 
 
 def build_required_smart_table_schema() -> SmartTableSchema:
-    """构造符合当前字段注册表的 Mock 管理员预配置结构。
+    """构造项目可写字段的 Mock 结构，不模拟尚未核实类型的原生系统时间列。
 
     返回：包含稳定字段与选项 ID 的 Mock 表结构。
     副作用：按字段注册表顺序生成仅用于 Mock 的底层标识。

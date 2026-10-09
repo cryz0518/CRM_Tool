@@ -50,9 +50,9 @@ def test_mock_schema_keeps_administrator_field_and_option_identifiers() -> None:
     business_line = schema.get_field("业务线")
 
     assert business_line is not None
-    assert business_line.field_id == "mock-field-2"
+    assert business_line.field_id == "mock-field-1"
     assert business_line.options[0] == SmartTableOption(
-        option_id="mock-field-2-option-1", name="协作机器人"
+        option_id="mock-field-1-option-1", name="协作机器人"
     )
 
 
@@ -348,7 +348,6 @@ def test_readiness_endpoint_returns_configuration_issues() -> None:
 
     assert response.status_code == 503
     assert response.json()["issues"] == [
-        "缺少必需字段：录入时间",
         "缺少必需字段：业务线",
         "缺少必需字段：线索名称",
         "缺少必需字段：是否为国际客户",
@@ -373,13 +372,14 @@ def test_readiness_endpoint_returns_configuration_issues() -> None:
     ]
 
 
-def test_capture_time_is_first_date_field_and_excluded_from_ai_and_crm_fields() -> None:
-    """录入时间为首个日期时间元数据字段，不能进入 AI/CRM 业务字段集合。"""
+def test_system_times_are_not_required_writable_ai_or_crm_fields() -> None:
+    """系统创建时间不映射普通 DATE；后台录入时间不是表格必需或 AI/CRM 字段。"""
     from app.smart_table.registry import CRM_BUSINESS_FIELD_NAMES, REQUIRED_SMART_TABLE_FIELDS
 
     schema = build_required_smart_table_schema()
-    assert REQUIRED_SMART_TABLE_FIELDS[0].name == "录入时间"
-    assert schema.fields[0].name == "录入时间"
-    assert schema.fields[0].field_type is SmartTableFieldType.DATE
-    assert schema.fields[1].name == "业务线"
+    assert REQUIRED_SMART_TABLE_FIELDS[0].name == "业务线"
+    assert schema.fields[0].name == "业务线"
+    assert schema.get_field("录入时间") is None
+    assert schema.get_field("创建时间") is None
+    assert SmartTableReadinessChecker().check(MockSmartTableAdapter(schema=schema)).ready
     assert "录入时间" not in CRM_BUSINESS_FIELD_NAMES

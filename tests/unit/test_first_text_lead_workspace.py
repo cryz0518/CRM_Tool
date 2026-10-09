@@ -598,7 +598,6 @@ def test_authorized_sales_text_creates_a_personal_review_record(
     )
     assert record.fields == {
         **DEFAULT_LEAD_BUSINESS_VALUES,
-        "录入时间": capture_time,
         "线索名称": "长广溪智造",
         "联系人": "张三",
         "工艺": ["码垛"],
@@ -1087,7 +1086,9 @@ def test_smart_table_failure_can_be_consumed_again_without_creating_a_second_lea
     assert failed.status is LeadProcessingStatus.SYNC_FAILED
     assert retried.status is LeadProcessingStatus.CREATED
     record = adapter.get_record(retried.smart_table_record_id)
-    assert record.fields["录入时间"] == first_capture
+    assert not {"创建时间", "录入时间"}.intersection(record.fields)
+    with session_factory() as session:
+        assert session.get(Lead, retried.lead_id).field_values["录入时间"] == first_capture
     assert all(record.fields[name] == value for name, value in DEFAULT_LEAD_BUSINESS_VALUES.items())
     assert adapter.get_records() == [adapter.get_record(retried.smart_table_record_id)]
     with session_factory() as session:
@@ -4718,7 +4719,11 @@ def test_system_defaults_reliable_replacement_and_immutable_capture_time(
     first = FirstTextLeadWorkspaceService(session_factory, adapter).consume(first_event)
     record = adapter.get_record(first.smart_table_record_id)
     assert all(record.fields[name] == value for name, value in DEFAULT_LEAD_BUSINESS_VALUES.items())
-    assert record.fields["录入时间"] == "2026-10-08 23:59:58"
+    assert not {"创建时间", "录入时间"}.intersection(record.fields)
+    # 模拟企业微信在建行时自动生成不同于消息接收时间的分钟级系统值；不能通过更新接口填它。
+    adapter._records[record.record_id] = SmartTableRecord(
+        record.record_id, {**record.fields, "创建时间": "2026-10-09 10:20"}
+    )
     replacements = {
         "业务线": "车载机器人",
         "职务": "工程师",
@@ -4748,10 +4753,11 @@ def test_system_defaults_reliable_replacement_and_immutable_capture_time(
     final = adapter.get_record(first.smart_table_record_id)
     expected = replacements if confidence == 0.99 else DEFAULT_LEAD_BUSINESS_VALUES
     assert all(final.fields[name] == value for name, value in expected.items())
-    assert final.fields["录入时间"] == "2026-10-08 23:59:58"
+    assert "录入时间" not in final.fields
+    assert final.fields["创建时间"] == "2026-10-09 10:20"
     with session_factory() as session:
         lead = session.get(Lead, first.lead_id)
-        assert lead.field_values["录入时间"] == final.fields["录入时间"]
+        assert lead.field_values["录入时间"] == "2026-10-08 23:59:58"
         sources = session.scalars(
             select(LeadFieldProvenance).where(
                 LeadFieldProvenance.lead_id == first.lead_id,
@@ -4935,7 +4941,8 @@ def test_default_replacement_failure_recovers_with_old_baseline_and_capture_time
             text="客户：甲科技；联系人：李工",
         )
     )
-    first_time = adapter.get_record(first.smart_table_record_id).fields["录入时间"]
+    with session_factory() as session:
+        first_time = session.get(Lead, first.lead_id).field_values["录入时间"]
     persist_outbox_text(
         session_factory,
         message_id="default-retry-update",
@@ -4969,11 +4976,13 @@ def test_default_replacement_failure_recovers_with_old_baseline_and_capture_time
         ExtractedLeadPatch(
             trace_id="recover-default",
             analysis=LeadAnalysis(intent="UPDATE_LEAD"),
-            fields={},
+            fields={"创建时间": "2026-10-10 12:00", "录入时间": "2026-10-10 12:00:00"},
             pending_confirmation_fields=(),
             low_confidence_candidates={},
         ),
     )
     record = adapter.get_record(first.smart_table_record_id)
     assert record.fields["职务"] == ("总监" if human_edit else "工程师")
-    assert record.fields["录入时间"] == first_time
+    assert not {"创建时间", "录入时间"}.intersection(record.fields)
+    with session_factory() as session:
+        assert session.get(Lead, first.lead_id).field_values["录入时间"] == first_time

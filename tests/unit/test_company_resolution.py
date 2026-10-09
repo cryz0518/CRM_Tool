@@ -928,8 +928,10 @@ def test_company_creation_and_confirmed_supplement_share_defaults_and_capture_ti
     )
     record = adapter.get_record(first.smart_table_record_id)
     assert record.fields["职务"] == "工程师"
-    assert record.fields["录入时间"] == first_record.fields["录入时间"]
+    assert not {"创建时间", "录入时间"}.intersection(first_record.fields)
+    assert not {"创建时间", "录入时间"}.intersection(record.fields)
     with session_factory() as session:
+        assert session.get(Lead, first.lead_id).field_values["录入时间"]
         source = session.scalar(
             select(LeadFieldProvenance)
             .where(

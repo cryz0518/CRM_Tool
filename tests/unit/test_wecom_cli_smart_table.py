@@ -2158,3 +2158,85 @@ def test_query_record_normalizes_sql_member_shape() -> None:
 
     assert record.fields == {"负责人": "member-1"}
     assert record.member_names == {"负责人": "测试销售"}
+
+
+@pytest.mark.parametrize("system_title", ["创建时间", "录入时间", "*创建时间"])
+def test_system_time_column_unknown_type_is_ignored_and_never_sent_to_cli(
+    system_title: str,
+) -> None:
+    """未知原生时间类型不猜测为 DATE，新增和更新 CLI 请求均排除系统时间字段。"""
+    field_response = _field_response()
+    fields = field_response["fields"]
+    assert isinstance(fields, list)
+    response = {
+        **field_response,
+        "fields": [
+            {
+                "field_id": "system-time",
+                "field_title": system_title,
+                "field_type": "unverified-native-system-type",
+            },
+            *fields,
+        ],
+    }
+    record_values = {"线索名称": "测试公司", "负责人": [{"userId": "sales-1"}]}
+    acknowledgement = {"errcode": 0, "records": [{"record_id": "system-time-record"}]}
+    remote_record = {
+        "errcode": 0,
+        "records": [{"record_id": "system-time-record", "values": record_values}],
+    }
+    fake = FakeCli(
+        [
+            response,
+            acknowledgement,
+            remote_record,
+            acknowledgement,
+            {
+                "errcode": 0,
+                "records": [
+                    {
+                        "record_id": "system-time-record",
+                        "values": {**record_values, "联系人": "李工"},
+                    }
+                ],
+            },
+        ]
+    )
+    adapter = _adapter(fake)
+    schema = adapter.get_schema()
+    assert schema.get_field(system_title) is None
+    assert schema.get_field("业务线").field_type is SmartTableFieldType.SINGLE_SELECT
+    adapter.create_record(
+        {"线索名称": "测试公司", "负责人": "sales-1", system_title: "2026-10-09 10:20"},
+        actor=SmartTableActor.ROBOT,
+    )
+    adapter.update_record(
+        "system-time-record",
+        {"联系人": "李工", system_title: "2026-10-10 10:20"},
+        skip_preflight=True,
+    )
+    assert _payload(fake.calls[1])["records"][0]["values"] == {
+        "*线索名称": "测试公司",
+        "负责人": [{"userId": "sales-1"}],
+    }
+    assert _payload(fake.calls[3])["records"][0]["values"] == {"*联系人": "李工"}
+
+
+def test_unknown_business_field_type_still_blocks_schema() -> None:
+    """只读时间名称例外不能让未知业务字段类型绕过原有 Schema 防线。"""
+    fake = FakeCli(
+        [
+            {
+                "errcode": 0,
+                "fields": [
+                    {
+                        "field_id": "unknown-business",
+                        "field_title": "业务线",
+                        "field_type": "unverified-native-system-type",
+                    }
+                ],
+            }
+        ]
+    )
+    with pytest.raises(WecomCliSmartTableAdapterError, match="不支持智能表格字段类型"):
+        _adapter(fake).get_schema()

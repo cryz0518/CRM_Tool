@@ -30,9 +30,11 @@ class FakeAdminCreateTable:
     def create_record(self, fields: dict[str, object], *, actor: object) -> SmartTableRecord:
         """返回远端创建快照。"""
 
+        assert not {"创建时间", "录入时间"}.intersection(fields)
         self.calls.append((dict(fields), actor))
         record = SmartTableRecord(
-            record_id=f"record-admin-{len(self.calls)}", fields=dict(fields)
+            record_id=f"record-admin-{len(self.calls)}",
+            fields={**fields, "创建时间": "2026-10-09 10:20"},
         )
         self.records[record.record_id] = record
         if self.definite_failures:
@@ -135,7 +137,8 @@ def test_admin_create_has_explicit_capture_and_owner_without_message(
         operation = session.get(AdminLeadCreationOperation, result.operation_id)
         assert lead is not None
         assert lead.source_message_id is None
-        assert lead.field_values["录入时间"] == fields["录入时间"]
+        assert lead.field_values["录入时间"]
+        assert not {"创建时间", "录入时间"}.intersection(fields)
         assert lead.original_capturing_sales_user_id == "sales-capture"
         assert lead.smart_table_owner_user_id == "sales-owner"
         assert lead.smart_table_record_id == "record-admin-1"
