@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from celery import Celery, signals
+from celery.schedules import crontab  # type: ignore[import-untyped]
 from redis import Redis
 
 from app.core.config import Settings, get_settings
@@ -49,6 +50,11 @@ def build_beat_schedule(settings: Settings) -> dict[str, dict[str, object]]:
             "task": "workers.schedule_lead_progress_reports",
             "schedule": settings.lead_outbox_poll_seconds,
         }
+    # 每日任务使用已配置的 Asia/Shanghai Beat 时区固定在晚上八点运行。
+    schedule["schedule-daily-unsubmitted-lead-reminders"] = {
+        "task": "workers.schedule_daily_unsubmitted_lead_reminders",
+        "schedule": crontab(hour=20, minute=0),
+    }
     return schedule
 
 settings = get_settings()

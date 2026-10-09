@@ -30,6 +30,7 @@ from app.crm.commands import (
 from app.crm.dependencies import get_crm_adapter
 from app.leads.models import Lead, LeadMessageResolution
 from app.leads.progress import LeadProgressService, activate_progress_intent_candidate
+from app.leads.reminders import DailyUnsubmittedLeadReminderService
 from app.leads.review import LeadReviewService
 from app.leads.service import COMPLETED_CHECKPOINT_STATUSES, FirstTextLeadWorkspaceService
 from app.media.dependencies import get_media_attachment_service, get_media_storage_provider
@@ -650,6 +651,23 @@ def schedule_lead_progress_reports() -> int:
         service = LeadProgressService(factory, get_smart_table_adapter(), settings)
         return service.schedule_due_reports()
     finally:
+        engine.dispose()
+
+
+@celery_app.task(name="workers.schedule_daily_unsubmitted_lead_reminders")  # type: ignore[untyped-decorator]
+def schedule_daily_unsubmitted_lead_reminders() -> int:
+    """扫描并登记当日 20:00 后尚未提交 CRM 的销售提醒。
+
+    参数：无。
+    返回值：本轮新登记的逻辑提醒数量。
+    异常：数据库错误向 Celery 传播并由任务机制重试。
+    副作用：仅写入现有通知 Outbox；实际企业微信发送仍由 Bot 进程完成。
+    """
+    engine, factory = _session_factory()
+    try:
+        return DailyUnsubmittedLeadReminderService(factory).schedule_due_reminders()
+    finally:
+        # 任务使用独立短连接池，结束时释放，避免每日调度长期占用连接。
         engine.dispose()
 
 
