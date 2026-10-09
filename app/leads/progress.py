@@ -452,7 +452,7 @@ class LeadProgressService:
         )
 
     def schedule_due_reports(self, *, now: datetime | None = None) -> int:
-        """扫描到期会话，创建唯一汇总通知并在空闲完成后发送最终汇总。
+        """扫描到期会话，只为有新消息且未过期的窗口创建唯一汇总通知。
 
         参数：now 可注入调度时钟；省略时使用当前 UTC 时间。
         返回值：本次新建的逻辑通知数量。
@@ -529,8 +529,13 @@ class LeadProgressService:
                 window_end = _as_utc(progress.next_report_at)
                 if window_end > current_time:
                     continue
-                stats = self._calculate_stats(session, progress, fresh_fields)
                 interval = timedelta(minutes=self._settings.lead_progress_interval_minutes)
+                if current_time > window_end + interval:
+                    # 严格超过一完整周期才过期；保留半开窗口边界，下一次扫描重读对应快照。
+                    skipped_windows = (current_time - window_end - timedelta.resolution) // interval
+                    progress.next_report_at = window_end + skipped_windows * interval
+                    continue
+                stats = self._calculate_stats(session, progress, fresh_fields)
                 if stats.received_messages == 0:
                     # 空窗口不创建通知；未来消息重新锚定周期，旧消息处理完成也不会重复汇报。
                     next_received = session.scalar(
@@ -583,7 +588,7 @@ class LeadProgressService:
                             "event": "lead_progress_notification_queued",
                         },
                     )
-                # 严格推进固定半开窗口，扫描迟到时也不能累计或跳过未汇报消息。
+                # 按固定半开窗口推进，不累计旧消息；过期窗口在上方静默跳过。
                 progress.next_report_at = window_end + interval
         return created
 
