@@ -189,14 +189,9 @@ class LeadReviewService:
 
         # 数据库事务不包裹外部调用；Adapter 只收到确有变化的字段补丁。
         if plan.fields_to_write:
-            if initial_record is None:
-                self._smart_table_adapter.update_record(record_id, plan.fields_to_write)
-            else:
-                self._smart_table_adapter.update_record(
-                    record_id,
-                    plan.fields_to_write,
-                    skip_preflight=True,
-                )
+            self._smart_table_adapter.update_record(
+                record_id, plan.fields_to_write, skip_preflight=True
+            )
 
         with self._session_factory.begin() as session:
             # 最终写回仍要取得 Lead 行锁，并只合并本次计划中未被并发后续写入改变的字段。
@@ -512,7 +507,7 @@ class LeadReviewService:
                 raise ValueError(f"确认字段缺少合法表格值：{field_name}")
             confirmed_values[field_name] = value
         self._smart_table_adapter.update_record(
-            record.record_id, {AI_CONFIRMATION_FIELD: remaining}
+            record.record_id, {AI_CONFIRMATION_FIELD: remaining}, skip_preflight=True
         )
         if on_remote_success is not None:
             # 远端事实已发生后先写 recovery evidence；本地 finalize 失败不能盲目重放表格更新。
@@ -658,7 +653,9 @@ class LeadReviewService:
             remaining = sorted(pending - protected)
         # 销售不维护 AI待确认；系统只因实际业务字段偏离才移除对应标记。
         self._smart_table_adapter.update_record(
-            lead.smart_table_record_id or "", {AI_CONFIRMATION_FIELD: remaining}
+            lead.smart_table_record_id or "",
+            {AI_CONFIRMATION_FIELD: remaining},
+            skip_preflight=True,
         )
         return protected
 

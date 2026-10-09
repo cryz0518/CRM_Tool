@@ -358,8 +358,8 @@ class WecomCliSmartTableAdapter:
     ) -> SmartTableRecord:
         """更新指定记录并在返回成功前远端回读核实每个补丁字段。
 
-        参数：record_id 为目标记录标识；fields 只包含本次变更的字段和值；skip_preflight 表示刚创建的
-        记录已有可信快照，可跳过写入前读取。
+        参数：record_id 为目标记录标识；fields 只包含本次变更的字段和值；skip_preflight 表示调用方
+        已持有刚读取或刚创建的记录快照，可跳过重复预读。
         返回：远端回读且逐字段匹配后的记录快照。
         异常：记录不存在、CLI 写入失败或有限核实窗口后仍有字段不匹配时抛出异常。
         副作用：只修改目标记录的传入字段，并在 ACK 后执行有上限的只读回查。

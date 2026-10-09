@@ -8,8 +8,8 @@ from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import uuid4
 
-from sqlalchemy import Engine, and_, create_engine, or_, select, update
-from sqlalchemy.engine import CursorResult
+from sqlalchemy import Engine, and_, create_engine, or_, select, text, update
+from sqlalchemy.engine import Connection, CursorResult
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -509,7 +509,22 @@ def consume_lead_outbox_event(
     """
     # 适配器始终经依赖边界构造，Worker 不直接执行 wecom-cli 或操作表格字段。
     engine, factory = _session_factory()
+    lock_connection: Connection | None = None
+    locked_sales_user_id: str | None = None
+    processing_lock_acquired = False
     try:
+        lock_connection = engine.connect()
+        # 会话级锁覆盖解析、业务决策、全部表格写入及核实；数据库连接断开时由 PostgreSQL 自动释放。
+        if lock_connection.dialect.name == "postgresql":
+            locked_sales_user_id = lock_connection.scalar(
+                select(OutboxEvent.sales_user_id).where(OutboxEvent.id == outbox_event_id)
+            )
+            lock_connection.commit()
+            if locked_sales_user_id is None:
+                return "already_processed"
+            _acquire_sales_processing_lock(lock_connection, locked_sales_user_id)
+            processing_lock_acquired = True
+
         # Celery 可能重复投递同一消息；只有首个任务可接管本次持久化认领。
         if claimed_at is None or not _take_lead_outbox_claim(factory, outbox_event_id, claimed_at):
             return "already_processed"
@@ -630,6 +645,16 @@ def consume_lead_outbox_event(
         )
         return service.consume(outbox_event_id, claimed_for_processing=True).status.value
     finally:
+        if lock_connection is not None:
+            if processing_lock_acquired and locked_sales_user_id is not None:
+                try:
+                    if not _release_sales_processing_lock(lock_connection, locked_sales_user_id):
+                        raise RuntimeError("sales_processing_lock_not_owned")
+                except Exception:
+                    # 解锁失败时丢弃物理连接，避免池化连接携带锁继续服务其它任务。
+                    lock_connection.invalidate()
+                    logger.exception("lead_sales_processing_lock_release_failed")
+            lock_connection.close()
         # 每个短任务释放独立连接池，避免 Beat 持续扫描时堆积空闲连接。
         engine.dispose()
 
@@ -802,6 +827,63 @@ class LeadOutboxDispatchClaim:
     recover_expired_lease: bool
 
 
+def _acquire_sales_processing_lock(connection: Connection, sales_user_id: str) -> None:
+    """在当前 PostgreSQL 连接上取得单销售的消息处理会话锁。
+
+    参数：connection 为整个 Worker 消息处理期间保持打开的数据库连接；sales_user_id 为队列身份。
+    返回值：成功持锁后返回 None；数据库调用失败时由 SQLAlchemy 抛出。
+    异常：PostgreSQL 锁查询失败时抛出 SQLAlchemy 异常，并先废弃连接。
+    副作用：成功后锁在显式释放或数据库连接断开前持续有效。
+    """
+    try:
+        connection.execute(
+            text("SELECT pg_advisory_lock(hashtextextended(:sales_user_id, 0))"),
+            {"sales_user_id": sales_user_id},
+        )
+        # 会话锁跨事务存活，但提交当前查询事务可避免整条消息期间占用事务快照。
+        connection.commit()
+    except Exception:
+        # 锁可能已在提交阶段取得；连接失效可让 PostgreSQL 回收后端锁，避免池内遗留。
+        connection.invalidate()
+        raise
+
+
+def _release_sales_processing_lock(connection: Connection, sales_user_id: str) -> bool:
+    """显式释放 Worker 持有的单销售消息处理会话锁。
+
+    参数：connection 为取得锁的同一 PostgreSQL 连接；sales_user_id 为队列身份。
+    返回值：PostgreSQL 确认当前连接释放了锁时返回 True。
+    异常：数据库调用失败时由调用方丢弃连接后记录。
+    副作用：释放当前后端持有的 advisory lock。
+    """
+    released = bool(
+        connection.scalar(
+            text("SELECT pg_advisory_unlock(hashtextextended(:sales_user_id, 0))"),
+            {"sales_user_id": sales_user_id},
+        )
+    )
+    connection.commit()
+    return released
+
+
+def _try_claim_sales_processing_stream(session: Session, sales_user_id: str) -> bool:
+    """仅在该销售没有活跃 Worker 时允许调度器变更 Outbox 租约。
+
+    参数：session 为当前认领事务；sales_user_id 为待调度消息所属销售。
+    返回值：获得事务级队列锁时返回 True；活跃消息处理期间返回 False。
+    异常：PostgreSQL advisory lock 查询失败时由 SQLAlchemy 抛出。
+    副作用：PostgreSQL 上的锁只保持到当前认领事务结束；其它数据库用于轻量单测时跳过该机制。
+    """
+    if session.get_bind().dialect.name != "postgresql":
+        return True
+    return bool(
+        session.scalar(
+            text("SELECT pg_try_advisory_xact_lock(hashtextextended(:sales_user_id, 0))"),
+            {"sales_user_id": sales_user_id},
+        )
+    )
+
+
 def claim_dispatchable_lead_outbox_events(
     session_factory: sessionmaker[Session], *, lease_timeout: timedelta
 ) -> list[LeadOutboxDispatchClaim]:
@@ -827,7 +909,7 @@ def claim_dispatchable_lead_outbox_events(
                     ),
                 )
             )
-            .order_by(OutboxEvent.created_at, OutboxEvent.sequence)
+            .order_by(OutboxEvent.sequence, OutboxEvent.id)
         ).all()
 
     claims: list[LeadOutboxDispatchClaim] = []
@@ -855,6 +937,9 @@ def _claim_lead_outbox_event(
     with session_factory.begin() as session:
         event = session.get(OutboxEvent, outbox_event_id)
         if event is None:
+            return None
+        # 调度器不能因租约过期覆盖仍在执行外部写入的 Worker 认领。
+        if not _try_claim_sales_processing_stream(session, event.sales_user_id):
             return None
         authorization = session.scalar(
             select(SalesAuthorization)

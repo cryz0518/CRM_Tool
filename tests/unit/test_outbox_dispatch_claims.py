@@ -213,3 +213,30 @@ def test_different_sales_can_be_claimed_in_parallel(
     )
 
     assert {claim.event_id for claim in claims} == {first_event_id, second_event_id}
+
+
+def test_ten_same_sales_messages_follow_sequence_not_creation_time(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证十条同销售消息始终按持久化 sequence 逐条推进。"""
+    event_ids = [
+        persist_event(session_factory, sales_user_id="sales-1", sequence=sequence)
+        for sequence in range(1, 11)
+    ]
+    # 故意让后续 sequence 的创建时间更早，证明它不参与同销售处理顺序。
+    with session_factory.begin() as session:
+        for sequence, event_id in enumerate(event_ids, start=1):
+            event = session.get(OutboxEvent, event_id)
+            assert event is not None
+            event.created_at = utc_now() - timedelta(minutes=sequence)
+
+    for expected_event_id in event_ids:
+        claims = claim_dispatchable_lead_outbox_events(
+            session_factory, lease_timeout=timedelta(minutes=5)
+        )
+        assert [claim.event_id for claim in claims] == [expected_event_id]
+        with session_factory.begin() as session:
+            event = session.get(OutboxEvent, expected_event_id)
+            assert event is not None
+            event.status = "succeeded"
+            event.processing_started_at = None
