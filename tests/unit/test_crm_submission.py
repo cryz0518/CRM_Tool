@@ -3590,3 +3590,176 @@ def test_terminal_command_failure_persists_notification_before_terminal_status(
         )
         assert event is not None and event.status == "failed_pending_review"
         assert notice is not None and "需要人工处理" in (notice.content or "")
+
+
+@pytest.mark.parametrize(
+    "count, failure_stage", [(1, "preview"), (1, "card"), (21, "preview"), (21, "card")]
+)
+def test_submission_delivery_orders_all_details_cards_then_one_configured_link(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    count: int,
+    failure_stage: str,
+) -> None:
+    """单条及多页批量提交在实际成功投递后发链接，失败和命令重放不重复成功消息。"""
+    import app.crm.commands as commands
+    from app.notifications.outbound import WecomOutboundNotificationSender
+
+    settings = get_settings().model_copy(
+        update={
+            "wecom_card_callback_enabled": True,
+            "wecom_card_transport_configured": True,
+            "wecom_card_callback_handler_configured": True,
+            "lead_smart_table_url": "https://example.invalid/configured-review-table",
+        }
+    )
+    monkeypatch.setattr(commands, "get_settings", lambda: settings)
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    with session_factory.begin() as session:
+        session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
+        for index in range(count):
+            record = adapter.create_record(
+                {
+                    "负责人": "sales-1",
+                    "线索名称": f"投递公司{index}",
+                    "提交状态": "未提交",
+                },
+                actor=SmartTableActor.ROBOT,
+            )
+            session.add(
+                Lead(
+                    id=f"delivery-{index}",
+                    original_capturing_sales_user_id="sales-1",
+                    smart_table_owner_user_id="sales-1",
+                    smart_table_record_id=record.record_id,
+                    lifecycle_state="pending_create",
+                    field_values=dict(record.fields),
+                )
+            )
+
+    command = SubmissionCommand(
+        "提交我所有线索" if count > 1 else "请帮我提交投递公司0这条线索",
+        "sales-1",
+        "delivery-command",
+    )
+
+    def prepare(request: SubmissionCommand) -> None:
+        """调用实际命令入口，只构造待提交明细和卡片，不调用 CRM。"""
+        if count > 1:
+            prepare_batch_submission_selection(session_factory, adapter, MockCRMAdapter(), request)
+        else:
+            prepare_company_submission_preview(session_factory, adapter, request, "投递公司0")
+
+    class Client:
+        """按阶段模拟一次投递失败，只保存真正成功的消息。"""
+
+        def __init__(self) -> None:
+            """初始化投递记录及一次故障开关，无外部副作用。"""
+            self.delivered: list[str] = []
+            self.failed = False
+
+        async def send_message(
+            self, userid_or_chatid: str, body: dict[str, object]
+        ) -> dict[str, str]:
+            """将成功消息记入内存；指定阶段首次抛出可重试连接错误。"""
+            assert userid_or_chatid == "sales-1"
+            assert set(body) == {"msgtype", str(body["msgtype"])}
+            stage = (
+                "card"
+                if body["msgtype"] == "template_card"
+                else ("link" if "configured-review-table" in str(body) else "preview")
+            )
+            if stage == failure_stage and not self.failed:
+                self.failed = True
+                raise ConnectionError("isolated delivery failure")
+            self.delivered.append(stage)
+            return {"msgid": str(len(self.delivered))}
+
+    prepare(command)
+    prepare(command)
+    client = Client()
+    sender = WecomOutboundNotificationSender(session_factory, client)
+    asyncio.run(sender.send_pending_once())
+    assert "link" not in client.delivered
+    for _ in range(4):
+        asyncio.run(sender.send_pending_once())
+    assert client.delivered == sorted(
+        client.delivered, key={"preview": 0, "card": 1, "link": 2}.get
+    )
+    assert client.delivered.count("card") == (2 if count > 1 else 1)
+    assert client.delivered.count("link") == 1
+    prepare(command)
+    assert asyncio.run(sender.send_pending_once()) == 0
+    with session_factory() as session:
+        notices = list(session.scalars(select(NotificationRecord)))
+        assert all(notice.status == "succeeded" for notice in notices)
+        assert all(notice.attempts <= 2 for notice in notices)
+    # 新消息是新的有效命令，不能被首次录入成功链接的历史去重规则抑制。
+    prepare(SubmissionCommand(command.text, "sales-1", "delivery-command-next"))
+    for _ in range(3):
+        asyncio.run(sender.send_pending_once())
+    assert client.delivered.count("link") == 2
+
+
+def test_submission_missing_table_url_logs_configuration_and_never_records_sent_link(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """链接缺失时明确记录配置错误，已有明细和卡片仍可投递，无假成功链接。"""
+    import app.crm.commands as commands
+
+    settings = get_settings().model_copy(
+        update={
+            "wecom_card_callback_enabled": True,
+            "wecom_card_transport_configured": True,
+            "wecom_card_callback_handler_configured": True,
+            "lead_smart_table_url": None,
+        }
+    )
+    monkeypatch.setattr(commands, "get_settings", lambda: settings)
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    record = adapter.create_record(
+        {"负责人": "sales-1", "线索名称": "配置测试公司", "提交状态": "未提交"},
+        actor=SmartTableActor.ROBOT,
+    )
+    with session_factory.begin() as session:
+        session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
+        session.add(
+            Lead(
+                id="missing-url",
+                original_capturing_sales_user_id="sales-1",
+                smart_table_owner_user_id="sales-1",
+                smart_table_record_id=record.record_id,
+                field_values=dict(record.fields),
+                lifecycle_state="pending_create",
+            )
+        )
+    prepare_company_submission_preview(
+        session_factory,
+        adapter,
+        SubmissionCommand("提交", "sales-1", "missing-url-command"),
+        "配置测试公司",
+    )
+    assert "crm_submission_table_link_configuration_missing" in caplog.text
+    with session_factory() as session:
+        assert (
+            session.scalar(
+                select(func.count(NotificationRecord.notification_key)).where(
+                    NotificationRecord.notification_type == "crm_submission_table_link",
+                )
+            )
+            == 0
+        )
+
+
+def test_capture_metadata_never_changes_crm_payload_or_submission_preview() -> None:
+    """录入时间不进入 CRM 载荷，也不扩展提交确认十字段。"""
+    from app.crm.payload import CrmPayloadBuilder
+    from app.wecom_bot.actions import SUBMISSION_PREVIEW_FIELDS
+
+    builder = CrmPayloadBuilder()
+    fields = {"线索名称": "元数据测试公司", "业务线": "协作机器人"}
+    assert builder.build(fields) == builder.build({**fields, "录入时间": "2026-10-09 10:20:30"})
+    assert "录入时间" not in SUBMISSION_PREVIEW_FIELDS
+    assert len(SUBMISSION_PREVIEW_FIELDS) == 10

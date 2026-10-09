@@ -623,7 +623,7 @@ def test_unverified_850005_record_and_record_id_mismatch_never_count_success() -
 
 
 def test_first_message_anchors_due_timer_and_late_scans_do_not_catch_up() -> None:
-    """首条消息建立个人 due_at，未到期不发送，迟到扫描只创建一条通知。"""
+    """08:00 接收后到 08:50 才调度时，历史窗口不创建或发送汇报。"""
     context = progress_context()
     start = datetime(2026, 10, 8, 8, 0, tzinfo=UTC)
     seed_message(
@@ -644,13 +644,19 @@ def test_first_message_anchors_due_timer_and_late_scans_do_not_catch_up() -> Non
         assert progress.next_report_at.replace(tzinfo=UTC) == start + timedelta(minutes=15)
 
     assert context.service.schedule_due_reports(now=start + timedelta(minutes=14)) == 0
-    assert context.service.schedule_due_reports(now=start + timedelta(minutes=50)) == 1
+    assert context.service.schedule_due_reports(now=start + timedelta(minutes=50)) == 0
     assert context.service.schedule_due_reports(now=start + timedelta(minutes=50)) == 0
     with context.session_factory() as session:
         progress = session.scalar(select(LeadProgressSession))
         assert progress is not None
-        assert progress.next_report_at.replace(tzinfo=UTC) == start + timedelta(minutes=65)
-        assert session.scalar(select(func.count()).select_from(NotificationRecord)) == 1
+        assert progress.status == "closed"
+        assert progress.next_report_at.replace(tzinfo=UTC) == start + timedelta(minutes=45)
+        assert session.scalar(select(func.count()).select_from(NotificationRecord)) == 0
+    client = RecordingClient()
+    assert asyncio.run(
+        WecomOutboundNotificationSender(context.session_factory, client).send_pending_once()
+    ) == 0
+    assert client.calls == []
 
 
 def test_pending_message_is_counted_before_worker_completion_and_recovered_after_restart() -> None:
@@ -930,8 +936,8 @@ def test_scheduler_restart_preserves_session_and_retries_only_notification() -> 
     assert restarted_client.calls == []
 
 
-def test_idle_session_sends_final_and_new_message_opens_fresh_window() -> None:
-    """任务完成且空闲后发送最终汇总关闭会话，后续消息另起窗口。"""
+def test_idle_session_stops_without_final_and_new_message_opens_fresh_window() -> None:
+    """空窗口不发送最终汇报并关闭会话，后续消息另起窗口。"""
     context = progress_context()
     start = datetime(2026, 10, 8, 10, 0, tzinfo=UTC)
     seed_message(
@@ -943,16 +949,18 @@ def test_idle_session_sends_final_and_new_message_opens_fresh_window() -> None:
     )
     context.service.record_resolved_message("first-session", now=start)
     context.adapter.records["idle-record"] = SmartTableRecord("idle-record", full_required_fields())
-    assert context.service.schedule_due_reports(now=start + timedelta(minutes=60)) == 1
+    assert context.service.schedule_due_reports(now=start + timedelta(minutes=15)) == 1
     final_notice = read_notice(context.session_factory, "sales-a")
     assert final_notice is not None and final_notice.payload is not None
-    assert final_notice.payload["final"] is True
-    assert "最终汇报" in (final_notice.content or "")
+    assert final_notice.payload["final"] is False
+    assert context.service.schedule_due_reports(now=start + timedelta(minutes=60)) == 0
+    assert context.service.schedule_due_reports(now=start + timedelta(minutes=60)) == 0
+    assert "最终汇报" not in (final_notice.content or "")
     with context.session_factory() as session:
         old_session = session.scalar(select(LeadProgressSession))
         assert old_session is not None and old_session.status == "closed"
 
-    next_start = start + timedelta(minutes=61)
+    next_start = start + timedelta(hours=4, minutes=1)
     seed_message(
         context.session_factory,
         message_id="second-session",
@@ -969,6 +977,11 @@ def test_idle_session_sends_final_and_new_message_opens_fresh_window() -> None:
         assert sessions[0].status == "closed"
         assert sessions[1].status == "active"
         assert sessions[1].started_at.replace(tzinfo=UTC) == next_start
+    context.adapter.records["new-record"] = SmartTableRecord("new-record", full_required_fields())
+    assert context.service.schedule_due_reports(now=next_start + timedelta(minutes=15)) == 1
+    assert context.service.schedule_due_reports(now=next_start + timedelta(minutes=15)) == 0
+    notice = read_notice(context.session_factory, "sales-a")
+    assert notice is not None and notice.payload["stats"]["received_messages"] == 1
 
 
 def test_inactive_sales_closes_session_without_sending_progress() -> None:
@@ -1055,8 +1068,8 @@ def test_ignored_demand_candidate_closes_without_emitting_a_progress_report() ->
         assert session.scalar(select(func.count()).select_from(NotificationRecord)) == 0
 
 
-def test_old_message_recovery_does_not_start_a_historical_timer() -> None:
-    """超过空闲周期才恢复的旧事件从处理时刻重新起算，不补发历史窗口。"""
+def test_old_message_recovery_preserves_received_time() -> None:
+    """旧事件恢复仍按持久化接收时间划分窗口，不伪装为新收到的消息。"""
     context = progress_context()
     received = datetime(2026, 10, 8, 1, 0, tzinfo=UTC)
     resumed = received + timedelta(hours=4)
@@ -1071,8 +1084,14 @@ def test_old_message_recovery_does_not_start_a_historical_timer() -> None:
     with context.session_factory() as session:
         progress = session.scalar(select(LeadProgressSession))
         assert progress is not None
-        assert progress.started_at.replace(tzinfo=UTC) == resumed
-        assert progress.next_report_at.replace(tzinfo=UTC) == resumed + timedelta(minutes=15)
+        assert progress.started_at.replace(tzinfo=UTC) == received
+        assert progress.next_report_at.replace(tzinfo=UTC) == received + timedelta(minutes=15)
+    assert context.service.schedule_due_reports(now=resumed) == 0
+    assert context.service.schedule_due_reports(now=resumed) == 0
+    with context.session_factory() as session:
+        progress = session.scalar(select(LeadProgressSession))
+        assert progress is not None and progress.status == "closed"
+        assert session.scalar(select(func.count()).select_from(NotificationRecord)) == 0
 
 
 def test_progress_notification_sender_suppresses_when_feature_is_disabled(
@@ -1243,3 +1262,138 @@ def test_existing_receipt_crm_and_first_success_notifications_remain_supported(
         "crm_submission_summary",
         "lead_first_smart_table_success",
     }
+
+
+def test_window_boundaries_cross_day_and_empty_window_never_repeat_processing() -> None:
+    """相邻窗口按接收时间独立统计，旧任务仍处理中也不进入新窗口，跨日重放幂等。"""
+    context = progress_context()
+    start = datetime(2026, 10, 8, 15, 50, tzinfo=UTC)
+    for index, minutes in enumerate((0, 1, 15)):
+        message_id = f"bounded-{index}"
+        received = start + timedelta(minutes=minutes)
+        seed_message(
+            context.session_factory,
+            message_id=message_id,
+            sales_user_id="sales-a",
+            received_at=received,
+            outbox_status="processing",
+            segments=(SegmentSpec(None, resolution_status="unassigned"),),
+        )
+        register_candidate(context, message_id, now=received)
+    assert context.service.schedule_due_reports(now=start + timedelta(minutes=15)) == 1
+    assert (
+        read_notice(context.session_factory, "sales-a").payload["stats"]["received_messages"] == 2
+    )
+    assert context.service.schedule_due_reports(now=start + timedelta(minutes=15)) == 0
+    assert context.service.schedule_due_reports(now=start + timedelta(minutes=30)) == 1
+    notice = read_notice(context.session_factory, "sales-a")
+    assert notice.payload["stats"]["received_messages"] == 1
+    assert notice.payload["stats"]["processing_items"] == 1
+    assert context.service.schedule_due_reports(now=start + timedelta(minutes=45)) == 0
+    assert context.service.schedule_due_reports(now=start + timedelta(hours=3)) == 0
+    client = RecordingClient()
+    sender = WecomOutboundNotificationSender(context.session_factory, client)
+    assert asyncio.run(sender.send_pending_once()) == 2
+    assert asyncio.run(sender.send_pending_once()) == 0
+
+
+@pytest.mark.parametrize(
+    ("delay", "expected"),
+    (
+        (timedelta(0), 1),
+        (timedelta(seconds=1), 1),
+        (timedelta(minutes=14, seconds=59), 1),
+        (timedelta(minutes=15), 1),
+        (timedelta(minutes=15, microseconds=1), 0),
+    ),
+)
+def test_report_expiration_requires_more_than_one_complete_interval(
+    delay: timedelta, expected: int,
+) -> None:
+    """窗口结束后严格超过一完整周期才过期，正常及短暂迟到仍只发送一次。"""
+    context = progress_context()
+    start = datetime(2026, 10, 8, 8, 0, tzinfo=UTC)
+    seed_message(
+        context.session_factory,
+        message_id="expiry-boundary",
+        sales_user_id="sales-a",
+        received_at=start,
+        segments=(SegmentSpec(None, resolution_status="unassigned"),),
+    )
+    context.service.record_resolved_message("expiry-boundary", now=start)
+    now = start + timedelta(minutes=15) + delay
+    assert context.service.schedule_due_reports(now=now) == expected
+    assert context.service.schedule_due_reports(now=now) == 0
+    client = RecordingClient()
+    sender = WecomOutboundNotificationSender(context.session_factory, client)
+    assert asyncio.run(sender.send_pending_once()) == expected
+    assert asyncio.run(sender.send_pending_once()) == 0
+    assert len(client.calls) == expected
+
+
+def test_long_pause_skips_expired_windows_without_losing_later_message_statistics() -> None:
+    """跨多个窗口暂停后跳过旧消息，后续有消息窗口统计独立、读取正确快照且重放幂等。"""
+    context = progress_context()
+    start = datetime(2026, 10, 8, 8, 0, tzinfo=UTC)
+    for index, minutes in enumerate((0, 272, 284, 285)):
+        received = start + timedelta(minutes=minutes)
+        seed_message(
+            context.session_factory,
+            message_id=f"pause-message-{index}",
+            sales_user_id="sales-a",
+            received_at=received,
+            segments=(SegmentSpec(f"pause-lead-{index}", "测试公司", f"pause-record-{index}"),),
+        )
+        context.service.record_resolved_message(f"pause-message-{index}", now=received)
+        context.adapter.records[f"pause-record-{index}"] = SmartTableRecord(
+            f"pause-record-{index}", full_required_fields()
+        )
+    # 12:50 首次扫描只推进过期游标；重扫重新读取 12:30—12:45 窗口的真实表格快照。
+    resumed = start + timedelta(minutes=290)
+    assert context.service.schedule_due_reports(now=resumed) == 0
+    assert context.service.schedule_due_reports(now=resumed) == 1
+    assert context.service.schedule_due_reports(now=resumed) == 0
+    notice = read_notice(context.session_factory, "sales-a")
+    assert notice is not None and notice.payload is not None
+    assert notice.payload["window_started_at"] == (start + timedelta(minutes=270)).isoformat()
+    assert notice.payload["window_ended_at"] == (start + timedelta(minutes=285)).isoformat()
+    assert notice.payload["stats"]["received_messages"] == 2
+    assert notice.payload["stats"]["successful_leads"] == 2
+    # 恰好 12:45 接收的消息属于下一半开窗口，不能泄漏到上一汇报或重复累计。
+    next_due = start + timedelta(minutes=300)
+    assert context.service.schedule_due_reports(now=next_due) == 1
+    assert context.service.schedule_due_reports(now=next_due) == 0
+    notice = read_notice(context.session_factory, "sales-a")
+    assert notice is not None and notice.payload["stats"]["received_messages"] == 1
+    assert notice.payload["stats"]["successful_leads"] == 1
+    client = RecordingClient()
+    sender = WecomOutboundNotificationSender(context.session_factory, client)
+    assert asyncio.run(sender.send_pending_once()) == 2
+    assert asyncio.run(sender.send_pending_once()) == 0
+    assert len(client.calls) == 2
+
+
+def test_consecutive_empty_windows_never_create_or_send_reports() -> None:
+    """首轮汇报后连续空窗口及跨日扫描保持关闭，不登记或重发通知。"""
+    context = progress_context()
+    start = datetime(2026, 10, 8, 8, 0, tzinfo=UTC)
+    seed_message(
+        context.session_factory,
+        message_id="empty-followups",
+        sales_user_id="sales-a",
+        received_at=start,
+        segments=(SegmentSpec(None, resolution_status="unassigned"),),
+    )
+    context.service.record_resolved_message("empty-followups", now=start)
+    assert context.service.schedule_due_reports(now=start + timedelta(minutes=15)) == 1
+    client = RecordingClient()
+    sender = WecomOutboundNotificationSender(context.session_factory, client)
+    assert asyncio.run(sender.send_pending_once()) == 1
+    for minutes in (30, 45, 60, 24 * 60):
+        assert context.service.schedule_due_reports(now=start + timedelta(minutes=minutes)) == 0
+        assert asyncio.run(sender.send_pending_once()) == 0
+    with context.session_factory() as session:
+        progress = session.scalar(select(LeadProgressSession))
+        assert progress is not None and progress.status == "closed"
+        assert session.scalar(select(func.count()).select_from(NotificationRecord)) == 1
+    assert len(client.calls) == 1

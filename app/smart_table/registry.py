@@ -154,8 +154,16 @@ AI_FIELD_ALIASES = {
     "营收": "年销售额",
     "收入": "年销售额",
 }
+# 业务默认值独立于历史表格元数据，禁止在历史记录读取时批量补写。
+DEFAULT_LEAD_BUSINESS_VALUES = {
+    "业务线": "协作机器人",
+    "职务": "经理",
+    "沟通方式": "活动",
+    "客户行业": "其他",
+}
 DEFAULT_SMART_TABLE_FIELD_VALUES = {"是否为国际客户": "国内", "提交状态": "未提交"}
 REQUIRED_SMART_TABLE_FIELDS = (
+    RequiredSmartTableField("录入时间", SmartTableFieldType.DATE),
     RequiredSmartTableField("业务线", SmartTableFieldType.SINGLE_SELECT, BUSINESS_LINE_OPTIONS),
     RequiredSmartTableField("线索名称", SmartTableFieldType.TEXT),
     RequiredSmartTableField(

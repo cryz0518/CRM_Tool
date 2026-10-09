@@ -22,9 +22,7 @@ from app.messaging.models import NotificationRecord, OutboxEvent, SalesAuthoriza
 logger = logging.getLogger(__name__)
 _NOTIFICATION_LEASE = timedelta(minutes=5)
 _SDK_ERROR_CODE = re.compile(r"errcode=(\d+)")
-_NON_RETRYABLE_PROVIDER_CODES = frozenset(
-    {f"420{code}" for code in range(27, 52)}
-)
+_NON_RETRYABLE_PROVIDER_CODES = frozenset({f"420{code}" for code in range(27, 52)})
 _RECEIPT_TERMINAL_OUTBOX_STATUSES = frozenset(
     {"succeeded", "ignored", "unauthorized", "invalid", "failed_pending_review"}
 )
@@ -38,6 +36,7 @@ _SUPPORTED_NOTIFICATION_TYPES = frozenset(
         "crm_submission_summary",
         "crm_submission_retry_summary",
         "crm_submission_preview",
+        "crm_submission_table_link",
         "crm_submission_intent_unrecognized",
         "lead_processing_failed",
         "wecom_action_preview",
@@ -69,7 +68,8 @@ class WecomOutboundNotificationSender:
         """发送当前待投递通知，失败保留 retrying 而不触碰 CRM。"""
         with self._session_factory() as session:
             notices = session.scalars(
-                select(NotificationRecord).where(
+                select(NotificationRecord)
+                .where(
                     NotificationRecord.notification_type.in_(_SUPPORTED_NOTIFICATION_TYPES),
                     or_(
                         NotificationRecord.status.in_(("pending", "retrying")),
@@ -98,6 +98,16 @@ class WecomOutboundNotificationSender:
                 )
                 if current is None or (
                     current.status not in {"pending", "retrying"} and not lease_expired
+                ):
+                    continue
+                # 依赖未成功时不认领，不消耗重试次数；明细或卡片失败不能让后续消息抢先发送。
+                metadata = current.payload or {}
+                dependencies = metadata.get("depends_on", [])
+                if metadata.get("delivery_pending") or any(
+                    (dependency := session.get(NotificationRecord, key)) is None
+                    or dependency.sales_user_id != current.sales_user_id
+                    or dependency.status != "succeeded"
+                    for key in dependencies
                 ):
                     continue
                 if current.notification_type == "lead_progress_summary":
@@ -424,11 +434,11 @@ def _build_supported_body(
     if isinstance(payload, dict):
         msgtype = payload.get("msgtype")
         if msgtype == "template_card":
-            return payload
+            return {"msgtype": msgtype, msgtype: payload[msgtype]}
         if msgtype == "markdown":
             markdown = payload.get("markdown")
             if isinstance(markdown, dict) and isinstance(markdown.get("content"), str):
-                return payload
+                return {"msgtype": msgtype, msgtype: payload[msgtype]}
         if msgtype == "text":
             text = payload.get("text")
             if isinstance(text, dict) and isinstance(text.get("content"), str):

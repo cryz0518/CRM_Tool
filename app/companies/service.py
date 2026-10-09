@@ -20,6 +20,7 @@ from app.companies.models import (
     TYCCandidate,
     TYCLookupResult,
 )
+from app.leads.capture import initialize_lead_capture
 from app.leads.identity import DatabaseSalesIdentityProvider, SalesIdentityProvider
 from app.leads.models import (
     Lead,
@@ -581,10 +582,7 @@ class CompanyLeadService:
             fields["是否为国际客户"] = "国外"
         if standard_name is not None and (
             verification_status is CompanyVerificationStatus.TYC_VERIFIED
-            or (
-                verification_status is CompanyVerificationStatus.COMPANY_UNVERIFIED
-                and candidates
-            )
+            or (verification_status is CompanyVerificationStatus.COMPANY_UNVERIFIED and candidates)
         ):
             fields["线索名称"] = standard_name
         lead = Lead(
@@ -603,6 +601,7 @@ class CompanyLeadService:
         )
         session.add(lead)
         session.flush()
+        initialize_lead_capture(session, lead)
         # 每个首次字段都建立可追溯来源，后续人工保护与保守合并依赖这份事实。
         for field_name, value in fields.items():
             session.add(
@@ -674,14 +673,35 @@ class CompanyLeadService:
         enrichment = dict(lead.enrichment_values)
         # 逐字段合并仅允许补空；非空冲突和人工保护值均转为补充信息而非覆盖表格。
         for field_name, value in incoming.items():
-            if not value or field_name == "线索名称":
+            if not value or field_name in {"线索名称", "录入时间"}:
                 continue
             old_value = values.get(field_name)
             if field_name in protected:
                 # 人工编辑保护优先于所有公司、AI 或消息补充规则。
                 self._append_enrichment(enrichment, field_name, value)
                 continue
-            if not old_value:
+            source = session.scalar(
+                select(LeadFieldProvenance)
+                .where(
+                    LeadFieldProvenance.lead_id == lead.id,
+                    LeadFieldProvenance.field_name == field_name,
+                )
+                .order_by(LeadFieldProvenance.id.desc())
+                .limit(1)
+            )
+            replace_default = (
+                source is not None
+                and source.is_system_default
+                and not source.is_user_modified
+                and not source.is_user_confirmed
+            )
+            if replace_default and old_value != value:
+                # 公司服务只接收确定性业务校验后的字段；保留旧同步基线供外部重读保护。
+                values[field_name] = value
+                patch[field_name] = value
+                source.value = serialize_field_value(value)
+                source.is_system_default = False
+            elif not old_value:
                 values[field_name] = value
                 patch[field_name] = value
                 session.add(
@@ -1000,7 +1020,10 @@ class CompanyLeadService:
             session.scalars(
                 select(LeadFieldProvenance.field_name).where(
                     LeadFieldProvenance.lead_id == lead_id,
-                    LeadFieldProvenance.is_user_modified.is_(True),
+                    (
+                        LeadFieldProvenance.is_user_modified.is_(True)
+                        | LeadFieldProvenance.is_user_confirmed.is_(True)
+                    ),
                 )
             ).all()
         )

@@ -143,12 +143,13 @@ class LeadFieldProvenance(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     lead_id: Mapped[str] = mapped_column(ForeignKey("leads.id"), nullable=False, index=True)
-    source_message_id: Mapped[str] = mapped_column(
-        ForeignKey("incoming_messages.message_id"), nullable=False
+    source_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("incoming_messages.message_id"), nullable=True
     )
     field_name: Mapped[str] = mapped_column(String(64), nullable=False)
     value: Mapped[str] = mapped_column(Text, nullable=False)
     last_ai_synced_value: Mapped[str | None] = mapped_column(Text)
+    is_system_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_user_modified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_user_confirmed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(

@@ -43,24 +43,24 @@ def register_progress_message(
     settings: Settings,
     *,
     now: datetime | None = None,
-    anchor_at: datetime | None = None,
 ) -> bool:
     """在来源消息事务中登记已确定走线索管线的需求消息。
 
     参数：session 为来源消息接收事务；message 为已持久化消息；settings 为功能开关与计时配置；
-    now 为登记时间；anchor_at 可用于安全恢复时覆盖统计窗口锚点。
+    now 为登记时间；统计锚点始终使用持久化接收时间。
     返回值：首次登记返回 True，功能关闭、销售停用或消息已登记时返回 False。
     异常：数据库读取或写入异常向事务调用方传播并回滚消息接收。
     副作用：在同一事务中创建销售会话和 processing 候选，不调用外部服务。
     """
-    if not settings.lead_progress_enabled or session.get(
-        LeadProgressMessage, message.message_id
-    ) is not None:
+    if (
+        not settings.lead_progress_enabled
+        or session.get(LeadProgressMessage, message.message_id) is not None
+    ):
         return False
     if not _active_sales_authorization(session, message.sales_user_id):
         return False
 
-    received_at = _as_utc(anchor_at or message.received_at)
+    received_at = _as_utc(message.received_at)
     progress_message = LeadProgressMessage(
         message_id=message.message_id,
         status="processing",
@@ -276,9 +276,7 @@ class LeadProgressService:
                     select(OutboxEvent).where(
                         OutboxEvent.message_id == message_id,
                         OutboxEvent.sales_user_id == message.sales_user_id,
-                        OutboxEvent.event_type.in_(
-                            ("message_received", "crm_submission_intent")
-                        ),
+                        OutboxEvent.event_type.in_(("message_received", "crm_submission_intent")),
                     )
                 )
                 resolution_exists = session.scalar(
@@ -288,20 +286,7 @@ class LeadProgressService:
                 )
                 if event is None or resolution_exists is None:
                     return False
-                received_at = _as_utc(message.received_at)
-                idle_window = timedelta(minutes=self._settings.lead_progress_idle_stop_minutes)
-                anchor_at = (
-                    current_time
-                    if received_at < current_time - idle_window
-                    else received_at
-                )
-                register_progress_message(
-                    session,
-                    message,
-                    self._settings,
-                    now=current_time,
-                    anchor_at=anchor_at,
-                )
+                register_progress_message(session, message, self._settings, now=current_time)
                 progress_message = session.get(LeadProgressMessage, message_id)
             if progress_message is None:
                 return False
@@ -467,7 +452,7 @@ class LeadProgressService:
         )
 
     def schedule_due_reports(self, *, now: datetime | None = None) -> int:
-        """扫描到期会话，创建唯一汇总通知并在空闲完成后发送最终汇总。
+        """扫描到期会话，只为有新消息且未过期的窗口创建唯一汇总通知。
 
         参数：now 可注入调度时钟；省略时使用当前 UTC 时间。
         返回值：本次新建的逻辑通知数量。
@@ -541,19 +526,41 @@ class LeadProgressService:
                     progress.close_reason = "sales_disabled"
                     continue
 
-                stats = self._calculate_stats(session, progress, fresh_fields)
-                now_idle = _as_utc(progress.last_activity_at) <= idle_before
-                is_final = now_idle and stats.processing_items == 0
-                is_due = _as_utc(progress.next_report_at) <= current_time
-                if not is_final and not is_due:
+                window_end = _as_utc(progress.next_report_at)
+                if window_end > current_time:
                     continue
-
-                occurrence = "final" if is_final else _as_utc(progress.next_report_at).isoformat()
+                interval = timedelta(minutes=self._settings.lead_progress_interval_minutes)
+                if current_time > window_end + interval:
+                    # 严格超过一完整周期才过期；保留半开窗口边界，下一次扫描重读对应快照。
+                    skipped_windows = (current_time - window_end - timedelta.resolution) // interval
+                    progress.next_report_at = window_end + skipped_windows * interval
+                    continue
+                stats = self._calculate_stats(session, progress, fresh_fields)
+                if stats.received_messages == 0:
+                    # 空窗口不创建通知；未来消息重新锚定周期，旧消息处理完成也不会重复汇报。
+                    next_received = session.scalar(
+                        select(LeadProgressMessage.received_at)
+                        .where(
+                            LeadProgressMessage.progress_session_id == progress.id,
+                            LeadProgressMessage.status.not_in(("ignored", "awaiting_intent")),
+                            LeadProgressMessage.received_at >= window_end,
+                        )
+                        .order_by(LeadProgressMessage.received_at)
+                        .limit(1)
+                    )
+                    if next_received is None:
+                        progress.status = "closed"
+                        progress.closed_at = current_time
+                        progress.close_reason = "no_new_demand"
+                    else:
+                        progress.next_report_at = _as_utc(next_received) + interval
+                    continue
+                occurrence = window_end.isoformat()
                 notification_key = hashlib.sha256(
                     f"lead_progress:{progress.id}:{occurrence}".encode()
                 ).hexdigest()
                 if session.get(NotificationRecord, notification_key) is None:
-                    content = _render_summary(stats, final=is_final)
+                    content = _render_summary(stats, final=False)
                     session.add(
                         NotificationRecord(
                             notification_key=notification_key,
@@ -563,10 +570,10 @@ class LeadProgressService:
                             content=content,
                             payload={
                                 "progress_session_id": progress.id,
-                                "window_started_at": _as_utc(progress.started_at).isoformat(),
-                                "window_ended_at": current_time.isoformat(),
+                                "window_started_at": (window_end - interval).isoformat(),
+                                "window_ended_at": window_end.isoformat(),
                                 "scheduled_due_at": _as_utc(progress.next_report_at).isoformat(),
-                                "final": is_final,
+                                "final": False,
                                 "stats": asdict(stats),
                             },
                         )
@@ -577,25 +584,12 @@ class LeadProgressService:
                         extra={
                             "progress_session_id": progress.id,
                             "notification_key": notification_key,
-                            "is_final": is_final,
+                            "is_final": False,
                             "event": "lead_progress_notification_queued",
                         },
                     )
-                if is_final:
-                    progress.status = "closed"
-                    progress.closed_at = current_time
-                    progress.close_reason = "idle_complete"
-                else:
-                    # 错过多个扫描周期时只排一条通知，并从本次扫描时间继续计时。
-                    next_report_at = _as_utc(progress.next_report_at) + timedelta(
-                        minutes=self._settings.lead_progress_interval_minutes
-                    )
-                    progress.next_report_at = (
-                        next_report_at
-                        if next_report_at > current_time
-                        else current_time
-                        + timedelta(minutes=self._settings.lead_progress_interval_minutes)
-                    )
+                # 按固定半开窗口推进，不累计旧消息；过期窗口在上方静默跳过。
+                progress.next_report_at = window_end + interval
         return created
 
     def _close_disabled_session(self, progress_id: str, sales_user_id: str, now: datetime) -> None:
@@ -683,7 +677,11 @@ class LeadProgressService:
         """
         message_ids = select(LeadProgressMessage.message_id).where(
             LeadProgressMessage.progress_session_id == progress.id,
-            LeadProgressMessage.status != "ignored",
+            LeadProgressMessage.status.not_in(("ignored", "awaiting_intent")),
+            LeadProgressMessage.received_at
+            >= _as_utc(progress.next_report_at)
+            - timedelta(minutes=self._settings.lead_progress_interval_minutes),
+            LeadProgressMessage.received_at < _as_utc(progress.next_report_at),
         )
         lead_ids = select(LeadMessageResolution.lead_id).where(
             LeadMessageResolution.message_id.in_(message_ids),
@@ -720,7 +718,11 @@ class LeadProgressService:
             session.scalars(
                 select(LeadProgressMessage.message_id).where(
                     LeadProgressMessage.progress_session_id == progress.id,
-                    LeadProgressMessage.status != "ignored",
+                    LeadProgressMessage.status.not_in(("ignored", "awaiting_intent")),
+                    LeadProgressMessage.received_at
+                    >= _as_utc(progress.next_report_at)
+                    - timedelta(minutes=self._settings.lead_progress_interval_minutes),
+                    LeadProgressMessage.received_at < _as_utc(progress.next_report_at),
                 )
             ).all()
         )
@@ -798,9 +800,7 @@ class LeadProgressService:
                 ).where(
                     OutboxEvent.message_id.in_(message_ids),
                     OutboxEvent.sales_user_id == progress.sales_user_id,
-                    OutboxEvent.event_type.in_(
-                        ("message_received", "crm_submission_intent")
-                    ),
+                    OutboxEvent.event_type.in_(("message_received", "crm_submission_intent")),
                     OutboxEvent.status == "failed_pending_review",
                 )
             ).all()

@@ -227,6 +227,7 @@ class LeadReviewService:
                 else:
                     source.value = serialize_field_value(value)
                     source.last_ai_synced_value = serialize_field_value(value)
+                    source.is_system_default = False
             if actual_written_names:
                 # 仅按字段合并本次 T09 实际写入值，绝不使用旧 Lead JSON 整体覆盖后续消息。
                 final_lead.field_values = current_values
@@ -273,9 +274,7 @@ class LeadReviewService:
                 current_values[field_name] = value
                 source = provenance.get(field_name)
                 serialized_value = serialize_field_value(value)
-                synced_value = (
-                    None if field_name in pending_external_names else serialized_value
-                )
+                synced_value = None if field_name in pending_external_names else serialized_value
                 if source is None:
                     session.add(
                         LeadFieldProvenance(
@@ -290,8 +289,8 @@ class LeadReviewService:
                     source.value = serialized_value
                     if synced_value is not None:
                         source.last_ai_synced_value = synced_value
-                    else:
-                        source.last_ai_synced_value = None
+                        source.is_system_default = False
+                    # 外部写入尚未成功时保留旧基线和默认来源，供重试核实与人工编辑保护。
             if plan.synced_values:
                 lead.field_values = current_values
             if enrichment:
@@ -342,7 +341,10 @@ class LeadReviewService:
             # 失败消息留下的来源值属于未完成外部同步，后续消息必须把它们重新纳入远端补丁。
             candidate_fields: dict[str, LeadFieldValue] = dict(patch.fields)
             for field_name, field_provenance in provenance.items():
-                if field_provenance.last_ai_synced_value is not None:
+                if (
+                    field_provenance.last_ai_synced_value is not None
+                    and field_provenance.value == field_provenance.last_ai_synced_value
+                ):
                     continue
                 pending_value = deserialize_field_value(field_provenance.value)
                 if isinstance(pending_value, str) or (
@@ -352,12 +354,28 @@ class LeadReviewService:
                     candidate_fields.setdefault(field_name, pending_value)
             # T08 已完成结构和业务校验；本层仅决定是否可安全写入，不重新解释 AI 内容。
             for field_name, value in candidate_fields.items():
+                if field_name == "录入时间":
+                    # 接收时间属于系统元数据，AI、后续消息或重试都不得改写。
+                    continue
                 if field_name == "备注":
                     # 备注只由本关口在正式字段保护完成后按冻结模板生成。
                     continue
                 field_source = provenance.get(field_name)
                 current_value = current_fields.get(field_name)
                 is_pending = field_name in patch.pending_confirmation_fields
+                if (
+                    field_source is not None
+                    and field_source.is_system_default
+                    and (
+                        is_pending
+                        or field_name in patch.low_confidence_candidates
+                        or patch.analysis.confidence_by_field.get(field_name, 0)
+                        < get_settings().ai_high_confidence_threshold
+                    )
+                    and field_name in patch.fields
+                ):
+                    # 默认值只让位于已经确认的可靠结果；中低置信度仍保留候选供销售审核。
+                    continue
                 if is_pending and self._must_not_prefill_without_confirmation(
                     field_name, patch.pending_prefill_allowed_fields
                 ):
@@ -384,7 +402,11 @@ class LeadReviewService:
                     pending.discard(field_name)
                     continue
                 if field_values_equal(current_value, value):
-                    if lead.field_values.get(field_name) != value:
+                    if lead.field_values.get(field_name) != value or (
+                        field_source is not None
+                        and field_source.is_system_default
+                        and field_name in patch.fields
+                    ):
                         written_names.append(field_name)
                         synced_values[field_name] = value
                     if is_pending:
@@ -411,6 +433,11 @@ class LeadReviewService:
                 field_name: value
                 for field_name, value in all_reviewed_fields.items()
                 if field_name not in pending
+                and not (
+                    (source := provenance.get(field_name)) is not None
+                    and source.is_system_default
+                    and field_name not in synced_values
+                )
             }
             enrichment = {**lead.enrichment_values, **patch.enrichment}
             remark_value = RemarksBuilder().build(reviewed_fields, enrichment)

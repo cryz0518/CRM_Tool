@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.failures import safe_audit_text, safe_failure_summary, validate_request_id
+from app.leads.capture import initialize_lead_capture
 from app.leads.models import AdminLeadCreationOperation, Lead, new_lead_id
 from app.messaging.models import SalesAuthorization, utc_now
 from app.smart_table.adapter import (
@@ -50,7 +51,7 @@ class _AdminCreationSnapshot:
 class AdminLeadCreationService:
     """创建没有来源消息的管理员线索，并异步语义地协调 Smart Table。"""
 
-    _REQUIRED_FIELDS = frozenset({"线索名称", "业务线"})
+    _REQUIRED_FIELDS = frozenset({"线索名称"})
     _CONTACT_FIELDS = frozenset({"手机", "电话", "邮箱"})
     _RECOVERY_LEASE = timedelta(minutes=5)
 
@@ -100,7 +101,7 @@ class AdminLeadCreationService:
         if any(not key or value in (None, "", []) for key, value in normalized_fields.items()):
             raise ValueError("管理员创建线索的字段名和值不能为空")
         if not self._REQUIRED_FIELDS.issubset(normalized_fields):
-            raise ValueError("管理员创建线索缺少线索名称或业务线")
+            raise ValueError("管理员创建线索缺少线索名称")
         if not self._CONTACT_FIELDS.intersection(normalized_fields):
             raise ValueError("管理员创建线索至少需要手机、电话或邮箱")
 
@@ -435,6 +436,7 @@ class AdminLeadCreationService:
             )
             session.add_all([lead, operation])
             session.flush()
+            initialize_lead_capture(session, lead)
             return operation.id, lead_id, operation.final_status, True
 
     def _claim_operation(

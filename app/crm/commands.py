@@ -453,6 +453,10 @@ def prepare_batch_submission_selection(
     异常：卡片能力或服务端状态异常向调用方传播；不吞掉安全拒绝。
     副作用：可能写入一张仅允许当前销售勾选的模板卡动作。
     """
+    if _submission_delivery_was_prepared(session_factory, command):
+        # 重放只复用已冻结通知，不能因表格快照改变而再发行卡片或追加新页。
+        _queue_submission_table_link(session_factory, command)
+        return "本次提交确认消息已登记，请在原确认卡中操作。"
     service = CrmSubmissionService(
         session_factory,
         smart_table_adapter,
@@ -474,8 +478,7 @@ def prepare_batch_submission_selection(
     try:
         page_size = 20
         pages = [
-            candidates[start : start + page_size]
-            for start in range(0, len(candidates), page_size)
+            candidates[start : start + page_size] for start in range(0, len(candidates), page_size)
         ]
         for page_number, page in enumerate(pages, start=1):
             # 每一页都由服务端冻结候选 ID；销售只能在对应卡片内选择，不能传任意 offset。
@@ -508,9 +511,11 @@ def prepare_batch_submission_selection(
                 ),
                 page=page_number,
                 page_count=len(pages),
+                defer_delivery=True,
             )
     except CardCapabilityUnavailable:
         return "候选线索已找到，但当前机器人卡片能力未就绪，请先完成卡片配置。"
+    _queue_submission_table_link(session_factory, command)
     title = "重新提交放弃线索" if command.text == "帮我提交放弃提交的线索" else "选择要提交的线索"
     page_suffix = f"，共 {len(pages)} 张候选卡" if len(pages) > 1 else ""
     return f"{title}：已发送候选卡，请勾选后确认提交（共 {len(candidates)} 条{page_suffix}）。"
@@ -578,6 +583,10 @@ def prepare_company_submission_preview(
     副作用：读取智能表格和 Lead；唯一匹配时新增一张待确认卡片。
     """
 
+    if _submission_delivery_was_prepared(session_factory, command):
+        # 重放只复用已冻结通知，不能因表格快照改变而再发行卡片或追加新页。
+        _queue_submission_table_link(session_factory, command)
+        return "本次提交确认消息已登记，请在原确认卡中操作。"
     records, contains_match = _find_company_records(smart_table_adapter, company_name)
     if not records:
         return "未找到该公司名称的线索，请确认智能表格中的线索名称后重试。"
@@ -653,16 +662,28 @@ def prepare_company_submission_preview(
                 company_name=company_name,
                 candidates=candidates,
                 contains_match=contains_match,
+                preview_markdown_chunks=build_batch_submission_markdown(
+                    tuple(
+                        {
+                            "lead_id": lead.id,
+                            "company_name": str(record.fields.get("线索名称")),
+                            "field_values": dict(record.fields),
+                            "missing_fields": (),
+                        }
+                        for record, lead in eligible
+                    ),
+                    page=1,
+                    page_count=1,
+                ),
+                defer_delivery=True,
             )
         except CardCapabilityUnavailable:
             return "找到多个同名线索，但当前机器人卡片能力未就绪，请先在智能表格中确认唯一记录。"
+        _queue_submission_table_link(session_factory, command)
         return f"找到 {len(eligible)} 条同名线索，请在卡片中选择要提交的一条。"
 
     record, lead = eligible[0]
-    display_fields = {
-        name: record.fields.get(name)
-        for name in SUBMISSION_PREVIEW_FIELDS
-    }
+    display_fields = {name: record.fields.get(name) for name in SUBMISSION_PREVIEW_FIELDS}
     try:
         action_service.issue_company_submission_confirmation_action(
             actor_user_id=command.sales_user_id,
@@ -671,14 +692,101 @@ def prepare_company_submission_preview(
             company_name=str(record.fields.get("线索名称") or company_name),
             display_text=_company_submission_display_text(record.fields, lead),
             field_values=display_fields,
+            defer_delivery=True,
         )
     except CardCapabilityUnavailable:
         return "已精确找到线索，但当前机器人卡片能力未就绪；请先完成卡片配置后再确认提交。"
+    _queue_submission_table_link(session_factory, command)
     match_description = "按名称包含关系找到候选" if contains_match else "精确找到线索"
     return (
-        f"已{match_description}，已发送提交前确认卡；"
-        "如需修改，请先编辑智能表格后再点击确认提交。"
+        f"已{match_description}，已发送提交前确认卡；如需修改，请先编辑智能表格后再点击确认提交。"
     )
+
+
+def _submission_delivery_was_prepared(
+    session_factory: sessionmaker[Session],
+    command: SubmissionCommand,
+) -> bool:
+    """检查该销售命令是否已原子冻结全部投递依赖；只读数据库，错误向调用方传播。"""
+    with session_factory() as session:
+        notices = session.scalars(
+            select(NotificationRecord).where(
+                NotificationRecord.sales_user_id == command.sales_user_id,
+                NotificationRecord.source_message_id == command.request_message_id,
+                NotificationRecord.notification_type == "wecom_action_card",
+            )
+        )
+        return any(
+            isinstance(notice.payload, dict) and "depends_on" in notice.payload
+            for notice in notices
+        )
+
+
+def _queue_submission_table_link(
+    session_factory: sessionmaker[Session],
+    command: SubmissionCommand,
+) -> None:
+    """原子激活提交明细、卡片和一次表格链接的严格投递依赖。
+
+    参数：session_factory 为通知事务工厂；command 提供销售与命令幂等标识。
+    返回值：无。异常：数据库错误向调用方传播，任务重试复用原通知。
+    副作用：只登记 NotificationRecord；缺少链接时记录脱敏配置错误，不伪造成功。
+    """
+    with session_factory.begin() as session:
+        # 同销售命令串行收敛，避免重放为已投递通知重新创建链接。
+        session.scalar(
+            select(SalesAuthorization)
+            .where(SalesAuthorization.wecom_user_id == command.sales_user_id)
+            .with_for_update()
+        )
+        notices = list(
+            session.scalars(
+                select(NotificationRecord)
+                .where(
+                    NotificationRecord.sales_user_id == command.sales_user_id,
+                    NotificationRecord.source_message_id == command.request_message_id,
+                    NotificationRecord.notification_type.in_(
+                        ("wecom_action_preview", "wecom_action_card")
+                    ),
+                )
+                .order_by(NotificationRecord.created_at, NotificationRecord.notification_key)
+            )
+        )
+        if not notices:
+            return
+        # 所有页的明细先完成，再发送所有页卡片；前一条实际成功才解锁后一条。
+        ordered = sorted(notices, key=lambda item: item.notification_type == "wecom_action_card")
+        dependencies: list[str] = []
+        for notice in ordered:
+            notice.payload = {
+                **(notice.payload or {}),
+                "delivery_pending": False,
+                "depends_on": list(dependencies),
+            }
+            dependencies = [notice.notification_key]
+        key = hashlib.sha256(
+            f"crm_submission_table_link:{command.sales_user_id}:"
+            f"{command.request_message_id}".encode()
+        ).hexdigest()
+        if session.get(NotificationRecord, key) is not None:
+            return
+        url = (get_settings().lead_smart_table_url or "").strip()
+        if not url:
+            _LOGGER.error(
+                "crm_submission_table_link_configuration_missing",
+                extra={"configuration_key": "LEAD_SMART_TABLE_URL"},
+            )
+            return
+        session.add(
+            NotificationRecord(
+                notification_key=key,
+                sales_user_id=command.sales_user_id,
+                source_message_id=command.request_message_id,
+                notification_type="crm_submission_table_link",
+                content=f"请在智能表格中审核线索：[打开线索表]({url})",
+                payload={"depends_on": dependencies},
+            )
+        )
 
 
 def _link_existing_smart_table_record(
