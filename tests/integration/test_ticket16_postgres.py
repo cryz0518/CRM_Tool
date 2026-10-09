@@ -21,11 +21,12 @@ from app.leads.models import Lead, SmartTableOwnerTransferOperation
 from app.leads.service import FirstTextLeadWorkspaceService
 from app.leads.transfer import SmartTableOwnerTransferService
 from app.messaging.models import Base, IncomingMessage, OutboxEvent, SalesAuthorization
-from app.smart_table.models import SmartTableRecord
+from app.smart_table.models import SmartTableRecord, SmartTableSchema
 from app.smart_table.permissions import (
     SmartTablePermissionVerification,
     SmartTablePermissionVerificationUnavailable,
 )
+from app.smart_table.registry import build_required_smart_table_schema
 from tests.crm_submission_test_utils import submit_today_via_selection
 
 
@@ -67,6 +68,10 @@ class BlockingTransferAdapter:
                 member_names={"负责人": "sales-old"},
             )
 
+    def get_schema(self) -> SmartTableSchema:
+        """提供失败消息重试所需的隔离枚举快照；返回 Mock 结构，不访问真实表格。"""
+        return build_required_smart_table_schema()
+
     def get_records(self) -> list[SmartTableRecord]:
         """返回已初始化的远端记录，供候选卡测试构建服务端 TODAY 列表。"""
 
@@ -74,8 +79,10 @@ class BlockingTransferAdapter:
             record_ids = tuple(self.records)
         return [self.get_record(record_id) for record_id in record_ids]
 
-    def update_record(self, record_id: str, fields: dict[str, object]) -> SmartTableRecord:
-        """阻塞首个远端写入，随后返回记录快照。"""
+    def update_record(
+        self, record_id: str, fields: dict[str, object], *, skip_preflight: bool = False
+    ) -> SmartTableRecord:
+        """阻塞首个远端写入，随后返回记录快照；skip_preflight 保持现有适配器调用契约。"""
 
         with self._lock:
             self.calls.append((record_id, dict(fields)))

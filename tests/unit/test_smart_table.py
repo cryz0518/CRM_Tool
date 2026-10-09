@@ -89,13 +89,13 @@ def test_readiness_rejects_missing_required_field_wrong_type_and_missing_enum_op
         else field
         for field in fields
     ]
-    # 最后删去业务线的一个合法选项，验证枚举完整性检查。
+    # 最后删去业务线默认值，验证动态枚举仍要求默认选项存在。
     fields = [
         SmartTableField(
             field_id=field.field_id,
             name=field.name,
             field_type=field.field_type,
-            options=tuple(option for option in field.options if option.name != "车载机器人"),
+            options=tuple(option for option in field.options if option.name != "协作机器人"),
         )
         if field.name == "业务线"
         else field
@@ -108,7 +108,7 @@ def test_readiness_rejects_missing_required_field_wrong_type_and_missing_enum_op
     assert report.ready is False
     assert "缺少必需字段：负责人" in report.issues
     assert "字段类型不匹配：AI待确认，期望 MULTI_SELECT，实际 TEXT" in report.issues
-    assert "字段枚举选项缺失：业务线，缺少 车载机器人" in report.issues
+    assert "字段枚举选项缺失：业务线，缺少 协作机器人" in report.issues
 
 
 def test_readiness_rejects_an_adapter_that_has_not_been_configured() -> None:

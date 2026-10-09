@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Generator, Mapping
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -58,9 +59,53 @@ from app.messaging.models import (
 from app.notifications.outbound import WecomOutboundNotificationSender
 from app.smart_table.adapter import SmartTableActor
 from app.smart_table.mock import MockSmartTableAdapter
-from app.smart_table.models import SmartTableRecord
+from app.smart_table.models import SmartTableOption, SmartTableRecord
 from app.smart_table.registry import build_required_smart_table_schema
 from tests.crm_submission_test_utils import submit_today_via_selection
+
+
+@pytest.mark.parametrize("field_name", ["客户行业", "工艺"])
+def test_new_table_option_without_crm_mapping_blocks_create_and_update(
+    session_factory: sessionmaker[Session], field_name: str,
+) -> None:
+    """新合法选项无 CRM 字典映射时，创建和更新均不调用远端且保持待提交状态。"""
+    schema = build_required_smart_table_schema()
+    option = "半导体" if field_name == "客户行业" else "激光切割"
+    schema = replace(schema, fields=tuple(
+        replace(field, options=(*field.options, SmartTableOption("wecom-id-99999", option)))
+        if field.name == field_name else field for field in schema.fields
+    ))
+    adapter = MockSmartTableAdapter(schema=schema)
+    lead_id = _lead(session_factory, adapter)
+    record_id = adapter.get_records()[0].record_id
+    value = [option] if field_name == "工艺" else option
+    adapter.update_record(record_id, {field_name: value})
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    blocked_create = submit_today_via_selection(service, "sales-1", "missing-enum-create")
+    assert blocked_create.incomplete == 1
+    assert blocked_create.items[0].reason_code == "crm_enum_mapping_missing"
+    assert field_name in blocked_create.items[0].missing_fields[0]
+    assert option in blocked_create.items[0].missing_fields[0]
+    assert crm.search_calls == 0 and crm.calls == 0
+    with session_factory() as session:
+        assert session.get(Lead, lead_id).lifecycle_state == "pending_create"
+        assert session.scalar(select(func.count()).select_from(CrmSyncRecord)) == 0
+
+    # 先以既有字典选项完成首次创建，再测试新枚举不会被当成 CRM 数字 ID 更新。
+    known = ["装配"] if field_name == "工艺" else "其他"
+    adapter.update_record(record_id, {field_name: known})
+    assert submit_today_via_selection(service, "sales-1", "known-enum-create").succeeded == 1
+    adapter.update_record(record_id, {field_name: value})
+    blocked_update = service.submit(
+        SubmissionCommand("提交我的更新", "sales-1", "missing-enum-update")
+    )
+    assert blocked_update.incomplete == 1 and crm.update_calls == 0
+    assert blocked_update.items[0].reason_code == "crm_enum_mapping_missing"
+    with session_factory() as session:
+        assert session.get(Lead, lead_id).lifecycle_state == "pending_update"
+    reply = format_submission_reply(blocked_update, lead_labels={lead_id: "测试公司"})
+    assert "缺少 CRM 字典映射" in reply
 
 
 @pytest.fixture(autouse=True)

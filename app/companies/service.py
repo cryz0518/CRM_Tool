@@ -34,6 +34,7 @@ from app.leads.models import (
 )
 from app.messaging.models import BusinessAuditEvent, IncomingMessage
 from app.smart_table.adapter import SmartTableActor, SmartTableAdapter
+from app.smart_table.enums import enum_snapshot_operation, get_enum_snapshot_service
 from app.smart_table.registry import DEFAULT_SMART_TABLE_FIELD_VALUES, writable_smart_table_fields
 
 logger = logging.getLogger(__name__)
@@ -160,10 +161,12 @@ class CompanyLeadService:
         """
         self._session_factory = session_factory
         self._smart_table_adapter = smart_table_adapter
+        self._enum_snapshots = get_enum_snapshot_service(smart_table_adapter)
         self._tyc_adapter = tyc_adapter
         self._region_resolver = region_resolver or CompanyRegionResolver()
         self._sales_identity_provider = sales_identity_provider or DatabaseSalesIdentityProvider()
 
+    @enum_snapshot_operation
     def upsert(self, command: CompanyUpsertCommand) -> CompanyUpsertResult:
         """创建、升级或销售内合并一条线索，并仅同步安全字段补丁。
 
@@ -576,7 +579,11 @@ class CompanyLeadService:
         副作用：增加线索、字段来源和公司处理审计。
         """
         # 临时线索也保存全部可用补丁并进入表格审核，但没有可靠标准名时不会参与去重。
-        fields = {**DEFAULT_SMART_TABLE_FIELD_VALUES, **command.fields, "线索来源": "展会"}
+        fields = {
+            **DEFAULT_SMART_TABLE_FIELD_VALUES,
+            **self._enum_snapshots.source_defaults(),
+            **command.fields,
+        }
         if region is CompanyRegion.FOREIGN:
             # 国外判定来自显式证据，故可确定地覆盖默认国内值。
             fields["是否为国际客户"] = "国外"

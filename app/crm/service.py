@@ -21,7 +21,7 @@ from app.core.config import get_settings
 from app.core.failures import classify_task_failure, safe_failure_summary
 from app.crm.adapter import CRMAdapter
 from app.crm.employee_directory import EmployeeDirectory, EmployeeDirectoryError
-from app.crm.payload import CrmPayloadBuilder, CrmPayloadError
+from app.crm.payload import CrmEnumMappingError, CrmPayloadBuilder, CrmPayloadError
 from app.leads.models import (
     CrmCompanyIdentity,
     CrmSyncRecord,
@@ -322,8 +322,10 @@ def _append_update_result(
         "succeeded": SubmissionItemStatus.UPDATED,
         "unchanged": SubmissionItemStatus.UNCHANGED,
         "incomplete": SubmissionItemStatus.INCOMPLETE,
+        "enum_mapping_missing": SubmissionItemStatus.INCOMPLETE,
     }.get(status, _ITEM_STATUS_BY_OUTCOME.get(status, SubmissionItemStatus.FAILED_PENDING_REVIEW))
     reason_code = {
+        "enum_mapping_missing": "crm_enum_mapping_missing",
         "incomplete": "crm_update_incomplete",
         "mapping_missing": "crm_user_mapping_missing",
         "processing": "sync_processing",
@@ -335,7 +337,7 @@ def _append_update_result(
     return replace(
         result,
         retrying=result.retrying + (status == "retrying"),
-        incomplete=result.incomplete + (status == "incomplete"),
+        incomplete=result.incomplete + (status in {"incomplete", "enum_mapping_missing"}),
         processing=result.processing + (status == "processing"),
         failed_pending_review=result.failed_pending_review + (status == "failed_pending_review"),
         updated=result.updated + (status == "succeeded"),
@@ -779,6 +781,16 @@ class CrmSubmissionService:
                 reconciled.fields,
                 tyc_customer_id=self._reliable_tyc_customer_id(lead, reconciled.fields),
             )
+        except CrmEnumMappingError as error:
+            # 新增合法表格选项不能越过 CRM 字典边界；保存待更新状态，不调用远端接口。
+            with self._session_factory.begin() as session:
+                current = session.get(Lead, lead_id)
+                if current is not None and current.lifecycle_state == "synced":
+                    current.lifecycle_state = "pending_update"
+            self._audit(
+                command, "crm_update_enum_mapping_missing", details={"field_name": error.field_name}
+            )
+            return "enum_mapping_missing"
         except CrmPayloadError:
             # 字典、日期或备注格式不合法时只阻止当前线索，不让批次或其他线索被异常打断。
             self._audit(command, "crm_update_payload_invalid")
@@ -955,6 +967,16 @@ class CrmSubmissionService:
             canonical_payload = self._canonical_payload(
                 reconciled.fields,
                 tyc_customer_id=self._reliable_tyc_customer_id(lead, reconciled.fields),
+            )
+        except CrmEnumMappingError as error:
+            # 只返回当前字段缺映射提示，既不改为其他也不把 option ID 当成 CRM ID。
+            self._audit(
+                command, "crm_create_enum_mapping_missing", details={"field_name": error.field_name}
+            )
+            return _create_outcome(
+                "incomplete",
+                reason_code="crm_enum_mapping_missing",
+                missing_fields=(str(error),),
             )
         except CrmPayloadError:
             # CRM DTO 校验失败属于当前线索待完善，禁止进入远端写操作。

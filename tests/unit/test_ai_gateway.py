@@ -760,7 +760,6 @@ def test_gateway_normalizes_registered_field_aliases_without_creating_fields() -
 
     assert result.fields == {
         "线索名称": "长广溪智造",
-        "业务线": "协作机器人",
         "客户行业": "其他",
         "工艺": ["喷涂"],
     }
@@ -1234,7 +1233,7 @@ def test_gateway_drops_enrichment_without_verbatim_source_evidence() -> None:
 
     result = AIGateway(provider).extract_fields("客户希望后续沟通")
 
-    assert result.fields == {"线索名称": "长广溪智造", "业务线": "协作机器人"}
+    assert result.fields == {"线索名称": "长广溪智造"}
     assert result.enrichment == {}
     assert len(provider.requests) == 1
 

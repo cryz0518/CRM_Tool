@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     lead_smart_table_url: str | None = None
     audit_mirror_batch_size: int = 10
     smart_table_readiness_cache_seconds: int = 30
+    smart_table_enum_cache_seconds: int = 300
     lead_processing_timeout_seconds: int = 300
     llm_provider: Literal["mock", "qwen"] = "qwen"
     qwen_api_key: str | None = None
@@ -244,12 +245,14 @@ class Settings(BaseSettings):
             raise ValueError("AUDIT_MIRROR_BATCH_SIZE 必须大于 0")
         return value
 
-    @field_validator("smart_table_readiness_cache_seconds")
+    @field_validator("smart_table_readiness_cache_seconds", "smart_table_enum_cache_seconds")
     @classmethod
-    def smart_table_readiness_cache_seconds_must_be_positive(cls, value: int) -> int:
-        """拒绝非正 Smart Table readiness 缓存 TTL，防止退化为无期限缓存。"""
+    def smart_table_cache_seconds_must_be_positive(cls, value: int) -> int:
+        """校验就绪及枚举缓存秒数；返回正整数，非法值抛 ValueError，不修改外部状态。"""
         if value <= 0:
-            raise ValueError("SMART_TABLE_READINESS_CACHE_SECONDS 必须大于 0")
+            raise ValueError(
+                "SMART_TABLE_READINESS_CACHE_SECONDS / SMART_TABLE_ENUM_CACHE_SECONDS 必须大于 0"
+            )
         return value
 
     @field_validator("lead_processing_timeout_seconds")

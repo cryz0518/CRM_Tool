@@ -136,8 +136,8 @@ def _field_response() -> Mapping[str, object]:
             {
                 "field_id": "process",
                 "field_title": "工艺",
-                "field_type": "single_select",
-                "property_single_select": {
+                "field_type": "select",
+                "property_select": {
                     "options": [{"id": "process-assembly", "text": "装配"}]
                 },
             },
@@ -629,7 +629,7 @@ def test_records_are_paginated_and_robot_writes_only_given_field_patch() -> None
                 "records": [{"record_id": "record-1", "values": {"负责人": member}}],
                 "next_cursor": "record-page-2",
             },
-            {"errcode": 0, "records": [{"record_id": "record-2", "values": {"工艺": "装配"}}]},
+            {"errcode": 0, "records": [{"record_id": "record-2", "values": {"工艺": ["装配"]}}]},
             {"errcode": 0, "records": [{"record_id": "record-3", "values": {"负责人": member}}]},
             {
                 "errcode": 0,
@@ -645,8 +645,8 @@ def test_records_are_paginated_and_robot_writes_only_given_field_patch() -> None
                 ],
             },
             {"errcode": 0, "records": [{"record_id": "record-3", "values": {"负责人": member}}]},
-            {"errcode": 0, "records": [{"record_id": "record-3", "values": {"工艺": "装配"}}]},
-            {"errcode": 0, "records": [{"record_id": "record-3", "values": {"工艺": "装配"}}]},
+            {"errcode": 0, "records": [{"record_id": "record-3", "values": {"工艺": ["装配"]}}]},
+            {"errcode": 0, "records": [{"record_id": "record-3", "values": {"工艺": ["装配"]}}]},
         ]
     )
     adapter = _adapter(fake_cli)
@@ -656,7 +656,7 @@ def test_records_are_paginated_and_robot_writes_only_given_field_patch() -> None
         {"创建人": "sales-user", "负责人": "sales-user", "线索名称": "受控测试"},
         actor=SmartTableActor.ROBOT,
     )
-    updated = adapter.update_record(created.record_id, {"工艺": "装配"})
+    updated = adapter.update_record(created.record_id, {"工艺": ["装配"]})
 
     assert [record.record_id for record in records] == ["record-1", "record-2"]
     assert records[0].fields["负责人"] == "sales-user"
@@ -678,7 +678,7 @@ def test_records_are_paginated_and_robot_writes_only_given_field_patch() -> None
             "values": {"工艺": [{"id": "process-assembly", "text": "装配"}]},
         }
     ]
-    assert updated.fields == {"工艺": "装配"}
+    assert updated.fields == {"工艺": ["装配"]}
 
 
 def test_write_cells_match_wecom_cli_134_native_json_values_contract() -> None:
@@ -2041,7 +2041,8 @@ def test_query_record_accepts_native_sql_select_values_and_empty_members() -> No
     }
     fake_cli = FakeCli([{"errcode": 0, "values": [json.dumps({"rows": [row]})]}])
     adapter = _adapter(fake_cli, sheet_title="CRM线索")
-    adapter._schema = schema
+    adapter._enum_snapshots._schema = schema
+    adapter._enum_snapshots._deadline = float("inf")
 
     record = adapter.get_records()[0]
 
