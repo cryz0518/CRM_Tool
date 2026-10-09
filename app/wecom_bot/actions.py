@@ -83,6 +83,11 @@ _ACTION_LEASE = timedelta(minutes=5)
 _ACTION_DEFAULT_EXPIRY = timedelta(minutes=10)
 _MAX_CARD_PAYLOAD_BYTES = 8192
 _MAX_MARKDOWN_BYTES = 4096
+# 确认预览仅使用这些字段；固定三组顺序不改变服务端提交快照。
+SUBMISSION_PREVIEW_FIELDS = (
+    "业务线", "线索名称", "线索来源", "联系人", "职务", "沟通方式",
+    "手机", "备注", "客户行业", "提交状态",
+)
 _PII_EMAIL = re.compile(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b")
 _PII_PHONE = re.compile(r"(?<!\d)\+?\d[\d ()-]{6,}\d(?!\d)")
 
@@ -1495,7 +1500,7 @@ class WecomActionService:
         field_values: Mapping[str, object],
         display_text: str | None = None,
     ) -> WecomAction:
-        """发行单条公司线索的全字段提交确认卡。
+        """发行单条公司线索的十字段提交确认卡。
 
         参数：lead_id 为服务端线索标识；field_values 为本次查表得到的展示快照；
         display_text 为由该快照生成的安全冻结展示名。
@@ -1515,7 +1520,7 @@ class WecomActionService:
                 **({"display_text": display_text} if display_text is not None else {}),
             },
             title="确认提交线索",
-            description=f"请核对“{_redact_text(company_name, 96)}”的全部字段后确认提交",
+            description=f"请核对“{_redact_text(company_name, 96)}”的预览字段后确认提交",
             source_message_id=request_message_id,
             preview_fields=field_values,
         )
@@ -1827,10 +1832,10 @@ def build_action_card(
     selection_key: str | None = None,
     preview_fields: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """构造服务端生成的 template card body，并可附带只读预览快照。
+    """构造服务端生成的 template card body，字段详情由前置 Markdown 展示。
 
     参数：task_id 和 event_key 为服务端生成的关联值，title 和 description 为安全文案；
-    preview_fields 只用于卡片展示，业务目标仍只保存在服务端 action 中。
+    preview_fields 表示已有前置字段详情，卡片只显示纯文本提示；业务目标仍在服务端 action 中。
     返回值：可交给企业微信发送接口的卡片 body。
     异常：无；调用方应先完成动作定义校验。
     副作用：无，不保存任何客户端业务字段。
@@ -1844,8 +1849,10 @@ def build_action_card(
         "button_list": [{"text": "确认", "style": 1, "key": event_key}],
     }
     if isinstance(preview_fields, Mapping):
-        # 展示快照只进入待发送卡片，不进入 action context；确认时服务端会重新读取表格。
-        payload["horizontal_content_list"] = _preview_card_rows(preview_fields)
+        # 模板卡片普通文本不解析 Markdown，字段详情只在前置消息中展示。
+        payload["horizontal_content_list"] = [
+            {"keyname": "提交预览", "value": "请核对上方字段明细后确认提交"}
+        ]
     options = selection_options if selection_options is not None else duplicate_leads
     if isinstance(options, list) and options:
         submit_key = selection_key or CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE
@@ -2167,7 +2174,7 @@ def _redact_text(value: str, limit: int) -> str:
 def _preview_card_value(value: object) -> str:
     """把表格快照转换为不含换行的卡片展示文本。"""
 
-    if value is None or value == "":
+    if value is None or value == "" or (isinstance(value, (list, tuple, dict)) and not value):
         return "未填写"
     if isinstance(value, (list, tuple, dict)):
         text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -2176,27 +2183,28 @@ def _preview_card_value(value: object) -> str:
     return " ".join(text.replace("\r", " ").replace("\n", " ").split())[:512]
 
 
-def _preview_card_rows(preview_fields: Mapping[str, object]) -> list[dict[str, str]]:
-    """把完整字段快照压缩到企业微信模板卡片允许的最多六行。
+def _submission_preview_lines(preview_fields: Mapping[str, object]) -> list[str]:
+    """按固定十字段生成三组紧凑预览，不修改原值或状态。
 
-    参数：preview_fields 为已按表格顺序整理的字段快照。
-    返回值：不超过六项的卡片横向字段列表；完整字段由同一动作的 Markdown 明细通知展示。
-    异常：无；空字段名会被忽略。
-    副作用：无，不修改输入快照。
+    参数：preview_fields 为可信表格快照；缺项与空白值显示未填写。
+    返回值：三行横向字段，长文本带省略标记并转义 Markdown。
+    异常：无。副作用：无，截断仅作用于展示副本。
     """
-    items = [
-        (name, _preview_card_value(value))
-        for name, value in preview_fields.items()
-        if isinstance(name, str) and name
-    ]
-    if len(items) <= 6:
-        return [{"keyname": name[:64], "value": value} for name, value in items]
-    # 平台拒绝超过六项；卡片保留前六项，全部字段在同动作 Markdown 明细中逐行展示。
-    return [{"keyname": name[:64], "value": value} for name, value in items[:6]]
+    items: list[str] = []
+    for name in SUBMISSION_PREVIEW_FIELDS:
+        # 限制每个展示值长度，避免单个候选超过现有 Markdown 分片上限。
+        value = _preview_card_value(preview_fields.get(name)).strip() or "未填写"
+        if len(value) > 48:
+            value = value[:47] + "…"
+        rendered = _escape_markdown(value)
+        if value == "未填写":
+            rendered = f"**{rendered}**"
+        items.append(f"{name}：{rendered}")
+    return ["｜".join(items[:3]), "｜".join(items[3:6]), "｜".join(items[6:])]
 
 
 def build_preview_markdown(preview_fields: Mapping[str, object]) -> str:
-    """构造可换行阅读的完整提交前字段明细。
+    """构造只含固定十字段、三组横向内容的提交前预览。
 
     参数：preview_fields 为已按智能表格顺序整理的字段快照。
     返回值：适用于企业微信 AI Bot 的 Markdown 消息正文。
@@ -2204,12 +2212,8 @@ def build_preview_markdown(preview_fields: Mapping[str, object]) -> str:
     副作用：无，不修改输入快照。
     """
     lines = ["**提交前字段明细**"]
-    for name, value in preview_fields.items():
-        if isinstance(name, str) and name:
-            rendered_name = _escape_markdown(name)
-            rendered_value = _escape_markdown(_preview_card_value(value))
-            lines.append(f"- {rendered_name}：{rendered_value}")
-    lines.append("\n请核对以上全部字段后，点击下方确认卡片提交。")
+    lines.extend(_submission_preview_lines(preview_fields))
+    lines.append("\n请核对以上字段后，点击下方确认卡片提交。")
     return "\n".join(lines)
 
 
@@ -2226,23 +2230,6 @@ def build_batch_submission_markdown(
 
     if page < 1 or page_count < page or not candidates:
         raise ValueError("批量候选 Markdown 分页参数非法")
-    ordered_fields = (
-        "业务线",
-        "线索名称",
-        "线索来源",
-        "联系人",
-        "职务",
-        "沟通方式",
-        "手机",
-        "电话",
-        "邮箱",
-        "客户行业",
-        "客户级别",
-        "工艺",
-        "下次联系时间",
-        "备注",
-        "AI待确认",
-    )
     blocks: list[str] = []
     for index, candidate_data in enumerate(candidates, start=1):
         company_name = candidate_data.get("company_name")
@@ -2253,21 +2240,10 @@ def build_batch_submission_markdown(
         fields = candidate_data.get("field_values")
         if not isinstance(fields, Mapping):
             fields = {}
-        field_lines: list[str] = []
-        seen_fields: set[str] = set()
-        # 先按 CRM 业务字段固定顺序展示，再补充 Smart Table 快照中的其它字段。
-        for field_name in (*ordered_fields, *fields.keys()):
-            if not isinstance(field_name, str) or field_name in seen_fields:
-                continue
-            value = fields.get(field_name)
-            if field_name not in fields:
-                continue
-            seen_fields.add(field_name)
-            field_lines.append(
-                f"- {_escape_markdown(field_name)}："
-                f"{_escape_markdown(_preview_card_value(value))}"
-            )
         missing_fields = candidate_data.get("missing_fields")
+        # 标题同样限制长度并保留编号；完整名称和勾选目标仍来自原冻结候选。
+        label = " ".join(label.split())
+        label = label[:79] + "…" if len(label) > 80 else label
         candidate_lines = [f"【{index}】{_escape_markdown(label)}"]
         if (
             isinstance(missing_fields, (list, tuple))
@@ -2276,11 +2252,10 @@ def build_batch_submission_markdown(
         ):
             candidate_lines.extend(
                 (
-                    "- 状态：待完善",
                     "- 缺少：" + _escape_markdown("、".join(missing_fields)),
                 )
             )
-        candidate_lines.extend(field_lines)
+        candidate_lines.extend(_submission_preview_lines(fields))
         blocks.append("\n".join(candidate_lines))
 
     header = f"**待提交线索明细（第 {page}/{page_count} 页）**"

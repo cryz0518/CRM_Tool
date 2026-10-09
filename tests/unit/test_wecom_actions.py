@@ -684,10 +684,10 @@ def test_incomplete_retry_routing_keeps_abandoned_priority_and_guards() -> None:
     assert not is_explicit_submission_request("先不要重新提交")
 
 
-def test_company_submission_confirmation_card_contains_preview_fields(
+def test_company_submission_confirmation_card_keeps_fields_in_markdown(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证单条公司确认动作把全字段放入卡片，而不是放入客户端目标参数。"""
+    """验证单条公司确认动作先发字段 Markdown，按钮卡只显示简短纯文本提示。"""
 
     _authorize(session_factory)
     service = _service(session_factory)
@@ -709,16 +709,32 @@ def test_company_submission_confirmation_card_contains_preview_fields(
     preview_notice = next(
         notice for notice in notices if notice.notification_type == "wecom_action_preview"
     )
-    assert (
-        card_notice.payload["template_card"]["horizontal_content_list"][0]["keyname"] == "线索名称"
-    )
-    assert "备注" in preview_notice.payload["markdown"]["content"]
+    card = card_notice.payload["template_card"]
+    assert card["horizontal_content_list"] == [
+        {"keyname": "提交预览", "value": "请核对上方字段明细后确认提交"}
+    ]
+    assert card["button_list"] == [
+        {"text": "确认", "style": 1, "key": "crm.company_submission.confirm"}
+    ]
+    assert card["task_id"] == action.task_id
+    assert "销售确认" not in str(card) and "**" not in str(card)
+    assert "备注：销售确认" in preview_notice.payload["markdown"]["content"]
+    assert "职务：**未填写**" in preview_notice.payload["markdown"]["content"]
+    assert preview_notice.created_at <= card_notice.created_at
 
 
 def test_preview_card_and_markdown_fit_wecom_display_limits() -> None:
-    """验证卡片不超过六行，完整字段改由可换行 Markdown 展示。"""
+    """验证十字段三组 Markdown 保持截断，按钮卡仅提示且不泄漏格式标记。"""
 
-    preview = {f"字段{i}": f"值{i}" for i in range(1, 11)}
+    names = (
+        "业务线", "线索名称", "线索来源", "联系人", "职务", "沟通方式",
+        "手机", "备注", "客户行业", "提交状态",
+    )
+    preview = dict.fromkeys(names, "已填写")
+    preview.update({"线索名称": "长名称" * 1000, "备注": "长备注" * 1000, "职务": "  "})
+    extras = ("电话", "邮箱", "客户级别", "工艺", "下次联系时间", "AI待确认", "负责人")
+    preview.update(dict.fromkeys(extras, "不应展示"))
+    original = dict(preview)
     card = build_action_card(
         task_id="task-preview-limit",
         event_key="crm.company_submission.confirm",
@@ -728,13 +744,18 @@ def test_preview_card_and_markdown_fit_wecom_display_limits() -> None:
     )
     rows = card["horizontal_content_list"]
     assert isinstance(rows, list)
-    assert 0 < len(rows) <= 6
+    assert len(rows) == 1
     rendered = "".join(str(row) for row in rows)
     details = build_preview_markdown(preview)
-    for name, value in preview.items():
-        assert name in details
-        assert value in details
-    assert "字段7" not in rendered
+    field_lines = details.splitlines()[1:4]
+    assert [name for line in field_lines for name in names if name + "：" in line] == list(names)
+    assert "职务：**未填写**" in details
+    assert "…" in details and len(details.encode("utf-8")) < 4096
+    assert all(name not in details and name not in rendered for name in extras)
+    assert all(name + "：" not in rendered for name in names)
+    assert "**" not in rendered and "未填写" not in rendered
+    assert all(len(row["value"]) <= 26 for row in rows)
+    assert preview == original
 
 
 def test_company_submission_candidate_card_uses_single_selection() -> None:
@@ -755,6 +776,38 @@ def test_company_submission_candidate_card_uses_single_selection() -> None:
     assert card["card_type"] == "vote_interaction"
     assert card["checkbox"]["mode"] == 0  # type: ignore[index]
     assert card["submit_button"]["key"] == "crm.company_submission.confirm"  # type: ignore[index]
+
+
+def test_batch_preview_long_values_keep_three_groups_and_bounded_chunks() -> None:
+    """验证二十条超长候选仅展示十字段，缺项不改真实状态且每片不超过平台字节限制。"""
+    names = (
+        "业务线", "线索名称", "线索来源", "联系人", "职务", "沟通方式",
+        "手机", "备注", "客户行业", "提交状态",
+    )
+    fields = dict.fromkeys(names, "*超长内容*" * 1000)
+    fields.update({"提交状态": "未提交", "手机": [], "邮箱": "不应显示", "AI待确认": ["职务"]})
+    candidates = [
+        {
+            "lead_id": f"lead-{index}", "company_name": "很长公司名称" * 1000,
+            "field_values": dict(fields), "missing_fields": ["手机"],
+        }
+        for index in range(20)
+    ]
+    chunks = build_batch_submission_markdown(candidates, page=1, page_count=1)
+    assert len(chunks) > 1 and all(len(chunk.encode("utf-8")) <= 4096 for chunk in chunks)
+    content = "\n".join(chunks)
+    assert all(content.count(name + "：") == 20 for name in names)
+    assert "邮箱" not in content and "AI待确认" not in content
+    assert content.count("提交状态：未提交") == 20
+    assert content.count("手机：**未填写**") == 20
+    assert content.count("- 缺少：手机") == 20
+    for block in content.split("【")[1:]:
+        rows = [
+            line for line in block.splitlines()
+            if line.startswith(("业务线：", "联系人：", "手机："))
+        ]
+        assert len(rows) == 3
+    assert fields["备注"] == "*超长内容*" * 1000 and fields["提交状态"] == "未提交"
 
 
 def test_batch_submission_card_allows_multi_selection() -> None:
@@ -821,8 +874,8 @@ def test_batch_markdown_and_checkbox_share_frozen_page_order() -> None:
     assert len(markdown) == 1
     assert "【1】候选一｜王工｜2026-09-30" in markdown[0]
     assert "【2】候选二｜李工｜2026-09-30" in markdown[0]
-    assert "- AI待确认：[\"职务\"]" in markdown[0]
-    assert "- 状态：待完善" in markdown[0]
+    assert "AI待确认" not in markdown[0]
+    assert "提交状态：**未填写**" in markdown[0]
     assert "- 缺少：职务" in markdown[0]
     options = card["checkbox"]["option_list"]  # type: ignore[index]
     assert [option["id"] for option in options] == ["lead-a", "lead-b"]  # type: ignore[index]

@@ -36,6 +36,7 @@ _SUPPORTED_NOTIFICATION_TYPES = frozenset(
         "daily_unsubmitted_lead_reminder",
         "lead_first_smart_table_success",
         "crm_submission_summary",
+        "crm_submission_retry_summary",
         "crm_submission_preview",
         "crm_submission_intent_unrecognized",
         "lead_processing_failed",
