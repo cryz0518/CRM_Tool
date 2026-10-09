@@ -155,9 +155,9 @@ class EnumSnapshotService:
         return {"线索来源": "展会"} if "展会" in self.get_snapshot().options["线索来源"] else {}
 
     @contextmanager
-    def scope(self) -> Iterator[None]:
-        """延迟固定当前调用的结构；返回上下文，异常传播，退出恢复上下文且不提前读外部系统。"""
-        if self._scope.get() is not None:
+    def scope(self, *, isolate: bool = False) -> Iterator[None]:
+        """延迟固定当前调用的结构；isolate 为真时开新快照上下文，退出恢复父上下文。"""
+        if self._scope.get() is not None and not isolate:
             yield
             return
         token = self._scope.set({})
@@ -186,12 +186,24 @@ def _cached_enum_snapshot_service(adapter: SmartTableAdapter) -> EnumSnapshotSer
 
 def enum_snapshot_operation(method: Callable[_P, _R]) -> Callable[_P, _R]:
     """为持有快照服务的方法固定一次处理版本；返回包装方法，异常原样传播。"""
+    return _enum_snapshot_operation(method, isolate=False)
+
+
+def isolated_enum_snapshot_operation(method: Callable[_P, _R]) -> Callable[_P, _R]:
+    """为独立消息固定独立快照上下文；返回包装方法，异常原样传播。"""
+    return _enum_snapshot_operation(method, isolate=True)
+
+
+def _enum_snapshot_operation(
+    method: Callable[_P, _R], *, isolate: bool
+) -> Callable[_P, _R]:
+    """执行快照作用域包装；isolate 控制嵌套操作是否开启独立消息版本。"""
 
     @wraps(method)
     def scoped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
         """在调用对象的枚举范围内执行方法，返回原结果并保证异常后释放上下文。"""
         owner: Any = args[0]
-        with owner._enum_snapshots.scope():
+        with owner._enum_snapshots.scope(isolate=isolate):
             return method(*args, **kwargs)
 
     return scoped

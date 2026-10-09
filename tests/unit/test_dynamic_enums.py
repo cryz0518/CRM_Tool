@@ -263,6 +263,23 @@ def test_dynamic_option_still_requires_source_evidence(confidence: float) -> Non
     assert ("客户行业" in valid.pending_confirmation_fields) == (confidence < 0.85)
 
 
+def test_industry_word_in_company_name_is_not_industry_evidence() -> None:
+    """公司名称含行业词不能代替字段证据，行业标签及明确经营表达仍可识别。"""
+    schema = changed_options("客户行业", ("其他", "半导体"))
+    provider = MockLLMProvider(
+        [analysis_output({"客户行业": "半导体"}) for _ in range(3)]
+    )
+    gateway = AIGateway(provider, enum_snapshots=EnumSnapshotService(lambda: schema))
+
+    company_only = gateway.extract_fields("西安芯汇半导体")
+    labeled = gateway.extract_fields("客户行业：半导体")
+    described = gateway.extract_fields("主要从事半导体制造")
+
+    assert "客户行业" not in company_only.fields
+    assert labeled.fields["客户行业"] == "半导体"
+    assert described.fields["客户行业"] == "半导体"
+
+
 @pytest.mark.parametrize(
     ("field_name", "options", "value"),
     [

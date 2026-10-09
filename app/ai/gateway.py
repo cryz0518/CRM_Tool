@@ -1257,7 +1257,6 @@ class AIGateway:
                 # 行业和级别即使是合法选项，也不能从普通叙述或产品常识反推。
                 evidence_ok = all(
                     AIGateway._has_explicit_enum_evidence(field_name, item, source_text)
-                    or (field_name == "客户行业" and item in source_text)
                     for item in values
                 )
             elif all(item in self._enum_options[field_name] for item in values):
@@ -1324,6 +1323,12 @@ class AIGateway:
                 rf"业务线\s*[:：是为]?\s*{escaped}",
                 rf"(?:想|计划|准备|考虑|希望|打算)(?:要)?(?:上|用|采用|引入|部署|采购|购买)?"
                 rf"[^。；，,\n]{{0,16}}{escaped}",
+            )
+        elif field_name == "客户行业":
+            # 公司名或产品中出现行业词不算行业结论，须有明确从事该行业的语义。
+            patterns = (
+                rf"(?:客户行业|所属行业)\s*[:：是为]?\s*{escaped}",
+                rf"(?:主要)?(?:从事|经营|主营)[^。；，,\n]{{0,16}}{escaped}",
             )
         else:
             # 其他枚举只接受明确字段标签，避免普通叙述被擅自提升为业务字段。

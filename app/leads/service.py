@@ -58,7 +58,10 @@ from app.smart_table.adapter import (
     SmartTableAdapter,
     SmartTableRecordNotFoundError,
 )
-from app.smart_table.enums import enum_snapshot_operation, get_enum_snapshot_service
+from app.smart_table.enums import (
+    get_enum_snapshot_service,
+    isolated_enum_snapshot_operation,
+)
 from app.smart_table.models import SmartTableRecord
 from app.smart_table.registry import (
     DEFAULT_SMART_TABLE_FIELD_VALUES,
@@ -403,7 +406,7 @@ class FirstTextLeadWorkspaceService:
         self._lead_message_retry_count = settings.lead_message_retry_count
         self._lead_processing_timeout = timedelta(seconds=settings.lead_processing_timeout_seconds)
 
-    @enum_snapshot_operation
+    @isolated_enum_snapshot_operation
     def consume(
         self,
         outbox_event_id: int,
@@ -457,7 +460,7 @@ class FirstTextLeadWorkspaceService:
         self._consume_next_after_checkpoint(outbox_event_id)
         return result
 
-    @enum_snapshot_operation
+    @isolated_enum_snapshot_operation
     def retry_failed_message(
         self,
         message_id: str,
