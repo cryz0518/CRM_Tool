@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.leads.models import Lead, LeadMessageResolution, SmartTableSync
+from app.leads.reminders import daily_reminder_is_current
 from app.messaging.models import NotificationRecord, OutboxEvent, SalesAuthorization, utc_now
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ _SUPPORTED_NOTIFICATION_TYPES = frozenset(
     {
         "lead_intake_receipt",
         "lead_progress_summary",
+        "daily_unsubmitted_lead_reminder",
         "lead_first_smart_table_success",
         "crm_submission_summary",
         "crm_submission_preview",
@@ -102,6 +104,23 @@ class WecomOutboundNotificationSender:
                         or not authorization.is_active
                     ):
                         # 停用销售或功能关闭时不发送排队中的主动进度汇报。
+                        current.status = "suppressed"
+                        current.processing_started_at = None
+                        current.processing_lease_expires_at = None
+                        current.processing_claim_token = None
+                        continue
+                if current.notification_type == "daily_unsubmitted_lead_reminder":
+                    business_date = (
+                        current.payload.get("business_date")
+                        if isinstance(current.payload, dict)
+                        else None
+                    )
+                    if not daily_reminder_is_current(
+                        session,
+                        current.sales_user_id,
+                        business_date,
+                    ):
+                        # 已提交、跨日、停用或失去 CRM 映射的提醒不再发给销售。
                         current.status = "suppressed"
                         current.processing_started_at = None
                         current.processing_lease_expires_at = None
