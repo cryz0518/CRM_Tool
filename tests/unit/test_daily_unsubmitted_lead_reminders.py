@@ -14,7 +14,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import Settings
-from app.leads.models import CrmSyncRecord, Lead
+from app.leads.models import CrmSyncRecord, Lead, LeadMessageResolution
 from app.leads.reminders import (
     DAILY_UNSUBMITTED_REMINDER_CONTENT,
     DailyUnsubmittedLeadReminderService,
@@ -86,7 +86,7 @@ def seed_lead(
     *,
     lifecycle_state: str = "pending_create",
     crm_sync_status: str | tuple[str, ...] | None = None,
-    message_received: bool = False,
+    message_received: bool = True,
 ) -> None:
     """创建线索及可选 CRM 或消息处理状态。
 
@@ -97,13 +97,24 @@ def seed_lead(
     副作用：只在当前测试数据库新增线索和显式指定的模拟状态。
     """
     with session_factory.begin() as session:
+        sequence = (
+            int(
+                session.scalar(
+                    select(func.count(IncomingMessage.message_id)).where(
+                        IncomingMessage.sales_user_id == sales_user_id
+                    )
+                )
+                or 0
+            )
+            + 1
+        )
         if message_received:
             # 模拟消息接收已完成，但这不构成 CRM 提交成功。
             session.add(
                 IncomingMessage(
                     message_id=f"message-{lead_id}",
                     sales_user_id=sales_user_id,
-                    sequence=1,
+                    sequence=sequence,
                     raw_payload={"msgtype": "text"},
                     received_at=created_at,
                 )
@@ -112,7 +123,7 @@ def seed_lead(
                 OutboxEvent(
                     message_id=f"message-{lead_id}",
                     sales_user_id=sales_user_id,
-                    sequence=1,
+                    sequence=sequence,
                     status="succeeded",
                 )
             )
@@ -128,6 +139,16 @@ def seed_lead(
                 created_at=created_at,
             )
         )
+        session.flush()
+        if message_received:
+            session.add(
+                LeadMessageResolution(
+                    message_id=f"message-{lead_id}",
+                    segment_index=0,
+                    lead_id=lead_id,
+                    status="assigned",
+                )
+            )
         if crm_sync_status is not None:
             # 按 generation 保存 CRM 创建状态，用于验证只有最新状态决定提醒资格。
             sync_statuses = (
@@ -446,3 +467,23 @@ def test_failed_send_retries_only_notification_outbox(
         "msgtype": "markdown",
         "markdown": {"content": DAILY_UNSUBMITTED_REMINDER_CONTENT},
     }
+
+
+def test_no_today_intake_or_delayed_old_processing_never_reminds(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """今天仅后台新建旧消息线索或存在遗留线索，不能取得当日提醒资格。"""
+    seed_sales(session_factory, "sales-a")
+    seed_lead(session_factory, "old-demand", "sales-a", datetime(2026, 10, 8, 10, tzinfo=UTC))
+    with session_factory.begin() as session:
+        session.get(Lead, "old-demand").created_at = datetime(2026, 10, 9, 10, tzinfo=UTC)
+    seed_lead(
+        session_factory,
+        "manual-today",
+        "sales-a",
+        datetime(2026, 10, 9, 10, tzinfo=UTC),
+        message_received=False,
+    )
+    service = DailyUnsubmittedLeadReminderService(session_factory)
+    assert service.schedule_due_reminders(now=datetime(2026, 10, 9, 12, tzinfo=UTC)) == 0
+    assert notification_count(session_factory) == 0

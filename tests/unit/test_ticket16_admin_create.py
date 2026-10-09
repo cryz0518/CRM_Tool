@@ -112,7 +112,6 @@ def test_admin_create_has_explicit_capture_and_owner_without_message(
         smart_table_owner_user_id="sales-owner",
         field_values={
             "线索名称": "手工补建公司",
-            "业务线": "协作机器人",
             "手机": "13800000000",
         },
         operator_subject="admin-1",
@@ -127,11 +126,16 @@ def test_admin_create_has_explicit_capture_and_owner_without_message(
     fields, _actor = table.calls[0]
     assert fields["负责人"] == "sales-owner"
     assert fields["创建人"] == "sales-owner"
+    assert fields["业务线"] == "协作机器人"
+    assert fields["职务"] == "经理"
+    assert fields["沟通方式"] == "活动"
+    assert fields["客户行业"] == "其他"
     with session_factory() as session:
         lead = session.get(Lead, result.lead_id)
         operation = session.get(AdminLeadCreationOperation, result.operation_id)
         assert lead is not None
         assert lead.source_message_id is None
+        assert lead.field_values["录入时间"] == fields["录入时间"]
         assert lead.original_capturing_sales_user_id == "sales-capture"
         assert lead.smart_table_owner_user_id == "sales-owner"
         assert lead.smart_table_record_id == "record-admin-1"

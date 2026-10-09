@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Generator, Mapping
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import create_engine, func, select
@@ -47,7 +48,7 @@ from app.messaging.models import (
 from app.notifications.outbound import WecomOutboundNotificationSender
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.models import SmartTableRecord
-from app.smart_table.registry import build_required_smart_table_schema
+from app.smart_table.registry import DEFAULT_LEAD_BUSINESS_VALUES, build_required_smart_table_schema
 from app.smart_table.wecom_cli import (
     SmartTableWriteVerificationError,
     WecomCliProcessError,
@@ -588,7 +589,16 @@ def test_authorized_sales_text_creates_a_personal_review_record(
     assert result.smart_table_record_id is not None
     record = adapter.get_record(result.smart_table_record_id)
     assert record is not None
+    with session_factory() as session:
+        received = session.get(IncomingMessage, "message-1").received_at
+    capture_time = (
+        received.replace(tzinfo=UTC)
+        .astimezone(ZoneInfo("Asia/Shanghai"))
+        .strftime("%Y-%m-%d %H:%M:%S")
+    )
     assert record.fields == {
+        **DEFAULT_LEAD_BUSINESS_VALUES,
+        "录入时间": capture_time,
         "线索名称": "长广溪智造",
         "联系人": "张三",
         "工艺": ["码垛"],
@@ -623,6 +633,8 @@ def test_authorized_sales_text_creates_a_personal_review_record(
     assert lead.original_capturing_sales_user_id == "sales-1"
     assert lead.smart_table_owner_user_id == "sales-1"
     assert lead.field_values == {
+        **DEFAULT_LEAD_BUSINESS_VALUES,
+        "录入时间": capture_time,
         "线索名称": "长广溪智造",
         "联系人": "张三",
         "工艺": ["码垛"],
@@ -634,7 +646,13 @@ def test_authorized_sales_text_creates_a_personal_review_record(
             "特殊要求：未提供。"
         ),
     }
-    assert {source.field_name for source in provenance} == {"线索名称", "联系人", "工艺", "备注"}
+    assert {source.field_name for source in provenance} == {
+        "线索名称",
+        "联系人",
+        "工艺",
+        "备注",
+        *DEFAULT_LEAD_BUSINESS_VALUES,
+    }
     assert sync is not None
     assert sync.status == "succeeded"
     assert sync.smart_table_record_id == result.smart_table_record_id
@@ -1062,10 +1080,15 @@ def test_smart_table_failure_can_be_consumed_again_without_creating_a_second_lea
 
     with patch.object(adapter, "create_record", side_effect=ConnectionError("temporary")):
         failed = service.consume(event_id)
+    with session_factory() as session:
+        first_capture = session.get(Lead, failed.lead_id).field_values["录入时间"]
     retried = service.consume(event_id)
 
     assert failed.status is LeadProcessingStatus.SYNC_FAILED
     assert retried.status is LeadProcessingStatus.CREATED
+    record = adapter.get_record(retried.smart_table_record_id)
+    assert record.fields["录入时间"] == first_capture
+    assert all(record.fields[name] == value for name, value in DEFAULT_LEAD_BUSINESS_VALUES.items())
     assert adapter.get_records() == [adapter.get_record(retried.smart_table_record_id)]
     with session_factory() as session:
         assert session.query(Lead).count() == 1
@@ -4611,3 +4634,346 @@ def test_missing_link_configuration_does_not_block_smart_table_ingest(
         ).all()
     assert sync is not None and sync.status == "succeeded"
     assert notices == []
+
+
+@pytest.mark.parametrize("identity_shape", ["separate", "combined", "reference_only"])
+def test_existing_semiconductor_company_with_city_enrichment_updates_original(
+    session_factory: sessionmaker[Session],
+    identity_shape: str,
+) -> None:
+    """原句中的城市与公司名重叠仍应更新本人唯一公司，不重复建行。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    seed = FirstTextLeadWorkspaceService(session_factory, adapter).consume(
+        persist_outbox_text(
+            session_factory,
+            message_id="semiconductor-seed",
+            sales_user_id="sales-1",
+            text="客户：西安芯汇半导体；联系人：周工",
+        )
+    )
+    text = (
+        "西安芯汇半导体的周工，做晶圆封测的，想了解洁净室协作机器人做FOUP料盒搬运，"
+        "预算60万，电话13800000000，是行业协会推荐过来的，预计明年3月前完成选型。"
+    )
+    response = json.loads(
+        semantic_single_json(
+            intent="UPDATE_LEAD",
+            crm_fields={"线索名称": "西安芯汇半导体", "联系人": "周工", "手机": "13800000000"},
+            enrichment={
+                "城市/地区": "西安",
+                "主营产品": "晶圆封测",
+                "预算": "60万",
+                "客户需求/痛点": "洁净室协作机器人做FOUP料盒搬运",
+            },
+        )
+    )
+    response["customer_reference"] = {"company_name": "西安芯汇半导体", "contact": "周工"}
+    if identity_shape == "combined":
+        response["crm_fields"]["线索名称"] = "西安芯汇半导体的周工"
+    elif identity_shape == "reference_only":
+        response["crm_fields"].pop("线索名称")
+        response["confidence_by_field"].pop("线索名称")
+    service = FirstTextLeadWorkspaceService(
+        session_factory, adapter, ai_gateway=AIGateway(MockLLMProvider([json.dumps(response)]))
+    )
+    event_id = persist_outbox_text(
+        session_factory, message_id="semiconductor-update", sales_user_id="sales-1", text=text
+    )
+    result = service.consume(event_id)
+    with session_factory() as session:
+        audits = tuple(
+            session.scalars(
+                select(BusinessAuditEvent).where(
+                    BusinessAuditEvent.message_id == "semiconductor-update"
+                )
+            )
+        )
+        assert result.status is LeadProcessingStatus.UPDATED, [
+            (item.event_type, item.details) for item in audits
+        ]
+        lead = session.get(Lead, seed.lead_id)
+        assert lead is not None and lead.enrichment_values["预算"] == "60万"
+    assert result.lead_id == seed.lead_id
+    assert len(adapter.get_records()) == 1
+    assert adapter.get_record(seed.smart_table_record_id).fields["手机"] == "13800000000"
+    assert service.consume(event_id).status is LeadProcessingStatus.ALREADY_PROCESSED
+
+
+@pytest.mark.parametrize("confidence", [0.99, 0.70, 0.40])
+def test_system_defaults_reliable_replacement_and_immutable_capture_time(
+    session_factory: sessionmaker[Session],
+    confidence: float,
+) -> None:
+    """四个默认值只让位于高置信度原文证据，接收时间跨日补充和重放不变。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    first_event = persist_outbox_text(
+        session_factory,
+        message_id="defaults-first",
+        sales_user_id="sales-1",
+        text="客户：甲科技；联系人：李工",
+    )
+    received = datetime(2026, 10, 8, 15, 59, 58, tzinfo=UTC)
+    with session_factory.begin() as session:
+        session.get(IncomingMessage, "defaults-first").received_at = received
+    first = FirstTextLeadWorkspaceService(session_factory, adapter).consume(first_event)
+    record = adapter.get_record(first.smart_table_record_id)
+    assert all(record.fields[name] == value for name, value in DEFAULT_LEAD_BUSINESS_VALUES.items())
+    assert record.fields["录入时间"] == "2026-10-08 23:59:58"
+    replacements = {
+        "业务线": "车载机器人",
+        "职务": "工程师",
+        "沟通方式": "微信",
+        "客户行业": "汽车",
+    }
+    text = "甲科技的李工，业务线车载机器人，职务工程师，沟通方式微信，客户行业汽车。"
+    response = json.loads(
+        semantic_single_json(
+            intent="UPDATE_LEAD",
+            crm_fields={
+                "线索名称": "甲科技",
+                **replacements,
+            },
+        )
+    )
+    response["confidence_by_field"].update({name: confidence for name in replacements})
+    service = FirstTextLeadWorkspaceService(
+        session_factory, adapter, ai_gateway=AIGateway(MockLLMProvider([json.dumps(response)]))
+    )
+    event = persist_outbox_text(
+        session_factory, message_id="defaults-update", sales_user_id="sales-1", text=text
+    )
+    assert service.consume(event).lead_id == first.lead_id
+    assert service.consume(event).status is LeadProcessingStatus.ALREADY_PROCESSED
+    assert len(adapter.get_records()) == 1
+    final = adapter.get_record(first.smart_table_record_id)
+    expected = replacements if confidence == 0.99 else DEFAULT_LEAD_BUSINESS_VALUES
+    assert all(final.fields[name] == value for name, value in expected.items())
+    assert final.fields["录入时间"] == "2026-10-08 23:59:58"
+    with session_factory() as session:
+        lead = session.get(Lead, first.lead_id)
+        assert lead.field_values["录入时间"] == final.fields["录入时间"]
+        sources = session.scalars(
+            select(LeadFieldProvenance).where(
+                LeadFieldProvenance.lead_id == first.lead_id,
+                LeadFieldProvenance.field_name.in_(replacements),
+            )
+        ).all()
+        assert len(sources) == 4
+        assert all(source.is_system_default == (confidence != 0.99) for source in sources)
+
+
+def test_system_defaults_respect_human_changes_and_confirmation(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """默认值被销售修改或显式确认后，高置信度 AI 也不能覆盖。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    first = FirstTextLeadWorkspaceService(session_factory, adapter).consume(
+        persist_outbox_text(
+            session_factory,
+            message_id="protected-defaults",
+            sales_user_id="sales-1",
+            text="客户：甲科技；联系人：李工",
+        )
+    )
+    adapter.update_record(first.smart_table_record_id, {"职务": "总监", "客户行业": "新能源"})
+    with session_factory.begin() as session:
+        source = session.scalar(
+            select(LeadFieldProvenance).where(
+                LeadFieldProvenance.lead_id == first.lead_id,
+                LeadFieldProvenance.field_name == "业务线",
+            )
+        )
+        source.is_user_confirmed = True
+    response = semantic_single_json(
+        intent="UPDATE_LEAD",
+        crm_fields={
+            "线索名称": "甲科技",
+            "业务线": "车载机器人",
+            "职务": "工程师",
+            "客户行业": "汽车",
+        },
+    )
+    service = FirstTextLeadWorkspaceService(
+        session_factory, adapter, ai_gateway=AIGateway(MockLLMProvider([response]))
+    )
+    result = service.consume(
+        persist_outbox_text(
+            session_factory,
+            message_id="protected-defaults-update",
+            sales_user_id="sales-1",
+            text="甲科技的李工，业务线车载机器人，职务工程师，客户行业汽车。",
+        )
+    )
+    assert result.status is LeadProcessingStatus.UPDATED
+    record = adapter.get_record(first.smart_table_record_id)
+    assert record.fields["业务线"] == "协作机器人"
+    assert record.fields["职务"] == "总监"
+    assert record.fields["客户行业"] == "新能源"
+
+
+@pytest.mark.parametrize("other_owner", ["sales-1", "sales-other"])
+def test_free_text_company_match_stays_with_owner_and_ambiguous_targets_wait(
+    session_factory: sessionmaker[Session],
+    other_owner: str,
+) -> None:
+    """本人多条同名记录继续待归属，他人同名记录不影响本人的唯一目标。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    first = FirstTextLeadWorkspaceService(session_factory, adapter).consume(
+        persist_outbox_text(
+            session_factory,
+            message_id="identity-boundary-seed",
+            sales_user_id="sales-1",
+            text="客户：西安芯汇半导体；联系人：周工",
+        )
+    )
+    from app.smart_table.adapter import SmartTableActor
+
+    other_record = adapter.create_record(
+        {"负责人": other_owner, "线索名称": "西安芯汇半导体"}, actor=SmartTableActor.ROBOT
+    )
+    with session_factory.begin() as session:
+        if other_owner != "sales-1":
+            session.add(
+                SalesAuthorization(wecom_user_id=other_owner, is_authorized=True, is_active=True)
+            )
+        session.add(
+            Lead(
+                id="other-identity",
+                original_capturing_sales_user_id=other_owner,
+                smart_table_owner_user_id=other_owner,
+                smart_table_record_id=other_record.record_id,
+                field_values={"线索名称": "西安芯汇半导体"},
+            )
+        )
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        ai_gateway=AIGateway(
+            MockLLMProvider(
+                [
+                    semantic_single_json(
+                        intent="UPDATE_LEAD",
+                        crm_fields={
+                            "线索名称": "西安芯汇半导体",
+                            "联系人": "周工",
+                            "手机": "13800000000",
+                        },
+                        enrichment={"城市/地区": "西安", "预算": "60万"},
+                    )
+                ]
+            )
+        ),
+    )
+    result = service.consume(
+        persist_outbox_text(
+            session_factory,
+            message_id="identity-boundary-update",
+            sales_user_id="sales-1",
+            text="西安芯汇半导体的周工，预算60万，电话13800000000。",
+        )
+    )
+    expected = (
+        LeadProcessingStatus.UNASSIGNED
+        if other_owner == "sales-1"
+        else LeadProcessingStatus.UPDATED
+    )
+    assert result.status is expected
+    assert len(adapter.get_records()) == 2
+    if other_owner != "sales-1":
+        assert result.lead_id == first.lead_id
+    assert "手机" not in adapter.get_record(other_record.record_id).fields
+
+
+def test_invalid_ai_enum_preserves_system_default(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """高置信度非法枚举只能保留为候选，不能覆盖合法系统默认值。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    event = persist_outbox_text(
+        session_factory,
+        message_id="invalid-default-enum",
+        sales_user_id="sales-1",
+        text="甲科技的李工，想了解工业机器人。",
+    )
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        ai_gateway=AIGateway(
+            MockLLMProvider(
+                [
+                    semantic_single_json(
+                        intent="NEW_LEAD",
+                        crm_fields={
+                            "线索名称": "甲科技",
+                            "联系人": "李工",
+                            "业务线": "工业机器人",
+                        },
+                    )
+                ]
+            )
+        ),
+    )
+    result = service.consume(event)
+    assert result.status is LeadProcessingStatus.CREATED
+    assert adapter.get_record(result.smart_table_record_id).fields["业务线"] == "协作机器人"
+
+
+@pytest.mark.parametrize("human_edit", [False, True])
+def test_default_replacement_failure_recovers_with_old_baseline_and_capture_time(
+    session_factory: sessionmaker[Session],
+    human_edit: bool,
+) -> None:
+    """可靠 AI 替换失败后复用旧同步基线恢复；期间人工修改仍优先，首次时间不变。"""
+    from app.leads.review import LeadReviewService
+
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    first = FirstTextLeadWorkspaceService(session_factory, adapter).consume(
+        persist_outbox_text(
+            session_factory,
+            message_id="default-retry-seed",
+            sales_user_id="sales-1",
+            text="客户：甲科技；联系人：李工",
+        )
+    )
+    first_time = adapter.get_record(first.smart_table_record_id).fields["录入时间"]
+    persist_outbox_text(
+        session_factory,
+        message_id="default-retry-update",
+        sales_user_id="sales-1",
+        text="甲科技职务工程师",
+    )
+    ai_patch = AIGateway(
+        MockLLMProvider(
+            [
+                semantic_single_json(
+                    intent="UPDATE_LEAD",
+                    crm_fields={
+                        "职务": "工程师",
+                    },
+                )
+            ]
+        )
+    ).extract_fields("甲科技职务工程师")
+    review = LeadReviewService(session_factory, adapter)
+    with patch.object(
+        adapter, "update_record", side_effect=ConnectionError("isolated update failure")
+    ):
+        with pytest.raises(ConnectionError):
+            review.sync_ai_patch(first.lead_id, "default-retry-update", ai_patch)
+    if human_edit:
+        adapter.update_record(first.smart_table_record_id, {"职务": "总监"})
+    # 后续消息无需重新产生已持久化的可靠补丁；只重试尚未成功同步的字段计划。
+    review.sync_ai_patch(
+        first.lead_id,
+        "default-retry-update",
+        ExtractedLeadPatch(
+            trace_id="recover-default",
+            analysis=LeadAnalysis(intent="UPDATE_LEAD"),
+            fields={},
+            pending_confirmation_fields=(),
+            low_confidence_candidates={},
+        ),
+    )
+    record = adapter.get_record(first.smart_table_record_id)
+    assert record.fields["职务"] == ("总监" if human_edit else "工程师")
+    assert record.fields["录入时间"] == first_time

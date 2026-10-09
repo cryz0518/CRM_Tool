@@ -14,8 +14,8 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.leads.models import CrmSyncRecord, Lead
-from app.messaging.models import NotificationRecord, SalesAuthorization, utc_now
+from app.leads.models import CrmSyncRecord, Lead, LeadMessageResolution
+from app.messaging.models import IncomingMessage, NotificationRecord, SalesAuthorization, utc_now
 
 logger = logging.getLogger(__name__)
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -66,8 +66,6 @@ class DailyUnsubmittedLeadReminderService:
                         SalesAuthorization.is_administrator.is_(False),
                         SalesAuthorization.crm_user_id.is_not(None),
                         func.trim(SalesAuthorization.crm_user_id) != "",
-                        Lead.created_at >= day_start,
-                        Lead.created_at < day_end,
                         Lead.lifecycle_state.in_(_UNSUBMITTED_LEAD_STATES),
                     )
                     .distinct()
@@ -85,9 +83,7 @@ class DailyUnsubmittedLeadReminderService:
                 )
                 if not _eligible_sales(authorization):
                     continue
-                lead_count = _unsubmitted_lead_count(
-                    session, sales_user_id, day_start, day_end
-                )
+                lead_count = _unsubmitted_lead_count(session, sales_user_id, day_start, day_end)
                 if not lead_count:
                     continue
 
@@ -246,8 +242,21 @@ def _unsubmitted_lead_count(
         session.scalar(
             select(func.count(Lead.id)).where(
                 Lead.smart_table_owner_user_id == sales_user_id,
-                Lead.created_at >= day_start,
-                Lead.created_at < day_end,
+                # 只有当天接收且已判定为有效需求的消息才授予提醒资格，与后台完成时间无关。
+                select(IncomingMessage.message_id)
+                .join(
+                    LeadMessageResolution,
+                    LeadMessageResolution.message_id == IncomingMessage.message_id,
+                )
+                .where(
+                    IncomingMessage.sales_user_id == sales_user_id,
+                    IncomingMessage.received_at >= day_start,
+                    IncomingMessage.received_at < day_end,
+                    LeadMessageResolution.status.in_(
+                        ("assigned", "unassigned", "quote_unresolved")
+                    ),
+                )
+                .exists(),
                 Lead.lifecycle_state.in_(_UNSUBMITTED_LEAD_STATES),
                 func.coalesce(latest_create_status, "").not_in(("succeeded", "abandoned")),
             )

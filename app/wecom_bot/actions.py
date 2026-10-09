@@ -85,8 +85,16 @@ _MAX_CARD_PAYLOAD_BYTES = 8192
 _MAX_MARKDOWN_BYTES = 4096
 # 确认预览仅使用这些字段；固定三组顺序不改变服务端提交快照。
 SUBMISSION_PREVIEW_FIELDS = (
-    "业务线", "线索名称", "线索来源", "联系人", "职务", "沟通方式",
-    "手机", "备注", "客户行业", "提交状态",
+    "业务线",
+    "线索名称",
+    "线索来源",
+    "联系人",
+    "职务",
+    "沟通方式",
+    "手机",
+    "备注",
+    "客户行业",
+    "提交状态",
 )
 _PII_EMAIL = re.compile(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b")
 _PII_PHONE = re.compile(r"(?<!\d)\+?\d[\d ()-]{6,}\d(?!\d)")
@@ -467,13 +475,15 @@ class WecomActionService:
         expires_at: datetime | None = None,
         preview_fields: Mapping[str, object] | None = None,
         preview_markdown_chunks: Sequence[str] | None = None,
+        defer_delivery: bool = False,
     ) -> WecomAction:
         """持久化业务动作并在同一事务中登记待发送卡片通知。
 
         参数：actor_user_id、动作类型、服务端目标、预期 action key 和白名单 context
         共同冻结业务事实；
         title/description 为卡片展示摘要；source_message_id 为可选的已持久化来源消息；
-        preview_markdown_chunks 为卡片前发送的完整 Markdown 明细分片。
+        preview_markdown_chunks 为卡片前发送的完整 Markdown 明细分片；
+        defer_delivery 在整条命令的所有页持久化完成前暂停投递。
         返回值：已持久化的动作副本。
         异常：能力未就绪、动作参数非法或 actor 不存在/已停用时抛出 ValueError/PermissionError。
         副作用：新增 WecomAction 与 NotificationRecord，但不直接调用企业微信。
@@ -563,6 +573,7 @@ class WecomActionService:
                         payload={
                             "msgtype": "markdown",
                             "markdown": {"content": markdown},
+                            "delivery_pending": defer_delivery,
                         },
                         # 显式微调同一页分片时间，出站 sender 可保持候选顺序且无需 migration。
                         created_at=preview_created_at + timedelta(microseconds=chunk_index),
@@ -578,6 +589,7 @@ class WecomActionService:
                     content=description,
                     payload={
                         "msgtype": "template_card",
+                        "delivery_pending": defer_delivery,
                         "template_card": build_action_card(
                             task_id=task_id,
                             event_key=expected_action_key,
@@ -1452,6 +1464,7 @@ class WecomActionService:
         command_text: str,
         candidates: tuple[dict[str, str], ...],
         preview_markdown_chunks: Sequence[str] | None = None,
+        defer_delivery: bool = False,
         page: int = 1,
         page_count: int = 1,
     ) -> WecomAction:
@@ -1488,6 +1501,7 @@ class WecomActionService:
             description=description,
             source_message_id=request_message_id,
             preview_markdown_chunks=preview_markdown_chunks,
+            defer_delivery=defer_delivery,
         )
 
     def issue_company_submission_confirmation_action(
@@ -1499,6 +1513,7 @@ class WecomActionService:
         company_name: str,
         field_values: Mapping[str, object],
         display_text: str | None = None,
+        defer_delivery: bool = False,
     ) -> WecomAction:
         """发行单条公司线索的十字段提交确认卡。
 
@@ -1523,6 +1538,7 @@ class WecomActionService:
             description=f"请核对“{_redact_text(company_name, 96)}”的预览字段后确认提交",
             source_message_id=request_message_id,
             preview_fields=field_values,
+            defer_delivery=defer_delivery,
         )
 
     def issue_company_candidate_confirmation_action(
@@ -1533,6 +1549,8 @@ class WecomActionService:
         company_name: str,
         candidates: tuple[dict[str, str], ...],
         contains_match: bool = False,
+        preview_markdown_chunks: Sequence[str] | None = None,
+        defer_delivery: bool = False,
     ) -> WecomAction:
         """发行精确或包含匹配候选选择卡，禁止客户端自行指定目标线索。
 
@@ -1565,6 +1583,8 @@ class WecomActionService:
             title="选择要提交的线索",
             description=description,
             source_message_id=request_message_id,
+            preview_markdown_chunks=preview_markdown_chunks,
+            defer_delivery=defer_delivery,
         )
 
     def issue_discard_action(

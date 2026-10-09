@@ -890,3 +890,52 @@ def test_later_qcc_result_conflicting_with_sales_confirmation_requires_review(
 
     assert conflict.standard_company_name == "销售确认名称"
     assert conflict.verification_status.value == "verification_conflict"
+
+
+def test_company_creation_and_confirmed_supplement_share_defaults_and_capture_time(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """公司解析创建路径也写默认值，可靠补充可替换默认而不改首次接收时间。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = CompanyLeadService(
+        session_factory,
+        adapter,
+        MockQCCAdapter(
+            {
+                "测试公司": QCCLookupResult.matched(QCCCandidate("测试公司", "mock-company")),
+            }
+        ),
+    )
+    persist_source_message(session_factory, "company-default-first", "sales-1")
+    first = service.upsert(
+        CompanyUpsertCommand(
+            source_message_id="company-default-first",
+            sales_user_id="sales-1",
+            fields={"线索名称": "测试公司", "手机": "13800000000"},
+        )
+    )
+    first_record = adapter.get_record(first.smart_table_record_id)
+    assert first_record.fields["职务"] == "经理"
+    assert first_record.fields["业务线"] == "协作机器人"
+    persist_source_message(session_factory, "company-default-second", "sales-1")
+    service.upsert(
+        CompanyUpsertCommand(
+            source_message_id="company-default-second",
+            sales_user_id="sales-1",
+            existing_lead_id=first.lead_id,
+            fields={"线索名称": "测试公司", "职务": "工程师"},
+        )
+    )
+    record = adapter.get_record(first.smart_table_record_id)
+    assert record.fields["职务"] == "工程师"
+    assert record.fields["录入时间"] == first_record.fields["录入时间"]
+    with session_factory() as session:
+        source = session.scalar(
+            select(LeadFieldProvenance)
+            .where(
+                LeadFieldProvenance.lead_id == first.lead_id,
+                LeadFieldProvenance.field_name == "职务",
+            )
+            .order_by(LeadFieldProvenance.id.desc())
+        )
+        assert not source.is_system_default
