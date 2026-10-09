@@ -684,10 +684,10 @@ def test_incomplete_retry_routing_keeps_abandoned_priority_and_guards() -> None:
     assert not is_explicit_submission_request("先不要重新提交")
 
 
-def test_company_submission_confirmation_card_contains_preview_fields(
+def test_company_submission_confirmation_card_keeps_fields_in_markdown(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证单条公司确认动作把全字段放入卡片，而不是放入客户端目标参数。"""
+    """验证单条公司确认动作先发字段 Markdown，按钮卡只显示简短纯文本提示。"""
 
     _authorize(session_factory)
     service = _service(session_factory)
@@ -709,12 +709,22 @@ def test_company_submission_confirmation_card_contains_preview_fields(
     preview_notice = next(
         notice for notice in notices if notice.notification_type == "wecom_action_preview"
     )
-    assert len(card_notice.payload["template_card"]["horizontal_content_list"]) == 3
-    assert "备注" in preview_notice.payload["markdown"]["content"]
+    card = card_notice.payload["template_card"]
+    assert card["horizontal_content_list"] == [
+        {"keyname": "提交预览", "value": "请核对上方字段明细后确认提交"}
+    ]
+    assert card["button_list"] == [
+        {"text": "确认", "style": 1, "key": "crm.company_submission.confirm"}
+    ]
+    assert card["task_id"] == action.task_id
+    assert "销售确认" not in str(card) and "**" not in str(card)
+    assert "备注：销售确认" in preview_notice.payload["markdown"]["content"]
+    assert "职务：**未填写**" in preview_notice.payload["markdown"]["content"]
+    assert preview_notice.created_at <= card_notice.created_at
 
 
 def test_preview_card_and_markdown_fit_wecom_display_limits() -> None:
-    """验证单条卡片和 Markdown 只显示固定十字段，三组且长值截断。"""
+    """验证十字段三组 Markdown 保持截断，按钮卡仅提示且不泄漏格式标记。"""
 
     names = (
         "业务线", "线索名称", "线索来源", "联系人", "职务", "沟通方式",
@@ -734,7 +744,7 @@ def test_preview_card_and_markdown_fit_wecom_display_limits() -> None:
     )
     rows = card["horizontal_content_list"]
     assert isinstance(rows, list)
-    assert len(rows) == 3
+    assert len(rows) == 1
     rendered = "".join(str(row) for row in rows)
     details = build_preview_markdown(preview)
     field_lines = details.splitlines()[1:4]
@@ -742,7 +752,9 @@ def test_preview_card_and_markdown_fit_wecom_display_limits() -> None:
     assert "职务：**未填写**" in details
     assert "…" in details and len(details.encode("utf-8")) < 4096
     assert all(name not in details and name not in rendered for name in extras)
-    assert all(name + "：" in rendered for name in names)
+    assert all(name + "：" not in rendered for name in names)
+    assert "**" not in rendered and "未填写" not in rendered
+    assert all(len(row["value"]) <= 26 for row in rows)
     assert preview == original
 
 

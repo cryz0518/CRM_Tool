@@ -1832,10 +1832,10 @@ def build_action_card(
     selection_key: str | None = None,
     preview_fields: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """构造服务端生成的 template card body，并可附带只读预览快照。
+    """构造服务端生成的 template card body，字段详情由前置 Markdown 展示。
 
     参数：task_id 和 event_key 为服务端生成的关联值，title 和 description 为安全文案；
-    preview_fields 只用于卡片展示，业务目标仍只保存在服务端 action 中。
+    preview_fields 表示已有前置字段详情，卡片只显示纯文本提示；业务目标仍在服务端 action 中。
     返回值：可交给企业微信发送接口的卡片 body。
     异常：无；调用方应先完成动作定义校验。
     副作用：无，不保存任何客户端业务字段。
@@ -1849,8 +1849,10 @@ def build_action_card(
         "button_list": [{"text": "确认", "style": 1, "key": event_key}],
     }
     if isinstance(preview_fields, Mapping):
-        # 展示快照只进入待发送卡片，不进入 action context；确认时服务端会重新读取表格。
-        payload["horizontal_content_list"] = _preview_card_rows(preview_fields)
+        # 模板卡片普通文本不解析 Markdown，字段详情只在前置消息中展示。
+        payload["horizontal_content_list"] = [
+            {"keyname": "提交预览", "value": "请核对上方字段明细后确认提交"}
+        ]
     options = selection_options if selection_options is not None else duplicate_leads
     if isinstance(options, list) and options:
         submit_key = selection_key or CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE
@@ -2199,20 +2201,6 @@ def _submission_preview_lines(preview_fields: Mapping[str, object]) -> list[str]
             rendered = f"**{rendered}**"
         items.append(f"{name}：{rendered}")
     return ["｜".join(items[:3]), "｜".join(items[3:6]), "｜".join(items[6:])]
-
-
-def _preview_card_rows(preview_fields: Mapping[str, object]) -> list[dict[str, str]]:
-    """把指定提交字段压缩成三项卡片横向内容。
-
-    参数：preview_fields 为已按表格顺序整理的字段快照。
-    返回值：三项卡片内容，与 Markdown 使用相同字段和截断规则。
-    异常：无；空字段名会被忽略。
-    副作用：无，不修改输入快照。
-    """
-    return [
-        {"keyname": f"字段组{index}", "value": line}
-        for index, line in enumerate(_submission_preview_lines(preview_fields), start=1)
-    ]
 
 
 def build_preview_markdown(preview_fields: Mapping[str, object]) -> str:
