@@ -424,18 +424,29 @@ def test_inconsistent_legacy_success_restores_same_source_plan_from_provenance(
     # 只清空既有测试行的原计划字段，不创建或删除记录。
     adapter.update_record(record_id, {"工艺": None})
     update_calls: list[dict[str, object]] = []
+    preflight_skips: list[bool] = []
     original_update = adapter.update_record
 
-    def capture_update(target_id: str, fields: dict[str, object]) -> SmartTableRecord:
-        """记录远端补丁字段名和值形状，不触碰任何外部客户数据。"""
+    def capture_update(
+        target_id: str, fields: dict[str, object], *, skip_preflight: bool = False
+    ) -> SmartTableRecord:
+        """记录远端补丁和快照预读策略，并委托原 Mock 适配器执行。
+
+        参数：target_id 为目标记录；fields 为增量字段；skip_preflight 表示调用方已有新鲜快照。
+        返回值：原 Mock 适配器更新后的记录快照。
+        异常：原 Mock 适配器检测到缺失记录时抛出 SmartTableRecordNotFoundError。
+        副作用：记录测试调用并修改内存 Mock 记录，不触碰外部客户数据。
+        """
         update_calls.append(dict(fields))
-        return original_update(target_id, fields)
+        preflight_skips.append(skip_preflight)
+        return original_update(target_id, fields, skip_preflight=skip_preflight)
 
     monkeypatch.setattr(adapter, "update_record", capture_update)
     result = service.retry_failed_message(source_message_id)
 
     assert result.status is ProtectedSupplementStatus.SUCCEEDED
     assert update_calls == [{"工艺": ["装配"]}]
+    assert preflight_skips == [True]
     record = adapter.get_record(record_id)
     assert record is not None and record.fields["工艺"] == ["装配"]
     with session_factory() as session:

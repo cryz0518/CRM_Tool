@@ -890,7 +890,9 @@ class CompanyLeadService:
                 },
             )
             try:
-                self._smart_table_adapter.update_record(record_id, safe_patch)
+                self._smart_table_adapter.update_record(
+                    record_id, safe_patch, skip_preflight=True
+                )
             except Exception as error:
                 logger.exception(
                     "company_smart_table_update_failed",
