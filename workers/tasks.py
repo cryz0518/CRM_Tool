@@ -189,6 +189,7 @@ def _claim_audit_mirror_outbox(
         outbox.status = "processing"
         outbox.attempts += 1
         outbox.processing_started_at = now
+        outbox.dispatch_lease_expires_at = None
         outbox.claim_token = claim_token
         outbox.failure_category = None
         outbox.failure_code = None
@@ -225,6 +226,7 @@ def _finish_audit_mirror(
         if outbox is None:
             return "stale"
         outbox.processing_started_at = None
+        outbox.dispatch_lease_expires_at = None
         outbox.claim_token = None
         if succeeded:
             outbox.status = "succeeded"
@@ -354,6 +356,7 @@ def _defer_audit_mirror(
         # 等待 source Lead 的消费没有调用 SmartTable，不应消耗外部镜像尝试额度。
         outbox.attempts = max(0, outbox.attempts - 1)
         outbox.processing_started_at = None
+        outbox.dispatch_lease_expires_at = None
         outbox.claim_token = None
         outbox.failure_category = None
         outbox.failure_code = None
@@ -459,14 +462,17 @@ def consume_pending_audit_mirrors() -> int:
     try:
         settings = get_settings()
         now = utc_now()
-        expired_before = now - timedelta(
-            seconds=settings.lead_processing_timeout_seconds
+        expired_before = now - timedelta(seconds=settings.lead_processing_timeout_seconds)
+        dispatch_due = or_(
+            AuditMirrorOutbox.dispatch_lease_expires_at.is_(None),
+            AuditMirrorOutbox.dispatch_lease_expires_at <= now,
         )
-        with factory() as session:
-            outbox_ids = list(
+        with factory.begin() as session:
+            outboxes = list(
                 session.scalars(
-                    select(AuditMirrorOutbox.id)
+                    select(AuditMirrorOutbox)
                     .where(
+                        dispatch_due,
                         or_(
                             AuditMirrorOutbox.status == "pending",
                             and_(
@@ -478,17 +484,23 @@ def consume_pending_audit_mirrors() -> int:
                                 AuditMirrorOutbox.processing_started_at.is_not(None),
                                 AuditMirrorOutbox.processing_started_at < expired_before,
                             ),
-                        )
+                        ),
                     )
-                    # defer 会刷新 updated_at，较老的等待任务因此让位给后续 pending 项。
+                    # 同一事务领取派发租约，避免每个 Beat 周期重复向共享 Worker 队列塞入相同任务。
                     .order_by(AuditMirrorOutbox.updated_at, AuditMirrorOutbox.id)
                     .limit(settings.audit_mirror_batch_size)
+                    .with_for_update(skip_locked=True)
                 )
             )
+            for outbox in outboxes:
+                outbox.dispatch_lease_expires_at = now + timedelta(
+                    seconds=settings.lead_processing_timeout_seconds
+                )
+            outbox_ids = [outbox.id for outbox in outboxes]
     finally:
         engine.dispose()
     for outbox_id in outbox_ids:
-        # 认领留给任务本身，重复调度也由数据库条件更新收敛。
+        # 数据库派发租约在 Worker 启动后由 _claim_audit_mirror_outbox 清除。
         consume_audit_mirror_outbox.delay(outbox_id)
     return len(outbox_ids)
 

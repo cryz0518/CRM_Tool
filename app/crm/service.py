@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -656,13 +656,16 @@ class CrmSubmissionService:
         self,
         command: SubmissionCommand,
         selected_lead_ids: tuple[str, ...],
+        *,
+        on_item_result: Callable[[SubmissionItemResult], None] | None = None,
     ) -> SubmissionBatchResult:
         """提交卡片勾选的线索，并在服务端重新校验候选归属和状态。
 
         参数：command 为原始精确命令；selected_lead_ids 为 callback 中的服务端候选标识。
         返回值：与普通批量提交相同的部分成功汇总。
-        异常：actor 不存在/已停用或命令不支持时抛出 ValueError。
-        副作用：每个 callback 已接受的目标均得到结果；仅仍有效的目标调用首次提交流程。
+        异常：actor 不存在/已停用或命令不支持时抛出 ValueError；结果回调异常向调用方传播。
+        副作用：每个 callback 已接受的目标均得到结果；仅仍有效的目标调用首次提交流程，
+        并在单条处理结束后可选地持久化该条结果。
         """
         if command.text not in {_TODAY_COMMAND, _ALL_COMMAND, _ABANDONED_COMMAND}:
             raise ValueError("不支持卡片选择提交")
@@ -671,10 +674,6 @@ class CrmSubmissionService:
             authorization = session.get(SalesAuthorization, command.sales_user_id)
             if authorization is None or not authorization.is_active:
                 raise ValueError("提交销售 actor 不存在或已停用")
-            # 回调重新校验身份后只读取一份快照，避免多次启动 CLI 导致偶发协议/进程错误。
-            smart_table_snapshot = {
-                record.record_id: record for record in self._smart_table_adapter.get_records()
-            }
             valid_ids: set[str] = set()
             for lead_id in selected:
                 lead = session.get(Lead, lead_id)
@@ -695,9 +694,6 @@ class CrmSubmissionService:
                         and lead.lifecycle_state in {"pending_create", "temporary"}
                         and self._is_today_owned_candidate(lead, command.sales_user_id)
                         and (sync is None or sync.status not in {"succeeded", "abandoned"})
-                        and self._is_unsubmitted_smart_table_record(
-                            lead, snapshot=smart_table_snapshot
-                        )
                     ):
                         valid_ids.add(lead_id)
                 elif (
@@ -705,9 +701,6 @@ class CrmSubmissionService:
                     and lead.smart_table_owner_user_id == command.sales_user_id
                     and lead.lifecycle_state in {"pending_create", "temporary"}
                     and (sync is None or sync.status not in {"succeeded", "abandoned"})
-                    and self._is_unsubmitted_smart_table_record(
-                        lead, snapshot=smart_table_snapshot
-                    )
                 ):
                     valid_ids.add(lead_id)
         result = SubmissionBatchResult()
@@ -715,15 +708,26 @@ class CrmSubmissionService:
             if lead_id not in valid_ids:
                 outcome = _create_outcome("not_submitted")
             else:
-                outcome = self._submit_create(
-                    lead_id,
-                    SubmissionCommand(
-                        command.text,
-                        command.sales_user_id,
-                        command.request_message_id,
-                    ),
-                )
+                try:
+                    outcome = self._submit_create(
+                        lead_id,
+                        SubmissionCommand(
+                            command.text,
+                            command.sales_user_id,
+                            command.request_message_id,
+                        ),
+                    )
+                except Exception as error:
+                    # 单条最终快照读取失败只影响该线索，不能中止其它已勾选记录。
+                    _LOGGER.warning(
+                        "crm_selected_submission_item_failed",
+                        extra={"lead_id": lead_id, "failure": safe_failure_summary(error)},
+                    )
+                    outcome = _create_outcome("failed_pending_review")
             result = _append_create_result(result, lead_id, outcome)
+            if on_item_result is not None:
+                # _submit_create 已重新读取该条最终快照；先保存结果并续租，再开始下一条。
+                on_item_result(result.items[-1])
         return result
 
     def _submit_updates(self, command: SubmissionCommand) -> SubmissionBatchResult:
