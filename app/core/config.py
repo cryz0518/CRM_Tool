@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     wecom_smart_table_sales_can_delete_records: bool | None = None
     wecom_cli_command: str = "wecom-cli"
     wecom_cli_timeout_seconds: float = 20.0
-    wecom_cli_retry_count: int = 1
+    wecom_cli_retry_count: int = 3
     lead_context_ttl_minutes: int = 30
     lead_message_retry_count: int = 1
     lead_outbox_poll_seconds: int = 10

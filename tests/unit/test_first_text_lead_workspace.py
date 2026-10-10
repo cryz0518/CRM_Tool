@@ -3872,6 +3872,35 @@ def test_company_candidate_overlapping_demand_or_identity_details_fails_closed(
         assert session.scalar(select(func.count()).select_from(Lead)) == 1
 
 
+def test_company_name_may_contain_its_main_product() -> None:
+    """公司名称包含主营产品词时仍保留原文可核验的公司身份。"""
+    company_name = "承德华净活性炭"
+    patch = ExtractedLeadPatch(
+        trace_id="company-product-overlap",
+        analysis=LeadAnalysis(
+            intent="NEW_LEAD",
+            customer_reference={"company": company_name, "contact": "石厂长"},
+            crm_fields={
+                "线索名称": company_name,
+                "联系人": "石厂长",
+                "职务": "厂长",
+            },
+            confidence_by_field={"线索名称": 1.0, "联系人": 1.0, "职务": 0.8},
+            enrichment={"主营产品": "活性炭", "预算": "25万", "城市/地区": "承德"},
+        ),
+        fields={"线索名称": company_name, "联系人": "石厂长", "职务": "厂长"},
+        pending_confirmation_fields=("职务",),
+        low_confidence_candidates={},
+        enrichment={"主营产品": "活性炭", "预算": "25万", "城市/地区": "承德"},
+    )
+    text = "承德华净活性炭石厂长13800000000，活性炭行业，想了解协作机器人，预算25万。"
+
+    grounded = FirstTextLeadWorkspaceService._ground_source_identity_patch(patch, text)
+
+    assert grounded.fields["线索名称"] == company_name
+    assert grounded.fields["联系人"] == "石厂长"
+
+
 def test_expired_context_does_not_assign_weak_ai_update(
     session_factory: sessionmaker[Session],
 ) -> None:

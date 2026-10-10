@@ -5,8 +5,12 @@ ENV PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai
 
 # 安装时区数据，确保容器内时间与项目部署时区一致。
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y nodejs npm tzdata \
+RUN sed -i \
+    -e 's|http://deb.debian.org/debian-security|https://mirrors.aliyun.com/debian-security|g' \
+    -e 's|http://deb.debian.org/debian|https://mirrors.aliyun.com/debian|g' \
+    /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install --no-install-recommends -y nodejs npm tzdata \
     && ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime \
     && echo "${TZ}" > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
@@ -23,7 +27,9 @@ COPY alembic ./alembic
 COPY alembic.ini ./
 COPY tests ./tests
 
-RUN pip install --no-cache-dir ".[dev]"
+# 国内服务器访问 PyPI 不稳定，构建使用镜像源并允许网络超时重试。
+RUN pip install --no-cache-dir --index-url https://mirrors.aliyun.com/pypi/simple \
+    --timeout 60 --retries 5 ".[dev]"
 
 # 运行时使用非 root 账号，避免 Worker 以高权限执行任务。
 RUN groupadd --system appuser \

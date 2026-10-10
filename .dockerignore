@@ -1,4 +1,8 @@
 .env
+.env.*
+.wecom-cli-credentials
+log
+backups
 .git
 .codegraph
 .mypy_cache

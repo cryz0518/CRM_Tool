@@ -973,20 +973,51 @@ class WecomActionService:
             if outbox.status == WecomActionOutboxStatus.PROCESSING.value and not lease_expired:
                 return ActionExecutionResult("already_processing", "已在处理中", False)
             if lease_expired and outbox.domain_started_at is not None:
-                # 领域调用已经取得不可逆 operation 事实，不能自动 takeover 再调用一次。
-                _transition_action(action, WecomActionStatus.PENDING_RECOVERY.value)
+                # 领域调用已开始时只用持久化的逐条结果收敛反馈，绝不重新调用 CRM。
+                recovered = self._saved_submission_results_summary(action)
+                recovered_complete = recovered is not None and recovered[1]
+                result_summary = (
+                    recovered[0]
+                    if recovered is not None
+                    else "领域操作已开始但 Worker 失联，需要恢复核对"
+                )
+                terminal_status = (
+                    WecomActionStatus.SUCCEEDED.value
+                    if recovered_complete
+                    else WecomActionStatus.PENDING_RECOVERY.value
+                )
+                terminal_outbox_status = (
+                    WecomActionOutboxStatus.SUCCEEDED.value
+                    if recovered_complete
+                    else WecomActionOutboxStatus.FAILED.value
+                )
+                _transition_action(action, terminal_status)
                 action.processed_at = now
-                action.result_code = "domain_operation_recovery_required"
-                action.result_summary = "领域操作已开始但 Worker 失联，需要恢复核对"
-                outbox.status = WecomActionOutboxStatus.FAILED.value
+                action.processing_lease_expires_at = None
+                action.result_code = (
+                    "submission_results_recovered"
+                    if recovered_complete
+                    else "domain_operation_recovery_required"
+                )
+                action.result_summary = result_summary[:256]
+                outbox.status = terminal_outbox_status
                 outbox.processing_started_at = None
                 outbox.processing_lease_expires_at = None
-                self._add_result_notification(session, action, action.result_summary)
+                outbox.claim_token = None
+                self._add_result_notification(session, action, result_summary)
                 logger.warning(
                     "wecom_action_recovery_required",
-                    extra={"action_id": action.id, "event": "action_recovery"},
+                    extra={
+                        "action_id": action.id,
+                        "event": "action_recovery",
+                        "submission_results_recovered": recovered is not None,
+                    },
                 )
-                return ActionExecutionResult("recovery_required", action.result_summary, False)
+                return ActionExecutionResult(
+                    "recovered_results" if recovered_complete else "recovery_required",
+                    result_summary,
+                    False,
+                )
 
             # Worker 可能在 callback claim 后延迟执行；执行前再次读取授权，避免撤销后仍产生副作用。
             authorization = session.get(SalesAuthorization, action.bound_actor_wecom_user_id)
@@ -1058,6 +1089,67 @@ class WecomActionService:
             result_summary=result_summary,
         )
 
+    @staticmethod
+    def _saved_submission_results_summary(
+        action: WecomAction,
+    ) -> tuple[str, bool] | None:
+        """仅根据动作已持久化的逐条结果生成安全的恢复汇总。
+
+        参数：action 为租约过期后锁定的 CRM 批量动作。
+        返回值：汇总文本与结果是否覆盖全部冻结选择；无可用结果时返回 None。
+        异常：无；非法或越界结果按不可恢复处理。
+        副作用：无，不访问 CRM 或智能表格。
+        """
+        if action.action_type != ACTION_TYPE_CRM_BATCH_SUBMISSION:
+            return None
+        selected = action.context.get("selected_lead_ids")
+        saved = action.context.get("submission_results")
+        if (
+            not isinstance(selected, list)
+            or not selected
+            or not all(isinstance(lead_id, str) for lead_id in selected)
+            or not isinstance(saved, list)
+            or not saved
+        ):
+            return None
+        allowed_statuses = {
+            "created", "updated", "unchanged", "incomplete", "duplicate_confirmation",
+            "mapping_missing", "processing", "retrying", "failed_pending_review",
+            "company_identity_review", "not_submitted",
+        }
+        saved_by_lead: dict[str, str] = {}
+        for item in saved:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("lead_id"), str)
+                or item["lead_id"] not in selected
+                or not isinstance(item.get("status"), str)
+                or item["status"] not in allowed_statuses
+                or item["lead_id"] in saved_by_lead
+            ):
+                return None
+            saved_by_lead[item["lead_id"]] = item["status"]
+        counts = {
+            status: sum(saved_status == status for saved_status in saved_by_lead.values())
+            for status in allowed_statuses
+        }
+        complete = len(saved_by_lead) == len(selected)
+        summary = (
+            "CRM 提交结果已恢复："
+            f"创建成功 {counts['created']} 条，更新成功 {counts['updated']} 条，"
+            f"无变化 {counts['unchanged']} 条，待完善 {counts['incomplete']} 条，"
+            f"处理中 {counts['processing']} 条，重试中 {counts['retrying']} 条，"
+            f"未提交 {counts['not_submitted']} 条，需人工处理 "
+            f"{counts['mapping_missing'] + counts['failed_pending_review'] + counts['company_identity_review']} 条，"
+            f"重复待确认 {counts['duplicate_confirmation']} 条；"
+            f"已核实 {len(saved_by_lead)}/{len(selected)} 条。"
+        )
+        if not complete:
+            summary += (
+                f"其余 {len(selected) - len(saved_by_lead)} 条结果待核对，系统不会再次提交 CRM。"
+            )
+        return summary, complete
+
     def begin_domain_operation(
         self,
         action_id: str,
@@ -1115,6 +1207,8 @@ class WecomActionService:
             "company_identity_reserved", "crm_duplicate_search_retrying",
             "crm_duplicate_search_failed", "crm_update_incomplete", "crm_update_retrying",
             "crm_update_failed_pending_review", "company_identity_change_pending_review",
+            "crm_enum_mapping_missing", "crm_outcome_unknown", "wecom_smart_table_retryable",
+            "pre_crm_transient_failure",
         }
         if not items or len(items) > 20:
             raise ValueError("逐条提交结果数量非法")
@@ -1172,20 +1266,41 @@ class WecomActionService:
             if (
                 not isinstance(selected, list)
                 or not all(isinstance(lead_id, str) for lead_id in selected)
-                or len(selected) != len(safe_items)
-                or set(selected) != seen
+                or not seen.issubset(set(selected))
             ):
                 raise ValueError("逐条结果与服务端冻结选择不一致")
+            saved_items = action.context.get("submission_results", [])
+            if not isinstance(saved_items, list):
+                raise ValueError("已保存逐条结果结构非法")
+            merged_by_lead: dict[str, dict[str, object]] = {}
+            for item in saved_items:
+                if (
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("lead_id"), str)
+                    or item["lead_id"] not in selected
+                ):
+                    raise ValueError("已保存逐条结果与服务端冻结选择不一致")
+                merged_by_lead[item["lead_id"]] = item
+            for item in safe_items:
+                previous = merged_by_lead.get(item["lead_id"])
+                if previous is not None and previous != item:
+                    raise ValueError("已保存逐条结果不可被覆盖")
+                merged_by_lead[item["lead_id"]] = item
+            merged_items = [merged_by_lead[lead_id] for lead_id in selected if lead_id in merged_by_lead]
             action.context = {
                 **action.context,
                 "selected_lead_ids": list(selected),
-                "submission_results": safe_items,
+                "submission_results": merged_items,
                 "incomplete_selected_lead_ids": [
                     item["lead_id"]
-                    for item in safe_items
+                    for item in merged_items
                     if item["status"] == "incomplete"
                 ],
             }
+            # 每条最终快照处理后刷新租约，批次耗时不再与固定五分钟租约竞争。
+            lease_expires = utc_now() + _ACTION_LEASE
+            outbox.processing_lease_expires_at = lease_expires
+            action.processing_lease_expires_at = lease_expires
 
     def mark_remote_effect_succeeded(
         self,
@@ -2485,7 +2600,11 @@ class DeterministicWecomActionExecutor:
         """
 
         from app.crm.commands import format_submission_reply
-        from app.crm.service import CrmSubmissionService, SubmissionCommand
+        from app.crm.service import (
+            CrmSubmissionService,
+            SubmissionCommand,
+            SubmissionItemResult,
+        )
         from app.leads.review import LeadReviewService
 
         fields = action.context.get("field_names")
@@ -2618,24 +2737,29 @@ class DeterministicWecomActionExecutor:
             self._crm_adapter,
             robot_submission_confirmation_available=True,
         )
-        result = service.submit_selected(
-            SubmissionCommand(command_text, action.bound_actor_wecom_user_id, request_message_id),
-            tuple(selected),
-        )
-        if self._action_service is not None:
+
+        def persist_item_result(item: SubmissionItemResult) -> None:
+            """每条 CRM 结果返回后即持久化并续租，供动作失联恢复使用。"""
+            if self._action_service is None:
+                return
             self._action_service.record_submission_results(
                 action.id,
                 action.claim_token,
-                tuple(
+                (
                     {
                         "lead_id": item.lead_id,
                         "status": getattr(item.status, "value", str(item.status)),
                         "reason_code": item.reason_code,
                         "missing_fields": item.missing_fields,
-                    }
-                    for item in result.items
+                    },
                 ),
             )
+
+        result = service.submit_selected(
+            SubmissionCommand(command_text, action.bound_actor_wecom_user_id, request_message_id),
+            tuple(selected),
+            on_item_result=persist_item_result,
+        )
         if result.duplicate_confirmations and self._action_service is not None:
             self._action_service.issue_duplicate_confirmation_action(
                 actor_user_id=action.bound_actor_wecom_user_id,

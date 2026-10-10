@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -656,13 +656,16 @@ class CrmSubmissionService:
         self,
         command: SubmissionCommand,
         selected_lead_ids: tuple[str, ...],
+        *,
+        on_item_result: Callable[[SubmissionItemResult], None] | None = None,
     ) -> SubmissionBatchResult:
         """提交卡片勾选的线索，并在服务端重新校验候选归属和状态。
 
         参数：command 为原始精确命令；selected_lead_ids 为 callback 中的服务端候选标识。
         返回值：与普通批量提交相同的部分成功汇总。
-        异常：actor 不存在/已停用或命令不支持时抛出 ValueError。
-        副作用：每个 callback 已接受的目标均得到结果；仅仍有效的目标调用首次提交流程。
+        异常：actor 不存在/已停用或命令不支持时抛出 ValueError；结果回调异常向调用方传播。
+        副作用：每个 callback 已接受的目标均得到结果；仅仍有效的目标调用首次提交流程，
+        并在单条处理结束后可选地持久化该条结果。
         """
         if command.text not in {_TODAY_COMMAND, _ALL_COMMAND, _ABANDONED_COMMAND}:
             raise ValueError("不支持卡片选择提交")
@@ -671,10 +674,6 @@ class CrmSubmissionService:
             authorization = session.get(SalesAuthorization, command.sales_user_id)
             if authorization is None or not authorization.is_active:
                 raise ValueError("提交销售 actor 不存在或已停用")
-            # 回调重新校验身份后只读取一份快照，避免多次启动 CLI 导致偶发协议/进程错误。
-            smart_table_snapshot = {
-                record.record_id: record for record in self._smart_table_adapter.get_records()
-            }
             valid_ids: set[str] = set()
             for lead_id in selected:
                 lead = session.get(Lead, lead_id)
@@ -695,9 +694,6 @@ class CrmSubmissionService:
                         and lead.lifecycle_state in {"pending_create", "temporary"}
                         and self._is_today_owned_candidate(lead, command.sales_user_id)
                         and (sync is None or sync.status not in {"succeeded", "abandoned"})
-                        and self._is_unsubmitted_smart_table_record(
-                            lead, snapshot=smart_table_snapshot
-                        )
                     ):
                         valid_ids.add(lead_id)
                 elif (
@@ -705,9 +701,6 @@ class CrmSubmissionService:
                     and lead.smart_table_owner_user_id == command.sales_user_id
                     and lead.lifecycle_state in {"pending_create", "temporary"}
                     and (sync is None or sync.status not in {"succeeded", "abandoned"})
-                    and self._is_unsubmitted_smart_table_record(
-                        lead, snapshot=smart_table_snapshot
-                    )
                 ):
                     valid_ids.add(lead_id)
         result = SubmissionBatchResult()
@@ -715,15 +708,26 @@ class CrmSubmissionService:
             if lead_id not in valid_ids:
                 outcome = _create_outcome("not_submitted")
             else:
-                outcome = self._submit_create(
-                    lead_id,
-                    SubmissionCommand(
-                        command.text,
-                        command.sales_user_id,
-                        command.request_message_id,
-                    ),
-                )
+                try:
+                    outcome = self._submit_create(
+                        lead_id,
+                        SubmissionCommand(
+                            command.text,
+                            command.sales_user_id,
+                            command.request_message_id,
+                        ),
+                    )
+                except Exception as error:
+                    # 单条最终快照读取失败只影响该线索，不能中止其它已勾选记录。
+                    _LOGGER.warning(
+                        "crm_selected_submission_item_failed",
+                        extra={"lead_id": lead_id, "failure": safe_failure_summary(error)},
+                    )
+                    outcome = _create_outcome("failed_pending_review")
             result = _append_create_result(result, lead_id, outcome)
+            if on_item_result is not None:
+                # _submit_create 已重新读取该条最终快照；先保存结果并续租，再开始下一条。
+                on_item_result(result.items[-1])
         return result
 
     def _submit_updates(self, command: SubmissionCommand) -> SubmissionBatchResult:
@@ -894,6 +898,56 @@ class CrmSubmissionService:
         return self._claim_and_call(existing_sync_id or sync_id, command.sales_user_id)
 
     def _submit_create(self, lead_id: str, command: SubmissionCommand) -> CreateSubmissionOutcome:
+        """隔离首次提交异常，并仅在没有 CRM 同步事实时释放临时公司占位。
+
+        参数：lead_id 为当前销售待提交线索；command 为固定提交命令事实。
+        返回值：单条提交结果；外部暂态故障以可安全重试的审核结果返回。
+        异常：业务异常转换为受控结果；占位清理失败保留人工处理状态。
+        副作用：可能清理尚未关联 CRM 同步记录的公司占位并写审计。
+        """
+        try:
+            return self._submit_create_once(lead_id, command)
+        except Exception as error:
+            failure_category = classify_task_failure(error)
+            safe_before_crm = False
+            try:
+                # CRM 创建只会在同步记录落库后执行；无同步记录时可安全清理预留。
+                safe_before_crm = self._release_uncommitted_identity_reservation(
+                    lead_id, command
+                )
+            except Exception as cleanup_error:
+                _LOGGER.error(
+                    "crm_global_identity_reservation_release_failed error_type=%s",
+                    safe_failure_summary(cleanup_error),
+                )
+            _LOGGER.warning(
+                "crm_submission_item_failed lead_id=%s error_type=%s failure_category=%s",
+                lead_id,
+                safe_failure_summary(error),
+                failure_category.value,
+            )
+            if safe_before_crm and failure_category.value == "transient":
+                failure_code = getattr(error, "error_code", None)
+                if not isinstance(failure_code, str):
+                    external_code = getattr(error, "external_error_code", None)
+                    failure_code = str(external_code) if type(external_code) is int else None
+                reason_code = (
+                    "wecom_smart_table_retryable"
+                    if failure_code in {"rate_limited", "network_error"}
+                    else "pre_crm_transient_failure"
+                )
+                return _create_outcome(
+                    "failed_pending_review",
+                    reason_code=reason_code,
+                    failure_category=failure_category.value,
+                    adapter_category="transport",
+                    failure_code=failure_code,
+                )
+            return _create_outcome("failed_pending_review")
+
+    def _submit_create_once(
+        self, lead_id: str, command: SubmissionCommand
+    ) -> CreateSubmissionOutcome:
         """冻结首次提交快照，先查 CRM 再决定创建或等待重复确认。
 
         参数：lead_id 为当前销售待提交线索；command 为固定提交命令事实。
@@ -1076,6 +1130,8 @@ class CrmSubmissionService:
                     **failure_evidence,
                 },
             )
+            # 查重仅是只读请求；失败时释放尚未绑定同步记录的预留，防止跨销售永久阻塞。
+            self._release_uncommitted_identity_reservation(lead_id, command)
             # 查重尚未创建 Sync 记录；暂态故障返回 retrying，下一次命令会重新执行查重。
             return _create_outcome(
                 "retrying" if failure_category.value == "transient" else "failed_pending_review",
@@ -1864,6 +1920,48 @@ class CrmSubmissionService:
             return identity
         # PostgreSQL 唯一索引竞争会被 savepoint 回滚；此时以已提交 reservation 的实际状态为准。
         return session.get(CrmCompanyIdentity, company_name)
+
+    def _release_uncommitted_identity_reservation(
+        self, lead_id: str, command: SubmissionCommand
+    ) -> bool:
+        """仅当 CRM 同步记录尚未建立时释放当前线索的临时公司占位。
+
+        参数：lead_id 为异常线索；command 为本次提交的审计命令。
+        返回值：未发现 CRM 同步记录时返回 True，否则返回 False。
+        异常：数据库读写失败时向调用方传播。
+        副作用：删除本线索尚未关联同步记录的 reserving 占位，并写入脱敏审计。
+        """
+        with self._session_factory.begin() as session:
+            lead = session.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
+            if lead is None:
+                return False
+            # 所有 CRM 写操作都以已提交的 CrmSyncRecord 为入口，因此该检查保护远端未知事实。
+            if latest_crm_create_sync(session, lead_id, for_update=True) is not None:
+                return False
+            identity = session.scalar(
+                select(CrmCompanyIdentity)
+                .where(
+                    CrmCompanyIdentity.creating_lead_id == lead_id,
+                    CrmCompanyIdentity.state == "reserving",
+                    CrmCompanyIdentity.creating_sync_record_id.is_(None),
+                )
+                .with_for_update()
+            )
+            if identity is None:
+                return True
+            company_hash = hashlib.sha256(identity.standard_company_name.encode()).hexdigest()
+            session.delete(identity)
+            lead_hash = hashlib.sha256(lead_id.encode()).hexdigest()[:32]
+            self._record_audit(
+                session,
+                command,
+                f"crm_global_identity_reservation_released_before_sync:{lead_hash}",
+                details={
+                    "lead_id": lead_id,
+                    "standard_company_name_hash": company_hash,
+                },
+            )
+            return True
 
     @staticmethod
     def _insert_identity(

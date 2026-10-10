@@ -829,7 +829,7 @@ class WecomCliSmartTableAdapter:
         参数：resource、action 构成 smartsheet 子命令；payload 为 CLI JSON 请求体。
         返回：已验证成功状态的 JSON 响应对象。
         异常：超时、网络失败、非零业务错误或非 JSON 响应时抛出异常。
-        副作用：启动 wecom-cli 子进程；重试间隔固定为短暂退避以避免风暴。
+        副作用：启动 wecom-cli 子进程；限流和网络错误按递增间隔有限重试。
         """
         # 文档和子表标识只在进程参数中流转，日志和异常均不输出其原值。
         request = {"docid": self._doc_id, "sheet_id": self._sheet_id, **payload}
@@ -974,14 +974,20 @@ class WecomCliSmartTableAdapter:
 
     @staticmethod
     def _retry_delay_seconds(error_code: str, attempt: int) -> float:
-        """计算有限重试退避，避免限流错误继续以短间隔冲击远端。
+        """为限流和网络暂态故障计算有上限的指数退避。
 
         参数：error_code 为安全内部错误分类；attempt 为从零开始的重试序号。
-        返回值：限流使用 1、2、4 秒并封顶 8 秒，普通暂态保持原短退避。
+        返回值：限流、网络和超时错误使用 1、2、4 秒并封顶 8 秒，其它暂态保持短退避。
         异常：无。
         副作用：无，不等待也不访问外部服务。
         """
-        if error_code == "rate_limited":
+        if error_code in {
+            "rate_limited",
+            "network_error",
+            "NetworkError",
+            "ConnectionError",
+            "TimeoutExpired",
+        }:
             return float(min(8, 2**attempt))
         return 0.2 * (attempt + 1)
 

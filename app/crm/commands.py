@@ -1282,6 +1282,8 @@ def format_submission_reply(
         "sync_processing": "已有提交任务正在处理，本次未重复创建",
         "crm_duplicate_search_retrying": "CRM 查重暂时失败，本次未提交，请稍后重新提交",
         "crm_duplicate_search_failed": "CRM 查重失败，需要人工处理",
+        "wecom_smart_table_retryable": "企微智能表格暂时限流或网络异常，本次未发起 CRM 提交，请稍后重新提交",
+        "pre_crm_transient_failure": "提交前依赖暂时不可用，本次未发起 CRM 提交，请稍后重新提交",
         "crm_create_retrying": "CRM 创建暂时失败，系统将自动重试",
         "crm_create_failed_pending_review": "CRM 提交失败，需要人工处理",
         "crm_update_retrying": "CRM 更新暂时失败，系统将自动重试",

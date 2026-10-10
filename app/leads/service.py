@@ -2247,7 +2247,11 @@ class FirstTextLeadWorkspaceService:
                 )
                 patch = replace(patch, analysis=analysis, fields=fields)
                 company_identity_claimed = True
-            patch = self._ground_source_identity_patch(patch, message.normalized_text)
+            patch = self._ground_source_identity_patch(
+                patch,
+                message.normalized_text,
+                company_name_hint=company_name_hint,
+            )
         except AIGatewayError as error:
             # 网关已完成自身传输重试；此处绝不伪造建档成功，也不能阻塞该销售的后续消息。
             event.status = "failed_pending_review"
@@ -3406,15 +3410,40 @@ class FirstTextLeadWorkspaceService:
 
     @classmethod
     def _ground_source_identity_patch(
-        cls, patch: ExtractedLeadPatch, normalized_text: str | None
+        cls,
+        patch: ExtractedLeadPatch,
+        normalized_text: str | None,
+        *,
+        company_name_hint: str | None = None,
     ) -> ExtractedLeadPatch:
-        """移除无法回指当前消息的公司与联系人候选，统一保护单客户路由。"""
+        """用原文公司片段校验身份，并移除无法回指当前消息的公司与联系人候选。
+
+        参数：patch 为 AI 字段补丁；normalized_text 为当前消息原文；company_name_hint 为确定性标签提取值。
+        返回值：公司名保留为原文片段、联系人与补充字段通过来源核验后的补丁。
+        异常：无。
+        副作用：无；仅构造副本，不调用模型或外部服务。
+        """
         fields = dict(patch.fields)
         crm_fields = dict(patch.analysis.crm_fields)
         confidences = dict(patch.analysis.confidence_by_field)
         pending = tuple(patch.pending_confirmation_fields)
         low_candidates = dict(patch.low_confidence_candidates)
         semantic_company = patch.analysis.crm_fields.get("线索名称")
+        # 企微引用字段已在 AI Gateway 逐字校验；这里再次核验并保留原文公司片段，工商标准化在归属后执行。
+        source_company = company_name_hint
+        if source_company is None and normalized_text is not None:
+            company_reference_keys = {
+                "company", "company_name", "企业", "企业名称", "公司", "公司名称", "线索名称"
+            }
+            source_company = next(
+                (
+                    value.strip()
+                    for key, value in patch.analysis.customer_reference.items()
+                    if key.strip().lower() in company_reference_keys
+                    and cls.validate_company_candidate_against_source(value, normalized_text)
+                ),
+                None,
+            )
         identity_details = [
             value
             for field_name, value in (*fields.items(), *crm_fields.items())
@@ -3432,13 +3461,18 @@ class FirstTextLeadWorkspaceService:
         business_details = [
             value
             for key, value in (*patch.enrichment.items(), *patch.analysis.enrichment.items())
-            if key not in {"城市/地区", "客户行业"} and isinstance(value, str) and value.strip()
+            if key not in {"城市/地区", "客户行业", "主营产品"}
+            and isinstance(value, str)
+            and value.strip()
         ]
-        # 城市和行业可以合法出现在公司名中；只用联系人及需求等独立事实拦截拼接候选。
+        # 城市、行业和主营产品词可属于公司名；联系人及需求等仍用于拦截拼接候选。
         # shortcut: 当前保留 4 字重叠差量校验，模型提供来源跨度后升级为跨度校验。
+        company_candidates = [fields.get("线索名称"), crm_fields.get("线索名称")]
+        if source_company is not None:
+            company_candidates.append(source_company)
         ambiguous_company_values = {
             candidate.strip()
-            for candidate in (fields.get("线索名称"), crm_fields.get("线索名称"))
+            for candidate in company_candidates
             if isinstance(candidate, str)
             and (
                 any(
@@ -3459,6 +3493,17 @@ class FirstTextLeadWorkspaceService:
                 )
             )
         }
+        if (
+            source_company is not None
+            and source_company not in ambiguous_company_values
+            and ("线索名称" in fields or "线索名称" in crm_fields)
+        ):
+            # AI 可提议标准名，但归属和去重先使用可回指的原文公司片段。
+            if "线索名称" in fields:
+                fields["线索名称"] = source_company
+            if "线索名称" in crm_fields:
+                crm_fields["线索名称"] = source_company
+            semantic_company = source_company
         for field_name in ("线索名称", "联系人"):
             field_value = fields.get(field_name)
             company_is_ambiguous = (
