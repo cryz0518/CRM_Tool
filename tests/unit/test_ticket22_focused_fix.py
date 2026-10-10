@@ -65,6 +65,7 @@ def _media_service(
     *,
     retention: RetentionPolicy | None = None,
     ocr: object | None = None,
+    allow_scan_exemption: bool = False,
 ) -> MediaAttachmentService:
     """构造使用 fake seam 的媒体服务。"""
     return MediaAttachmentService(
@@ -75,6 +76,7 @@ def _media_service(
         ocr or MockASRProvider([]),  # type: ignore[arg-type]
         MockASRProvider([]),
         retention_policy=retention,
+        allow_scan_exemption=allow_scan_exemption,
     )
 
 
@@ -117,8 +119,99 @@ def test_ingest_commits_intent_before_put_and_freezes_retention(
         assert "message-intent" not in attachment.storage_key
 
 
-def test_ingest_timeout_with_remote_success_reconciles_without_second_put(
+def test_explicit_scan_exemption_reaches_ocr(
     session_factory: sessionmaker[Session], tmp_path: Path
+) -> None:
+    """验证扫描豁免保留 not_required 审计状态并完成一次 OCR，不访问真实服务。"""
+    _seed_message(session_factory, "scan-exempt")
+    service = _media_service(
+        session_factory,
+        FakeStorageProvider(tmp_path),
+        FakeFileScanProvider("not_required"),
+        ocr=MockASRProvider(["客户：测试图片公司"]),
+        allow_scan_exemption=True,
+    )
+    attachment_id = service.ingest(
+        "scan-exempt",
+        b"\x89PNG\r\n\x1a\nimage",
+        media_kind="image",
+        declared_mime_type="image/png",
+    )
+    service.process_pending_for_message("scan-exempt")
+    with session_factory() as session:
+        attachment = session.get(MessageAttachment, attachment_id)
+        assert attachment is not None and attachment.processing_status == "succeeded"
+        assert attachment.scan_status == "not_required"
+
+
+@pytest.mark.parametrize(
+    "scan_status, allowed, expected",
+    [
+        ("not_required", False, "failed_pending_review"),
+        ("clean", False, "succeeded"),
+        ("quarantined", True, "failed_pending_review"),
+        ("infected", True, "failed_pending_review"),
+        ("scan_failed", True, "failed_pending_review"),
+        ("timeout", True, "failed_pending_review"),
+    ],
+)
+def test_media_scan_safety_policy(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+    scan_status: str,
+    allowed: bool,
+    expected: str,
+) -> None:
+    """验证豁免必须显式授权，其余隔离/感染/失败/超时不能识别，无外部调用。"""
+    _seed_message(session_factory, "scan-policy")
+    service = _media_service(
+        session_factory,
+        FakeStorageProvider(tmp_path),
+        FakeFileScanProvider(scan_status),
+        allow_scan_exemption=allowed,
+        ocr=MockASRProvider(["安全测试正文"]),
+    )
+    attachment_id = service.ingest(
+        "scan-policy",
+        b"\x89PNG\r\n\x1a\nimage",
+        media_kind="image",
+        declared_mime_type="image/png",
+    )
+    service.process_pending_for_message("scan-policy")
+    with session_factory() as session:
+        attachment = session.get(MessageAttachment, attachment_id)
+        assert attachment is not None and attachment.processing_status == expected
+        assert (attachment.recognized_text is not None) == (expected == "succeeded")
+
+
+def test_storage_tampering_cannot_reach_ocr(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    """验证扫描通过后存储摘要改变仍禁止识别，失败独立可观察。"""
+    _seed_message(session_factory, "tamper")
+    storage = FakeStorageProvider(tmp_path)
+    service = _media_service(session_factory, storage, FakeFileScanProvider("clean"))
+    attachment_id = service.ingest(
+        "tamper",
+        b"\x89PNG\r\n\x1a\nimage",
+        media_kind="image",
+        declared_mime_type="image/png",
+    )
+    with session_factory() as session:
+        attachment = session.get(MessageAttachment, attachment_id)
+        assert attachment is not None
+        (tmp_path / attachment.storage_key).write_bytes(b"\x89PNG\r\n\x1a\nchanged")
+    service.process_pending_for_message("tamper")
+    with session_factory() as session:
+        attachment = session.get(MessageAttachment, attachment_id)
+        assert attachment is not None and attachment.processing_status == "failed_pending_review"
+        assert attachment.recognized_text is None
+
+
+@pytest.mark.parametrize("wait_expired", [False, True])
+def test_ingest_timeout_with_remote_success_reconciles_without_second_put(
+    session_factory: sessionmaker[Session], tmp_path: Path, wait_expired: bool,
 ) -> None:
     """验证 put 超时但远端已落盘时 recovery 只 HEAD 固定 key。"""
     _seed_message(session_factory, "message-timeout")
@@ -137,7 +230,8 @@ def test_ingest_timeout_with_remote_success_reconciles_without_second_put(
             raise TimeoutError("remote_outcome_unknown")
 
     storage = TimeoutAfterWriteStorage(tmp_path)
-    attachment_id = _media_service(session_factory, storage, FakeFileScanProvider("clean")).ingest(
+    service = _media_service(session_factory, storage, FakeFileScanProvider("clean"))
+    attachment_id = service.ingest(
         "message-timeout",
         b"\x89PNG\r\n\x1a\nimage",
         media_kind="image",
@@ -147,6 +241,13 @@ def test_ingest_timeout_with_remote_success_reconciles_without_second_put(
         operation = session.scalar(select(StorageIngestOperation))
         assert operation is not None
         operation_id = operation.id
+    if wait_expired:
+        # 来源等待先过期，迟到 HEAD 只能确认存储事实，不能重开识别或重复创建 task。
+        with session_factory.begin() as session:
+            session.get(MessageAttachment, attachment_id).created_at = (
+                datetime.now(UTC) - timedelta(minutes=6)
+            )
+        service.process_pending_for_message("message-timeout")
     from app.media.retention import StorageIngestRecoveryService
 
     assert (
@@ -155,7 +256,11 @@ def test_ingest_timeout_with_remote_success_reconciles_without_second_put(
     )
     assert storage.put_calls == 1
     with session_factory() as session:
-        assert session.get(MessageAttachment, attachment_id).processing_status == "pending"  # type: ignore[union-attr]
+        from app.messaging.models import MediaProcessingTask
+        expected = "failed_pending_review" if wait_expired else "pending"
+        assert session.get(MessageAttachment, attachment_id).processing_status == expected
+        tasks = session.scalars(select(MediaProcessingTask)).all()
+        assert len(tasks) == 1 and tasks[0].status == expected
 
 
 def test_scan_transition_and_clean_quarantine_race_block_finalize(

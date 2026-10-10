@@ -873,6 +873,11 @@ class WecomActionService:
                         "selection_mismatch",
                         "卡片选择项已失效，请重新提交",
                     )
+                frozen_card_update = _freeze_vote_card_update(action, callback.selected_option_ids)
+                if frozen_card_update is None:
+                    return self._deny_action(
+                        action, delivery, "invalid_action_context", "重复确认卡已失效，请重新发起"
+                    )
                 action.context = {
                     **action.context,
                     "decision": (
@@ -1928,7 +1933,11 @@ def _freeze_vote_card_update(
     副作用：无，不读取 ORM 目标记录之外的客户端名称或展示字段。
     """
     context = action.context
-    candidates = context.get("candidate_leads")
+    candidates = context.get(
+        "duplicate_leads"
+        if action.action_type == ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION
+        else "candidate_leads"
+    )
     if not isinstance(candidates, list) or not candidates:
         return None
     if action.action_type == ACTION_TYPE_CRM_BATCH_SUBMISSION:
@@ -1960,6 +1969,10 @@ def _freeze_vote_card_update(
             if isinstance(card_description, str)
             else "已受理，后台正在提交，请勿重复操作"
         )
+    elif action.action_type == ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION:
+        # 重复覆盖卡沿用发行时的投票类型和双决策按钮，内容仅从服务端冻结候选重建。
+        title = "发现重复线索"
+        description = "已受理，后台正在处理，请勿重复操作"
     else:
         return None
 
@@ -1969,8 +1982,13 @@ def _freeze_vote_card_update(
         event_key=action.expected_action_key,
         title=title,
         description=description,
-        selection_options=candidates,
+        selection_options=(
+            None if action.action_type == ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION else candidates
+        ),
         selection_key=action.expected_action_key,
+        duplicate_leads=candidates
+        if action.action_type == ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION
+        else None,
     )
     main_title = original_card.get("main_title")
     checkbox = original_card.get("checkbox")
@@ -2566,7 +2584,8 @@ class DeterministicWecomActionExecutor:
         return (
             "crm_duplicate_submission_completed",
             f"重复线索处理完成：覆盖成功 {result.submitted} 条；"
-            f"未选择 {result.remaining} 条；失败 {result.failed} 条。",
+            f"未选择 {result.remaining} 条；失败 {result.failed} 条。"
+            + "".join(result.failure_reasons),
         )
 
     def _confirm_batch_submission(self, action: ActionSnapshot) -> tuple[str, str]:

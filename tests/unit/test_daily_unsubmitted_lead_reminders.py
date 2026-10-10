@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Iterator
 from zoneinfo import ZoneInfo
@@ -119,6 +119,8 @@ def seed_lead(
                     received_at=created_at,
                 )
             )
+            # 复用到 PostgreSQL 集成时先写来源消息，再创建有外键的线索和出箱。
+            session.flush()
             session.add(
                 OutboxEvent(
                     message_id=f"message-{lead_id}",
@@ -182,6 +184,44 @@ def notification_count(session_factory: sessionmaker[Session]) -> int:
     """
     with session_factory() as session:
         return int(session.scalar(select(func.count(NotificationRecord.notification_key))) or 0)
+
+
+@pytest.mark.parametrize("authorized", (False, True))
+@pytest.mark.parametrize("crm_user_id", (None, "crm-user"))
+def test_legacy_authorization_and_mapping_do_not_gate_reminders(
+    session_factory: sessionmaker[Session],
+    authorized: bool,
+    crm_user_id: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证旧授权标记和映射均不限制提醒排程及发送；仅使用隔离数据库和假客户端。"""
+    import app.leads.reminders as reminders
+
+    seed_sales(
+        session_factory, "sales-without-db-map", authorized=authorized, crm_user_id=crm_user_id
+    )
+    seed_lead(
+        session_factory,
+        "lead-without-db-map",
+        "sales-without-db-map",
+        datetime(2026, 10, 9, 10, tzinfo=_SHANGHAI),
+    )
+    assert (
+        DailyUnsubmittedLeadReminderService(session_factory).schedule_due_reminders(
+            now=datetime(2026, 10, 9, 20, tzinfo=_SHANGHAI)
+        )
+        == 1
+    )
+    # 出箱复核也必须遵守 PR #74 的启用状态规则，不能重新添加授权门槛。
+    monkeypatch.setattr(reminders, "utc_now", lambda: datetime(2026, 10, 9, 20, tzinfo=_SHANGHAI))
+    client = RecordingClient()
+    assert asyncio.run(
+        WecomOutboundNotificationSender(session_factory, client).send_pending_once()
+    ) == 1
+    assert len(client.calls) == 1
+    with session_factory() as session:
+        notice = session.scalar(select(NotificationRecord))
+        assert notice is not None and notice.status == "succeeded"
 
 
 def test_beat_runs_daily_reminder_at_2000_shanghai() -> None:
@@ -316,7 +356,7 @@ def test_shanghai_midnight_and_next_day_are_independent(
 def test_ineligible_and_zero_lead_users_are_not_reminded(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证未授权、停用、管理员、未映射及零线索账号不会收到提醒。
+    """验证停用、管理员及零线索账号不会收到提醒。
 
     参数：session_factory 为隔离 SQLite 会话工厂。
     返回值：断言不符合资格的账号没有对应通知。
@@ -324,14 +364,12 @@ def test_ineligible_and_zero_lead_users_are_not_reminded(
     副作用：只在临时数据库登记不同资格状态的成员和线索。
     """
     for user_id, options in (
-        ("unauthorized", {"authorized": False}),
         ("inactive", {"active": False}),
         ("admin", {"administrator": True}),
-        ("unmapped", {"crm_user_id": None}),
         ("no-lead", {}),
     ):
         seed_sales(session_factory, user_id, **options)
-    for user_id in ("unauthorized", "inactive", "admin", "unmapped"):
+    for user_id in ("inactive", "admin"):
         seed_lead(
             session_factory,
             f"lead-{user_id}",
@@ -410,6 +448,34 @@ class RecordingClient:
         return {"msgid": f"fake-{len(self.calls)}"}
 
 
+@pytest.mark.parametrize("changed_flag", ("is_active", "is_administrator"))
+def test_sender_rechecks_active_and_administrator_status(
+    session_factory: sessionmaker[Session],
+    changed_flag: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证排程后停用或转管理员仍抑制发送，移除旧授权门槛不改变当前身份规则。"""
+    import app.leads.reminders as reminders
+
+    now = datetime(2026, 10, 9, 20, tzinfo=_SHANGHAI)
+    seed_sales(session_factory, "changed-sales", authorized=False)
+    seed_lead(session_factory, "changed-lead", "changed-sales", now.astimezone(UTC))
+    assert DailyUnsubmittedLeadReminderService(session_factory).schedule_due_reminders(now=now) == 1
+    with session_factory.begin() as session:
+        actor = session.get(SalesAuthorization, "changed-sales")
+        assert actor is not None
+        setattr(actor, changed_flag, changed_flag == "is_administrator")
+    monkeypatch.setattr(reminders, "utc_now", lambda: now)
+    client = RecordingClient()
+    assert asyncio.run(
+        WecomOutboundNotificationSender(session_factory, client).send_pending_once()
+    ) == 0
+    assert client.calls == []
+    with session_factory() as session:
+        notice = session.scalar(select(NotificationRecord))
+        assert notice is not None and notice.status == "suppressed"
+
+
 def test_failed_send_retries_only_notification_outbox(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -422,7 +488,7 @@ def test_failed_send_retries_only_notification_outbox(
     """
     now = datetime.now(UTC)
     business_date = now.astimezone(_SHANGHAI).date()
-    seed_sales(session_factory, "sales-a")
+    seed_sales(session_factory, "sales-a", authorized=False)
     seed_lead(session_factory, "retry-lead", "sales-a", now, crm_sync_status="processing")
     seed_lead(session_factory, "completed-lead", "sales-a", now, crm_sync_status="processing")
     scheduled_at = datetime.combine(business_date, time(20, 0), tzinfo=_SHANGHAI).astimezone(UTC)
@@ -487,3 +553,30 @@ def test_no_today_intake_or_delayed_old_processing_never_reminds(
     service = DailyUnsubmittedLeadReminderService(session_factory)
     assert service.schedule_due_reminders(now=datetime(2026, 10, 9, 12, tzinfo=UTC)) == 0
     assert notification_count(session_factory) == 0
+
+
+def test_late_daily_task_creates_today_only_and_next_day_sender_suppresses(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证任务迟到仍只创建当日一次提醒，次日出箱抑制昨天通知，假客户端不外发。"""
+    import app.leads.reminders as reminders
+
+    today = datetime(2026, 10, 9, 20, 37, tzinfo=_SHANGHAI)
+    seed_sales(session_factory, "late-sales", authorized=False, crm_user_id=None)
+    seed_lead(
+        session_factory, "late-lead", "late-sales", today.astimezone(UTC) - timedelta(hours=2)
+    )
+    service = DailyUnsubmittedLeadReminderService(session_factory)
+    assert service.schedule_due_reminders(now=today) == 1
+    assert service.schedule_due_reminders(now=today + timedelta(minutes=1)) == 0
+    monkeypatch.setattr(reminders, "utc_now", lambda: today + timedelta(days=1))
+    client = RecordingClient()
+    assert (
+        asyncio.run(WecomOutboundNotificationSender(session_factory, client).send_pending_once())
+        == 0
+    )
+    assert client.calls == []
+    with session_factory() as session:
+        notice = session.scalar(select(NotificationRecord))
+        assert notice is not None and notice.status == "suppressed"

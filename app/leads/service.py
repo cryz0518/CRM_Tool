@@ -1663,6 +1663,25 @@ class FirstTextLeadWorkspaceService:
                     logger.info("lead_outbox_waiting_for_media_enrichment")
                     return LeadProcessingResult(LeadProcessingStatus.WAITING_FOR_PREVIOUS)
 
+                if (
+                    message.requires_media_enrichment
+                    and not message.normalized_text
+                    and session.scalar(
+                        select(MessageAttachment.id).where(
+                            MessageAttachment.message_id == message.message_id,
+                            MessageAttachment.processing_status == "failed_pending_review",
+                        )
+                    )
+                ):
+                    # 媒体失败保留人工恢复检查点，不能把丢失正文的客户消息标为闲聊忽略。
+                    event.status = "failed_pending_review"
+                    event.failure_category = "permanent"
+                    event.failure_summary = "media_enrichment_failed"
+                    event.failed_at = utc_now()
+                    event.processing_started_at = None
+                    self._record_audit(session, event, "lead_media_failed_pending_review")
+                    return self._processed_result(session, event)
+
                 multi_fields = extractor.extract_many(message.normalized_text)
                 if quote_target_lead is not None and len(multi_fields) > 1:
                     # quote 关系不能替代当前消息明确拆出的多个客户，无法安全选择单一目标。
@@ -3745,7 +3764,9 @@ class FirstTextLeadWorkspaceService:
             )
         ).all()
         # 下载尚未创建附件元数据同样必须等待，避免媒体消息被错误提前忽略。
-        return not statuses or "pending" in statuses
+        return not statuses or any(
+            status in {"pending", "pending_upload", "processing"} for status in statuses
+        )
 
     def _mark_unassigned(self, session: Session, event: OutboxEvent) -> None:
         """将无法可靠归属的消息持久化为待归属，并越过首次消费检查点。

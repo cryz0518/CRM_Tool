@@ -22,6 +22,7 @@ from app.crm.commands import (
     parse_crm_submission_command,
 )
 from app.crm.mock import MockCRMAdapter
+from app.crm.service import DuplicateSubmission
 from app.crm.sop import SopCRMError
 from app.leads.discard import LeadDiscardService
 from app.leads.models import (
@@ -51,6 +52,7 @@ from app.wecom_bot.actions import (
     CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
     CARD_EVENT_KEY_CRM_COMPANY_CONFIRM,
     CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE,
+    CARD_EVENT_KEY_CRM_DUPLICATE_STOP,
     CARD_EVENT_KEY_CRM_FIELD_CONFIRM,
     CARD_EVENT_KEY_DISCARD_CONFIRM,
     CARD_EVENT_KEY_REASSIGN_CONFIRM,
@@ -389,6 +391,79 @@ def test_duplicate_card_supports_batch_selection_and_two_decisions() -> None:
     assert parsed.selected_option_ids == ("lead-a",)
     assert parsed.provider_msgid == "provider-msg-001"
     assert parsed.req_id == "request-001"
+
+
+@pytest.mark.parametrize(
+    "decision", [CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE, CARD_EVENT_KEY_CRM_DUPLICATE_STOP]
+)
+@pytest.mark.parametrize("ack_code", [0, 42045])
+def test_duplicate_callback_freezes_vote_card_once_even_when_ack_fails(
+    session_factory: sessionmaker[Session],
+    decision: str,
+    ack_code: int,
+) -> None:
+    """验证重复确认继续/停止均冻结同类型卡；ACK 失败及重复点击不重复执行后台动作。"""
+    lead_ids = _seed_batch_leads(session_factory, count=1)
+    service = _service(session_factory)
+    action = service.issue_duplicate_confirmation_action(
+        actor_user_id="sales-a",
+        request_message_id="duplicate-freeze",
+        duplicates=(DuplicateSubmission(lead_ids[0], "测试公司", "crm-a", "owner-a"),),
+    )
+    updates: list[dict[str, object]] = []
+
+    async def update_card(frame: object, card: dict[str, object]) -> dict[str, int]:
+        """记录唯一更新体并模拟 ACK；返回错误码，无真实发送。"""
+        updates.append(card)
+        return {"errcode": ack_code}
+
+    def frame_for_click(msgid: str) -> dict[str, object]:
+        """构造官方选择结构；参数为投递幂等标识，返回测试帧，无外部副作用。"""
+        frame = _frame_for_action(action, msgid=msgid)
+        event = frame["body"]["event"]["template_card_event"]
+        event["event_key"] = decision
+        event["card_type"] = "vote_interaction"
+        event["selected_items"] = {
+            "selected_item": [
+                {
+                    "question_key": "crm_duplicate_leads",
+                    "option_ids": {"option_id": list(lead_ids)},
+                }
+            ]
+        }
+        return frame
+
+    handler = WecomTemplateCardCallbackHandler(service)
+    asyncio.run(handler.handle(frame_for_click("duplicate-click"), update_card))
+    asyncio.run(handler.handle(frame_for_click("duplicate-click"), update_card))
+    asyncio.run(handler.handle(frame_for_click("duplicate-second-click"), update_card))
+    assert len(updates) == 1
+    card = updates[0]
+    assert card["card_type"] == "vote_interaction" and card["task_id"] == action.task_id
+    assert card["checkbox"]["question_key"] == "crm_duplicate_leads"
+    assert card["checkbox"]["mode"] == 1 and card["checkbox"]["disable"] is True
+    assert card["checkbox"]["option_list"][0]["is_checked"] is True
+    assert card["replace_text"] == "已确认选择"
+    calls: list[object] = []
+
+    def executor(snapshot: object) -> tuple[str, str]:
+        """记录业务执行并返回假结果；不连接 CRM，重复执行将使断言失败。"""
+        calls.append(snapshot)
+        return "crm_duplicate_submission_completed", "覆盖处理结束"
+
+    service.execute_action(action.id, executor)
+    service.execute_action(action.id, executor)
+    assert len(calls) == 1
+    with session_factory() as session:
+        delivery = session.scalar(
+            select(WecomCallbackDelivery).where(
+                WecomCallbackDelivery.provider_msgid == "duplicate-click"
+            )
+        )
+        assert delivery is not None
+        assert delivery.transport_status == ("succeeded" if ack_code == 0 else "failed")
+        if ack_code:
+            assert delivery.transport_failure_code == "sdk_ack_errcode_42045"
 
 
 def test_malformed_callback_fields_fail_closed() -> None:
@@ -1607,6 +1682,7 @@ def test_callback_nonzero_sdk_ack_is_transport_failure_without_ack_text(
     assert "PRIVATE RESPONSE" not in str(delivery.transport_failure_summary)
     assert "DO_NOT_LOG_REQID" not in str(delivery.transport_failure_summary)
     assert "PRIVATE RESPONSE" not in caplog.text
+    assert "DO_NOT_LOG_REQID" not in caplog.text
     assert "DO_NOT_LOG_REQID" not in caplog.text
 
 

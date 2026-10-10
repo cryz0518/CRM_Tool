@@ -264,6 +264,10 @@ class WecomBotRuntime:
             receipt = await asyncio.to_thread(self._media_adapter.receive_media_frame, frame)
             if receipt is None or receipt.result.duplicate or not receipt.result.accepted:
                 return
+            if receipt.has_transcription:
+                # 同一语音已有可信转写时不再下载/ASR，双来源也只消费同一消息一次。
+                logger.info("wecom_bot_voice_transcription_forwarded")
+                return
             if receipt.download_url is None:
                 self._media_attachment_service.record_download_failure(
                     receipt.message_id, media_kind=receipt.media_kind

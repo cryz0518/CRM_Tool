@@ -22,6 +22,7 @@ class MediaFrameReceipt:
     download_url: str | None
     aes_key: str | None
     declared_mime_type: str | None
+    has_transcription: bool = False
 
 
 class WecomTextMessageAdapter:
@@ -118,16 +119,22 @@ class WecomMediaMessageAdapter:
         download_url = media.get("url")
         aes_key = media.get("aeskey")
         declared_mime_type = media.get("mime_type")
+        # 官方 voice.content 已是企微转写；只接受非空字符串，不从其它字段猜测正文。
+        transcription = media.get("content") if media_kind == "voice" else None
+        transcription = (transcription.strip() if isinstance(transcription, str) else None) or None
+        quote = body.get("quote")
         return MediaFrameReceipt(
             result=self._message_intake_service.receive(
                 IncomingMessageCommand(
                     message_id=message_id,
                     sales_user_id=sales_user_id,
                     raw_payload=self._redact_download_credentials(frame, media_kind),
-                    requires_media_enrichment=True,
+                    normalized_text=transcription,
+                    requires_media_enrichment=transcription is None,
                     display_name=display_name if isinstance(display_name, str) else None,
                     chat_id=chat_id if isinstance(chat_id, str) else None,
                     chat_type=chat_type if isinstance(chat_type, str) else None,
+                    quote=quote if isinstance(quote, dict) else None,
                 )
             ),
             message_id=message_id,
@@ -137,6 +144,7 @@ class WecomMediaMessageAdapter:
             declared_mime_type=(
                 declared_mime_type if isinstance(declared_mime_type, str) else None
             ),
+            has_transcription=transcription is not None,
         )
 
     @staticmethod

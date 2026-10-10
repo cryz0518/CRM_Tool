@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Generator
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -15,6 +16,9 @@ from app.ai.gateway import AIGateway
 from app.ai.provider import MockLLMProvider
 from app.leads.models import LeadFieldProvenance, LeadMessageResolution, SalesLeadContext
 from app.leads.service import FirstTextLeadWorkspaceService, LeadProcessingStatus
+from app.media.providers import FakeFileScanProvider, MockASRProvider, MockOCRProvider
+from app.media.service import MediaAttachmentService, MediaValidator
+from app.media.storage import FakeStorageProvider
 from app.messaging.models import (
     Base,
     IncomingMessage,
@@ -452,6 +456,112 @@ def test_media_message_wait_releases_claim_for_ocr_retry(
     assert event is not None
     assert event.status == "pending"
     assert event.processing_started_at is None
+
+
+@pytest.mark.parametrize(
+    "state", ["missing", "pending_scan", "pending_upload", "processing", "not_required"]
+)
+def test_stale_media_releases_sales_stream_and_preserves_recovery_checkpoint(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+    state: str,
+) -> None:
+    """验证下载/扫描/上传失联或未许可豁免有限等待后失败，后续消息正常且可受控恢复。"""
+    first, second = persist_outbox_texts(session_factory, "sales-1", ["", "客户：后续测试公司"])
+    with session_factory.begin() as session:
+        message = session.get(IncomingMessage, "sales-1-message-1")
+        message.requires_media_enrichment = True
+        message.received_at = utc_now() - timedelta(minutes=6)
+        if state != "missing":
+            session.add(
+                MessageAttachment(
+                    id="stale-attachment",
+                    message_id=message.message_id,
+                    media_kind="image",
+                    scan_status=(
+                        "clean"
+                        if state == "pending_upload"
+                        else "not_required"
+                        if state == "not_required"
+                        else "pending_scan"
+                    ),
+                    processing_status=(
+                        state if state in {"pending_upload", "processing"} else "pending"
+                    ),
+                    created_at=utc_now() - timedelta(minutes=6),
+                )
+            )
+    media = MediaAttachmentService(
+        session_factory,
+        MediaValidator(image_mime_types=("image/png",), audio_mime_types=()),
+        FakeStorageProvider(tmp_path),
+        FakeFileScanProvider("clean"),
+        MockOCRProvider([]),
+        MockASRProvider([]),
+        pending_timeout_seconds=300,
+    )
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        MockSmartTableAdapter(schema=build_required_smart_table_schema()),
+    )
+    assert service.consume(second).status == LeadProcessingStatus.WAITING_FOR_PREVIOUS
+    media.process_pending_for_message("sales-1-message-1")
+    service.consume(first)
+    # 首条形成终态后服务会主动继续同销售队列，再消费应仅返回幂等结果。
+    assert service.consume(second).status == LeadProcessingStatus.ALREADY_PROCESSED
+    with session_factory() as session:
+        event = session.get(OutboxEvent, first)
+        attachment = session.scalar(select(MessageAttachment))
+        assert (
+            event.status == "failed_pending_review"
+            and event.failure_summary == "media_enrichment_failed"
+        )
+        assert attachment.processing_status == "failed_pending_review"
+        assert session.get(OutboxEvent, second).status == "succeeded"
+
+
+def test_scan_recovery_reopens_media_only_without_replaying_later_messages(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    """验证受控重新扫描可恢复单工件正文，但不重放已越过的首次消费检查点。"""
+    first, second = persist_outbox_texts(session_factory, "sales-1", ["", "客户：后续恢复公司"])
+    with session_factory.begin() as session:
+        session.get(IncomingMessage, "sales-1-message-1").requires_media_enrichment = True
+    media = MediaAttachmentService(
+        session_factory,
+        MediaValidator(image_mime_types=("image/png",), audio_mime_types=()),
+        FakeStorageProvider(tmp_path),
+        FakeFileScanProvider("pending_scan"),
+        MockOCRProvider(["客户：原始图片公司"]),
+        MockASRProvider([]),
+    )
+    attachment_id = media.ingest(
+        "sales-1-message-1",
+        b"\x89PNG\r\n\x1a\nimage",
+        media_kind="image",
+        declared_mime_type="image/png",
+    )
+    with session_factory.begin() as session:
+        session.get(MessageAttachment, attachment_id).created_at = utc_now() - timedelta(minutes=6)
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        MockSmartTableAdapter(schema=build_required_smart_table_schema()),
+    )
+    media.process_pending_for_message("sales-1-message-1")
+    service.consume(first)
+    service.consume(second)
+    media.apply_scan_result(attachment_id, "scanning")
+    media.apply_scan_result(attachment_id, "clean")
+    media.process_pending_for_message("sales-1-message-1")
+    media.process_pending_for_message("sales-1-message-1")
+    with session_factory() as session:
+        assert (
+            session.get(IncomingMessage, "sales-1-message-1").normalized_text
+            == "客户：原始图片公司"
+        )
+        assert session.get(OutboxEvent, first).status == "failed_pending_review"
+        assert session.get(OutboxEvent, second).status == "succeeded"
 
 
 def test_expired_current_context_keeps_weak_fragment_unassigned(

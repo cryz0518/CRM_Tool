@@ -105,7 +105,8 @@ def test_tyc_malformed_response_and_timeout_raise_classified_error() -> None:
 
 
 def _crm(
-    response: object, callback: object | None = None, authorization: str | None = None
+    response: object, callback: object | None = None, authorization: str | None = None,
+    *, status: int = 200,
 ) -> tuple[SopCRMAdapter, list[httpx.Request]]:
     """以临时 RSA key 和 fake transport 构造 SOP 客户端。"""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -117,10 +118,11 @@ def _crm(
     requests: list[httpx.Request] = []
 
     def send(request: httpx.Request) -> httpx.Response:
+        """记录假请求并返回指定 HTTP 状态；参数为请求，返回假响应，不访问网络。"""
         requests.append(request)
         if callback:
             callback(request, key)
-        return httpx.Response(200, json=response, request=request)
+        return httpx.Response(status, json=response, request=request)
 
     adapter = SopCRMAdapter(
         "https://crm.invalid/gateway",
@@ -252,6 +254,41 @@ def test_sop_duplicate_create_and_update_response_shapes() -> None:
     assert adapter.create_lead({}, idempotency_key="x", crm_user_id="u").crm_lead_id == "1001"
     adapter, _ = _crm({"code": 200, "data": {"success": True}})
     assert adapter.update_lead("99", {}, idempotency_key="x", crm_user_id="u").crm_lead_id == "99"
+
+
+@pytest.mark.parametrize("success", [True, False])
+def test_sop_update_boolean_response(success: bool) -> None:
+    """验证 SOP 修改接口的真实 Boolean 契约；拒绝不会被记为成功，无外部调用。"""
+    adapter, _ = _crm({"code": 200, "data": success})
+    if success:
+        assert (
+            adapter.update_lead("99", {}, idempotency_key="x", crm_user_id="u").crm_lead_id == "99"
+        )
+    else:
+        with pytest.raises(SopCRMError) as error:
+            adapter.update_lead("99", {}, idempotency_key="x", crm_user_id="u")
+        assert error.value.category == "business_rejection"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [None, "", 1, {}, {"success": "true"}],
+)
+def test_sop_update_unknown_response_stays_unknown(data: object) -> None:
+    """验证缺失或畸形覆盖响应不能证明成功或拒绝；参数为假响应，异常由断言检查。"""
+    adapter, _ = _crm({"code": 200, "data": data})
+    with pytest.raises(SopCRMError) as error:
+        adapter.update_lead("99", {}, idempotency_key="x", crm_user_id="u")
+    assert error.value.category == "malformed_response"
+
+
+@pytest.mark.parametrize("status", [401, 403, 500])
+def test_sop_http_failure_cannot_masquerade_as_update_success(status: int) -> None:
+    """验证 HTTP 错误与成功 JSON 冲突时保留错误事实；仅使用假 transport，无外部调用。"""
+    adapter, _ = _crm({"code": 200, "data": True}, status=status)
+    with pytest.raises(SopCRMError) as error:
+        adapter.update_lead("99", {}, idempotency_key="x", crm_user_id="u")
+    assert error.value.http_status == status
 
 
 @pytest.mark.parametrize(

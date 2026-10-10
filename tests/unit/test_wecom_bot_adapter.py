@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Generator
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -12,6 +14,7 @@ from sqlalchemy.pool import StaticPool
 from app.messaging.models import Base, IncomingMessage, OutboxEvent, SalesAuthorization
 from app.messaging.service import MessageIntakeService
 from app.wecom_bot.adapter import WecomMediaMessageAdapter, WecomTextMessageAdapter
+from app.wecom_bot.runner import WecomBotRuntime
 
 
 @pytest.fixture
@@ -180,3 +183,99 @@ def test_media_frame_persists_auditable_payload_without_download_credentials(
         assert message.requires_media_enrichment is True
         assert "url" not in message.raw_payload["body"]["image"]
         assert "aeskey" not in message.raw_payload["body"]["image"]
+
+
+@pytest.mark.parametrize("with_audio", [False, True])
+def test_voice_content_is_used_once_without_media_wait(
+    session_factory: sessionmaker[Session], with_audio: bool
+) -> None:
+    """验证官方 voice.content 单一落库、重复投递幂等，双来源优先转写且保留证据。"""
+    with session_factory.begin() as session:
+        session.add(
+            SalesAuthorization(wecom_user_id="sales-1", is_authorized=False, is_active=True)
+        )
+    voice = {"content": "客户：测试语音公司，需要码垛机器人"}
+    if with_audio:
+        voice.update(url="https://temporary.example/audio", aeskey="secret")
+    frame = {
+        "cmd": "aibot_msg_callback",
+        "body": {
+            "msgid": "voice-text",
+            "from": {"userid": "sales-1"},
+            "msgtype": "voice",
+            "voice": voice,
+            "quote": {"msgid": "quoted-message"},
+        },
+    }
+    adapter = WecomMediaMessageAdapter(MessageIntakeService(session_factory))
+    first = adapter.receive_media_frame(frame)
+    second = adapter.receive_media_frame(frame)
+    assert first is not None and first.result.accepted
+    assert second is not None and second.result.duplicate
+    with session_factory() as session:
+        message = session.get(IncomingMessage, "voice-text")
+        assert message is not None
+        assert message.normalized_text == voice["content"]
+        assert message.requires_media_enrichment is False
+        assert message.raw_payload["body"]["voice"]["content"] == voice["content"]
+        assert message.raw_payload["body"]["quote"]["msgid"] == "quoted-message"
+        assert len(session.scalars(select(OutboxEvent)).all()) == 1
+
+
+@pytest.mark.parametrize(
+    "content, with_audio", [("可信语音正文", False), ("可信语音正文", True), ("", True)]
+)
+def test_voice_runtime_selects_one_source_and_duplicate_delivery_is_noop(
+    session_factory: sessionmaker[Session],
+    content: str,
+    with_audio: bool,
+) -> None:
+    """验证真实运行时文本跳过下载、纯音频进入 ASR 工件路径，重复投递不产生第二任务。"""
+    with session_factory.begin() as session:
+        session.add(
+            SalesAuthorization(wecom_user_id="sales-1", is_authorized=False, is_active=True)
+        )
+    voice = {"content": content}
+    if with_audio:
+        voice["url"] = "https://temporary.example/audio"
+    frame = {
+        "body": {
+            "msgid": "runtime-voice",
+            "from": {"userid": "sales-1"},
+            "msgtype": "voice",
+            "voice": voice,
+        }
+    }
+    # 不创建或连接 SDK 客户端，仅驱动正式运行时方法及真实消息接收事务。
+    runtime = object.__new__(WecomBotRuntime)
+    runtime._media_adapter = WecomMediaMessageAdapter(MessageIntakeService(session_factory))
+    runtime._media_attachment_service = Mock()
+    runtime._client = Mock(download_file=AsyncMock(return_value=(b"ID3audio", None)))
+    asyncio.run(runtime._receive_media_frame(frame))
+    asyncio.run(runtime._receive_media_frame(frame))
+    expected = 0 if content else 1
+    assert runtime._client.download_file.await_count == expected
+    assert runtime._media_attachment_service.ingest.call_count == expected
+    runtime._media_attachment_service.record_download_failure.assert_not_called()
+
+
+def test_inactive_voice_sender_cannot_create_media_work(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证语音转写不会绕过停用成员校验，拒绝时不创建来源消息或工件。"""
+    with session_factory.begin() as session:
+        session.add(SalesAuthorization(wecom_user_id="inactive", is_active=False))
+    frame = {
+        "body": {
+            "msgid": "inactive-voice",
+            "from": {"userid": "inactive"},
+            "msgtype": "voice",
+            "voice": {"content": "客户：无权公司"},
+        }
+    }
+    result = WecomMediaMessageAdapter(MessageIntakeService(session_factory)).receive_media_frame(
+        frame
+    )
+    assert result is not None and not result.result.accepted
+    with session_factory() as session:
+        assert session.get(IncomingMessage, "inactive-voice") is None

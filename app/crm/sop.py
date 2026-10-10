@@ -163,6 +163,9 @@ class SopCRMAdapter:
         body["id"] = crm_lead_id
         body["headerId"] = crm_user_id
         data = self._call("crm_update_lead", body)
+        # 无明确布尔结果时不能证明远端拒绝，更不能自动再次覆盖。
+        if type(data.get("success")) is not bool:
+            raise SopCRMError("CRM update result unknown", category="malformed_response")
         if data.get("success") is False:
             raise SopCRMError("CRM update rejected")
         return CRMCreateResult(crm_lead_id, None, "CRM update succeeded")
@@ -199,8 +202,10 @@ class SopCRMAdapter:
             try:
                 payload = response.json()
             except ValueError as error:
-                category = "authentication" if status == 401 else (
-                    "gateway" if status >= 400 else "malformed_response"
+                category = (
+                    "authentication"
+                    if status == 401
+                    else ("gateway" if status >= 400 else "malformed_response")
                 )
                 raise SopCRMError(
                     "CRM gateway response is not JSON", category=category, http_status=status
@@ -228,16 +233,8 @@ class SopCRMAdapter:
         if code not in (0, 200):
             raw_error_code = payload.get("error_code")
             raw_sub_code = payload.get("sub_code")
-            error_code = (
-                str(raw_error_code)
-                if isinstance(raw_error_code, (str, int))
-                else None
-            )
-            sub_code = (
-                str(raw_sub_code)
-                if isinstance(raw_sub_code, (str, int))
-                else None
-            )
+            error_code = str(raw_error_code) if isinstance(raw_error_code, (str, int)) else None
+            sub_code = str(raw_sub_code) if isinstance(raw_sub_code, (str, int)) else None
             reported_error_code = error_code or (
                 str(code) if isinstance(code, (str, int)) else None
             )
@@ -249,7 +246,9 @@ class SopCRMAdapter:
                 "aop.invalid-auth-token", "aop.invalid-app-auth-token",
             )
             gateway_codes = (
-                "route-no-permissions", "invalid-content-type", "insufficient-isv-permissions"
+                "route-no-permissions",
+                "invalid-content-type",
+                "insufficient-isv-permissions",
             )
             if any(token in classification_code for token in auth_codes):
                 category = "authentication"
@@ -274,13 +273,20 @@ class SopCRMAdapter:
                 error_code=reported_error_code,
                 sub_code=sub_code,
             )
+        # HTTP 错误与成功 envelope 冲突时仍保留未知事实，不能把 5xx 记成成功覆盖。
+        if status >= 400:
+            raise SopCRMError(
+                "CRM HTTP failure", category="authentication" if status == 401 else "gateway",
+                http_status=status,
+            )
         data = payload.get("data")
+        # 修改接口返回 Boolean；空值或未知响应不能被当作远端成功。
+        if method == "crm_update_lead" and type(data) is bool:
+            return {"success": data}
         if isinstance(data, Mapping):
             return data
         if method == "crm_create_lead" and data not in (None, ""):
             return {"id": data}
-        if method == "crm_update_lead" and data in (None, ""):
-            return {"success": True}
         raise SopCRMError(
             "CRM response missing data", category="malformed_response", http_status=status
         )

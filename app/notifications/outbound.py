@@ -134,7 +134,7 @@ class WecomOutboundNotificationSender:
                         current.sales_user_id,
                         business_date,
                     ):
-                        # 已提交、跨日、停用或失去 CRM 映射的提醒不再发给销售。
+                        # 已提交、跨日、停用或转为管理员的提醒不再发给成员。
                         current.status = "suppressed"
                         current.processing_started_at = None
                         current.processing_lease_expires_at = None
