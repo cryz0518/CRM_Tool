@@ -324,6 +324,7 @@ def _append_update_result(
         "enum_mapping_missing": SubmissionItemStatus.INCOMPLETE,
     }.get(status, _ITEM_STATUS_BY_OUTCOME.get(status, SubmissionItemStatus.FAILED_PENDING_REVIEW))
     reason_code = {
+        "followed_up": "crm_followed_up",
         "enum_mapping_missing": "crm_enum_mapping_missing",
         "incomplete": "crm_update_incomplete",
         "mapping_missing": "crm_user_mapping_missing",

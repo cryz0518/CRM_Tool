@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.core.config import get_settings
-from app.crm.adapter import CRMSearchResult
+from app.crm.adapter import CRMCreateResult
 from app.crm.commands import (
     is_explicit_submission_request,
     parse_company_submission_request,
@@ -23,7 +23,6 @@ from app.crm.commands import (
 )
 from app.crm.mock import MockCRMAdapter
 from app.crm.service import DuplicateSubmission
-from app.crm.sop import SopCRMError
 from app.leads.discard import LeadDiscardService
 from app.leads.models import (
     CrmSyncRecord,
@@ -1195,18 +1194,104 @@ def test_today_callback_claim_executor_submits_only_selected_lead(
     assert execution.executed is True
     replay_execution = action_service.execute_action(action.id, executor)
     assert replay_execution.executed is False
-    assert crm.search_calls == 1 and crm.calls == 1 and crm.update_calls == 0
+    assert crm.search_calls == 0 and crm.submit_calls == 1 and crm.calls == 1
+    assert crm.update_calls == 0
     assert [payload["name"] for payload in crm.payloads] == ["TODAY测试公司-0"]
     with session_factory() as session:
         assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
 
 
-def test_duplicate_response_message_never_enters_result_notification(
+@pytest.mark.parametrize("mode", ["company", "batch"])
+def test_follow_up_result_is_persisted_for_all_confirmation_modes(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """验证指定线索和批量确认都持久化 FOLLOW_UP 并在恢复摘要中保留跟进语义。"""
+
+    import app.crm.service as crm_service
+
+    employee_path = tmp_path / "employee.csv"
+    employee_path.write_text("id,name,nickname\ncrm-sales-a,测试销售,测试\n", encoding="utf-8")
+    settings = get_settings().model_copy(update={"employee_directory_path": str(employee_path)})
+    monkeypatch.setattr(crm_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(crm_service, "_TEST_EMPLOYEE_DIRECTORY_PATH", employee_path, raising=False)
+
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_ids = _seed_today_submission_leads(session_factory, adapter, count=1)
+    action_service = _service(session_factory)
+    message_id = f"follow-up-{mode}"
+    if mode == "company":
+        action = action_service.issue_company_submission_confirmation_action(
+            actor_user_id="sales-a",
+            lead_id=lead_ids[0],
+            request_message_id=message_id,
+            company_name="TODAY测试公司-0",
+            display_text="TODAY测试公司-0｜王工",
+            field_values={"线索名称": "TODAY测试公司-0"},
+        )
+        claim = action_service.claim_callback(
+            _frame_for_action(action, msgid="follow-up-company-provider")
+        )
+    else:
+        action = _issue_today_action(action_service, lead_ids, message_id=message_id)
+        claim = action_service.claim_callback(
+            _batch_frame_for_action(
+                action, (lead_ids[0],), msgid="follow-up-batch-provider"
+            )
+        )
+
+    class FollowUpCRM(MockCRMAdapter):
+        def submit_lead(
+            self,
+            payload: Mapping[str, object],
+            *,
+            idempotency_key: str,
+            crm_user_id: str,
+        ) -> CRMCreateResult:
+            """模拟 CRM 查重命中后的成功跟进结果。"""
+            self.submit_calls += 1
+            self.submit_payloads.append(dict(payload))
+            return CRMCreateResult(
+                None, None, "CRM submit FOLLOW_UP succeeded", action="FOLLOW_UP"
+            )
+
+    crm = FollowUpCRM()
+    execution = action_service.execute_action(
+        action.id,
+        DeterministicWecomActionExecutor(session_factory, adapter, crm, action_service),
+    )
+
+    assert claim.code == "claimed"
+    assert execution.executed is True
+    assert "CRM 已存在并跟进 1 条" in execution.summary
+    assert "创建成功" not in execution.summary
+    assert crm.submit_calls == 1 and crm.calls == 0
+    with session_factory() as session:
+        saved = session.get(WecomAction, action.id)
+        sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_ids[0]))
+    assert saved is not None and saved.status == "succeeded"
+    assert saved.context["submission_results"] == [
+        {
+            "lead_id": lead_ids[0],
+            "status": "followed_up",
+            "reason_code": "crm_followed_up",
+            "missing_fields": [],
+        }
+    ]
+    recovered = WecomActionService._saved_submission_results_summary(saved)
+    assert recovered is not None and recovered[1]
+    assert "已存在并跟进 1 条" in recovered[0]
+    assert sync is not None and "FOLLOW_UP" in (sync.response_summary or "")
+
+
+def test_follow_up_response_message_never_enters_result_notification(
     session_factory: sessionmaker[Session],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """验证 CRM 重复原文不会进入动作结果通知，且缺少 ID 时不创建 CRM 线索。"""
+    """验证 CRM FOLLOW_UP 原始响应不会泄漏到动作结果通知。"""
     import app.crm.service as crm_service
 
     employee_path = tmp_path / "employee.csv"
@@ -1223,29 +1308,28 @@ def test_duplicate_response_message_never_enters_result_notification(
         _batch_frame_for_action(action, (lead_ids[0],), msgid="duplicate-message-safe-1")
     )
 
-    class DuplicateTargetCRM(MockCRMAdapter):
-        """返回安全分类，但异常正文模拟远端敏感文案。"""
-
-        def search_by_company_name(
-            self, payload: Mapping[str, object] | str
-        ) -> tuple[CRMSearchResult, ...]:
-            """阻止测试走 create，并验证远端正文不被结果路径读取。"""
-            del payload
-            self.search_calls += 1
-            raise SopCRMError(
-                "PRIVATE RAW SOP MESSAGE",
-                category="duplicate_target_unavailable",
-                sub_code="duplicate_detected_without_lead_id",
-                duplicate_entity_type="lead",
+    class FollowUpCRM(MockCRMAdapter):
+        def submit_lead(
+            self,
+            payload: Mapping[str, object],
+            *,
+            idempotency_key: str,
+            crm_user_id: str,
+        ) -> CRMCreateResult:
+            """返回跟进动作并模拟不应泄漏到用户通知的原始响应。"""
+            self.submit_calls += 1
+            self.submit_payloads.append(dict(payload))
+            return CRMCreateResult(
+                None, None, "PRIVATE RAW SOP MESSAGE", action="FOLLOW_UP"
             )
 
-    crm = DuplicateTargetCRM()
+    crm = FollowUpCRM()
     executor = DeterministicWecomActionExecutor(session_factory, adapter, crm, action_service)
     execution = action_service.execute_action(action.id, executor)
 
     assert claim.code == "claimed"
     assert execution.executed is True
-    assert crm.search_calls == 1 and crm.calls == 0
+    assert crm.submit_calls == 1 and crm.search_calls == 0 and crm.calls == 0
     with session_factory() as session:
         notifications = session.scalars(
             select(NotificationRecord).where(
@@ -1255,7 +1339,7 @@ def test_duplicate_response_message_never_enters_result_notification(
         ).all()
     assert notifications
     assert all("PRIVATE RAW SOP MESSAGE" not in (item.content or "") for item in notifications)
-    assert any("CRM 检测到重复线索" in (item.content or "") for item in notifications)
+    assert any("CRM 中已存在该线索，已进行跟进" in (item.content or "") for item in notifications)
 
 
 def test_today_callback_defers_temporary_lifecycle_to_worker_revalidation(
@@ -2047,23 +2131,22 @@ def test_company_submission_result_uses_frozen_label_and_safe_reason(
         _frame_for_action(action, msgid="company-safe-result-replay")
     )
 
-    class DuplicateTargetCRM(MockCRMAdapter):
-        """模拟重复目标没有可操作 CRM Lead ID 的受控结果。"""
-
-        def search_by_company_name(
-            self, payload: Mapping[str, object] | str
-        ) -> tuple[CRMSearchResult, ...]:
-            """阻止测试走 create，并返回安全 duplicate 分类。"""
-            del payload
-            self.search_calls += 1
-            raise SopCRMError(
-                "PRIVATE RAW SOP MESSAGE",
-                category="duplicate_target_unavailable",
-                sub_code="duplicate_detected_without_lead_id",
-                duplicate_entity_type="lead",
+    class FollowUpCRM(MockCRMAdapter):
+        def submit_lead(
+            self,
+            payload: Mapping[str, object],
+            *,
+            idempotency_key: str,
+            crm_user_id: str,
+        ) -> CRMCreateResult:
+            """返回统一接口跟进动作，校验通知只展示安全原因。"""
+            self.submit_calls += 1
+            self.submit_payloads.append(dict(payload))
+            return CRMCreateResult(
+                None, None, "PRIVATE RAW SOP MESSAGE", action="FOLLOW_UP"
             )
 
-    crm = DuplicateTargetCRM()
+    crm = FollowUpCRM()
     executor = DeterministicWecomActionExecutor(
         session_factory, adapter, crm, action_service
     )
@@ -2075,10 +2158,10 @@ def test_company_submission_result_uses_frozen_label_and_safe_reason(
     assert execution.executed is True
     assert replay_execution.executed is False
     assert "CRM 提交结果（已选择 1 条）" in execution.summary
-    assert f"{frozen_label}：CRM 检测到重复线索" in execution.summary
+    assert f"{frozen_label}：CRM 中已存在该线索，已进行跟进" in execution.summary
     assert "客户端注入名称" not in execution.summary
     assert "PRIVATE RAW SOP MESSAGE" not in execution.summary
-    assert crm.search_calls == 1 and crm.calls == 0
+    assert crm.submit_calls == 1 and crm.search_calls == 0 and crm.calls == 0
     with session_factory() as session:
         assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
 
@@ -2147,7 +2230,8 @@ def test_company_candidate_submission_executes_only_selected_lead_and_uses_froze
     assert "CRM 提交结果（已选择 1 条）" in execution.summary
     assert f"{labels[1]}" in execution.summary
     assert "客户端注入名称" not in execution.summary
-    assert crm.search_calls == 1 and crm.calls == 1 and crm.update_calls == 0
+    assert crm.search_calls == 0 and crm.submit_calls == 1 and crm.calls == 1
+    assert crm.update_calls == 0
     assert [payload["name"] for payload in crm.payloads] == ["TODAY测试公司-1"]
     with session_factory() as session:
         assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
