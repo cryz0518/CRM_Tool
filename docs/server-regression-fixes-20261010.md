@@ -15,7 +15,7 @@
 
 测试镜像 `crm-tool-server-fix-test:local` 以本地已有依赖镜像为基础，只复制 app、workers、tests、scripts、Alembic 与项目配置；构建使用 `--network none`。没有复制或注入真实环境文件、员工目录及机器人凭据。单元测试容器也使用 `--network none`，项目统一测试 fixture 禁用 dotenv，并使用假外部适配器。
 
-最终验证：全量单元测试 **921 passed**，其中每日提醒回归 15 项，覆盖取消旧授权门槛后的排程与发送；CRM 专项另已验证 145 passed；隔离 PostgreSQL 集成 **1 passed**（同时覆盖三个问题，并使用历史授权标记 false 的启用成员测试提醒）。Ruff `check app workers tests` 和 `git diff --check` 通过。16 个现有依赖弃用警告来自 websockets 和 Alembic 配置，不影响断言；本次未扩大范围修改依赖。
+复审修正后最终验证：全量单元测试 **934 passed**（83.48 秒），含新增 13 项复审回归及原 15 项每日提醒回归，继续验证无普通销售授权门槛；隔离 PostgreSQL 集成 **1 passed**（同时覆盖三个原问题，并新增旧 permanent/空 kind 更新记录的并发阻断及数日前附件重新扫描的顺序检查点验证）。Ruff `check app workers tests` 和 `git diff --check` 通过。16 个现有依赖弃用警告来自 websockets 和 Alembic 配置，不影响断言；本次未扩大范围修改依赖。
 
 隔离 PostgreSQL 使用单独随机 Compose project、随机数据库/用户/密码、internal 网络、tmpfs PGDATA，没有宿主机端口或生产卷。迁移前调用既有 `_validate_worker_environment` 并只读核验数据库名、用户及 PGDATA，禁止 `.env`；随后仅在该一次性库升级至 `0034_lead_system_defaults` 并执行 `tests/integration/test_server_regressions_postgres.py`。并发确认、过期覆盖租约、通知唯一性及媒体流终态验证通过；测试结束已清理其容器和网络。
 
@@ -27,13 +27,17 @@ docker run --rm --network none --entrypoint ruff crm-tool-server-fix-test:local 
 git diff --check
 ```
 
-## 当前服务器环境
+## 前次只读核查的服务器环境
+
+本次复审仅使用本地隔离测试，未连接或修改服务器；以下是前次只读核查事实，不代表重新检查了服务器实时状态。
 
 只读核实 `APP_ENV=development`、`MEDIA_SCANNER_PROVIDER=noop`；这表示当前并未执行真实文件安全扫描。生产要求实际扫描时应先安装、配置并验证真实 scanner，不能仅改 APP_ENV 或把 not_required 改成 clean。该基础设施配置不在本次代码修复中。
 
-app、worker、wecom-bot、PostgreSQL、Redis 当前健康；scheduler 进程运行、20:00 调度已有执行证据，但当前健康探针超过 3 秒而 unhealthy。服务器数据库为 `0034_lead_system_defaults`，本次没有新增或修改 Alembic 迁移、表或列。
+核查时 app、worker、wecom-bot、PostgreSQL、Redis 健康；scheduler 进程运行、20:00 调度已有执行证据，但健康探针超过 3 秒而 unhealthy。服务器数据库为 `0034_lead_system_defaults`，本次没有新增或修改 Alembic 迁移、表或列。
 
 ## 待审批发布步骤
+
+PR #90 复审补充的发布风险：旧 permanent/空 failure_kind 的已尝试 update 会被只读阻断，不能通过新消息或改表重新提交；运维须先逐条确认远端结果。历史媒体重新扫描只恢复媒体阶段，不恢复已结束的来源消息；扫描超时后的迟到成功不能自动打开任务。两个修正均复用现有字段，没有新增数据库迁移，也没有触碰 PR #74 已取消的普通销售授权门槛。
 
 部署依据仍为 `docs/server-deployment.md` 及已有 `scripts/server-update.sh`，服务器目录 `/opt/CRM_Tool`，统一使用 `docker compose -f docker-compose.yml -f docker-compose.server.yml`。PostgreSQL 保留宿主机 `/opt/CRM_TOOL/DATA/postgresql/data`，Redis/媒体保留原卷。
 

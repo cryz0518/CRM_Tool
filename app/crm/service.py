@@ -761,21 +761,7 @@ class CrmSubmissionService:
             if latest is None or latest.crm_lead_id is None:
                 return "incomplete"
             # 未完成 update 是冻结事实，必须优先恢复，不能先读表并换掉 payload。
-            unfinished = session.scalar(
-                select(CrmSyncRecord)
-                .where(
-                    CrmSyncRecord.lead_id == lead_id,
-                    CrmSyncRecord.operation == "update",
-                    or_(
-                        CrmSyncRecord.status.in_(("pending", "retrying", "processing")),
-                        and_(
-                            CrmSyncRecord.status == "failed_pending_review",
-                            CrmSyncRecord.failure_category == "unknown",
-                        ),
-                    ),
-                )
-                .order_by(CrmSyncRecord.id.asc())
-            )
+            unfinished = self._unfinished_update(session, lead_id)
             if unfinished is not None:
                 return self._claim_and_call(unfinished.id, command.sales_user_id)
         reconciled = LeadReviewService(
@@ -849,6 +835,13 @@ class CrmSubmissionService:
             authorization = session.get(SalesAuthorization, command.sales_user_id)
             if lead is None or authorization is None:
                 return "incomplete"
+            # 回读期间可能完成另一次覆盖，持有 Lead 锁后再次检查，禁止新快照绕过旧事实。
+            unfinished = self._unfinished_update(session, lead_id)
+            if unfinished is not None:
+                return (
+                    "failed_pending_review" if unfinished.status == "failed_pending_review"
+                    else "processing"
+                )
             crm_user_id = self._resolve_crm_owner(lead)
             if crm_user_id is None:
                 return self._record_mapping_missing(
@@ -932,24 +925,10 @@ class CrmSubmissionService:
             # temporary 草稿可以展示在“所有未提交”卡片中；后续统一按八项必填字段判定，
             # 字段完整的记录允许继续查重，字段不完整的记录返回具体缺失项且不调用 CRM。
             # 重复确认把 create 记录转为 update，未知远端结果不能因重新提交而绕过冻结事实。
-            unfinished_update = session.scalar(
-                select(CrmSyncRecord)
-                .where(
-                    CrmSyncRecord.lead_id == lead_id,
-                    CrmSyncRecord.operation == "update",
-                    or_(
-                        CrmSyncRecord.status.in_(("pending", "retrying", "processing")),
-                        and_(
-                            CrmSyncRecord.status == "failed_pending_review",
-                            CrmSyncRecord.failure_category == "unknown",
-                        ),
-                    ),
-                )
-                .limit(1)
-            )
+            unfinished_update = self._unfinished_update(session, lead_id)
             if unfinished_update is not None:
                 return _create_outcome(
-                    "failed_pending_review" if unfinished_update.failure_category == "unknown"
+                    "failed_pending_review" if unfinished_update.status == "failed_pending_review"
                     else "processing", reason_code="crm_outcome_unknown",
                 )
             existing = latest_crm_create_sync(session, lead_id)
@@ -1039,6 +1018,8 @@ class CrmSubmissionService:
                 )
             ):
                 return _create_outcome("not_submitted")
+            if self._unfinished_update(session, lead_id) is not None:
+                return _create_outcome("failed_pending_review", reason_code="crm_outcome_unknown")
             if current_lead.lifecycle_state == "temporary":
                 # 临时线索通过最终快照和 CRM payload 校验后，先晋升再进入 owner/查重状态机。
                 current_lead.lifecycle_state = "pending_create"
@@ -1129,6 +1110,11 @@ class CrmSubmissionService:
                     )
                 ):
                     return _create_outcome("incomplete")
+                # 查重返回后仍须在同一 Lead 锁下复核，不追加可绕过未知覆盖的新同步记录。
+                if self._unfinished_update(session, lead_id) is not None:
+                    return _create_outcome(
+                        "failed_pending_review", reason_code="crm_outcome_unknown"
+                    )
                 crm_user_id = self._resolve_crm_owner(lead)
                 if crm_user_id is None:
                     return _create_outcome(
@@ -1375,7 +1361,9 @@ class CrmSubmissionService:
     @staticmethod
     def _duplicate_failure_reason(sync: CrmSyncRecord | None) -> str:
         """返回重复覆盖失败的安全中文说明；参数为同步事实，返回固定文案，无外部调用。"""
-        if sync is None or sync.failure_category == "unknown":
+        if sync is None or sync.failure_category == "unknown" or (
+            sync.operation == "update" and sync.attempts > 0 and sync.failure_kind is None
+        ):
             return "CRM 远端覆盖结果待核实，已停止自动重试；请联系管理员核对后处理，勿重复提交。"
         if sync.failure_kind == "authentication":
             return "CRM 身份认证失败，已停止覆盖；请联系管理员检查调用身份。"
@@ -1438,6 +1426,33 @@ class CrmSubmissionService:
             lead.lifecycle_state = "pending_update"
         return "mapping_missing"
 
+    @staticmethod
+    def _unfinished_update(
+        session: Session, lead_id: str, *, exclude_sync_id: int | None = None,
+    ) -> CrmSyncRecord | None:
+        """查找阻止新覆盖的冻结更新；旧已尝试但无 kind 的失败也按待核实阻断。
+
+        参数：session 为当前事务，lead_id 为线索，exclude_sync_id 排除本次认领自身。
+        返回：最早的未结更新或 None；数据库异常传播；只读，不改写历史分类和记录。
+        """
+        return session.scalar(
+            select(CrmSyncRecord).where(
+                CrmSyncRecord.lead_id == lead_id,
+                CrmSyncRecord.operation == "update",
+                exclude_sync_id is None or CrmSyncRecord.id != exclude_sync_id,
+                or_(
+                    CrmSyncRecord.status.in_(("pending", "retrying", "processing")),
+                    and_(
+                        CrmSyncRecord.status == "failed_pending_review",
+                        or_(
+                            CrmSyncRecord.failure_category == "unknown",
+                            and_(CrmSyncRecord.attempts > 0, CrmSyncRecord.failure_kind.is_(None)),
+                        ),
+                    ),
+                ),
+            ).order_by(CrmSyncRecord.id.asc()).limit(1)
+        )
+
     def _claim_and_call(self, sync_id: int, sales_user_id: str) -> str:
         """原子认领 pending/retrying 同步记录后调用 CRM，并持久化独立结果。"""
         claim_started_at: datetime
@@ -1472,6 +1487,12 @@ class CrmSubmissionService:
             is_unknown_outcome_recovery = lease_expired or (
                 sync.status == "failed_pending_review" and sync.failure_category == "unknown"
             )
+            unfinished = self._unfinished_update(session, sync.lead_id, exclude_sync_id=sync.id)
+            if unfinished is not None:
+                return (
+                    "failed_pending_review" if unfinished.status == "failed_pending_review"
+                    else "processing"
+                )
             if sync.operation == "update" and sync.attempts > 0:
                 # SOP 不提供远端幂等更新契约；租约过期、网络未知和人工重试均不得再覆盖。
                 self._mark_unknown_crm_outcome(session, sync, sales_user_id)

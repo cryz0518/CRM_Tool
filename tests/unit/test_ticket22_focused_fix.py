@@ -19,6 +19,7 @@ from app.media.storage import FakeStorageProvider
 from app.messaging.models import (
     Base,
     IncomingMessage,
+    MediaProcessingTask,
     MessageAttachment,
     NotificationRecord,
     OutboxEvent,
@@ -184,6 +185,52 @@ def test_media_scan_safety_policy(
         assert (attachment.recognized_text is not None) == (expected == "succeeded")
 
 
+@pytest.mark.parametrize("phase", ("pending_upload", "processing"))
+@pytest.mark.parametrize("elapsed", (299, 301))
+def test_historical_media_phase_timeout_uses_current_phase_boundary(
+    session_factory: sessionmaker[Session], tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, phase: str, elapsed: int,
+) -> None:
+    """历史附件的上传和识别阶段各自计时，不借用附件年龄或扫描开始时间。"""
+    import app.media.service as media_module
+
+    _seed_message(session_factory, "phase-timeout")
+    now = datetime.now(UTC)
+    service = _media_service(
+        session_factory, FakeStorageProvider(tmp_path), FakeFileScanProvider("clean")
+    )
+    attachment_id = service.ingest(
+        "phase-timeout", b"\x89PNG\r\n\x1a\nimage",
+        media_kind="image", declared_mime_type="image/png",
+    )
+    with session_factory.begin() as session:
+        attachment = session.get(MessageAttachment, attachment_id)
+        attachment.created_at = now - timedelta(days=3)
+        attachment.scan_started_at = now - timedelta(hours=2)
+        attachment.scan_completed_at = now - timedelta(hours=1)
+        attachment.processing_status = phase
+        task = session.scalar(select(MediaProcessingTask))
+        task.status = "processing" if phase == "processing" else "pending"
+        task.created_at = now
+        upload = session.scalar(select(StorageIngestOperation))
+        upload.created_at = now - timedelta(days=3)
+        upload.remote_started_at = now
+    monkeypatch.setattr(media_module, "utc_now", lambda: now + timedelta(seconds=elapsed))
+    service.process_pending_for_message("phase-timeout")
+    with session_factory() as session:
+        attachment = session.get(MessageAttachment, attachment_id)
+        task = session.scalar(select(MediaProcessingTask))
+        expected = "failed_pending_review" if elapsed > 300 else phase
+        assert attachment.processing_status == expected
+        if elapsed < 300:
+            assert task.completed_at is None
+        else:
+            assert task.status == "failed_pending_review"
+            assert attachment.error_summary == (
+                "media_upload_timeout" if phase == "pending_upload" else "media_processing_timeout"
+            )
+
+
 def test_storage_tampering_cannot_reach_ocr(
     session_factory: sessionmaker[Session],
     tmp_path: Path,
@@ -244,9 +291,10 @@ def test_ingest_timeout_with_remote_success_reconciles_without_second_put(
     if wait_expired:
         # 来源等待先过期，迟到 HEAD 只能确认存储事实，不能重开识别或重复创建 task。
         with session_factory.begin() as session:
-            session.get(MessageAttachment, attachment_id).created_at = (
-                datetime.now(UTC) - timedelta(minutes=6)
-            )
+            started_at = datetime.now(UTC) - timedelta(minutes=6)
+            session.get(MessageAttachment, attachment_id).created_at = started_at
+            # 上传超时由冻结 intent 的真实远端开始时间决定，而非仅修改附件年龄。
+            session.get(StorageIngestOperation, operation_id).remote_started_at = started_at
         service.process_pending_for_message("message-timeout")
     from app.media.retention import StorageIngestRecoveryService
 
@@ -256,7 +304,6 @@ def test_ingest_timeout_with_remote_success_reconciles_without_second_put(
     )
     assert storage.put_calls == 1
     with session_factory() as session:
-        from app.messaging.models import MediaProcessingTask
         expected = "failed_pending_review" if wait_expired else "pending"
         assert session.get(MessageAttachment, attachment_id).processing_status == expected
         tasks = session.scalars(select(MediaProcessingTask)).all()

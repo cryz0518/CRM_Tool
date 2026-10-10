@@ -292,6 +292,21 @@ class MediaAttachmentService:
                     ),
                 )
             ).all()
+            # 各阶段使用自己的时间边界；历史附件创建时间不代表新扫描或新识别开始。
+            tasks = {
+                task.attachment_id: task for task in session.scalars(
+                    select(MediaProcessingTask).where(
+                        MediaProcessingTask.attachment_id.in_([item.id for item in attachments])
+                    )
+                )
+            }
+            uploads = {
+                operation.attachment_id: operation for operation in session.scalars(
+                    select(StorageIngestOperation).where(
+                        StorageIngestOperation.attachment_id.in_([item.id for item in attachments])
+                    )
+                )
+            }
             message = session.get(IncomingMessage, message_id)
             has_attachment = (
                 session.scalar(
@@ -320,7 +335,16 @@ class MediaAttachmentService:
             # 尚在异步扫描/上传时保留有限等待；失败或被策略拒绝时立即收敛。
             if attachment.processing_status == "processing":
                 # 已在识别的工件不能并发再次调用；失联超过期限后收敛为人工检查点。
-                if self._wait_expired(attachment.created_at):
+                task = tasks.get(attachment.id)
+                # 识别阶段从任务登记或本轮扫描放行后开始，外部识别仍受 provider 超时限制。
+                started_at = max(
+                    value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+                    for value in (
+                        task.created_at if task is not None else attachment.created_at,
+                        attachment.scan_completed_at or attachment.created_at,
+                    )
+                )
+                if self._wait_expired(started_at):
                     self._record_processing_failure(attachment.id, "media_processing_timeout")
                 continue
             if attachment.deletion_status != "active":
@@ -328,7 +352,7 @@ class MediaAttachmentService:
                 continue
             if attachment.scan_status not in self._processable_scan_statuses:
                 if attachment.scan_status in {"pending", "pending_scan", "scanning"}:
-                    if not self._wait_expired(attachment.created_at):
+                    if not self._wait_expired(attachment.scan_started_at or attachment.created_at):
                         continue
                     reason = "media_scan_timeout"
                 else:
@@ -336,7 +360,13 @@ class MediaAttachmentService:
                 self._record_processing_failure(attachment.id, reason)
                 continue
             if attachment.processing_status == "pending_upload":
-                if self._wait_expired(attachment.created_at):
+                upload = uploads.get(attachment.id)
+                # 上传不借用扫描时钟；未知远端上传继续按原冻结 intent 有限等待。
+                started_at = (
+                    upload.remote_started_at or upload.created_at
+                    if upload is not None else attachment.created_at
+                )
+                if self._wait_expired(started_at):
                     self._record_processing_failure(attachment.id, "media_upload_timeout")
                 continue
             if attachment.storage_key is None or attachment.detected_mime_type is None:
@@ -358,23 +388,58 @@ class MediaAttachmentService:
             attachment = session.get(MessageAttachment, attachment_id)
             if attachment is None:
                 raise ValueError("attachment_not_found")
+            if (
+                scan_status == "clean" and attachment.scan_status == "scan_failed"
+                and attachment.error_summary == "media_scan_timeout"
+            ):
+                # 超时已形成恢复检查点；迟到成功不能替代新一轮显式扫描或重放来源。
+                logger.info("media_scan_late_result_ignored", extra={"media_id": attachment_id})
+                return
             if scan_status not in SCAN_TRANSITIONS.get(attachment.scan_status, set()):
                 raise ValueError("scan_transition_invalid")
+            # 即使轮询尚未收敛，超过本轮扫描期限的成功回调也不能放行 OCR。
+            scan_timed_out = (
+                scan_status == "clean" and attachment.scan_status == "scanning"
+                and self._wait_expired(attachment.scan_started_at or attachment.created_at)
+            )
+            if scan_timed_out:
+                scan_status = "scan_failed"
             attachment.scan_status = scan_status
             transition_time = utc_now()
             if scan_status == "scanning":
                 attachment.scan_started_at = transition_time
                 attachment.scan_completed_at = None
+                if attachment.processing_status != "succeeded":
+                    upload = (
+                        session.get(StorageIngestOperation, attachment.ingest_operation_id)
+                        if attachment.ingest_operation_id is not None else None
+                    )
+                    attachment.processing_status = (
+                        "pending_upload" if upload is not None and upload.status != "succeeded"
+                        else "pending"
+                    )
+                    attachment.error_summary = None
+                    attachment.completed_at = None
             else:
                 attachment.scan_completed_at = transition_time
             if scan_status in {"infected", "quarantined"}:
                 attachment.deletion_status = "quarantined"
                 attachment.quarantined_at = utc_now()
                 attachment.processing_status = "failed_pending_review"
+                attachment.error_summary = "media_infected"
+                attachment.completed_at = transition_time
             elif scan_status == "scan_failed":
                 attachment.processing_status = "failed_pending_review"
-            elif scan_status == "clean":
-                attachment.processing_status = "pending"
+                attachment.error_summary = (
+                    "media_scan_timeout" if scan_timed_out else "media_scan_failed"
+                )
+                attachment.completed_at = transition_time
+            elif scan_status == "clean" and attachment.processing_status not in {
+                "failed_pending_review", "succeeded",
+            }:
+                # clean 放行识别，但不能跳过仍未完成的上传。
+                if attachment.processing_status != "pending_upload":
+                    attachment.processing_status = "pending"
                 attachment.error_summary = None
                 attachment.completed_at = None
             task = session.scalar(
@@ -382,14 +447,14 @@ class MediaAttachmentService:
                     MediaProcessingTask.attachment_id == attachment_id
                 )
             )
-            if task is not None and scan_status != "clean":
-                task.status = "failed_pending_review"
-                task.completed_at = utc_now()
-            elif task is not None:
-                # 受控重新扫描通过后恢复媒体任务，来源消息仍需受保护补充而非批量回放。
-                task.status = "pending"
-                task.error_summary = None
-                task.completed_at = None
+            if task is not None:
+                # 扫描等待不是失败终态；仅同步媒体任务，绝不修改已结束的来源 Outbox。
+                task.status = (
+                    "pending" if attachment.processing_status == "pending_upload"
+                    else attachment.processing_status
+                )
+                task.error_summary = attachment.error_summary
+                task.completed_at = attachment.completed_at
             self._audit(session, attachment.message_id, f"media_scan_{scan_status}")
             logger.info(
                 "media_scan_transition",
@@ -577,6 +642,10 @@ class MediaAttachmentService:
             attachment.processing_status = "failed_pending_review"
             attachment.error_summary = summary
             attachment.completed_at = utc_now()
+            if summary == "media_scan_timeout":
+                # 扫描超时有独立终态，下一轮扫描必须显式从 scan_failed 开始。
+                attachment.scan_status = "scan_failed"
+                attachment.scan_completed_at = attachment.completed_at
             task.status = "failed_pending_review"
             task.attempts += 1
             task.error_summary = summary

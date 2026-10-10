@@ -318,6 +318,138 @@ def test_duplicate_update_failure_is_safe_and_never_written_twice(
     assert crm.update_calls == 1 and crm.calls == 0
 
 
+@pytest.mark.parametrize("duplicate", (True, False))
+def test_legacy_attempted_update_blocks_new_submissions_and_snapshots(
+    session_factory: sessionmaker[Session], duplicate: bool,
+) -> None:
+    """模拟历史 Sync 24，旧 permanent/空 kind 不能因新消息或表格改动而重复覆盖。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    crm = MockCRMAdapter(search_results={
+        "人工最终公司": (CRMSearchResult("crm-existing", "original-owner", "duplicate"),)
+    } if duplicate else {})
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    initial = submit_today_via_selection(service, "sales-1", "initial")
+    assert initial.succeeded == (0 if duplicate else 1)
+    record_id = adapter.get_records()[0].record_id
+    if duplicate:
+        service.resolve_duplicate_confirmation(
+            "initial", "sales-1", continue_submission=True, selected_lead_ids=(lead_id,)
+        )
+    else:
+        adapter.update_record(record_id, {"手机": "13900000000"})
+        assert service.submit(SubmissionCommand("提交我的更新", "sales-1", "update")).updated == 1
+    with session_factory.begin() as session:
+        sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.operation == "update"))
+        sync.status = "failed_pending_review"
+        sync.failure_category = "permanent"
+        sync.failure_kind = None
+        sync.failure_code = None
+        sync.failure_summary = "SopCRMError"
+        frozen = (sync.id, sync.canonical_payload, sync.snapshot_hash, sync.request_message_id)
+        session.get(Lead, lead_id).lifecycle_state = (
+            "pending_create" if duplicate else "pending_update"
+        )
+        session.get(SalesAuthorization, "sales-1").is_authorized = False
+    calls = (crm.calls, crm.update_calls, crm.search_calls)
+    for index, fields in enumerate(({}, {"手机": "13700000000"}, {"线索名称": "另一个测试公司"})):
+        adapter.update_record(record_id, {"提交状态": "未提交", **fields})
+        command = SubmissionCommand(
+            "提交指定线索" if duplicate else "提交我的更新", "sales-1", f"retry-{index}",
+            target_lead_id=lead_id if duplicate else None,
+        )
+        assert service.submit(command).failed_pending_review == 1
+    assert (crm.calls, crm.update_calls, crm.search_calls) == calls
+    with session_factory() as session:
+        sync = session.get(CrmSyncRecord, frozen[0])
+        assert (
+            sync.id, sync.canonical_payload, sync.snapshot_hash, sync.request_message_id
+        ) == frozen
+        assert (sync.failure_category, sync.failure_kind, sync.attempts) == ("permanent", None, 1)
+        assert session.scalar(select(func.count()).select_from(CrmSyncRecord)) == (
+            1 if duplicate else 2
+        )
+
+
+@pytest.mark.parametrize("entry", ("claim", "confirmation"))
+def test_new_sync_cannot_bypass_legacy_unknown_update(
+    session_factory: sessionmaker[Session], entry: str,
+) -> None:
+    """验证已有旧版未知覆盖时，另一个新同步或重复确认入口仍不能调用 CRM。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    with session_factory.begin() as session:
+        for number in (24, 25):
+            session.add(CrmSyncRecord(
+                id=number, lead_id=lead_id,
+                operation="create" if number == 25 and entry == "confirmation" else "update",
+                generation=1 if number == 25 and entry == "confirmation" else None,
+                smart_table_record_id=adapter.get_records()[0].record_id,
+                idempotency_key=f"legacy-{number}", canonical_payload={"name": "人工最终公司"},
+                snapshot_hash=str(number) * 32, request_message_id=f"message-{number}",
+                submitting_sales_user_id="sales-1", submitting_crm_user_id="crm-1",
+                crm_lead_id="crm-existing", attempts=1 if number == 24 else 0,
+                status="failed_pending_review" if number == 24 else (
+                    "awaiting_duplicate_confirmation" if entry == "confirmation" else "pending"
+                ),
+                failure_category="permanent" if number == 24 else None,
+                failure_kind=None,
+            ))
+    if entry == "claim":
+        assert service._claim_and_call(25, "sales-1") == "failed_pending_review"
+    else:
+        result = service.resolve_duplicate_confirmation(
+            "message-25", "sales-1", continue_submission=True, selected_lead_ids=(lead_id,)
+        )
+        assert result.failed == 1
+    assert crm.calls == crm.update_calls == crm.search_calls == 0
+    with session_factory() as session:
+        sync = session.get(CrmSyncRecord, 24)
+        assert (sync.status, sync.failure_category, sync.failure_kind, sync.attempts) == (
+            "failed_pending_review", "permanent", None, 1
+        )
+
+
+def test_explicit_business_rejection_allows_a_new_confirmed_snapshot(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """明确业务拒绝保留 permanent 分类；修正字段后新确认可以执行，旧记录不被重写。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    crm = MockCRMAdapter(search_results={
+        "人工最终公司": (CRMSearchResult("crm-existing", "original-owner", "duplicate"),)
+    })
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    submit_today_via_selection(service, "sales-1", "rejected")
+    original_update = crm.update_lead
+
+    def reject(*args: object, **kwargs: object) -> CRMCreateResult:
+        """模拟明确拒绝；无远端调用，增加测试计数并抛出稳定业务分类。"""
+        crm.update_calls += 1
+        raise SopCRMError("明确拒绝", category="business_rejection")
+
+    monkeypatch.setattr(crm, "update_lead", reject)
+    assert service.resolve_duplicate_confirmation(
+        "rejected", "sales-1", continue_submission=True, selected_lead_ids=(lead_id,)
+    ).failed == 1
+    monkeypatch.setattr(crm, "update_lead", original_update)
+    adapter.update_record(adapter.get_records()[0].record_id, {"手机": "13700000000"})
+    assert submit_today_via_selection(service, "sales-1", "corrected").duplicate_confirmations
+    assert service.resolve_duplicate_confirmation(
+        "corrected", "sales-1", continue_submission=True, selected_lead_ids=(lead_id,)
+    ).submitted == 1
+    assert crm.update_calls == 2
+    with session_factory() as session:
+        old = session.scalar(
+            select(CrmSyncRecord).where(CrmSyncRecord.request_message_id == "rejected")
+        )
+        assert (old.failure_category, old.failure_kind, old.attempts) == (
+            "permanent", "business_rejection", 1
+        )
+
+
 def test_all_submission_includes_historical_pending_lead(
     session_factory: sessionmaker[Session],
 ) -> None:
