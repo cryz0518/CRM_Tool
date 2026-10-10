@@ -191,34 +191,23 @@ def _lead(
 
 
 class RecordingCRMAdapter(MockCRMAdapter):
-    """记录查重与创建 payload，验证 TYC 身份是否越过提交服务边界。"""
+    """记录统一提交 payload，验证 TYC 身份是否越过提交服务边界。"""
 
     def __init__(self) -> None:
-        """初始化空的查重和创建 payload 记录。"""
+        """初始化空的统一提交 payload 记录。"""
         super().__init__()
-        self.search_payloads: list[dict[str, object]] = []
-        self.create_payloads: list[dict[str, object]] = []
+        self.submit_payloads: list[dict[str, object]] = []
 
-    def search_by_company_name(
-        self, payload: Mapping[str, object] | str
-    ) -> tuple[CRMSearchResult, ...]:
-        """记录查重请求后返回空的 CRM 结果。"""
-        if isinstance(payload, str):
-            self.search_payloads.append({"name": payload})
-        else:
-            self.search_payloads.append(dict(payload))
-        return super().search_by_company_name(payload)
-
-    def create_lead(
+    def submit_lead(
         self,
         payload: Mapping[str, object],
         *,
         idempotency_key: str,
         crm_user_id: str,
     ) -> CRMCreateResult:
-        """记录创建请求并复用 Mock 的成功响应。"""
-        self.create_payloads.append(dict(payload))
-        return super().create_lead(
+        """记录统一提交请求并复用 Mock 的成功响应。"""
+        self.submit_payloads.append(dict(payload))
+        return super().submit_lead(
             payload, idempotency_key=idempotency_key, crm_user_id=crm_user_id
         )
 
@@ -239,7 +228,7 @@ def test_create_uses_stable_lead_key_and_current_smart_table_values(
 
     assert first.succeeded == 1
     assert second.succeeded == 0
-    assert crm.search_calls == 1 and crm.calls == 1
+    assert crm.submit_calls == 1 and crm.search_calls == 0 and crm.calls == 1
     assert crm.payloads[0]["name"] == "人工最终公司"
     assert adapter.get_records()[0].fields["提交状态"] == "已提交"
     with session_factory() as session:
@@ -1038,8 +1027,7 @@ def test_tyc_unique_identity_is_sent_to_crm(
     )
 
     assert result.succeeded == 1
-    assert crm.search_payloads[0]["tycCustomerId"] == "tyc-verified"
-    assert crm.create_payloads[0]["tycCustomerId"] == "tyc-verified"
+    assert crm.submit_payloads[0]["tycCustomerId"] == "tyc-verified"
 
 
 def test_tyc_ambiguous_candidate_id_never_enters_crm(
@@ -1062,8 +1050,7 @@ def test_tyc_ambiguous_candidate_id_never_enters_crm(
     )
 
     assert result.succeeded == 1
-    assert "tycCustomerId" not in crm.search_payloads[0]
-    assert "tycCustomerId" not in crm.create_payloads[0]
+    assert "tycCustomerId" not in crm.submit_payloads[0]
 
 
 def test_salesperson_company_name_edit_drops_old_tyc_candidate_id(
@@ -1089,8 +1076,7 @@ def test_salesperson_company_name_edit_drops_old_tyc_candidate_id(
     )
 
     assert result.succeeded == 1
-    assert "tycCustomerId" not in crm.search_payloads[0]
-    assert "tycCustomerId" not in crm.create_payloads[0]
+    assert "tycCustomerId" not in crm.submit_payloads[0]
 
 
 def test_targeted_company_submission_reuses_service_for_one_lead(
