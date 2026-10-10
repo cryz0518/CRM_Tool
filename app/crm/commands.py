@@ -20,7 +20,6 @@ from app.crm.service import (
     CrmSubmissionService,
     SubmissionBatchResult,
     SubmissionCommand,
-    SubmissionItemResult,
     _append_create_result,
 )
 from app.leads.models import CrmSyncRecord, Lead, latest_crm_create_sync, new_lead_id
@@ -1166,49 +1165,6 @@ def _record_command_failure(
         return reply
 
 
-def _crm_duplicate_failure_detail(item: SubmissionItemResult) -> str:
-    """把查重受控诊断字段映射为不含远端正文的销售文案。
-
-    参数：item 为携带服务端白名单失败证据的逐线索结果。
-    返回值：按适配器类别和安全状态码生成的原因说明。
-    异常：无；非法状态码或 HTTP 状态会被忽略。
-    副作用：无，不读取 CRM 响应正文或异常文本。
-    """
-    if item.reason_code == "duplicate_target_unavailable":
-        entity_name = {
-            "lead": "线索",
-            "customer": "客户",
-            "dealer": "经销商",
-        }.get(item.duplicate_entity_type or "", "对象")
-        return f"CRM 检测到重复{entity_name}，但未返回可操作的线索 ID，请人工确认。"
-
-    metadata: list[str] = []
-    if isinstance(item.http_status, int) and not isinstance(item.http_status, bool):
-        if 100 <= item.http_status <= 599:
-            metadata.append(f"HTTP {item.http_status}")
-    code = item.failure_code
-    if code and len(code) <= 64 and all(
-        character.isalnum() or character in "._:-" for character in code
-    ):
-        metadata.append(f"错误码：{code}")
-    suffix = f"（{'，'.join(metadata)}）" if metadata else ""
-    if item.adapter_category == "malformed_response":
-        detail = f"CRM 返回格式异常{suffix}，未获得有效查重结果"
-    elif item.adapter_category in {"business", "business_rejection"}:
-        detail = f"CRM 返回业务错误{suffix}，查重未通过"
-    elif item.adapter_category == "authentication":
-        detail = f"CRM 鉴权失败{suffix}，请联系管理员检查 CRM 接口配置"
-    elif item.adapter_category == "gateway":
-        detail = f"CRM 网关拒绝或处理失败{suffix}"
-    elif item.adapter_category == "transport":
-        detail = f"CRM 网络连接或超时异常{suffix}，本次未完成查重"
-    else:
-        detail = f"CRM 查重失败{suffix}，需要人工处理"
-    if item.reason_code == "crm_duplicate_search_retrying":
-        return f"{detail}；本次未提交，请稍后重新提交"
-    return detail
-
-
 def format_submission_reply(
     result: SubmissionBatchResult,
     *,
@@ -1234,40 +1190,39 @@ def format_submission_reply(
         + result.mapping_missing
         + result.company_identity_review
     )
-    duplicate_retry_count = sum(
-        getattr(item.status, "value", str(item.status)) == "retrying"
-        and item.reason_code == "crm_duplicate_search_retrying"
+    success_count = result.succeeded + result.updated
+    completed_count = success_count + result.followed_up
+    processing_count = result.processing + sum(
+        getattr(item.status, "value", str(item.status)) == "duplicate_confirmation"
         for item in result.items
     )
-    other_retrying_count = max(0, result.retrying - duplicate_retry_count)
     lines = [
         title,
         "",
-        f"✅ 创建成功 {result.succeeded} 条",
-        f"✅ 更新成功 {result.updated} 条",
+        f"✅ CRM 新增/更新成功 {success_count} 条",
+        f"🔁 CRM 已存在并跟进 {result.followed_up} 条",
         f"✅ 无变化 {result.unchanged} 条",
         f"⚠️ 待完善 {result.incomplete} 条",
-        f"⏳ 处理中 {result.processing} 条",
+        f"⏳ 处理中 {processing_count} 条",
         f"⚪ 未提交 {result.not_submitted} 条",
-        f"⚠️ 查重暂时失败 {duplicate_retry_count} 条",
-        f"🔄 重试中 {other_retrying_count} 条",
+        f"🔄 重试中 {result.retrying} 条",
         f"需人工处理 {failed_count} 条",
         "",
         (
-            f"汇总：创建 {result.succeeded}｜更新 {result.updated}｜"
-            f"待完善 {result.incomplete}｜处理中 {result.processing}｜"
+            f"汇总：提交完成 {completed_count}｜新增/更新成功 {success_count}｜"
+            f"已存在并跟进 {result.followed_up}｜"
+            f"待完善 {result.incomplete}｜处理中 {processing_count}｜"
             f"未提交 {result.not_submitted}｜失败 {failed_count}"
         ),
     ]
     detail_lines: list[str] = []
     status_titles = {
-        "created": "✅ 创建成功",
-        "updated": "✅ 更新成功",
         "unchanged": "✅ 无变化",
         "incomplete": "⚠️ 待完善",
+        "followed_up": "🔁 已存在并跟进",
         "processing": "⏳ 处理中",
         "retrying": "🔄 重试中",
-        "duplicate_confirmation": "重复待确认",
+        "duplicate_confirmation": "⏳ 处理中",
         "mapping_missing": "CRM 用户映射缺失",
         "company_identity_review": "需人工处理",
         "failed_pending_review": "需人工处理",
@@ -1275,29 +1230,37 @@ def format_submission_reply(
     }
     reason_text = {
         "crm_enum_mapping_missing": "智能表格选项缺少 CRM 字典映射，请联系管理员配置后重新提交",
-        "duplicate_confirmation_required": "CRM 已存在同公司线索，请在后续确认卡决定是否覆盖",
         "crm_user_mapping_missing": "当前负责人无法映射 CRM 用户，请联系管理员",
-        "company_identity_conflict": "公司身份与 CRM 查重结果不一致，需要人工处理",
+        "company_identity_conflict": "公司身份记录冲突，需要人工处理",
         "company_identity_reserved": "已有提交任务正在处理，本次未重复创建",
         "sync_processing": "已有提交任务正在处理，本次未重复创建",
-        "crm_duplicate_search_retrying": "CRM 查重暂时失败，本次未提交，请稍后重新提交",
-        "crm_duplicate_search_failed": "CRM 查重失败，需要人工处理",
-        "wecom_smart_table_retryable": "企微智能表格暂时限流或网络异常，本次未发起 CRM 提交，请稍后重新提交",
+        "wecom_smart_table_retryable": (
+            "企微智能表格暂时限流或网络异常，本次未发起 CRM 提交，请稍后重新提交"
+        ),
         "pre_crm_transient_failure": "提交前依赖暂时不可用，本次未发起 CRM 提交，请稍后重新提交",
-        "crm_create_retrying": "CRM 创建暂时失败，系统将自动重试",
+        "crm_create_retrying": "CRM 提交暂时失败，系统将自动重试",
         "crm_create_failed_pending_review": "CRM 提交失败，需要人工处理",
-        "crm_update_retrying": "CRM 更新暂时失败，系统将自动重试",
-        "crm_update_failed_pending_review": "CRM 更新失败，需要人工处理",
-        "crm_update_incomplete": "CRM 更新前校验未通过，请检查当前线索信息",
+        "crm_followed_up": "CRM 中已存在该线索，已进行跟进",
+        "crm_update_retrying": "CRM 提交暂时失败，系统将自动重试",
+        "crm_update_failed_pending_review": "CRM 提交失败，需要人工处理",
+        "crm_update_incomplete": "CRM 提交前校验未通过，请检查当前线索信息",
         "company_identity_change_pending_review": "公司名称发生变化，需要人工处理",
         "candidate_state_changed": "线索状态已变化，请重新发起提交",
         "already_submitted": "该线索已完成提交，本次未重复创建",
     }
+    successful_items = [
+        item
+        for item in result.items
+        if getattr(item.status, "value", str(item.status)) in {"created", "updated"}
+        and item.lead_id in labels
+    ]
+    if successful_items:
+        detail_lines.append(f"✅ CRM 新增/更新成功 {len(successful_items)} 条")
+        detail_lines.extend(f"- {labels[item.lead_id]}" for item in successful_items)
     grouped_statuses = (
-        "created",
-        "updated",
         "unchanged",
         "incomplete",
+        "followed_up",
         "duplicate_confirmation",
         "mapping_missing",
         "processing",
@@ -1315,54 +1278,14 @@ def format_submission_reply(
         ]
         if not items:
             continue
-        duplicate_reason = (
-            "crm_duplicate_search_retrying"
-            if status == "retrying"
-            else "crm_duplicate_search_failed"
-        )
-        if status in {"retrying", "failed_pending_review"}:
-            duplicate_items = [item for item in items if item.reason_code == duplicate_reason]
-            unavailable_targets = [
-                item for item in items if item.reason_code == "duplicate_target_unavailable"
-            ]
-            other_items = [
-                item
-                for item in items
-                if item.reason_code not in {duplicate_reason, "duplicate_target_unavailable"}
-            ]
-            groups = []
-            if status == "failed_pending_review" and unavailable_targets:
-                groups.append(("❌ 重复待人工确认", unavailable_targets))
-            if duplicate_items:
-                groups.append(
-                    (
-                        "⚠️ 查重暂时失败" if status == "retrying" else "❌ 查重失败",
-                        duplicate_items,
-                    )
-                )
-            groups.append((status_titles[status], other_items))
-        else:
-            groups = [(status_titles[status], items)]
-        for title_text, group_items in groups:
-            if not group_items:
-                continue
-            detail_lines.append(f"{title_text} {len(group_items)} 条")
-            for item in group_items:
-                label = labels[item.lead_id]
-                if status == "incomplete" and item.missing_fields:
-                    detail_lines.append(f"- {label}：缺少「{'、'.join(item.missing_fields)}」")
-                else:
-                    detail = (
-                        _crm_duplicate_failure_detail(item)
-                        if item.reason_code
-                        in {
-                            "crm_duplicate_search_failed",
-                            "crm_duplicate_search_retrying",
-                            "duplicate_target_unavailable",
-                        }
-                        else reason_text.get(item.reason_code or "", "")
-                    )
-                    detail_lines.append(f"- {label}：{detail}".rstrip("："))
+        detail_lines.append(f"{status_titles[status]} {len(items)} 条")
+        for item in items:
+            label = labels[item.lead_id]
+            if status == "incomplete" and item.missing_fields:
+                detail_lines.append(f"- {label}：缺少「{'、'.join(item.missing_fields)}」")
+            else:
+                detail = reason_text.get(item.reason_code or "", "")
+                detail_lines.append(f"- {label}：{detail}".rstrip("："))
     if detail_lines:
         lines.extend(["", "明细：", *detail_lines])
     elif not result.items and result.incomplete_missing_fields:

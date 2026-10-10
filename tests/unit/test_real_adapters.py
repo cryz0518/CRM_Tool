@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -152,6 +153,42 @@ def test_sop_signing_matches_posted_biz_content_and_header_identity() -> None:
         crm_user_id="crm-user",
     )
     assert result.crm_lead_id == "123" and len(requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("action", "lead_id"),
+    [("CREATE", "123"), ("FOLLOW_UP", None)],
+)
+def test_sop_unified_submit_sends_stable_request_id_and_maps_actions(
+    action: str, lead_id: str | None,
+) -> None:
+    """验证统一接口字段、重试稳定 requestId 及两种成功动作的映射。"""
+    posted: list[dict[str, str]] = []
+
+    def record_request(request: httpx.Request, _key: rsa.RSAPrivateKey) -> None:
+        """记录 SOP 表单，便于断言统一 method 与 JSON 业务参数。"""
+        form = parse_qs(request.content.decode())
+        posted.append({name: values[0] for name, values in form.items()})
+
+    data = {"action": action}
+    if lead_id is not None:
+        data["leadId"] = lead_id
+    adapter, _ = _crm({"code": 0, "data": data}, record_request)
+    payload = {"name": "样例公司", "mobile": "13800000000"}
+
+    first = adapter.submit_lead(payload, idempotency_key="lead-key", crm_user_id="crm-user")
+    second = adapter.submit_lead(payload, idempotency_key="lead-key", crm_user_id="crm-user")
+
+    assert first.crm_lead_id == second.crm_lead_id == lead_id
+    assert first.action == second.action == action
+    assert len(posted) == 2
+    bodies = [json.loads(item["biz_content"]) for item in posted]
+    assert all(item["method"] == "crm_submit_lead" for item in posted)
+    assert bodies[0] == bodies[1]
+    assert bodies[0]["name"] == "样例公司"
+    assert bodies[0]["mobile"] == "13800000000"
+    assert bodies[0]["headerId"] == "crm-user"
+    assert bodies[0]["requestId"] == hashlib.sha256(b"lead-key").hexdigest()
 
 
 def test_sop_authorization_header_is_sent_when_configured() -> None:

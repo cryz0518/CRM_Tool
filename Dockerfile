@@ -29,6 +29,7 @@ COPY tests ./tests
 
 # 国内服务器访问 PyPI 不稳定，构建使用镜像源并允许网络超时重试。
 RUN pip install --no-cache-dir --index-url https://mirrors.aliyun.com/pypi/simple \
+    --extra-index-url https://pypi.org/simple \
     --timeout 60 --retries 5 ".[dev]"
 
 # 运行时使用非 root 账号，避免 Worker 以高权限执行任务。

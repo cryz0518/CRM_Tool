@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.crm.adapter import CRMAdapter
+from app.crm.service import SubmissionItemResult
 from app.messaging.models import (
     NotificationRecord,
     SalesAuthorization,
@@ -83,6 +84,13 @@ _ACTION_LEASE = timedelta(minutes=5)
 _ACTION_DEFAULT_EXPIRY = timedelta(minutes=10)
 _MAX_CARD_PAYLOAD_BYTES = 8192
 _MAX_MARKDOWN_BYTES = 4096
+_CRM_SUBMISSION_RESULT_STATUSES = frozenset(
+    {
+        "created", "updated", "followed_up", "unchanged", "incomplete",
+        "duplicate_confirmation", "mapping_missing", "processing", "retrying",
+        "failed_pending_review", "company_identity_review", "not_submitted",
+    }
+)
 # 确认预览仅使用这些字段；固定三组顺序不改变服务端提交快照。
 SUBMISSION_PREVIEW_FIELDS = (
     "业务线",
@@ -1095,14 +1103,17 @@ class WecomActionService:
     ) -> tuple[str, bool] | None:
         """仅根据动作已持久化的逐条结果生成安全的恢复汇总。
 
-        参数：action 为租约过期后锁定的 CRM 批量动作。
+        参数：action 为租约过期后锁定的 CRM 批量或指定线索动作。
         返回值：汇总文本与结果是否覆盖全部冻结选择；无可用结果时返回 None。
         异常：无；非法或越界结果按不可恢复处理。
         副作用：无，不访问 CRM 或智能表格。
         """
-        if action.action_type != ACTION_TYPE_CRM_BATCH_SUBMISSION:
+        if action.action_type == ACTION_TYPE_CRM_BATCH_SUBMISSION:
+            selected = action.context.get("selected_lead_ids")
+        elif action.action_type == ACTION_TYPE_CRM_COMPANY_CONFIRMATION:
+            selected = [action.context.get("selected_lead_id", action.target_id)]
+        else:
             return None
-        selected = action.context.get("selected_lead_ids")
         saved = action.context.get("submission_results")
         if (
             not isinstance(selected, list)
@@ -1112,11 +1123,6 @@ class WecomActionService:
             or not saved
         ):
             return None
-        allowed_statuses = {
-            "created", "updated", "unchanged", "incomplete", "duplicate_confirmation",
-            "mapping_missing", "processing", "retrying", "failed_pending_review",
-            "company_identity_review", "not_submitted",
-        }
         saved_by_lead: dict[str, str] = {}
         for item in saved:
             if (
@@ -1124,24 +1130,29 @@ class WecomActionService:
                 or not isinstance(item.get("lead_id"), str)
                 or item["lead_id"] not in selected
                 or not isinstance(item.get("status"), str)
-                or item["status"] not in allowed_statuses
+                or item["status"] not in _CRM_SUBMISSION_RESULT_STATUSES
                 or item["lead_id"] in saved_by_lead
             ):
                 return None
             saved_by_lead[item["lead_id"]] = item["status"]
         counts = {
             status: sum(saved_status == status for saved_status in saved_by_lead.values())
-            for status in allowed_statuses
+            for status in _CRM_SUBMISSION_RESULT_STATUSES
         }
         complete = len(saved_by_lead) == len(selected)
+        failed_count = (
+            counts["mapping_missing"]
+            + counts["failed_pending_review"]
+            + counts["company_identity_review"]
+        )
         summary = (
             "CRM 提交结果已恢复："
-            f"创建成功 {counts['created']} 条，更新成功 {counts['updated']} 条，"
+            f"新增/更新成功 {counts['created'] + counts['updated']} 条，"
+            f"已存在并跟进 {counts['followed_up']} 条，"
             f"无变化 {counts['unchanged']} 条，待完善 {counts['incomplete']} 条，"
-            f"处理中 {counts['processing']} 条，重试中 {counts['retrying']} 条，"
-            f"未提交 {counts['not_submitted']} 条，需人工处理 "
-            f"{counts['mapping_missing'] + counts['failed_pending_review'] + counts['company_identity_review']} 条，"
-            f"重复待确认 {counts['duplicate_confirmation']} 条；"
+            f"处理中 {counts['processing'] + counts['duplicate_confirmation']} 条，"
+            f"重试中 {counts['retrying']} 条，"
+            f"未提交 {counts['not_submitted']} 条，需人工处理 {failed_count} 条，"
             f"已核实 {len(saved_by_lead)}/{len(selected)} 条。"
         )
         if not complete:
@@ -1194,11 +1205,6 @@ class WecomActionService:
         异常：claim 已失效、结果与冻结选择不一致或结果字段不受控时抛出异常。
         副作用：仅更新 action.context 的结果摘要，不保存客户字段、payload 或异常正文。
         """
-        allowed_statuses = {
-            "created", "updated", "unchanged", "incomplete", "duplicate_confirmation",
-            "mapping_missing", "processing", "retrying", "failed_pending_review",
-            "company_identity_review", "not_submitted",
-        }
         allowed_reasons = {
             "missing_required_fields", "duplicate_confirmation_required",
             "crm_user_mapping_missing", "sync_processing", "crm_create_retrying",
@@ -1208,7 +1214,7 @@ class WecomActionService:
             "crm_duplicate_search_failed", "crm_update_incomplete", "crm_update_retrying",
             "crm_update_failed_pending_review", "company_identity_change_pending_review",
             "crm_enum_mapping_missing", "crm_outcome_unknown", "wecom_smart_table_retryable",
-            "pre_crm_transient_failure",
+            "pre_crm_transient_failure", "crm_followed_up",
         }
         if not items or len(items) > 20:
             raise ValueError("逐条提交结果数量非法")
@@ -1225,7 +1231,7 @@ class WecomActionService:
                 or _ID_PATTERN.fullmatch(lead_id) is None
                 or lead_id in seen
                 or not isinstance(status, str)
-                or status not in allowed_statuses
+                or status not in _CRM_SUBMISSION_RESULT_STATUSES
                 or (
                     reason_code is not None
                     and (
@@ -1286,7 +1292,9 @@ class WecomActionService:
                 if previous is not None and previous != item:
                     raise ValueError("已保存逐条结果不可被覆盖")
                 merged_by_lead[item["lead_id"]] = item
-            merged_items = [merged_by_lead[lead_id] for lead_id in selected if lead_id in merged_by_lead]
+            merged_items = [
+                merged_by_lead[lead_id] for lead_id in selected if lead_id in merged_by_lead
+            ]
             action.context = {
                 **action.context,
                 "selected_lead_ids": list(selected),
@@ -2603,7 +2611,6 @@ class DeterministicWecomActionExecutor:
         from app.crm.service import (
             CrmSubmissionService,
             SubmissionCommand,
-            SubmissionItemResult,
         )
         from app.leads.review import LeadReviewService
 

@@ -191,34 +191,23 @@ def _lead(
 
 
 class RecordingCRMAdapter(MockCRMAdapter):
-    """记录查重与创建 payload，验证 TYC 身份是否越过提交服务边界。"""
+    """记录统一提交 payload，验证 TYC 身份是否越过提交服务边界。"""
 
     def __init__(self) -> None:
-        """初始化空的查重和创建 payload 记录。"""
+        """初始化空的统一提交 payload 记录。"""
         super().__init__()
-        self.search_payloads: list[dict[str, object]] = []
-        self.create_payloads: list[dict[str, object]] = []
+        self.submit_payloads: list[dict[str, object]] = []
 
-    def search_by_company_name(
-        self, payload: Mapping[str, object] | str
-    ) -> tuple[CRMSearchResult, ...]:
-        """记录查重请求后返回空的 CRM 结果。"""
-        if isinstance(payload, str):
-            self.search_payloads.append({"name": payload})
-        else:
-            self.search_payloads.append(dict(payload))
-        return super().search_by_company_name(payload)
-
-    def create_lead(
+    def submit_lead(
         self,
         payload: Mapping[str, object],
         *,
         idempotency_key: str,
         crm_user_id: str,
     ) -> CRMCreateResult:
-        """记录创建请求并复用 Mock 的成功响应。"""
-        self.create_payloads.append(dict(payload))
-        return super().create_lead(
+        """记录统一提交请求并复用 Mock 的成功响应。"""
+        self.submit_payloads.append(dict(payload))
+        return super().submit_lead(
             payload, idempotency_key=idempotency_key, crm_user_id=crm_user_id
         )
 
@@ -239,7 +228,7 @@ def test_create_uses_stable_lead_key_and_current_smart_table_values(
 
     assert first.succeeded == 1
     assert second.succeeded == 0
-    assert crm.search_calls == 1 and crm.calls == 1
+    assert crm.submit_calls == 1 and crm.search_calls == 0 and crm.calls == 1
     assert crm.payloads[0]["name"] == "人工最终公司"
     assert adapter.get_records()[0].fields["提交状态"] == "已提交"
     with session_factory() as session:
@@ -627,6 +616,106 @@ def test_missing_member_display_name_rejects_opaque_owner_id(
     assert result.mapping_missing == 1
     assert crm.search_calls == 0
     assert crm.calls == 0
+
+
+def test_unified_follow_up_is_reported_as_existing_lead_followed_up(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证 CRM 查重命中后的 FOLLOW_UP 作为跟进成功通知，不误报为创建。"""
+
+    class FollowUpCRM(MockCRMAdapter):
+        def submit_lead(
+            self,
+            payload: Mapping[str, object],
+            *,
+            idempotency_key: str,
+            crm_user_id: str,
+        ) -> CRMCreateResult:
+            """记录一次统一提交并模拟 CRM 查重后完成跟进。"""
+            self.submit_calls += 1
+            self.submit_payloads.append(dict(payload))
+            return CRMCreateResult(
+                None, None, "CRM submit FOLLOW_UP succeeded", action="FOLLOW_UP"
+            )
+
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    crm = FollowUpCRM()
+    result = submit_today_via_selection(
+        CrmSubmissionService(session_factory, adapter, crm), "sales-1", "follow-up-message"
+    )
+
+    assert result.succeeded == 0 and result.followed_up == 1
+    assert result.items[0].status is SubmissionItemStatus.FOLLOWED_UP
+    assert result.items[0].reason_code == "crm_followed_up"
+    assert crm.submit_calls == 1 and crm.calls == 0
+    reply = format_submission_reply(
+        result, lead_labels={lead_id: "测试公司｜张工"}, selected_count=1
+    )
+    assert "CRM 已存在并跟进 1 条" in reply
+    assert "测试公司｜张工：CRM 中已存在该线索，已进行跟进" in reply
+    assert "创建成功" not in reply
+
+    with session_factory() as session:
+        sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
+        audit = session.scalar(
+            select(BusinessAuditEvent).where(
+                BusinessAuditEvent.event_type == "crm_follow_up_succeeded"
+            )
+        )
+    assert sync is not None and "FOLLOW_UP" in (sync.response_summary or "")
+    assert sync.crm_lead_id is None
+    sync.response_summary = "CRM submit succeeded"
+    assert CrmSubmissionService._completed_sync_outcome(sync) == "followed_up"
+    assert audit is not None
+
+
+def test_my_updates_follow_up_is_reported_as_existing_lead_followed_up(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证“提交我的更新”收到 FOLLOW_UP 时也使用统一跟进状态和说明。"""
+
+    class CreateThenFollowUpCRM(MockCRMAdapter):
+        def submit_lead(
+            self,
+            payload: Mapping[str, object],
+            *,
+            idempotency_key: str,
+            crm_user_id: str,
+        ) -> CRMCreateResult:
+            """首次模拟创建，后续更新模拟 CRM 命中已有线索并完成跟进。"""
+            if self.submit_calls == 0:
+                return super().submit_lead(
+                    payload, idempotency_key=idempotency_key, crm_user_id=crm_user_id
+                )
+            self.submit_calls += 1
+            self.submit_payloads.append(dict(payload))
+            return CRMCreateResult(
+                None, None, "CRM submit FOLLOW_UP succeeded", action="FOLLOW_UP"
+            )
+
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    crm = CreateThenFollowUpCRM()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    created = service.submit(
+        SubmissionCommand("提交指定线索", "sales-1", "initial", target_lead_id=lead_id)
+    )
+    assert created.succeeded == 1
+
+    record = adapter.get_records()[0]
+    adapter.update_record(record.record_id, {"手机": "13900000000"})
+    result = service.submit(SubmissionCommand("提交我的更新", "sales-1", "update-follow-up"))
+
+    assert result.updated == 0 and result.followed_up == 1
+    assert result.items[0].status is SubmissionItemStatus.FOLLOWED_UP
+    assert result.items[0].reason_code == "crm_followed_up"
+    reply = format_submission_reply(
+        result, lead_labels={lead_id: "测试公司｜张工"}, selected_count=1
+    )
+    assert "CRM 已存在并跟进 1 条" in reply
+    assert "测试公司｜张工：CRM 中已存在该线索，已进行跟进" in reply
+    assert "创建成功" not in reply
 
 
 @pytest.mark.parametrize(
@@ -1038,8 +1127,7 @@ def test_tyc_unique_identity_is_sent_to_crm(
     )
 
     assert result.succeeded == 1
-    assert crm.search_payloads[0]["tycCustomerId"] == "tyc-verified"
-    assert crm.create_payloads[0]["tycCustomerId"] == "tyc-verified"
+    assert crm.submit_payloads[0]["tycCustomerId"] == "tyc-verified"
 
 
 def test_tyc_ambiguous_candidate_id_never_enters_crm(
@@ -1062,8 +1150,7 @@ def test_tyc_ambiguous_candidate_id_never_enters_crm(
     )
 
     assert result.succeeded == 1
-    assert "tycCustomerId" not in crm.search_payloads[0]
-    assert "tycCustomerId" not in crm.create_payloads[0]
+    assert "tycCustomerId" not in crm.submit_payloads[0]
 
 
 def test_salesperson_company_name_edit_drops_old_tyc_candidate_id(
@@ -1089,8 +1176,7 @@ def test_salesperson_company_name_edit_drops_old_tyc_candidate_id(
     )
 
     assert result.succeeded == 1
-    assert "tycCustomerId" not in crm.search_payloads[0]
-    assert "tycCustomerId" not in crm.create_payloads[0]
+    assert "tycCustomerId" not in crm.submit_payloads[0]
 
 
 def test_targeted_company_submission_reuses_service_for_one_lead(
@@ -3139,9 +3225,9 @@ def test_submission_reply_is_count_only_and_includes_update_categories() -> None
         )
     )
 
-    assert "创建成功 1 条" in create_reply and "更新成功 0 条" in create_reply
+    assert "CRM 新增/更新成功 1 条" in create_reply
     assert "手机号" not in create_reply and "payload" not in create_reply.lower()
-    assert "更新成功 1 条" in update_reply and "无变化 2 条" in update_reply
+    assert "CRM 新增/更新成功 1 条" in update_reply and "无变化 2 条" in update_reply
     assert "缺少必填字段：业务线、手机" in incomplete_reply
 
 
@@ -3153,8 +3239,12 @@ def test_update_item_results_are_operation_aware() -> None:
     unchanged = _append_update_result(SubmissionBatchResult(), "lead-same", "unchanged")
     incomplete = _append_update_result(SubmissionBatchResult(), "lead-incomplete", "incomplete")
     retrying = _append_update_result(SubmissionBatchResult(), "lead-retry", "retrying")
+    followed_up = _append_update_result(SubmissionBatchResult(), "lead-existing", "followed_up")
 
     assert succeeded.items[0].status is SubmissionItemStatus.UPDATED
+    assert followed_up.items[0].status is SubmissionItemStatus.FOLLOWED_UP
+    assert followed_up.items[0].reason_code == "crm_followed_up"
+    assert followed_up.followed_up == 1
     assert unchanged.items[0].status is SubmissionItemStatus.UNCHANGED
     assert incomplete.items[0].status is SubmissionItemStatus.INCOMPLETE
     assert incomplete.incomplete == 1
