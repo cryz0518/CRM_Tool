@@ -1191,6 +1191,7 @@ def format_submission_reply(
         + result.company_identity_review
     )
     success_count = result.succeeded + result.updated
+    completed_count = success_count + result.followed_up
     processing_count = result.processing + sum(
         getattr(item.status, "value", str(item.status)) == "duplicate_confirmation"
         for item in result.items
@@ -1198,7 +1199,8 @@ def format_submission_reply(
     lines = [
         title,
         "",
-        f"✅ CRM 提交成功 {success_count} 条",
+        f"✅ CRM 新增/更新成功 {success_count} 条",
+        f"🔁 CRM 已存在并跟进 {result.followed_up} 条",
         f"✅ 无变化 {result.unchanged} 条",
         f"⚠️ 待完善 {result.incomplete} 条",
         f"⏳ 处理中 {processing_count} 条",
@@ -1207,7 +1209,8 @@ def format_submission_reply(
         f"需人工处理 {failed_count} 条",
         "",
         (
-            f"汇总：提交成功 {success_count}｜"
+            f"汇总：提交完成 {completed_count}｜新增/更新成功 {success_count}｜"
+            f"已存在并跟进 {result.followed_up}｜"
             f"待完善 {result.incomplete}｜处理中 {processing_count}｜"
             f"未提交 {result.not_submitted}｜失败 {failed_count}"
         ),
@@ -1216,6 +1219,7 @@ def format_submission_reply(
     status_titles = {
         "unchanged": "✅ 无变化",
         "incomplete": "⚠️ 待完善",
+        "followed_up": "🔁 已存在并跟进",
         "processing": "⏳ 处理中",
         "retrying": "🔄 重试中",
         "duplicate_confirmation": "⏳ 处理中",
@@ -1236,6 +1240,7 @@ def format_submission_reply(
         "pre_crm_transient_failure": "提交前依赖暂时不可用，本次未发起 CRM 提交，请稍后重新提交",
         "crm_create_retrying": "CRM 提交暂时失败，系统将自动重试",
         "crm_create_failed_pending_review": "CRM 提交失败，需要人工处理",
+        "crm_followed_up": "CRM 中已存在该线索，已进行跟进",
         "crm_update_retrying": "CRM 提交暂时失败，系统将自动重试",
         "crm_update_failed_pending_review": "CRM 提交失败，需要人工处理",
         "crm_update_incomplete": "CRM 提交前校验未通过，请检查当前线索信息",
@@ -1250,11 +1255,12 @@ def format_submission_reply(
         and item.lead_id in labels
     ]
     if successful_items:
-        detail_lines.append(f"✅ CRM 提交成功 {len(successful_items)} 条")
+        detail_lines.append(f"✅ CRM 新增/更新成功 {len(successful_items)} 条")
         detail_lines.extend(f"- {labels[item.lead_id]}" for item in successful_items)
     grouped_statuses = (
         "unchanged",
         "incomplete",
+        "followed_up",
         "duplicate_confirmation",
         "mapping_missing",
         "processing",

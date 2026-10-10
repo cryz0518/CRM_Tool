@@ -84,6 +84,7 @@ class SubmissionItemStatus(StrEnum):
 
     CREATED = "created"
     UPDATED = "updated"
+    FOLLOWED_UP = "followed_up"
     UNCHANGED = "unchanged"
     INCOMPLETE = "incomplete"
     DUPLICATE_CONFIRMATION = "duplicate_confirmation"
@@ -129,6 +130,7 @@ class SubmissionBatchResult:
     duplicate_confirmations: tuple["DuplicateSubmission", ...] = ()
     items: tuple[SubmissionItemResult, ...] = ()
     not_submitted: int = 0
+    followed_up: int = 0
 
 
 @dataclass(frozen=True)
@@ -196,10 +198,12 @@ _CREATE_REASON_CODES = {
     "retrying": "crm_create_retrying",
     "failed_pending_review": "crm_create_failed_pending_review",
     "not_submitted": "candidate_state_changed",
+    "followed_up": "crm_followed_up",
 }
 _ITEM_STATUS_BY_OUTCOME = {
     "succeeded": SubmissionItemStatus.CREATED,
     "updated": SubmissionItemStatus.UPDATED,
+    "followed_up": SubmissionItemStatus.FOLLOWED_UP,
     "unchanged": SubmissionItemStatus.UNCHANGED,
     "incomplete": SubmissionItemStatus.INCOMPLETE,
     "duplicate_confirmation": SubmissionItemStatus.DUPLICATE_CONFIRMATION,
@@ -274,6 +278,7 @@ def _append_create_result(
     return replace(
         result,
         succeeded=result.succeeded + (outcome.status == "succeeded"),
+        followed_up=result.followed_up + (outcome.status == "followed_up"),
         incomplete=result.incomplete + (outcome.status == "incomplete"),
         incomplete_missing_fields=_merge_missing_fields(
             result.incomplete_missing_fields, outcome.missing_fields
@@ -313,6 +318,7 @@ def _append_update_result(
 
     item_status = {
         "succeeded": SubmissionItemStatus.UPDATED,
+        "followed_up": SubmissionItemStatus.FOLLOWED_UP,
         "unchanged": SubmissionItemStatus.UNCHANGED,
         "incomplete": SubmissionItemStatus.INCOMPLETE,
         "enum_mapping_missing": SubmissionItemStatus.INCOMPLETE,
@@ -334,6 +340,7 @@ def _append_update_result(
         processing=result.processing + (status == "processing"),
         failed_pending_review=result.failed_pending_review + (status == "failed_pending_review"),
         updated=result.updated + (status == "succeeded"),
+        followed_up=result.followed_up + (status == "followed_up"),
         unchanged=result.unchanged + (status == "unchanged"),
         company_identity_review=result.company_identity_review
         + (status == "company_identity_review"),
@@ -1328,7 +1335,7 @@ class CrmSubmissionService:
                     sync.status == "failed_pending_review"
                     and sync.failure_category == "unknown"
                 ):
-                    return sync.status
+                    return self._completed_sync_outcome(sync)
             is_unknown_outcome_recovery = lease_expired or (
                 sync.status == "failed_pending_review" and sync.failure_category == "unknown"
             )
@@ -1411,7 +1418,7 @@ class CrmSubmissionService:
                 return "failed_pending_review"
             if not self._claim_is_current(sync, claim_started_at, claim_attempts):
                 # 租约接管者已经提交了新事实；旧 worker 的迟到结果绝不能回写覆盖它。
-                return sync.status
+                return self._completed_sync_outcome(sync)
             sync.status = "succeeded"
             sync.processing_started_at = None
             sync.processing_lease_expires_at = None
@@ -1472,9 +1479,12 @@ class CrmSubmissionService:
                         "discard_request_id": discard_request.id,
                     },
                 )
-            self._record_audit_for_sync(
-                session, sync, sales_user_id, f"crm_{sync.operation}_succeeded"
+            event_type = (
+                "crm_follow_up_succeeded"
+                if crm_result.action == "FOLLOW_UP"
+                else f"crm_{sync.operation}_succeeded"
             )
+            self._record_audit_for_sync(session, sync, sales_user_id, event_type)
         if completed_lead_id is not None:
             try:
                 # CRM 成功事实已提交后再更新审核表状态，避免远端成功被表格慢调用锁住。
@@ -1489,7 +1499,17 @@ class CrmSubmissionService:
                         "error_type": type(error).__name__,
                     },
                 )
-        return "succeeded"
+        return "followed_up" if crm_result.action == "FOLLOW_UP" else "succeeded"
+
+    @staticmethod
+    def _completed_sync_outcome(sync: CrmSyncRecord) -> str:
+        """将已完成同步记录中的 CRM 动作恢复为可展示的结果状态。"""
+        if sync.status == "succeeded" and (
+            "FOLLOW_UP" in (sync.response_summary or "")
+            or (sync.operation == "create" and sync.crm_lead_id is None)
+        ):
+            return "followed_up"
+        return sync.status
 
     def _set_smart_table_submission_status(self, lead_id: str, status: str) -> None:
         """把 CRM 提交结果增量写入智能表格的提交状态列。

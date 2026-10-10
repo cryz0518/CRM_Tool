@@ -180,6 +180,7 @@ def test_sop_unified_submit_sends_stable_request_id_and_maps_actions(
     second = adapter.submit_lead(payload, idempotency_key="lead-key", crm_user_id="crm-user")
 
     assert first.crm_lead_id == second.crm_lead_id == lead_id
+    assert first.action == second.action == action
     assert len(posted) == 2
     bodies = [json.loads(item["biz_content"]) for item in posted]
     assert all(item["method"] == "crm_submit_lead" for item in posted)

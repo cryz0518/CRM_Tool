@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Protocol
+from typing import Literal, Mapping, Protocol
 
 
 @dataclass(frozen=True)
@@ -13,6 +13,7 @@ class CRMCreateResult:
     crm_lead_id: str | None
     crm_lead_owner_user_id: str | None
     response_summary: str
+    action: Literal["CREATE", "FOLLOW_UP"] = "CREATE"
 
 
 @dataclass(frozen=True)

@@ -201,9 +201,13 @@ class SopCRMAdapter:
                 raise SopCRMError(
                     "CRM submit response missing lead id", category="malformed_response"
                 )
-            return CRMCreateResult(str(lead_id), crm_user_id, "CRM submit succeeded")
+            return CRMCreateResult(
+                str(lead_id), crm_user_id, "CRM submit CREATE succeeded", action="CREATE"
+            )
         if action == "FOLLOW_UP":
-            return CRMCreateResult(None, None, "CRM submit succeeded")
+            return CRMCreateResult(
+                None, None, "CRM submit FOLLOW_UP succeeded", action="FOLLOW_UP"
+            )
         raise SopCRMError("CRM submit response missing action", category="malformed_response")
 
     def _call(self, method: str, biz_content: Mapping[str, object]) -> Mapping[str, object]:
