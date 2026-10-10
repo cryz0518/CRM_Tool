@@ -3461,9 +3461,11 @@ class FirstTextLeadWorkspaceService:
         business_details = [
             value
             for key, value in (*patch.enrichment.items(), *patch.analysis.enrichment.items())
-            if key not in {"城市/地区", "客户行业"} and isinstance(value, str) and value.strip()
+            if key not in {"城市/地区", "客户行业", "主营产品"}
+            and isinstance(value, str)
+            and value.strip()
         ]
-        # 城市和行业可以合法出现在公司名中；只用联系人及需求等独立事实拦截拼接候选。
+        # 城市、行业和主营产品词可属于公司名；联系人及需求等仍用于拦截拼接候选。
         # shortcut: 当前保留 4 字重叠差量校验，模型提供来源跨度后升级为跨度校验。
         company_candidates = [fields.get("线索名称"), crm_fields.get("线索名称")]
         if source_company is not None:
