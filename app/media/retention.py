@@ -753,12 +753,25 @@ class StorageIngestRecoveryService:
             )
             if result.rowcount != 1:
                 return False
-            attachment.processing_status = "pending"
+            # 来源消息已因等待超时结束时，迟到上传不得静默重开 OCR 或回放后续消息。
+            terminal = attachment.processing_status == "failed_pending_review"
+            if not terminal:
+                attachment.processing_status = "pending"
             attachment.storage_etag = getattr(stored, "etag", None)
             attachment.storage_encryption_mode = getattr(stored, "encryption_mode", None)
-            session.add(
-                MediaProcessingTask(attachment_id=attachment.id, task_type=attachment.media_kind)
+            task = session.scalar(
+                select(MediaProcessingTask).where(
+                    MediaProcessingTask.attachment_id == attachment.id
+                )
             )
+            if task is None:
+                session.add(
+                    MediaProcessingTask(
+                        attachment_id=attachment.id,
+                        task_type=attachment.media_kind,
+                        status="failed_pending_review" if terminal else "pending",
+                    )
+                )
             logger.info(
                 "media_ingest_completed",
                 extra={

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import uuid4
 
@@ -47,7 +47,8 @@ SCAN_TRANSITIONS = {
     "clean": {"infected", "quarantined"},
     "infected": set(),
     "quarantined": set(),
-    "not_required": set(),
+    # 豁免不是安全扫描通过，仍可由受控扫描或隔离动作收回处理资格。
+    "not_required": {"scanning", "infected", "quarantined"},
 }
 
 
@@ -154,8 +155,15 @@ class MediaAttachmentService:
         *,
         timeout_seconds: float = 20.0,
         retention_policy: RetentionPolicy | None = None,
+        allow_scan_exemption: bool = False,
+        pending_timeout_seconds: float = 300.0,
     ) -> None:
-        """保存所有可替换边界，构造时不读写数据库或媒体。"""
+        """保存媒体边界与显式扫描策略，构造时不读写数据库或媒体。
+
+        参数：session_factory 和 providers 为基础依赖；allow_scan_exemption 只由已核验的
+        环境策略授予，默认禁止；pending_timeout_seconds 为下载/扫描/存储等待期限。
+        返回值：无。异常：参数类型不合法时由 Python 传播。副作用：无外部调用。
+        """
         self._session_factory = session_factory
         self._validator = validator
         self._storage = storage
@@ -164,6 +172,11 @@ class MediaAttachmentService:
         self._asr_provider = asr_provider
         self._timeout_seconds = timeout_seconds
         self._retention_policy = retention_policy
+        # 豁免必须由组装层的环境策略显式授予；直接构造服务默认 fail closed。
+        self._processable_scan_statuses = (
+            {"clean", "not_required"} if allow_scan_exemption else {"clean"}
+        )
+        self._pending_timeout = timedelta(seconds=pending_timeout_seconds)
         self._ingest_recovery = StorageIngestRecoveryService(session_factory)
 
     def ingest(
@@ -265,18 +278,107 @@ class MediaAttachmentService:
         return attachment_id
 
     def process_pending_for_message(self, message_id: str) -> None:
-        """处理来源消息的待执行附件，并将成功文本追加到标准化消息。"""
+        """处理待执行附件；扫描/存储等待超时转可恢复终态，成功文本追加到来源消息。
+
+        参数：message_id 为来源消息；返回无；数据库异常传播。
+        副作用：更新独立媒体任务和安全通知，不重放历史线索或越过安全扫描。
+        """
         with self._session_factory() as session:
             attachments = session.scalars(
                 select(MessageAttachment).where(
                     MessageAttachment.message_id == message_id,
-                    MessageAttachment.processing_status == "pending",
-                    MessageAttachment.scan_status == "clean",
-                    MessageAttachment.deletion_status == "active",
+                    MessageAttachment.processing_status.in_(
+                        ("pending", "pending_upload", "processing")
+                    ),
                 )
             ).all()
+            # 各阶段使用自己的时间边界；历史附件创建时间不代表新扫描或新识别开始。
+            tasks = {
+                task.attachment_id: task for task in session.scalars(
+                    select(MediaProcessingTask).where(
+                        MediaProcessingTask.attachment_id.in_([item.id for item in attachments])
+                    )
+                )
+            }
+            uploads = {
+                operation.attachment_id: operation for operation in session.scalars(
+                    select(StorageIngestOperation).where(
+                        StorageIngestOperation.attachment_id.in_([item.id for item in attachments])
+                    )
+                )
+            }
+            message = session.get(IncomingMessage, message_id)
+            has_attachment = (
+                session.scalar(
+                    select(MessageAttachment.id).where(MessageAttachment.message_id == message_id)
+                )
+                is not None
+            )
+        if (
+            not has_attachment
+            and message is not None
+            and message.requires_media_enrichment
+            and self._wait_expired(message.received_at)
+        ):
+            # Bot 下载前失联也必须结束首次等待检查点，允许同销售后续消息继续。
+            body = message.raw_payload.get("body")
+            media_kind = (
+                "audio" if isinstance(body, dict) and body.get("msgtype") == "voice" else "image"
+            )
+            self._record_ingest_failure(
+                message_id,
+                media_kind,
+                None,
+                MediaValidationError("media_download_failed"),
+            )
         for attachment in attachments:
+            # 尚在异步扫描/上传时保留有限等待；失败或被策略拒绝时立即收敛。
+            if attachment.processing_status == "processing":
+                # 已在识别的工件不能并发再次调用；失联超过期限后收敛为人工检查点。
+                task = tasks.get(attachment.id)
+                # 识别阶段从任务登记或本轮扫描放行后开始，外部识别仍受 provider 超时限制。
+                started_at = max(
+                    value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+                    for value in (
+                        task.created_at if task is not None else attachment.created_at,
+                        attachment.scan_completed_at or attachment.created_at,
+                    )
+                )
+                if self._wait_expired(started_at):
+                    self._record_processing_failure(attachment.id, "media_processing_timeout")
+                continue
+            if attachment.deletion_status != "active":
+                self._record_processing_failure(attachment.id, "media_quarantined")
+                continue
+            if attachment.scan_status not in self._processable_scan_statuses:
+                if attachment.scan_status in {"pending", "pending_scan", "scanning"}:
+                    if not self._wait_expired(attachment.scan_started_at or attachment.created_at):
+                        continue
+                    reason = "media_scan_timeout"
+                else:
+                    reason = "media_scan_not_permitted"
+                self._record_processing_failure(attachment.id, reason)
+                continue
+            if attachment.processing_status == "pending_upload":
+                upload = uploads.get(attachment.id)
+                # 上传不借用扫描时钟；未知远端上传继续按原冻结 intent 有限等待。
+                started_at = (
+                    upload.remote_started_at or upload.created_at
+                    if upload is not None else attachment.created_at
+                )
+                if self._wait_expired(started_at):
+                    self._record_processing_failure(attachment.id, "media_upload_timeout")
+                continue
+            if attachment.storage_key is None or attachment.detected_mime_type is None:
+                self._record_processing_failure(attachment.id, "storage_metadata_invalid")
+                continue
             self._process_attachment(attachment.id)
+
+    def _wait_expired(self, started_at: datetime) -> bool:
+        """检查媒体等待是否超过配置期限；参数为数据库时间，返回布尔值，无副作用或异常。"""
+        # SQLite 可能返回无时区时间，业务统一按 UTC 比较。
+        value = started_at if started_at.tzinfo is not None else started_at.replace(tzinfo=UTC)
+        return utc_now() - value >= self._pending_timeout
 
     def apply_scan_result(self, attachment_id: str, scan_status: str) -> None:
         """应用异步扫描终态，只有 clean 才重新打开 OCR/ASR 下游任务。"""
@@ -286,31 +388,73 @@ class MediaAttachmentService:
             attachment = session.get(MessageAttachment, attachment_id)
             if attachment is None:
                 raise ValueError("attachment_not_found")
+            if (
+                scan_status == "clean" and attachment.scan_status == "scan_failed"
+                and attachment.error_summary == "media_scan_timeout"
+            ):
+                # 超时已形成恢复检查点；迟到成功不能替代新一轮显式扫描或重放来源。
+                logger.info("media_scan_late_result_ignored", extra={"media_id": attachment_id})
+                return
             if scan_status not in SCAN_TRANSITIONS.get(attachment.scan_status, set()):
                 raise ValueError("scan_transition_invalid")
+            # 即使轮询尚未收敛，超过本轮扫描期限的成功回调也不能放行 OCR。
+            scan_timed_out = (
+                scan_status == "clean" and attachment.scan_status == "scanning"
+                and self._wait_expired(attachment.scan_started_at or attachment.created_at)
+            )
+            if scan_timed_out:
+                scan_status = "scan_failed"
             attachment.scan_status = scan_status
             transition_time = utc_now()
             if scan_status == "scanning":
                 attachment.scan_started_at = transition_time
                 attachment.scan_completed_at = None
+                if attachment.processing_status != "succeeded":
+                    upload = (
+                        session.get(StorageIngestOperation, attachment.ingest_operation_id)
+                        if attachment.ingest_operation_id is not None else None
+                    )
+                    attachment.processing_status = (
+                        "pending_upload" if upload is not None and upload.status != "succeeded"
+                        else "pending"
+                    )
+                    attachment.error_summary = None
+                    attachment.completed_at = None
             else:
                 attachment.scan_completed_at = transition_time
             if scan_status in {"infected", "quarantined"}:
                 attachment.deletion_status = "quarantined"
                 attachment.quarantined_at = utc_now()
                 attachment.processing_status = "failed_pending_review"
+                attachment.error_summary = "media_infected"
+                attachment.completed_at = transition_time
             elif scan_status == "scan_failed":
                 attachment.processing_status = "failed_pending_review"
-            elif scan_status == "clean":
-                attachment.processing_status = "pending"
+                attachment.error_summary = (
+                    "media_scan_timeout" if scan_timed_out else "media_scan_failed"
+                )
+                attachment.completed_at = transition_time
+            elif scan_status == "clean" and attachment.processing_status not in {
+                "failed_pending_review", "succeeded",
+            }:
+                # clean 放行识别，但不能跳过仍未完成的上传。
+                if attachment.processing_status != "pending_upload":
+                    attachment.processing_status = "pending"
+                attachment.error_summary = None
+                attachment.completed_at = None
             task = session.scalar(
                 select(MediaProcessingTask).where(
                     MediaProcessingTask.attachment_id == attachment_id
                 )
             )
-            if task is not None and scan_status != "clean":
-                task.status = "failed_pending_review"
-                task.completed_at = utc_now()
+            if task is not None:
+                # 扫描等待不是失败终态；仅同步媒体任务，绝不修改已结束的来源 Outbox。
+                task.status = (
+                    "pending" if attachment.processing_status == "pending_upload"
+                    else attachment.processing_status
+                )
+                task.error_summary = attachment.error_summary
+                task.completed_at = attachment.completed_at
             self._audit(session, attachment.message_id, f"media_scan_{scan_status}")
             logger.info(
                 "media_scan_transition",
@@ -334,8 +478,9 @@ class MediaAttachmentService:
                 attachment is None
                 or attachment.storage_key is None
                 or attachment.detected_mime_type is None
-                or attachment.scan_status != "clean"
+                or attachment.scan_status not in self._processable_scan_statuses
                 or attachment.deletion_status != "active"
+                or attachment.processing_status != "pending"
             ):
                 return
             # 对象读取前再次确认，避免 retention 或 scanner 在上一次读取后改变状态。
@@ -344,7 +489,18 @@ class MediaAttachmentService:
             try:
                 # 存储读取失败也必须停留在该附件任务内，不能阻断来源消息的后续消费。
                 content = self._storage.get(attachment.storage_key)
-            except (OSError, ValueError):
+                # 上传后再次核对真实 MIME、大小及冻结摘要，存储被篡改时禁止模型读取。
+                validated = self._validator.validate(
+                    content,
+                    declared_mime_type=attachment.detected_mime_type,
+                    media_kind=attachment.media_kind,
+                )
+                if (
+                    validated.sha256 != attachment.sha256
+                    or validated.size_bytes != attachment.size_bytes
+                ):
+                    raise MediaValidationError("storage_integrity_failed")
+            except (OSError, ValueError, RuntimeError):
                 self._record_processing_failure(attachment_id, "storage_read_failed")
                 return
             media_kind = attachment.media_kind
@@ -370,7 +526,11 @@ class MediaAttachmentService:
             if attachment is None:
                 return
             # 外部识别返回后仍需确认，禁止将已隔离内容写入正文或标记成功。
-            if attachment.scan_status != "clean" or attachment.deletion_status != "active":
+            if (
+                attachment.scan_status not in self._processable_scan_statuses
+                or attachment.deletion_status != "active"
+                or attachment.processing_status != "pending"
+            ):
                 return
             task = session.scalar(
                 select(MediaProcessingTask).where(
@@ -398,8 +558,9 @@ class MediaAttachmentService:
             attachment = session.get(MessageAttachment, attachment_id)
             return bool(
                 attachment is not None
-                and attachment.scan_status == "clean"
+                and attachment.scan_status in self._processable_scan_statuses
                 and attachment.deletion_status == "active"
+                and attachment.processing_status == "pending"
             )
 
     def _record_ingest_failure(
@@ -473,10 +634,18 @@ class MediaAttachmentService:
                 )
             )
             if task is None:
-                return
+                # 上传尚未完成时同样保留可观察终态，不依赖成功上传后才创建的 task。
+                task = MediaProcessingTask(
+                    attachment_id=attachment_id, task_type=attachment.media_kind, attempts=0
+                )
+                session.add(task)
             attachment.processing_status = "failed_pending_review"
             attachment.error_summary = summary
             attachment.completed_at = utc_now()
+            if summary == "media_scan_timeout":
+                # 扫描超时有独立终态，下一轮扫描必须显式从 scan_failed 开始。
+                attachment.scan_status = "scan_failed"
+                attachment.scan_completed_at = attachment.completed_at
             task.status = "failed_pending_review"
             task.attempts += 1
             task.error_summary = summary

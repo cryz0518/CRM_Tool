@@ -61,11 +61,8 @@ class DailyUnsubmittedLeadReminderService:
                         Lead.smart_table_owner_user_id == SalesAuthorization.wecom_user_id,
                     )
                     .where(
-                        SalesAuthorization.is_authorized.is_(True),
                         SalesAuthorization.is_active.is_(True),
                         SalesAuthorization.is_administrator.is_(False),
-                        SalesAuthorization.crm_user_id.is_not(None),
-                        func.trim(SalesAuthorization.crm_user_id) != "",
                         Lead.lifecycle_state.in_(_UNSUBMITTED_LEAD_STATES),
                     )
                     .distinct()
@@ -116,6 +113,7 @@ class DailyUnsubmittedLeadReminderService:
                             .on_conflict_do_nothing(
                                 index_elements=[NotificationRecord.notification_key]
                             )
+                            .returning(NotificationRecord.notification_key)
                         ),
                     )
                 elif dialect == "sqlite":
@@ -127,6 +125,7 @@ class DailyUnsubmittedLeadReminderService:
                             .on_conflict_do_nothing(
                                 index_elements=[NotificationRecord.notification_key]
                             )
+                            .returning(NotificationRecord.notification_key)
                         ),
                     )
                 else:
@@ -136,7 +135,8 @@ class DailyUnsubmittedLeadReminderService:
                     session.add(NotificationRecord(**values))
                     created += 1
                     continue
-                if result.rowcount == 1:
+                # psycopg 的 INSERT rowcount 可能为 -1；用 RETURNING 判断本次真正创建的提醒。
+                if result.scalar_one_or_none() is not None:
                     created += 1
                     logger.info(
                         "daily_unsubmitted_lead_reminder_queued",
@@ -184,20 +184,18 @@ def daily_reminder_is_current(
 
 
 def _eligible_sales(authorization: SalesAuthorization | None) -> bool:
-    """判定提醒收件人已授权、启用、非管理员且已有 CRM 映射。
+    """判定提醒收件人已登记、启用且非管理员。
 
     参数：authorization 为数据库销售目录记录，缺失时为 None。
     返回值：符合提醒资格时返回 True。
     异常：无。
-    副作用：无；提醒遵循 AGENTS.md 销售授权目录的显式授权要求。
+    副作用：无；遵循 PR #74，历史 is_authorized 字段不作为业务门槛。
     """
     return bool(
         authorization is not None
-        and authorization.is_authorized
         and authorization.is_active
         and not authorization.is_administrator
-        and authorization.crm_user_id
-        and authorization.crm_user_id.strip()
+        # 提醒不执行 CRM 写入；提交身份仍由提交服务按当前员工目录独立校验。
     )
 
 

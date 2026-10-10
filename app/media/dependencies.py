@@ -115,4 +115,8 @@ def get_media_attachment_service(
         asr,
         timeout_seconds=settings.media_processing_timeout_seconds,
         retention_policy=retention_policy,
+        allow_scan_exemption=(
+            not policy.is_production and settings.media_scanner_provider == "noop"
+        ),
+        pending_timeout_seconds=settings.lead_processing_timeout_seconds,
     )
