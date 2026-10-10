@@ -1,4 +1,4 @@
-"""CRM 首次创建的最小稳定适配器契约。"""
+"""CRM 统一线索提交的适配器契约。"""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ from typing import Mapping, Protocol
 
 @dataclass(frozen=True)
 class CRMCreateResult:
-    """描述 CRM 成功创建后返回的最小身份事实。"""
+    """描述 CRM 统一提交成功后的返回事实。"""
 
-    crm_lead_id: str
+    crm_lead_id: str | None
     crm_lead_owner_user_id: str | None
     response_summary: str
 
@@ -25,27 +25,17 @@ class CRMSearchResult:
 
 
 class CRMAdapter(Protocol):
-    """隔离 CRM 查重、创建和更新动作。"""
+    """隔离 CRM 线索提交接口。"""
 
-    def search_by_company_name(
-        self, payload: Mapping[str, object] | str
-    ) -> tuple[CRMSearchResult, ...]:
-        """按 canonical payload 的 name、businessLine 和可选天眼查标识查重。"""
-        ...
-
-    def create_lead(
+    def submit_lead(
         self, payload: Mapping[str, object], *, idempotency_key: str, crm_user_id: str
     ) -> CRMCreateResult:
-        """以冻结的提交人 CRM 身份创建线索，并由实现再次校验最低条件。"""
-        ...
+        """向 CRM 统一线索接口提交字段，由 CRM 决定创建或生成跟进。
 
-    def update_lead(
-        self,
-        crm_lead_id: str,
-        payload: Mapping[str, object],
-        *,
-        idempotency_key: str,
-        crm_user_id: str,
-    ) -> CRMCreateResult:
-        """以冻结提交身份更新既有 CRM 线索，且不得改变其负责人。"""
+        参数：payload 为已校验的 CRM 字段；idempotency_key 用于远端幂等；
+        crm_user_id 为映射后的提交人。
+        返回值：CRM 返回的新线索身份；仅生成跟进时身份字段可以为空。
+        异常：接口或响应无法确认成功时抛出适配器异常。
+        副作用：向 CRM 发起一次统一提交请求。
+        """
         ...

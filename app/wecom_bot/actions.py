@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.crm.adapter import CRMAdapter
+from app.crm.service import SubmissionItemResult
 from app.messaging.models import (
     NotificationRecord,
     SalesAuthorization,
@@ -1134,14 +1135,18 @@ class WecomActionService:
             for status in allowed_statuses
         }
         complete = len(saved_by_lead) == len(selected)
+        failed_count = (
+            counts["mapping_missing"]
+            + counts["failed_pending_review"]
+            + counts["company_identity_review"]
+        )
         summary = (
             "CRM 提交结果已恢复："
-            f"创建成功 {counts['created']} 条，更新成功 {counts['updated']} 条，"
+            f"提交成功 {counts['created'] + counts['updated']} 条，"
             f"无变化 {counts['unchanged']} 条，待完善 {counts['incomplete']} 条，"
-            f"处理中 {counts['processing']} 条，重试中 {counts['retrying']} 条，"
-            f"未提交 {counts['not_submitted']} 条，需人工处理 "
-            f"{counts['mapping_missing'] + counts['failed_pending_review'] + counts['company_identity_review']} 条，"
-            f"重复待确认 {counts['duplicate_confirmation']} 条；"
+            f"处理中 {counts['processing'] + counts['duplicate_confirmation']} 条，"
+            f"重试中 {counts['retrying']} 条，"
+            f"未提交 {counts['not_submitted']} 条，需人工处理 {failed_count} 条，"
             f"已核实 {len(saved_by_lead)}/{len(selected)} 条。"
         )
         if not complete:
@@ -1286,7 +1291,9 @@ class WecomActionService:
                 if previous is not None and previous != item:
                     raise ValueError("已保存逐条结果不可被覆盖")
                 merged_by_lead[item["lead_id"]] = item
-            merged_items = [merged_by_lead[lead_id] for lead_id in selected if lead_id in merged_by_lead]
+            merged_items = [
+                merged_by_lead[lead_id] for lead_id in selected if lead_id in merged_by_lead
+            ]
             action.context = {
                 **action.context,
                 "selected_lead_ids": list(selected),
@@ -2603,7 +2610,6 @@ class DeterministicWecomActionExecutor:
         from app.crm.service import (
             CrmSubmissionService,
             SubmissionCommand,
-            SubmissionItemResult,
         )
         from app.leads.review import LeadReviewService
 

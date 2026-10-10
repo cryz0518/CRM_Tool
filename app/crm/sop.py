@@ -78,7 +78,7 @@ class SopCRMError(RuntimeError):
 
 
 class SopCRMAdapter:
-    """调用 CRM SOP 查重、新增和修改接口。"""
+    """调用 CRM SOP 线索接口。"""
 
     def __init__(
         self,
@@ -169,6 +169,42 @@ class SopCRMAdapter:
         if data.get("success") is False:
             raise SopCRMError("CRM update rejected")
         return CRMCreateResult(crm_lead_id, None, "CRM update succeeded")
+
+    def submit_lead(
+        self,
+        payload: Mapping[str, object],
+        *,
+        idempotency_key: str,
+        crm_user_id: str,
+    ) -> CRMCreateResult:
+        """提交字段到 CRM 统一线索接口，由 CRM 内部执行查重和分流。
+
+        参数：payload 为已校验的 CRM 字段；idempotency_key 为本地冻结操作键；
+        crm_user_id 为已映射的 CRM 提交人。
+        返回值：CREATE 返回新线索身份，FOLLOW_UP 返回无新线索身份的成功结果。
+        异常：接口错误或未知响应形态抛出 SopCRMError。
+        副作用：向 CRM SOP 发起一次签名请求；requestId 在重试间保持稳定。
+        """
+        body = dict(payload)
+        # SOP 的 requestId 限制为 100 字符；哈希同时保证键长稳定且重试时值不变。
+        body["requestId"] = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+        body["headerId"] = crm_user_id
+        data = self._call("crm_submit_lead", body)
+        action = data.get("action")
+        if action == "CREATE":
+            lead_id = data.get("leadId")
+            if (
+                isinstance(lead_id, bool)
+                or not isinstance(lead_id, (str, int))
+                or not str(lead_id).strip()
+            ):
+                raise SopCRMError(
+                    "CRM submit response missing lead id", category="malformed_response"
+                )
+            return CRMCreateResult(str(lead_id), crm_user_id, "CRM submit succeeded")
+        if action == "FOLLOW_UP":
+            return CRMCreateResult(None, None, "CRM submit succeeded")
+        raise SopCRMError("CRM submit response missing action", category="malformed_response")
 
     def _call(self, method: str, biz_content: Mapping[str, object]) -> Mapping[str, object]:
         """构造签名一致的表单请求并解析严格响应。"""

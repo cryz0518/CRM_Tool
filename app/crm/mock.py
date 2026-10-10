@@ -1,4 +1,4 @@
-"""用于 T12 闭环测试的内存 CRM 创建适配器。"""
+"""用于 T12 闭环测试的内存 CRM 线索提交适配器。"""
 
 from __future__ import annotations
 
@@ -27,6 +27,33 @@ class MockCRMAdapter:
         self.search_calls = 0
         self.search_company_names: list[str] = []
         self._search_results = dict(search_results or {})
+        self.submit_calls = 0
+        self.submit_payloads: list[dict[str, object]] = []
+        self._submit_results: dict[str, CRMCreateResult] = {}
+
+    def submit_lead(
+        self, payload: Mapping[str, object], *, idempotency_key: str, crm_user_id: str
+    ) -> CRMCreateResult:
+        """记录统一提交并按幂等键复用 CRM 模拟结果。
+
+        参数：payload 为完整业务字段；idempotency_key 为冻结提交键；crm_user_id 为提交人。
+        返回值：首次模拟提交结果；同键重试返回第一次结果。
+        异常：底层创建模拟器异常时向调用方传播。
+        副作用：更新 Mock 调用计数与字段记录，不访问网络或数据库。
+        """
+        self.submit_calls += 1
+        self.submit_payloads.append(dict(payload))
+        existing = self._submit_results.get(idempotency_key)
+        if existing is not None:
+            return existing
+        created = self.create_lead(
+            payload, idempotency_key=idempotency_key, crm_user_id=crm_user_id
+        )
+        result = CRMCreateResult(
+            created.crm_lead_id, created.crm_lead_owner_user_id, "CRM submit succeeded"
+        )
+        self._submit_results[idempotency_key] = result
+        return result
 
     def search_by_company_name(
         self, payload: Mapping[str, object] | str
