@@ -6,45 +6,41 @@ import argparse
 import logging
 import sys
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.core.logging import configure_logging
-from app.messaging.models import SalesAuthorization
+from app.messaging.sales_authorization import SalesAuthorizationDirectoryService
+from app.messaging.wecom_directory import (
+    WecomDirectoryError,
+    WecomDirectoryMember,
+    resolve_wecom_member,
+)
 
 _CLI_OPERATOR = "crm_cross_owner_submission_cli"
 logger = logging.getLogger(__name__)
 
 
-def grant_crm_submission_access(session: Session, employee_name: str) -> str:
-    """按唯一企微显示名授予跨员工 CRM 提交权限。
+def grant_crm_submission_access(session: Session, member: WecomDirectoryMember) -> str:
+    """为已由企微通讯录确认的成员授予跨员工 CRM 提交权限。
 
-    参数：session 为调用方持有的数据库事务；employee_name 为企微员工显示名。
+    参数：session 为调用方持有的数据库事务；member 为企微通讯录精确解析出的成员。
     返回值：已授权员工的显示名。
-    异常：姓名为空、未登记、重名或员工停用时抛出 ValueError。
-    副作用：更新该员工的跨员工提交权限和目录修改主体。
+    异常：成员信息不完整时抛 ValueError；数据库错误由会话层抛出。
+    副作用：按需创建或更新 Actor Registry 行，并授予该成员跨员工提交权限。
     """
-    normalized_name = employee_name.strip()
-    # 空白姓名不能回退到默认员工，也不能使用模糊查询选择成员。
-    if not normalized_name:
-        raise ValueError("企微员工姓名不能为空")
-    authorizations = session.scalars(
-        select(SalesAuthorization)
-        .where(SalesAuthorization.display_name == normalized_name)
-        .with_for_update()
-    ).all()
-    # 只接受精确且唯一的员工记录；重名或未登记时拒绝授权，避免授错账号。
-    if len(authorizations) != 1:
-        raise ValueError("未找到唯一的企微员工显示名，请先确认员工已在系统登记且姓名不重名")
-    authorization = authorizations[0]
-    # 停用成员不能获得新的提交权限。
-    if not authorization.is_active:
-        raise ValueError("目标企微员工已停用，不能授予提交权限")
+    if not member.user_id.strip() or not member.name.strip():
+        raise ValueError("企微通讯录成员信息不完整")
+    # 企微通讯录已证明成员有效；Actor Registry 可在首次授权时自动创建或恢复。
+    authorization = SalesAuthorizationDirectoryService().authorize_salesperson(
+        session, member.user_id, _CLI_OPERATOR
+    )
+    authorization.display_name = member.name.strip()
     # 只开启跨员工范围权限，不修改该成员的企微身份或 CRM 映射。
     authorization.can_submit_other_sales_leads = True
     authorization.updated_by = _CLI_OPERATOR
-    return normalized_name
+    return authorization.display_name
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="授权企微员工提交其他员工的 CRM 线索")
     subparsers = parser.add_subparsers(dest="action", required=True)
     grant_parser = subparsers.add_parser("grant", help="按企微显示姓名授予跨员工提交权限")
-    grant_parser.add_argument("employee_name", help="企微成员在系统登记的显示姓名")
+    grant_parser.add_argument("employee_name", help="企微通讯录中的唯一成员姓名")
     arguments = parser.parse_args(argv)
 
     settings = get_settings()
@@ -67,12 +63,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     engine = create_engine(settings.database_url)
     try:
+        # 必须先确认成员来自企微通讯录，再创建或更新本地授权目录行。
+        member = resolve_wecom_member(
+            settings.wecom_cli_command,
+            arguments.employee_name,
+            settings.wecom_cli_timeout_seconds,
+        )
         session_factory = sessionmaker(engine)
         with session_factory.begin() as session:
-            granted_name = grant_crm_submission_access(session, arguments.employee_name)
+            granted_name = grant_crm_submission_access(session, member)
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 2
+    except WecomDirectoryError as error:
+        print(str(error), file=sys.stderr)
+        return 1
     except Exception:
         logger.exception("crm_cross_owner_submission_authorization_failed")
         print("授权失败，请查看应用日志。", file=sys.stderr)
