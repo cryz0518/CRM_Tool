@@ -618,19 +618,23 @@ def _resolve_cross_owner_submission_scope(
     副作用：仅读取权限目录和线索。
     """
     target_name = command.target_owner_name
+    # 没有目标就无法安全确定负责人的筛选范围，因此在发行候选动作前拒绝。
     if target_name is None:
         return None, "没有解析到负责人姓名，请使用“提交负责人姓名的线索”或“提交所有员工的线索”。"
     with session_factory() as session:
         actor = session.get(SalesAuthorization, command.sales_user_id)
+        # 操作人必须是启用成员且具有管理员或专用授权，不能由命令文本授予权限。
         if actor is None or not actor.is_active:
             return None, "当前企微账号未启用，不能提交 CRM 线索。"
         if not (actor.is_administrator or actor.can_submit_other_sales_leads):
             return None, "当前账号没有跨员工 CRM 提交权限，请联系系统管理员授权。"
         if target_name == _CROSS_OWNER_ALL_TARGET:
+            # 将“所有员工”限制为数据库中已有线索的负责人，不把通配符传入提交服务。
             owner_user_ids = tuple(
                 sorted(set(session.scalars(select(Lead.smart_table_owner_user_id)).all()))
             )
         else:
+            # 只接受唯一的精确企微显示名匹配；重名时 fail closed，避免误选负责人。
             matches = session.scalars(
                 select(SalesAuthorization.wecom_user_id).where(
                     SalesAuthorization.display_name == target_name

@@ -1703,8 +1703,17 @@ class CrmSubmissionService:
         allow_temporary: bool = False,
         owner_scope_user_ids: tuple[str, ...] | None = None,
     ) -> bool:
-        """判定批量或精确目标线索是否允许进入首次 CRM 提交。"""
+        """判定目标线索是否满足当前提交命令的负责人范围和生命周期。
 
+        参数：lead 为当前数据库线索；sales_user_id 为操作人企微标识；
+        allow_non_today_target 表示是否允许提交非今日线索；allow_temporary 表示是否允许临时草稿；
+        owner_scope_user_ids 为授权提交时由服务端冻结的负责人范围，None 表示仅本人。
+        返回值：负责人、线索状态和采集日期均符合本次命令时返回 True。
+        异常：无。
+        副作用：无，仅读取线索字段并在需要时检查今日采集资格。
+        """
+
+        # 只有带服务端冻结范围的授权命令才能跳过“本人负责”约束。
         owner_matches = (
             lead.smart_table_owner_user_id in owner_scope_user_ids
             if owner_scope_user_ids is not None

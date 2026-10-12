@@ -26,6 +26,7 @@ def grant_crm_submission_access(session: Session, employee_name: str) -> str:
     副作用：更新该员工的跨员工提交权限和目录修改主体。
     """
     normalized_name = employee_name.strip()
+    # 空白姓名不能回退到默认员工，也不能使用模糊查询选择成员。
     if not normalized_name:
         raise ValueError("企微员工姓名不能为空")
     authorizations = session.scalars(
@@ -33,11 +34,14 @@ def grant_crm_submission_access(session: Session, employee_name: str) -> str:
         .where(SalesAuthorization.display_name == normalized_name)
         .with_for_update()
     ).all()
+    # 只接受精确且唯一的员工记录；重名或未登记时拒绝授权，避免授错账号。
     if len(authorizations) != 1:
         raise ValueError("未找到唯一的企微员工显示名，请先确认员工已在系统登记且姓名不重名")
     authorization = authorizations[0]
+    # 停用成员不能获得新的提交权限。
     if not authorization.is_active:
         raise ValueError("目标企微员工已停用，不能授予提交权限")
+    # 只开启跨员工范围权限，不修改该成员的企微身份或 CRM 映射。
     authorization.can_submit_other_sales_leads = True
     authorization.updated_by = _CLI_OPERATOR
     return normalized_name
