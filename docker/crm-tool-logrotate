@@ -1,0 +1,11 @@
+/opt/CRM_Tool/log/*.log {
+    daily
+    maxsize 50M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}

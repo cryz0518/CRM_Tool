@@ -1,0 +1,17 @@
+[Unit]
+Description=CRM Tool Docker runtime logs
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/CRM_Tool
+UMask=0077
+ExecStart=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.server.yml logs --follow --no-color --tail=100
+StandardOutput=append:/opt/CRM_Tool/log/runtime.log
+StandardError=append:/opt/CRM_Tool/log/runtime.log
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

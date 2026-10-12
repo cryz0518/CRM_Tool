@@ -1,0 +1,46 @@
+# 服务器补充配置：控制台通过 SSH 隧道访问，Docker 日志限制磁盘占用。
+x-server-logging: &server_logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+# 沿用本地 CRM 代理的内网目标；服务器可直连，不再依赖本地代理。
+x-server-crm-hosts: &server_crm_hosts
+  - "sopapi-test.cgxi.net:192.168.3.108"
+
+services:
+  postgres:
+    # 仅服务器使用固定宿主机目录；覆盖本地默认的同一容器挂载目标。
+    volumes:
+      - /opt/CRM_TOOL/DATA/postgresql/data:/var/lib/postgresql/data:Z
+    logging: *server_logging
+  redis:
+    logging: *server_logging
+    # 迁移和容器重建时保留任务队列，避免仅使用匿名卷。
+    volumes:
+      - redis_data:/data
+  migrate:
+    logging: *server_logging
+  app:
+    extra_hosts: *server_crm_hosts
+    ports: !override
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+    logging: *server_logging
+  worker:
+    extra_hosts: *server_crm_hosts
+    # 两核服务器繁忙时 Python 探针启动超过 3 秒；保留真实 Redis PING，降低探针频率。
+    healthcheck: &server_broker_healthcheck
+      interval: 30s
+      timeout: 30s
+    logging: *server_logging
+  scheduler:
+    extra_hosts: *server_crm_hosts
+    healthcheck: *server_broker_healthcheck
+    logging: *server_logging
+  wecom-bot:
+    extra_hosts: *server_crm_hosts
+    logging: *server_logging
+
+volumes:
+  redis_data:

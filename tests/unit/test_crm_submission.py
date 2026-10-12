@@ -70,7 +70,7 @@ def test_new_table_option_without_crm_mapping_blocks_create_and_update(
 ) -> None:
     """新合法选项无 CRM 字典映射时，创建和更新均不调用远端且保持待提交状态。"""
     schema = build_required_smart_table_schema()
-    option = "半导体" if field_name == "客户行业" else "激光切割"
+    option = "未配置行业" if field_name == "客户行业" else "激光切割"
     schema = replace(schema, fields=tuple(
         replace(field, options=(*field.options, SmartTableOption("wecom-id-99999", option)))
         if field.name == field_name else field for field in schema.fields
