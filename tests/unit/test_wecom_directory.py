@@ -68,6 +68,44 @@ def test_resolve_wecom_member_rejects_duplicate_exact_names(
         resolve_wecom_member("wecom-cli", "王明", 20)
 
 
+def test_resolve_wecom_member_matches_exact_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证按通讯录花名别名可以找到成员，并返回通讯录正式姓名。"""
+    response = {
+        "users": [
+            {"userid": "member-1", "name": "杨康鑫(杨康鑫)", "alias": "杨康鑫"},
+        ]
+    }
+    monkeypatch.setattr(
+        "app.messaging.wecom_directory.subprocess.run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, json.dumps(response, ensure_ascii=False), ""
+        ),
+    )
+
+    assert resolve_wecom_member("wecom-cli", "杨康鑫", 20) == WecomDirectoryMember(
+        "member-1", "杨康鑫(杨康鑫)"
+    )
+
+
+def test_resolve_wecom_member_matches_formal_name_in_combined_display_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证通讯录以“本名(花名)”展示时仍可按本名精确定位。"""
+    response = {"users": [{"userid": "member-1", "name": "张华杰(JJ)", "alias": "JJ"}]}
+    monkeypatch.setattr(
+        "app.messaging.wecom_directory.subprocess.run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, json.dumps(response, ensure_ascii=False), ""
+        ),
+    )
+
+    assert resolve_wecom_member("wecom-cli", "张华杰", 20) == WecomDirectoryMember(
+        "member-1", "张华杰(JJ)"
+    )
+
+
 def test_resolve_wecom_member_rejects_truncated_directory_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

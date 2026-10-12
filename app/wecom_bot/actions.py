@@ -78,6 +78,30 @@ ACTION_EXPECTED_EVENT_KEYS = {
     ACTION_TYPE_DISCARD_CONFIRMATION: CARD_EVENT_KEY_DISCARD_CONFIRM,
     ACTION_TYPE_REASSIGN_CONFIRMATION: CARD_EVENT_KEY_REASSIGN_CONFIRM,
 }
+_CRM_SUBMISSION_ACTION_TYPES = frozenset(
+    {
+        ACTION_TYPE_CRM_FIELD_CONFIRMATION,
+        ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION,
+        ACTION_TYPE_CRM_COMPANY_CONFIRMATION,
+        ACTION_TYPE_CRM_BATCH_SUBMISSION,
+    }
+)
+
+
+def _requires_active_sales_authorization(
+    action_type: str, context: Mapping[str, object]
+) -> bool:
+    """判断动作是否需要启用的销售授权目录记录。
+
+    参数：action_type 为服务端动作类型；context 为已校验或持久化的动作上下文。
+    返回值：普通 CRM 提交不要求登记，跨员工提交和其它受限动作仍要求有效授权。
+    异常：无。
+    副作用：无。
+    """
+    return action_type not in _CRM_SUBMISSION_ACTION_TYPES or (
+        action_type == ACTION_TYPE_CRM_BATCH_SUBMISSION
+        and context.get("owner_scope_user_ids") is not None
+    )
 
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _ACTION_LEASE = timedelta(minutes=5)
@@ -493,7 +517,7 @@ class WecomActionService:
         preview_markdown_chunks 为卡片前发送的完整 Markdown 明细分片；
         defer_delivery 在整条命令的所有页持久化完成前暂停投递。
         返回值：已持久化的动作副本。
-        异常：能力未就绪、动作参数非法或 actor 不存在/已停用时抛出 ValueError/PermissionError。
+        异常：能力未就绪、动作参数非法或需授权动作的 actor 不存在/已停用时抛出异常。
         副作用：新增 WecomAction 与 NotificationRecord，但不直接调用企业微信。
         """
         if not self._card_callback_ready:
@@ -522,10 +546,11 @@ class WecomActionService:
         action_id = str(uuid4())
 
         with self._session_factory.begin() as session:
-            # 每次发卡片前重新读取授权目录，禁止用旧会话或 UI 可见范围代替后端授权。
-            authorization = session.get(SalesAuthorization, actor_user_id)
-            if authorization is None or not authorization.is_active:
-                raise PermissionError("卡片动作操作者不存在或已停用")
+            # 普通 CRM 提交靠服务端负责人范围约束；跨员工及非 CRM 动作仍核验授权目录。
+            if _requires_active_sales_authorization(action_type, safe_context):
+                authorization = session.get(SalesAuthorization, actor_user_id)
+                if authorization is None or not authorization.is_active:
+                    raise PermissionError("卡片动作操作者不存在或已停用")
             # 发行幂等键由服务端业务事实生成；并发发行由数据库唯一约束收敛。
             existing = session.scalar(
                 select(WecomAction).where(WecomAction.issuance_key == issuance_key)
@@ -689,12 +714,13 @@ class WecomActionService:
 
             if action is None:
                 return self._reject_delivery(delivery, "unknown_task", "卡片动作不存在或已失效")
-            # 授权和 actor 绑定在每次 callback 重新读取，不能相信卡片发行时的旧权限。
-            authorization = session.get(SalesAuthorization, callback.actor_user_id)
-            if authorization is None or not authorization.is_active:
-                return self._deny_action(
-                    action, delivery, "actor_inactive", "当前账号不存在或已停用"
-                )
+            # 普通 CRM 回调以卡片绑定身份和线索负责人校验；跨员工及其它动作重验授权。
+            if _requires_active_sales_authorization(action.action_type, action.context):
+                authorization = session.get(SalesAuthorization, callback.actor_user_id)
+                if authorization is None or not authorization.is_active:
+                    return self._deny_action(
+                        action, delivery, "actor_inactive", "当前账号不存在或已停用"
+                    )
             if callback.actor_user_id != action.bound_actor_wecom_user_id:
                 return self._deny_action(action, delivery, "actor_mismatch", "该卡片不属于当前账号")
 
@@ -1028,18 +1054,19 @@ class WecomActionService:
                     False,
                 )
 
-            # Worker 可能在 callback claim 后延迟执行；执行前再次读取授权，避免撤销后仍产生副作用。
-            authorization = session.get(SalesAuthorization, action.bound_actor_wecom_user_id)
-            if authorization is None or not authorization.is_active:
-                _transition_action(action, WecomActionStatus.DENIED.value)
-                action.processed_at = now
-                action.result_code = "actor_inactive"
-                action.result_summary = "操作人不存在或已停用，未执行该动作"
-                outbox.status = WecomActionOutboxStatus.FAILED.value
-                outbox.processing_started_at = None
-                outbox.processing_lease_expires_at = None
-                self._add_result_notification(session, action, action.result_summary)
-                return ActionExecutionResult("actor_inactive", action.result_summary, False)
+            # Worker 延迟期间撤权仍阻止跨员工/非 CRM 操作；普通 CRM 操作按负责人范围重验。
+            if _requires_active_sales_authorization(action.action_type, action.context):
+                authorization = session.get(SalesAuthorization, action.bound_actor_wecom_user_id)
+                if authorization is None or not authorization.is_active:
+                    _transition_action(action, WecomActionStatus.DENIED.value)
+                    action.processed_at = now
+                    action.result_code = "actor_inactive"
+                    action.result_summary = "操作人不存在或已停用，未执行该动作"
+                    outbox.status = WecomActionOutboxStatus.FAILED.value
+                    outbox.processing_started_at = None
+                    outbox.processing_lease_expires_at = None
+                    self._add_result_notification(session, action, action.result_summary)
+                    return ActionExecutionResult("actor_inactive", action.result_summary, False)
 
             # 每次初次执行或 takeover 都生成新 token；旧 Worker 的 token 随即失效。
             claim_token = uuid4().hex

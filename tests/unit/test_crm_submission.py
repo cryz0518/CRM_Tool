@@ -2088,6 +2088,8 @@ def test_today_submission_promotes_temporary_lead_from_complete_table_snapshot(
 
     assert tuple(item.lead_id for item in candidates) == (lead_id,)
     assert result.succeeded == 1
+    assert crm.calls == 1
+    assert crm.crm_user_ids == ["crm-sales-2"]
     assert crm.search_calls == 1
     assert crm.calls == 1
     with session_factory() as session:
@@ -2227,14 +2229,79 @@ def test_authorized_operator_can_submit_selected_other_owner_lead(
 
     assert tuple(item.lead_id for item in candidates) == (lead_id,)
     assert result.succeeded == 1
-    assert crm.calls == 1
-    assert crm.crm_user_ids == ["crm-sales-2"]
+
+
+@pytest.mark.parametrize("submit_by_selection", [False, True])
+def test_self_crm_create_and_update_do_not_require_sales_authorization_row(
+    session_factory: sessionmaker[Session], submit_by_selection: bool,
+) -> None:
+    """验证本人提交只校验负责人范围，不要求提交人在销售授权目录登记。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    record_id = adapter.get_records()[0].record_id
+    with session_factory.begin() as session:
+        session.delete(session.get(SalesAuthorization, "sales-1"))
+
+    directory = Mock()
+    directory.resolve.return_value = "crm-1"
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(
+        session_factory, adapter, crm, employee_directory=directory
+    )
+
+    if submit_by_selection:
+        command = SubmissionCommand("提交今天的线索", "sales-1", "unregistered-create")
+        candidates = service.list_submission_candidates(command.text, command.sales_user_id)
+        created = service.submit_selected(
+            command, tuple(candidate.lead_id for candidate in candidates)
+        )
+    else:
+        created = service.submit(
+            SubmissionCommand(
+                "提交指定线索", "sales-1", "unregistered-create", target_lead_id=lead_id
+            )
+        )
+    adapter.update_record(record_id, {"手机": "13900000000"})
+    updated = service.submit(SubmissionCommand("提交我的更新", "sales-1", "unregistered-update"))
+
+    assert created.succeeded == 1
+    assert updated.updated == 1
+    assert crm.submit_calls == 2
+    assert crm.crm_user_ids == ["crm-1", "crm-1"]
+
+
+def test_existing_smart_table_lead_can_be_linked_without_authorization_row(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证本人负责的未提交表格行可直接绑定，不依赖授权目录登记。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    record = adapter.create_record(
+        {
+            "负责人": "unregistered-sales",
+            "线索名称": "未登记成员线索",
+            "提交状态": "未提交",
+        },
+        actor=SmartTableActor.ROBOT,
+    )
+
+    _link_unsubmitted_smart_table_records(
+        session_factory,
+        adapter,
+        SubmissionCommand("提交我所有线索", "unregistered-sales", "link-unregistered"),
+    )
+
+    with session_factory() as session:
+        linked = session.scalar(select(Lead).where(Lead.smart_table_record_id == record.record_id))
+    assert linked is not None
+    assert linked.smart_table_owner_user_id == "unregistered-sales"
 
 
 def test_submission_command_parser_routes_named_and_global_owner_scopes() -> None:
-    """验证只识别明确的代提交句式，疑问句仍不能触发提交。"""
+    """验证员工本名/花名和显式负责人句式都进入代提交，疑问句仍不能触发。"""
 
     assert parse_crm_submission_command("提交负责人张三的线索") == CROSS_OWNER_SUBMISSION_COMMAND
+    assert parse_crm_submission_command("提交JJ的线索") == CROSS_OWNER_SUBMISSION_COMMAND
+    assert parse_crm_submission_command("提交张华杰的线索") == CROSS_OWNER_SUBMISSION_COMMAND
     assert parse_crm_submission_command("提交所有员工的线索") == CROSS_OWNER_SUBMISSION_COMMAND
     assert parse_crm_submission_command("提交负责人张三的线索？") is None
     assert parse_crm_submission_command("提交负责人*的线索") is None
@@ -2254,6 +2321,11 @@ def test_cross_owner_selection_card_freezes_target_and_shows_names_only(
         }
     )
     monkeypatch.setattr(crm_commands, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        crm_commands,
+        "resolve_wecom_member",
+        lambda *_args: WecomDirectoryMember("sales-2", "张三"),
+    )
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter)
     source_record = adapter.get_records()[0]
@@ -3364,16 +3436,17 @@ def test_unknown_crm_failure_does_not_finalize_discard_request(
     assert audit is not None and audit.details["attempts"] == 1
 
 
-def test_update_command_requires_active_actor(
+def test_update_command_without_leads_is_noop_for_unregistered_actor(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证更新命令仍由确定性 actor active 边界保护。"""
+    """验证没有本人线索时，未登记成员的更新命令为空操作而非目录拒绝。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     crm = MockCRMAdapter()
-    with pytest.raises(ValueError, match="提交销售 actor 不存在或已停用"):
-        CrmSubmissionService(session_factory, adapter, crm).submit(
-            SubmissionCommand("提交我的更新", "sales-1", "message-12")
-        )
+    result = CrmSubmissionService(session_factory, adapter, crm).submit(
+        SubmissionCommand("提交我的更新", "sales-1", "message-12")
+    )
+
+    assert result == SubmissionBatchResult()
     assert crm.calls == 0
 
 

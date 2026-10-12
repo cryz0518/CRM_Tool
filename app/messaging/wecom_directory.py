@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -24,7 +25,7 @@ class WecomDirectoryMember:
 def resolve_wecom_member(
     command: str, employee_name: str, timeout_seconds: float
 ) -> WecomDirectoryMember:
-    """按企微通讯录中的精确姓名解析唯一成员。
+    """按企微通讯录中的精确姓名或别名解析唯一成员。
 
     参数：command 为 wecom-cli 可执行命令；employee_name 为待授权成员姓名；
     timeout_seconds 为通讯录查询超时时间。
@@ -82,8 +83,15 @@ def resolve_wecom_member(
         user_id, name = item.get("userid"), item.get("name")
         if not isinstance(user_id, str) or not user_id.strip() or not isinstance(name, str):
             raise WecomDirectoryError("企微通讯录成员缺少必要信息")
-        if name.strip() == normalized_name:
-            matches[user_id.strip()] = name.strip()
+        alias = item.get("alias")
+        display_name = name.strip()
+        # 企微可能把显示名格式化成“本名(花名)”，本名也应可精确命中。
+        combined_name = re.fullmatch(r"(.+?)[(（]([^()（）]+)[)）]", display_name)
+        formal_name = combined_name.group(1).strip() if combined_name is not None else display_name
+        if formal_name == normalized_name or (
+            isinstance(alias, str) and alias.strip() == normalized_name
+        ):
+            matches[user_id.strip()] = display_name
 
     if not matches:
         raise ValueError("企微通讯录中未找到该姓名的成员")

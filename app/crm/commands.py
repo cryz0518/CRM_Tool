@@ -33,6 +33,7 @@ from app.messaging.models import (
     SalesAuthorization,
     WecomAction,
 )
+from app.messaging.wecom_directory import WecomDirectoryError, resolve_wecom_member
 from app.smart_table.adapter import SmartTableAdapter
 from app.smart_table.models import SmartTableRecord
 from app.wecom_bot.actions import (
@@ -143,15 +144,15 @@ def parse_crm_submission_command(text: str) -> str | None:
     candidate = text.strip().rstrip("。").strip()
     if not is_explicit_submission_request(candidate):
         return None
-    if parse_cross_owner_submission_target(candidate) is not None:
-        return CROSS_OWNER_SUBMISSION_COMMAND
-    if parse_company_submission_request(candidate) is not None:
-        return candidate
     if candidate in CRM_SUBMISSION_COMMANDS:
         return candidate
     alias = _SUBMISSION_COMMAND_ALIASES.get(candidate)
     if alias is not None:
         return alias
+    if parse_cross_owner_submission_target(candidate) is not None:
+        return CROSS_OWNER_SUBMISSION_COMMAND
+    if parse_company_submission_request(candidate) is not None:
+        return candidate
     return None
 
 
@@ -159,15 +160,20 @@ def parse_cross_owner_submission_target(text: str) -> str | None:
     """解析明确的跨员工提交命令及其负责人姓名。
 
     参数：text 为用户原始命令。
-    返回值：目标企微显示姓名、全员范围哨兵值或 None。
+    返回值：目标企微姓名/花名、全员范围哨兵值或 None。
     异常：无；空姓名、过长姓名和含控制分隔符的文本返回 None。
     副作用：无，不查询数据库或触发提交。
     """
     candidate = text.strip().rstrip("。").strip()
     if candidate in {"提交所有员工的线索", "提交所有人的线索", "提交全部员工的线索"}:
         return _CROSS_OWNER_ALL_TARGET
-    prefix, suffix = "提交负责人", "的线索"
-    if not candidate.startswith(prefix) or not candidate.endswith(suffix):
+    if candidate in CRM_SUBMISSION_COMMANDS or candidate in _SUBMISSION_COMMAND_ALIASES:
+        return None
+    suffix = "的线索"
+    prefix = next(
+        (value for value in ("提交负责人", "提交") if candidate.startswith(value)), None
+    )
+    if prefix is None or not candidate.endswith(suffix):
         return None
     employee_name = candidate[len(prefix) : -len(suffix)].strip()
     if (
@@ -621,6 +627,7 @@ def _resolve_cross_owner_submission_scope(
     # 没有目标就无法安全确定负责人的筛选范围，因此在发行候选动作前拒绝。
     if target_name is None:
         return None, "没有解析到负责人姓名，请使用“提交负责人姓名的线索”或“提交所有员工的线索”。"
+    owner_user_ids: tuple[str, ...] | None = None
     with session_factory() as session:
         actor = session.get(SalesAuthorization, command.sales_user_id)
         # 操作人必须是启用成员且具有管理员或专用授权，不能由命令文本授予权限。
@@ -633,18 +640,20 @@ def _resolve_cross_owner_submission_scope(
             owner_user_ids = tuple(
                 sorted(set(session.scalars(select(Lead.smart_table_owner_user_id)).all()))
             )
-        else:
-            # 只接受唯一的精确企微显示名匹配；重名时 fail closed，避免误选负责人。
-            matches = session.scalars(
-                select(SalesAuthorization.wecom_user_id).where(
-                    SalesAuthorization.display_name == target_name
-                )
-            ).all()
-            if not matches:
-                return None, f"未找到企微显示姓名为「{target_name}」的员工，未发起提交。"
-            if len(matches) != 1:
-                return None, f"企微显示姓名「{target_name}」存在重名，无法确定负责人，未发起提交。"
-            owner_user_ids = (matches[0],)
+    if owner_user_ids is None:
+        # 通过完整通讯录解析本名和花名；不依赖员工预登记，也不在姓名重合时猜测。
+        settings = get_settings()
+        try:
+            member = resolve_wecom_member(
+                settings.wecom_cli_command,
+                target_name,
+                settings.wecom_cli_timeout_seconds,
+            )
+        except ValueError as error:
+            return None, f"{error}，未发起提交。"
+        except WecomDirectoryError:
+            return None, "企微通讯录当前不可查询，未发起提交，请稍后重试。"
+        owner_user_ids = (member.user_id,)
     return (
         replace(command, target_owner_name=None, owner_scope_user_ids=owner_user_ids),
         None,
@@ -929,16 +938,13 @@ def _link_existing_smart_table_record(
     """把当前销售负责的既有表格记录安全登记为待提交 Lead。
 
     参数：session 为当前事务；record 为智能表格快照；command 提供当前销售和审计消息。
-    返回值：新建或已存在的 Lead；负责人不匹配、actor 不可用或公司名无效时返回 None。
+    返回值：新建或已存在的 Lead；负责人不匹配或公司名无效时返回 None。
     异常：数据库约束异常向调用方传播；不调用外部 CRM。
     副作用：写入一条 pending_create Lead；write_audit 为 True 时追加绑定审计事件。
     """
     owner = record.fields.get("负责人")
     company_name = record.fields.get("线索名称")
     if owner != command.sales_user_id or not isinstance(company_name, str) or not company_name:
-        return None
-    authorization = session.get(SalesAuthorization, command.sales_user_id)
-    if authorization is None or not authorization.is_active:
         return None
     existing = session.scalar(
         select(Lead).where(Lead.smart_table_record_id == record.record_id).with_for_update()

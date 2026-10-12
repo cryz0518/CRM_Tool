@@ -1035,6 +1035,41 @@ def test_cross_owner_action_freezes_scope_and_accepts_selection(
         assert frozen.context["selected_lead_ids"] == ["lead-a"]
 
 
+def test_unregistered_actor_can_issue_confirm_and_execute_self_crm_action(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证普通 CRM 候选卡不依赖销售授权目录，但仍绑定企微操作人。"""
+    service = _service(session_factory)
+    action = service.issue_batch_submission_action(
+        actor_user_id="sales-a",
+        request_message_id="unregistered-self-submit",
+        command_text="提交我所有线索",
+        candidates=({"lead_id": "lead-a", "company_name": "本人线索"},),
+    )
+
+    claimed = service.claim_callback(
+        _batch_frame_for_action(action, ("lead-a",), msgid="unregistered-self-callback")
+    )
+    execution = service.execute_action(action.id, lambda _snapshot: ("submitted", "已提交"))
+
+    assert claimed.code == "claimed"
+    assert execution.executed is True
+
+
+def test_unregistered_actor_cannot_issue_cross_owner_crm_action(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证跨员工 CRM 卡仍需要登记且有效的专用权限主体。"""
+    with pytest.raises(PermissionError, match="操作者不存在或已停用"):
+        _service(session_factory).issue_batch_submission_action(
+            actor_user_id="unregistered-admin",
+            request_message_id="unregistered-cross-owner",
+            command_text=CROSS_OWNER_SUBMISSION_COMMAND,
+            candidates=({"lead_id": "lead-a", "company_name": "员工线索"},),
+            owner_scope_user_ids=("sales-b",),
+        )
+
+
 def test_batch_submission_action_freezes_page_for_more_than_one_page(
     session_factory: sessionmaker[Session],
 ) -> None:

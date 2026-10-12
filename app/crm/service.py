@@ -446,9 +446,6 @@ class CrmSubmissionService:
 
         target_missing = False
         with self._session_factory() as session:
-            authorization = session.get(SalesAuthorization, command.sales_user_id)
-            if authorization is None or not authorization.is_active:
-                raise ValueError("提交销售 actor 不存在或已停用")
             if command.text == "提交指定线索":
                 if command.target_lead_id is None:
                     raise ValueError("指定线索提交缺少目标线索")
@@ -501,9 +498,6 @@ class CrmSubmissionService:
             raise ValueError("不支持待完善线索重提命令")
         selected = tuple(dict.fromkeys(selected_lead_ids))
         with self._session_factory() as session:
-            authorization = session.get(SalesAuthorization, command.sales_user_id)
-            if authorization is None or not authorization.is_active:
-                raise ValueError("提交销售 actor 不存在或已停用")
             # 一次读取用于前置 fail-closed；真正创建前仍会在 _submit_create 重读 Final Snapshot。
             smart_table_snapshot = {
                 record.record_id: record for record in self._smart_table_adapter.get_records()
@@ -596,10 +590,15 @@ class CrmSubmissionService:
             owner_scope_user_ids if owner_scope_user_ids is not None else (sales_user_id,)
         )
         with self._session_factory() as session:
-            authorization = session.get(SalesAuthorization, sales_user_id)
-            if authorization is None or not authorization.is_active:
-                raise ValueError("提交销售 actor 不存在或已停用")
-            if cross_owner and not self._can_submit_other_sales_leads(authorization):
+            authorization = (
+                session.get(SalesAuthorization, sales_user_id) if cross_owner else None
+            )
+            # 本人提交以线索负责人范围校验；只有跨员工提交才读取专用权限目录。
+            if cross_owner and (
+                authorization is None
+                or not authorization.is_active
+                or not self._can_submit_other_sales_leads(authorization)
+            ):
                 raise ValueError("当前账号没有跨员工 CRM 提交权限")
             # 授权通过后，一次卡片候选计算只读取一份当前表格快照。
             smart_table_snapshot = {
@@ -707,11 +706,13 @@ class CrmSubmissionService:
             raise ValueError("跨员工提交负责人范围缺失或不适用于当前命令")
         selected = tuple(dict.fromkeys(selected_lead_ids))
         with self._session_factory() as session:
-            authorization = session.get(SalesAuthorization, command.sales_user_id)
-            if authorization is None or not authorization.is_active:
-                raise ValueError("提交销售 actor 不存在或已停用")
-            cross_owner_authorized = not cross_owner or self._can_submit_other_sales_leads(
-                authorization
+            authorization = (
+                session.get(SalesAuthorization, command.sales_user_id) if cross_owner else None
+            )
+            cross_owner_authorized = not cross_owner or (
+                authorization is not None
+                and authorization.is_active
+                and self._can_submit_other_sales_leads(authorization)
             )
             owner_scope = set(command.owner_scope_user_ids or ())
             valid_ids: set[str] = set()
@@ -789,9 +790,6 @@ class CrmSubmissionService:
     def _submit_updates(self, command: SubmissionCommand) -> SubmissionBatchResult:
         """扫描当前表格负责人的已同步记录，并仅提交规范业务快照差异。"""
         with self._session_factory() as session:
-            authorization = session.get(SalesAuthorization, command.sales_user_id)
-            if authorization is None or not authorization.is_active:
-                raise ValueError("提交销售 actor 不存在或已停用")
             candidate_ids = list(
                 session.scalars(
                     select(Lead.id).where(
@@ -892,8 +890,7 @@ class CrmSubmissionService:
         existing_sync_id: int | None = None
         with self._session_factory.begin() as session:
             lead = session.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
-            authorization = session.get(SalesAuthorization, command.sales_user_id)
-            if lead is None or authorization is None:
+            if lead is None:
                 return "incomplete"
             # 回读期间可能完成另一次覆盖，持有 Lead 锁后再次检查，禁止新快照绕过旧事实。
             unfinished = self._unfinished_update(session, lead_id)
@@ -1020,16 +1017,17 @@ class CrmSubmissionService:
             command.text == "提交指定线索" and command.target_lead_id == lead_id
         )
         with self._session_factory() as session:
-            authorization = session.get(SalesAuthorization, command.sales_user_id)
-            if command.owner_scope_user_ids is not None and (
-                authorization is None
-                or not authorization.is_active
-                or not self._can_submit_other_sales_leads(authorization)
-            ):
-                return _create_outcome(
-                    "not_submitted",
-                    reason_code="crm_cross_owner_submission_not_authorized",
-                )
+            if command.owner_scope_user_ids is not None:
+                authorization = session.get(SalesAuthorization, command.sales_user_id)
+                if (
+                    authorization is None
+                    or not authorization.is_active
+                    or not self._can_submit_other_sales_leads(authorization)
+                ):
+                    return _create_outcome(
+                        "not_submitted",
+                        reason_code="crm_cross_owner_submission_not_authorized",
+                    )
             lead = session.get(Lead, lead_id)
             if lead is None or not self._is_create_candidate(
                 lead,
@@ -1110,23 +1108,24 @@ class CrmSubmissionService:
         try:
             with self._session_factory.begin() as session:
                 lead = session.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
-                authorization = session.scalar(
-                    select(SalesAuthorization)
-                    .where(SalesAuthorization.wecom_user_id == command.sales_user_id)
-                    .with_for_update()
-                )
-                if command.owner_scope_user_ids is not None and (
-                    authorization is None
-                    or not authorization.is_active
-                    or not self._can_submit_other_sales_leads(authorization)
-                ):
-                    return _create_outcome(
-                        "not_submitted",
-                        reason_code="crm_cross_owner_submission_not_authorized",
+                authorization = None
+                if command.owner_scope_user_ids is not None:
+                    authorization = session.scalar(
+                        select(SalesAuthorization)
+                        .where(SalesAuthorization.wecom_user_id == command.sales_user_id)
+                        .with_for_update()
                     )
+                    if (
+                        authorization is None
+                        or not authorization.is_active
+                        or not self._can_submit_other_sales_leads(authorization)
+                    ):
+                        return _create_outcome(
+                            "not_submitted",
+                            reason_code="crm_cross_owner_submission_not_authorized",
+                        )
                 if (
                     lead is None
-                    or authorization is None
                     or not self._is_create_candidate(
                         lead,
                         command.sales_user_id,
@@ -1226,9 +1225,6 @@ class CrmSubmissionService:
         abandoned_lead_ids: list[str] = []
         remaining = 0
         with self._session_factory.begin() as session:
-            authorization = session.get(SalesAuthorization, sales_user_id)
-            if authorization is None or not authorization.is_active:
-                raise ValueError("提交销售 actor 不存在或已停用")
             rows = session.execute(
                 select(CrmSyncRecord, Lead)
                 .join(Lead, Lead.id == CrmSyncRecord.lead_id)
