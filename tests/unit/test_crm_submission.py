@@ -23,6 +23,7 @@ from app.crm.commands import (
     consume_submission_command,
     format_submission_reply,
     notification_key_for_message,
+    parse_crm_submission_command,
     prepare_batch_submission_selection,
     prepare_company_submission_preview,
     terminal_failure_notification_key_for_message,
@@ -30,6 +31,7 @@ from app.crm.commands import (
 from app.crm.employee_directory import EmployeeDirectory
 from app.crm.mock import MockCRMAdapter
 from app.crm.service import (
+    CROSS_OWNER_SUBMISSION_COMMAND,
     CrmSubmissionService,
     SubmissionBatchResult,
     SubmissionCommand,
@@ -46,6 +48,7 @@ from app.leads.models import (
     LeadFieldProvenance,
 )
 from app.leads.review import LeadReviewService
+from app.manage_crm_submission import grant_crm_submission_access
 from app.messaging.models import (
     Base,
     BusinessAuditEvent,
@@ -2137,6 +2140,219 @@ def test_today_submission_processes_only_card_selected_candidate(
     assert result.succeeded == 1
     assert crm.search_calls == 1
     assert crm.calls == 1
+
+
+def test_authorized_operator_can_submit_selected_other_owner_lead(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证跨员工提交需专用授权，勾选后仍使用线索负责人的 CRM 映射。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    source_record = adapter.get_records()[0]
+    target_fields = dict(source_record.fields)
+    target_fields["负责人"] = "sales-2"
+    owner_record = adapter.create_record(
+        target_fields,
+        actor=SmartTableActor.ROBOT,
+        member_names={"负责人": "张三"},
+    )
+    with session_factory.begin() as session:
+        session.add(
+            SalesAuthorization(wecom_user_id="sales-2", display_name="张三", is_active=True)
+        )
+        session.add(SalesAuthorization(wecom_user_id="operator", is_active=True))
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.smart_table_owner_user_id = "sales-2"
+        lead.smart_table_record_id = owner_record.record_id
+
+    crm = MockCRMAdapter()
+    directory = Mock()
+    directory.resolve.return_value = "crm-sales-2"
+    service = CrmSubmissionService(
+        session_factory, adapter, crm, employee_directory=directory
+    )
+    with pytest.raises(ValueError, match="没有跨员工 CRM 提交权限"):
+        service.list_submission_candidates(
+            CROSS_OWNER_SUBMISSION_COMMAND,
+            "operator",
+            owner_scope_user_ids=("sales-2",),
+        )
+
+    with session_factory.begin() as session:
+        operator = session.get(SalesAuthorization, "operator")
+        assert operator is not None
+        operator.can_submit_other_sales_leads = True
+    candidates = service.list_submission_candidates(
+        CROSS_OWNER_SUBMISSION_COMMAND,
+        "operator",
+        owner_scope_user_ids=("sales-2",),
+    )
+    with session_factory.begin() as session:
+        operator = session.get(SalesAuthorization, "operator")
+        assert operator is not None
+        operator.can_submit_other_sales_leads = False
+    denied = service.submit_selected(
+        SubmissionCommand(
+            CROSS_OWNER_SUBMISSION_COMMAND,
+            "operator",
+            "operator-submit-revoked",
+            owner_scope_user_ids=("sales-2",),
+        ),
+        (candidates[0].lead_id,),
+    )
+    denied_reply = format_submission_reply(
+        denied,
+        lead_labels={lead_id: "人工最终公司"},
+        selected_count=1,
+    )
+    assert denied.not_submitted == 1
+    assert "跨员工提交权限已撤销" in denied_reply
+    assert crm.calls == 0
+
+    with session_factory.begin() as session:
+        operator = session.get(SalesAuthorization, "operator")
+        assert operator is not None
+        operator.can_submit_other_sales_leads = True
+    result = service.submit_selected(
+        SubmissionCommand(
+            CROSS_OWNER_SUBMISSION_COMMAND,
+            "operator",
+            "operator-submit",
+            owner_scope_user_ids=("sales-2",),
+        ),
+        (candidates[0].lead_id,),
+    )
+
+    assert tuple(item.lead_id for item in candidates) == (lead_id,)
+    assert result.succeeded == 1
+    assert crm.calls == 1
+    assert crm.crm_user_ids == ["crm-sales-2"]
+
+
+def test_submission_command_parser_routes_named_and_global_owner_scopes() -> None:
+    """验证只识别明确的代提交句式，疑问句仍不能触发提交。"""
+
+    assert parse_crm_submission_command("提交负责人张三的线索") == CROSS_OWNER_SUBMISSION_COMMAND
+    assert parse_crm_submission_command("提交所有员工的线索") == CROSS_OWNER_SUBMISSION_COMMAND
+    assert parse_crm_submission_command("提交负责人张三的线索？") is None
+    assert parse_crm_submission_command("提交负责人*的线索") is None
+
+
+def test_cross_owner_selection_card_freezes_target_and_shows_names_only(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证代提交按企微姓名冻结负责人范围，候选预览只展示线索名称。"""
+    import app.crm.commands as crm_commands
+
+    settings = get_settings().model_copy(
+        update={
+            "wecom_card_callback_enabled": True,
+            "wecom_card_transport_configured": True,
+            "wecom_card_callback_handler_configured": True,
+        }
+    )
+    monkeypatch.setattr(crm_commands, "get_settings", lambda: settings)
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    source_record = adapter.get_records()[0]
+    owner_record = adapter.create_record(
+        dict(source_record.fields),
+        actor=SmartTableActor.ROBOT,
+        member_names={"负责人": "张三"},
+    )
+    with session_factory.begin() as session:
+        session.add_all(
+            [
+                SalesAuthorization(
+                    wecom_user_id="sales-2", display_name="张三", is_active=True
+                ),
+                SalesAuthorization(
+                    wecom_user_id="operator",
+                    is_active=True,
+                    can_submit_other_sales_leads=True,
+                ),
+            ]
+        )
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.smart_table_owner_user_id = "sales-2"
+        lead.smart_table_record_id = owner_record.record_id
+
+    reply = prepare_batch_submission_selection(
+        session_factory,
+        adapter,
+        MockCRMAdapter(),
+        SubmissionCommand(
+            CROSS_OWNER_SUBMISSION_COMMAND,
+            "operator",
+            "cross-owner-card-command",
+            target_owner_name="张三",
+        ),
+    )
+
+    with session_factory() as session:
+        action = session.scalar(select(WecomAction))
+        preview = session.scalar(
+            select(NotificationRecord).where(
+                NotificationRecord.notification_type == "wecom_action_preview"
+            )
+        )
+        card = session.scalar(
+            select(NotificationRecord).where(
+                NotificationRecord.notification_type == "wecom_action_card"
+            )
+        )
+        assert action is not None and preview is not None and card is not None
+        assert action.context["owner_scope_user_ids"] == ["sales-2"]
+        assert action.context["candidate_leads"][0]["lead_id"] == lead_id
+        markdown = preview.payload["markdown"]["content"]
+        options = card.payload["template_card"]["checkbox"]["option_list"]
+
+    assert "已发送候选卡" in reply
+    assert "人工最终公司" in markdown
+    assert "王工" not in markdown
+    assert "13800000000" not in markdown
+    assert options[0]["text"] == "1. 人工最终公司"
+
+
+def test_crm_submission_cli_grants_only_unique_active_employee(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证管理 CLI 按唯一启用的企微姓名授予专用跨员工权限。"""
+
+    with session_factory.begin() as session:
+        session.add(
+            SalesAuthorization(
+                wecom_user_id="grant-target", display_name="被授权员工", is_active=True
+            )
+        )
+    with session_factory.begin() as session:
+        assert grant_crm_submission_access(session, " 被授权员工 ") == "被授权员工"
+    with session_factory() as session:
+        authorization = session.get(SalesAuthorization, "grant-target")
+        assert authorization is not None
+        assert authorization.can_submit_other_sales_leads is True
+        assert authorization.updated_by == "crm_cross_owner_submission_cli"
+
+    with session_factory.begin() as session:
+        session.add_all(
+            [
+                SalesAuthorization(
+                    wecom_user_id="grant-target-duplicate",
+                    display_name="重名员工",
+                    is_active=True,
+                ),
+                SalesAuthorization(
+                    wecom_user_id="grant-target-duplicate-2",
+                    display_name="重名员工",
+                    is_active=True,
+                ),
+            ]
+        )
+    with session_factory() as session:
+        with pytest.raises(ValueError, match="未找到唯一"):
+            grant_crm_submission_access(session, "重名员工")
 
 
 def test_company_preview_exactly_matches_table_and_does_not_call_crm(

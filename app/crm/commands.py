@@ -6,7 +6,7 @@ import hashlib
 import logging
 import re
 from collections.abc import Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC
 from zoneinfo import ZoneInfo
 
@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import get_settings
 from app.crm.adapter import CRMAdapter
 from app.crm.service import (
+    CROSS_OWNER_SUBMISSION_COMMAND,
     CreateSubmissionOutcome,
     CrmSubmissionService,
     SubmissionBatchResult,
@@ -47,8 +48,15 @@ from app.wecom_bot.actions import (
 _LOGGER = logging.getLogger(__name__)
 
 CRM_SUBMISSION_COMMANDS = frozenset(
-    {"提交今天的线索", "提交我所有线索", "帮我提交放弃提交的线索", "提交我的更新"}
+    {
+        "提交今天的线索",
+        "提交我所有线索",
+        "帮我提交放弃提交的线索",
+        "提交我的更新",
+        CROSS_OWNER_SUBMISSION_COMMAND,
+    }
 )
+_CROSS_OWNER_ALL_TARGET = "*"
 _COMPANY_SUBMISSION_PATTERN = re.compile(r"^请帮我提交(?P<company>[^\r\n。]{1,128})这条线索$")
 _SUBMISSION_COMMAND_ALIASES = {
     "提交今天线索": "提交今天的线索",
@@ -135,6 +143,8 @@ def parse_crm_submission_command(text: str) -> str | None:
     candidate = text.strip().rstrip("。").strip()
     if not is_explicit_submission_request(candidate):
         return None
+    if parse_cross_owner_submission_target(candidate) is not None:
+        return CROSS_OWNER_SUBMISSION_COMMAND
     if parse_company_submission_request(candidate) is not None:
         return candidate
     if candidate in CRM_SUBMISSION_COMMANDS:
@@ -143,6 +153,31 @@ def parse_crm_submission_command(text: str) -> str | None:
     if alias is not None:
         return alias
     return None
+
+
+def parse_cross_owner_submission_target(text: str) -> str | None:
+    """解析明确的跨员工提交命令及其负责人姓名。
+
+    参数：text 为用户原始命令。
+    返回值：目标企微显示姓名、全员范围哨兵值或 None。
+    异常：无；空姓名、过长姓名和含控制分隔符的文本返回 None。
+    副作用：无，不查询数据库或触发提交。
+    """
+    candidate = text.strip().rstrip("。").strip()
+    if candidate in {"提交所有员工的线索", "提交所有人的线索", "提交全部员工的线索"}:
+        return _CROSS_OWNER_ALL_TARGET
+    prefix, suffix = "提交负责人", "的线索"
+    if not candidate.startswith(prefix) or not candidate.endswith(suffix):
+        return None
+    employee_name = candidate[len(prefix) : -len(suffix)].strip()
+    if (
+        not employee_name
+        or employee_name == _CROSS_OWNER_ALL_TARGET
+        or len(employee_name) > 128
+        or any(char in employee_name for char in "\r\n:：")
+    ):
+        return None
+    return employee_name
 
 
 def looks_like_submission_intent(text: str) -> bool:
@@ -236,8 +271,17 @@ def consume_submission_command(
             text=resolved_command_text,
             sales_user_id=message.sales_user_id,
             request_message_id=message.message_id,
+            target_owner_name=(
+                parse_cross_owner_submission_target(raw_text)
+                if resolved_command_text == CROSS_OWNER_SUBMISSION_COMMAND
+                else None
+            ),
         )
-    company_name = parse_company_submission_request(command.text)
+    company_name = (
+        None
+        if command.text == CROSS_OWNER_SUBMISSION_COMMAND
+        else parse_company_submission_request(command.text)
+    )
     if company_name is not None:
         reply = prepare_company_submission_preview(
             session_factory,
@@ -373,7 +417,12 @@ def consume_submission_command(
         return reply
     if crm_adapter is None:
         raise ValueError("批量 CRM 命令缺少 CRM Adapter")
-    if command.text in {"提交今天的线索", "提交我所有线索", "帮我提交放弃提交的线索"}:
+    if command.text in {
+        "提交今天的线索",
+        "提交我所有线索",
+        "帮我提交放弃提交的线索",
+        CROSS_OWNER_SUBMISSION_COMMAND,
+    }:
         try:
             reply = prepare_batch_submission_selection(
                 session_factory, smart_table_adapter, crm_adapter, command
@@ -456,6 +505,15 @@ def prepare_batch_submission_selection(
         # 重放只复用已冻结通知，不能因表格快照改变而再发行卡片或追加新页。
         _queue_submission_table_link(session_factory, command)
         return "本次提交确认消息已登记，请在原确认卡中操作。"
+    if command.text == CROSS_OWNER_SUBMISSION_COMMAND:
+        scoped_command, scope_error = _resolve_cross_owner_submission_scope(
+            session_factory, command
+        )
+        if scope_error is not None:
+            return scope_error
+        if scoped_command is None:
+            raise ValueError("跨员工提交负责人范围解析失败")
+        command = scoped_command
     service = CrmSubmissionService(
         session_factory,
         smart_table_adapter,
@@ -465,7 +523,11 @@ def prepare_batch_submission_selection(
     if command.text == "提交我所有线索":
         # 新数据库可能只保存了部分后台 Lead；按稳定 record_id 受控补齐当前销售的未提交表格行。
         _link_unsubmitted_smart_table_records(session_factory, smart_table_adapter, command)
-    candidates = service.list_submission_candidates(command.text, command.sales_user_id)
+    candidates = service.list_submission_candidates(
+        command.text,
+        command.sales_user_id,
+        owner_scope_user_ids=command.owner_scope_user_ids,
+    )
     if not candidates:
         if command.text == "帮我提交放弃提交的线索":
             return "当前没有可重新提交的放弃提交线索。"
@@ -485,12 +547,31 @@ def prepare_batch_submission_selection(
                 {
                     "lead_id": item.lead_id,
                     "company_name": item.company_name,
-                    "display_text": item.display_text or item.company_name,
-                    "field_values": dict(item.snapshot_fields),
-                    "missing_fields": item.missing_fields,
+                    "display_text": (
+                        item.company_name
+                        if command.text == CROSS_OWNER_SUBMISSION_COMMAND
+                        else item.display_text or item.company_name
+                    ),
+                    "field_values": (
+                        {}
+                        if command.text == CROSS_OWNER_SUBMISSION_COMMAND
+                        else dict(item.snapshot_fields)
+                    ),
+                    "missing_fields": (
+                        ()
+                        if command.text == CROSS_OWNER_SUBMISSION_COMMAND
+                        else item.missing_fields
+                    ),
                 }
                 for item in page
             )
+            page_owner_scope = tuple(
+                dict.fromkeys(
+                    item.owner_user_id for item in page if isinstance(item.owner_user_id, str)
+                )
+            )
+            if command.text == CROSS_OWNER_SUBMISSION_COMMAND and not page_owner_scope:
+                raise ValueError("跨员工候选缺少负责人身份")
             action_service.issue_batch_submission_action(
                 actor_user_id=command.sales_user_id,
                 request_message_id=command.request_message_id,
@@ -507,9 +588,15 @@ def prepare_batch_submission_selection(
                     page_details,
                     page=page_number,
                     page_count=len(pages),
+                    name_only=command.text == CROSS_OWNER_SUBMISSION_COMMAND,
                 ),
                 page=page_number,
                 page_count=len(pages),
+                owner_scope_user_ids=(
+                    page_owner_scope
+                    if command.text == CROSS_OWNER_SUBMISSION_COMMAND
+                    else None
+                ),
                 defer_delivery=True,
             )
     except CardCapabilityUnavailable:
@@ -518,6 +605,46 @@ def prepare_batch_submission_selection(
     title = "重新提交放弃线索" if command.text == "帮我提交放弃提交的线索" else "选择要提交的线索"
     page_suffix = f"，共 {len(pages)} 张候选卡" if len(pages) > 1 else ""
     return f"{title}：已发送候选卡，请勾选后确认提交（共 {len(candidates)} 条{page_suffix}）。"
+
+
+def _resolve_cross_owner_submission_scope(
+    session_factory: sessionmaker[Session], command: SubmissionCommand
+) -> tuple[SubmissionCommand | None, str | None]:
+    """校验操作人权限并将姓名目标解析成服务端冻结的负责人 user_id 范围。
+
+    参数：session_factory 为数据库会话工厂；command 包含操作人和原始目标姓名。
+    返回值：成功返回带冻结范围的命令；失败返回用户可读的拒绝原因。
+    异常：数据库读取失败时传播 SQLAlchemy 异常。
+    副作用：仅读取权限目录和线索。
+    """
+    target_name = command.target_owner_name
+    if target_name is None:
+        return None, "没有解析到负责人姓名，请使用“提交负责人姓名的线索”或“提交所有员工的线索”。"
+    with session_factory() as session:
+        actor = session.get(SalesAuthorization, command.sales_user_id)
+        if actor is None or not actor.is_active:
+            return None, "当前企微账号未启用，不能提交 CRM 线索。"
+        if not (actor.is_administrator or actor.can_submit_other_sales_leads):
+            return None, "当前账号没有跨员工 CRM 提交权限，请联系系统管理员授权。"
+        if target_name == _CROSS_OWNER_ALL_TARGET:
+            owner_user_ids = tuple(
+                sorted(set(session.scalars(select(Lead.smart_table_owner_user_id)).all()))
+            )
+        else:
+            matches = session.scalars(
+                select(SalesAuthorization.wecom_user_id).where(
+                    SalesAuthorization.display_name == target_name
+                )
+            ).all()
+            if not matches:
+                return None, f"未找到企微显示姓名为「{target_name}」的员工，未发起提交。"
+            if len(matches) != 1:
+                return None, f"企微显示姓名「{target_name}」存在重名，无法确定负责人，未发起提交。"
+            owner_user_ids = (matches[0],)
+    return (
+        replace(command, target_owner_name=None, owner_scope_user_ids=owner_user_ids),
+        None,
+    )
 
 
 def _link_unsubmitted_smart_table_records(
@@ -1231,6 +1358,7 @@ def format_submission_reply(
     reason_text = {
         "crm_enum_mapping_missing": "智能表格选项缺少 CRM 字典映射，请联系管理员配置后重新提交",
         "crm_user_mapping_missing": "当前负责人无法映射 CRM 用户，请联系管理员",
+        "crm_cross_owner_submission_not_authorized": "跨员工提交权限已撤销或不可用，本次未提交",
         "company_identity_conflict": "公司身份记录冲突，需要人工处理",
         "company_identity_reserved": "已有提交任务正在处理，本次未重复创建",
         "sync_processing": "已有提交任务正在处理，本次未重复创建",

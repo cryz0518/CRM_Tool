@@ -16,7 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.crm.adapter import CRMAdapter
-from app.crm.service import SubmissionItemResult
+from app.crm.service import CROSS_OWNER_SUBMISSION_COMMAND, SubmissionItemResult
 from app.messaging.models import (
     NotificationRecord,
     SalesAuthorization,
@@ -822,6 +822,7 @@ class WecomActionService:
                     "帮我提交放弃提交的线索",
                     "提交今天的线索",
                     "提交我所有线索",
+                    CROSS_OWNER_SUBMISSION_COMMAND,
                 }:
                     return self._deny_action(
                         action,
@@ -1595,8 +1596,9 @@ class WecomActionService:
         defer_delivery: bool = False,
         page: int = 1,
         page_count: int = 1,
+        owner_scope_user_ids: tuple[str, ...] | None = None,
     ) -> WecomAction:
-        """发行批量提交候选卡，销售只能勾选服务端冻结的本人线索。
+        """发行批量提交候选卡，负责人范围只保存在服务端动作上下文。
 
         参数：actor_user_id 为销售身份；request_message_id 为命令消息；command_text 为固定命令；
         candidates 仅含服务端线索标识和展示名称。
@@ -1608,6 +1610,18 @@ class WecomActionService:
 
         if not candidates or len(candidates) > 20 or page < 1 or page_count < page:
             raise ValueError("批量提交候选数量非法")
+        if command_text == CROSS_OWNER_SUBMISSION_COMMAND:
+            if (
+                not owner_scope_user_ids
+                or len(owner_scope_user_ids) > 20
+                or any(
+                    not isinstance(user_id, str) or not user_id
+                    for user_id in owner_scope_user_ids
+                )
+            ):
+                raise ValueError("跨员工候选缺少有效负责人范围")
+        elif owner_scope_user_ids is not None:
+            raise ValueError("普通批量候选不能携带跨员工负责人范围")
         target_id = hashlib.sha256(
             f"crm-batch-submission:{request_message_id}:{command_text}:page:{page}".encode()
         ).hexdigest()
@@ -1624,6 +1638,11 @@ class WecomActionService:
                 "candidate_leads": [dict(item) for item in candidates],
                 "page": page,
                 "page_count": page_count,
+                "owner_scope_user_ids": (
+                    list(dict.fromkeys(owner_scope_user_ids))
+                    if owner_scope_user_ids is not None
+                    else None
+                ),
             },
             title=title,
             description=description,
@@ -2069,13 +2088,28 @@ def _freeze_vote_card_update(
         page_count = context.get("page_count")
         if (
             command_text
-            not in {"帮我提交放弃提交的线索", "提交今天的线索", "提交我所有线索"}
+            not in {
+                "帮我提交放弃提交的线索",
+                "提交今天的线索",
+                "提交我所有线索",
+                CROSS_OWNER_SUBMISSION_COMMAND,
+            }
             or type(page) is not int
             or type(page_count) is not int
             or page < 1
             or page_count < page
             or action.expected_action_key != CARD_EVENT_KEY_CRM_BATCH_SUBMISSION
         ):
+            return None
+        owner_scope = context.get("owner_scope_user_ids")
+        if command_text == CROSS_OWNER_SUBMISSION_COMMAND:
+            if (
+                not isinstance(owner_scope, list)
+                or not owner_scope
+                or any(not isinstance(user_id, str) or not user_id for user_id in owner_scope)
+            ):
+                return None
+        elif owner_scope is not None:
             return None
         # 批量更新沿用发行时的页标题和多选卡文案。
         title, description = _batch_submission_card_copy(command_text, page, page_count)
@@ -2201,6 +2235,7 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
         "reason",
         "duplicate_leads",
         "candidate_leads",
+        "owner_scope_user_ids",
         "page",
         "page_count",
     }
@@ -2298,6 +2333,21 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
                     candidate["display_text"] = _redact_text(item["display_text"], 128)
                 safe_candidates.append(candidate)
             safe[key] = safe_candidates
+        elif key == "owner_scope_user_ids" and value is None:
+            safe[key] = None
+        elif (
+            key == "owner_scope_user_ids"
+            and isinstance(value, list)
+            and 0 < len(value) <= 20
+            and all(
+                isinstance(user_id, str)
+                and 0 < len(user_id) <= 128
+                and "\n" not in user_id
+                and "\r" not in user_id
+                for user_id in value
+            )
+        ):
+            safe[key] = list(dict.fromkeys(value))
         else:
             raise ValueError("动作 context 值类型非法")
     return safe
@@ -2379,9 +2429,13 @@ def build_preview_markdown(preview_fields: Mapping[str, object]) -> str:
 
 
 def build_batch_submission_markdown(
-    candidates: Sequence[Mapping[str, object]], *, page: int, page_count: int
+    candidates: Sequence[Mapping[str, object]],
+    *,
+    page: int,
+    page_count: int,
+    name_only: bool = False,
 ) -> tuple[str, ...]:
-    """构造按候选边界分页的批量提交 Markdown 明细。
+    """构造按候选边界分页的批量提交预览。
 
     参数：candidates 为同一页冻结顺序的候选快照；page/page_count 为页码信息。
     返回值：按安全字节长度切分的 Markdown 消息元组，每条消息都只包含完整候选。
@@ -2397,7 +2451,11 @@ def build_batch_submission_markdown(
         display_text = candidate_data.get("display_text")
         if not isinstance(company_name, str) or not company_name:
             raise ValueError("批量候选缺少公司名称")
-        label = display_text if isinstance(display_text, str) and display_text else company_name
+        label = (
+            company_name
+            if name_only
+            else display_text if isinstance(display_text, str) and display_text else company_name
+        )
         fields = candidate_data.get("field_values")
         if not isinstance(fields, Mapping):
             fields = {}
@@ -2406,7 +2464,7 @@ def build_batch_submission_markdown(
         label = " ".join(label.split())
         label = label[:79] + "…" if len(label) > 80 else label
         candidate_lines = [f"【{index}】{_escape_markdown(label)}"]
-        if (
+        if not name_only and (
             isinstance(missing_fields, (list, tuple))
             and missing_fields
             and all(isinstance(field, str) for field in missing_fields)
@@ -2416,10 +2474,12 @@ def build_batch_submission_markdown(
                     "- 缺少：" + _escape_markdown("、".join(missing_fields)),
                 )
             )
-        candidate_lines.extend(_submission_preview_lines(fields))
+        if not name_only:
+            candidate_lines.extend(_submission_preview_lines(fields))
         blocks.append("\n".join(candidate_lines))
 
-    header = f"**待提交线索明细（第 {page}/{page_count} 页）**"
+    title = "待提交线索" if name_only else "待提交线索明细"
+    header = f"**{title}（第 {page}/{page_count} 页）**"
     chunks: list[str] = []
     current = header
     for block in blocks:
@@ -2728,6 +2788,7 @@ class DeterministicWecomActionExecutor:
         command_text = action.context.get("command_text")
         request_message_id = action.context.get("request_message_id")
         selected = action.context.get("selected_lead_ids", [])
+        owner_scope = action.context.get("owner_scope_user_ids")
         if (
             not isinstance(command_text, str)
             or not isinstance(request_message_id, str)
@@ -2736,6 +2797,15 @@ class DeterministicWecomActionExecutor:
             or not all(isinstance(item, str) for item in selected)
         ):
             raise ValueError("批量提交动作 context 不完整")
+        if command_text == CROSS_OWNER_SUBMISSION_COMMAND:
+            if (
+                not isinstance(owner_scope, list)
+                or not owner_scope
+                or any(not isinstance(user_id, str) or not user_id for user_id in owner_scope)
+            ):
+                raise ValueError("跨员工批量提交动作缺少负责人范围")
+        elif owner_scope is not None:
+            raise ValueError("普通批量提交动作包含非法负责人范围")
         if self._action_service is not None:
             self._action_service.begin_domain_operation(action.id, action.claim_token)
         service = CrmSubmissionService(
@@ -2763,7 +2833,14 @@ class DeterministicWecomActionExecutor:
             )
 
         result = service.submit_selected(
-            SubmissionCommand(command_text, action.bound_actor_wecom_user_id, request_message_id),
+            SubmissionCommand(
+                command_text,
+                action.bound_actor_wecom_user_id,
+                request_message_id,
+                owner_scope_user_ids=(
+                    tuple(owner_scope) if isinstance(owner_scope, list) else None
+                ),
+            ),
             tuple(selected),
             on_item_result=persist_item_result,
         )
@@ -2786,7 +2863,11 @@ class DeterministicWecomActionExecutor:
                 if not isinstance(lead_id, str) or not isinstance(company_name, str):
                     continue
                 labels[lead_id] = (
-                    display_text if isinstance(display_text, str) and display_text else company_name
+                    company_name
+                    if command_text == CROSS_OWNER_SUBMISSION_COMMAND
+                    else display_text
+                    if isinstance(display_text, str) and display_text
+                    else company_name
                 )
         return (
             "crm_batch_submission_completed",
