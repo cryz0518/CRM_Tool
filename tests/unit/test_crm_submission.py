@@ -59,6 +59,7 @@ from app.messaging.models import (
     WecomAction,
     utc_now,
 )
+from app.messaging.wecom_directory import WecomDirectoryMember
 from app.notifications.outbound import WecomOutboundNotificationSender
 from app.smart_table.adapter import SmartTableActor
 from app.smart_table.mock import MockSmartTableAdapter
@@ -2316,43 +2317,22 @@ def test_cross_owner_selection_card_freezes_target_and_shows_names_only(
     assert options[0]["text"] == "1. 人工最终公司"
 
 
-def test_crm_submission_cli_grants_only_unique_active_employee(
+def test_crm_submission_cli_creates_actor_for_verified_wecom_member(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证管理 CLI 按唯一启用的企微姓名授予专用跨员工权限。"""
-
+    """验证已由企微通讯录确认的成员无需预先登记或 CRM 映射即可获权。"""
     with session_factory.begin() as session:
-        session.add(
-            SalesAuthorization(
-                wecom_user_id="grant-target", display_name="被授权员工", is_active=True
-            )
-        )
-    with session_factory.begin() as session:
-        assert grant_crm_submission_access(session, " 被授权员工 ") == "被授权员工"
+        assert grant_crm_submission_access(
+            session, WecomDirectoryMember("grant-target", "被授权员工")
+        ) == "被授权员工"
     with session_factory() as session:
         authorization = session.get(SalesAuthorization, "grant-target")
         assert authorization is not None
+        assert authorization.is_active is True
+        assert authorization.display_name == "被授权员工"
+        assert authorization.crm_user_id is None
         assert authorization.can_submit_other_sales_leads is True
         assert authorization.updated_by == "crm_cross_owner_submission_cli"
-
-    with session_factory.begin() as session:
-        session.add_all(
-            [
-                SalesAuthorization(
-                    wecom_user_id="grant-target-duplicate",
-                    display_name="重名员工",
-                    is_active=True,
-                ),
-                SalesAuthorization(
-                    wecom_user_id="grant-target-duplicate-2",
-                    display_name="重名员工",
-                    is_active=True,
-                ),
-            ]
-        )
-    with session_factory() as session:
-        with pytest.raises(ValueError, match="未找到唯一"):
-            grant_crm_submission_access(session, "重名员工")
 
 
 def test_company_preview_exactly_matches_table_and_does_not_call_crm(
