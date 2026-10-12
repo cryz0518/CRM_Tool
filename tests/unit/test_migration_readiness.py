@@ -126,10 +126,10 @@ def _check_migration(rows: list[str]) -> ReadinessComponent:
 def test_app_runtime_readiness_accepts_database_at_current_alembic_head(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """代码 head 为 0034 且数据库为 0034 时，应用 migration 必须就绪。"""
+    """代码 head 与数据库均为当前 CRM 重试迁移时，应用 migration 必须就绪。"""
     import app.main as main_module
 
-    _install_runtime_dependencies(monkeypatch, ["0034_lead_system_defaults"])
+    _install_runtime_dependencies(monkeypatch, ["0037_crm_submission_retry_schedule"])
 
     component = _migration_component(main_module._runtime_readiness_components())
 
@@ -142,7 +142,7 @@ def test_production_verify_runtime_accepts_database_at_current_alembic_head(
     """production_verify runtime 使用与应用相同的动态 migration head 判断。"""
     import app.production_verify as verify_module
 
-    _install_runtime_dependencies(monkeypatch, ["0034_lead_system_defaults"])
+    _install_runtime_dependencies(monkeypatch, ["0037_crm_submission_retry_schedule"])
     settings = Settings(_env_file=None, app_env="production")
 
     component = _migration_component(verify_module.verify("runtime", settings).components)
@@ -251,14 +251,14 @@ def test_current_graph_is_single_head_and_database_check_only_executes_select(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    """当前仓库以 0034 为唯一 head，readiness 只查询 alembic_version。"""
+    """当前仓库以 CRM 重试迁移为唯一 head，readiness 只查询 alembic_version。"""
     from app.core import migration_readiness
 
-    connection = FakeConnection(["0034_lead_system_defaults"])
+    connection = FakeConnection(["0037_crm_submission_retry_schedule"])
     monkeypatch.chdir(tmp_path)
     component = migration_readiness.check_migration_readiness(connection)
 
-    assert migration_readiness._get_code_heads() == ("0034_lead_system_defaults",)
+    assert migration_readiness._get_code_heads() == ("0037_crm_submission_retry_schedule",)
     assert (component.status, component.reason_code) == ("ok", "migration_current")
     assert len(connection.statements) == 1
     assert connection.statements[0].lstrip().upper().startswith("SELECT")
@@ -274,7 +274,9 @@ def test_app_and_production_verify_runtime_and_all_share_migration_result(
     import app.main as main_module
     import app.production_verify as verify_module
 
-    connection = _install_runtime_dependencies(monkeypatch, ["0034_lead_system_defaults"])
+    connection = _install_runtime_dependencies(
+        monkeypatch, ["0037_crm_submission_retry_schedule"]
+    )
     production_settings = Settings(_env_file=None, app_env="production")
     monkeypatch.setattr(main_module, "settings", production_settings)
     monkeypatch.setattr(

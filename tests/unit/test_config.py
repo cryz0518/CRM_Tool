@@ -23,6 +23,7 @@ def test_ai_gateway_defaults_use_sixty_second_timeout_and_one_retry(monkeypatch)
 
     assert settings.ai_gateway_timeout_seconds == 60.0
     assert settings.ai_gateway_retry_count == 1
+    assert settings.crm_create_retry_delay_seconds == 30
 
 
 def test_smart_table_stability_defaults_and_positive_validators() -> None:

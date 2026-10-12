@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.companies.models import CompanyVerificationStatus
 from app.core.config import get_settings
-from app.core.failures import classify_task_failure, safe_failure_summary
+from app.core.failures import classify_task_failure, safe_audit_text, safe_failure_summary
 from app.crm.adapter import CRMAdapter
 from app.crm.employee_directory import EmployeeDirectory, EmployeeDirectoryError
 from app.crm.payload import CrmEnumMappingError, CrmPayloadBuilder, CrmPayloadError
@@ -30,7 +30,12 @@ from app.leads.models import (
     latest_crm_create_sync,
 )
 from app.leads.review import LeadReviewService
-from app.messaging.models import BusinessAuditEvent, SalesAuthorization, utc_now
+from app.messaging.models import (
+    BusinessAuditEvent,
+    NotificationRecord,
+    SalesAuthorization,
+    utc_now,
+)
 from app.smart_table.adapter import SmartTableAdapter
 from app.smart_table.models import SmartTableRecord
 
@@ -374,22 +379,60 @@ class CrmSubmissionService:
         异常：无。
         副作用：只保存依赖，不读取数据库或调用外部系统。
         """
+        settings = get_settings()
         self._session_factory = session_factory
         self._smart_table_adapter = smart_table_adapter
         self._crm_adapter = crm_adapter
         self._crm_create_retry_count = (
-            get_settings().crm_create_retry_count
+            settings.crm_create_retry_count
             if crm_create_retry_count is None
             else crm_create_retry_count
         )
+        self._crm_create_retry_delay_seconds = settings.crm_create_retry_delay_seconds
         self._employee_directory = employee_directory
         # 当前销售只能提交本人负责且已从智能表格读取到的线索，CRM headerId 由负责人目录解析。
-        self._crm_payload_builder = CrmPayloadBuilder(get_settings().crm_customer_level_scheme)
+        self._crm_payload_builder = CrmPayloadBuilder(settings.crm_customer_level_scheme)
         self._robot_submission_confirmation_available = (
-            get_settings().wecom_card_callback_ready()
+            settings.wecom_card_callback_ready()
             if robot_submission_confirmation_available is None
             else robot_submission_confirmation_available
         )
+
+    def retry_due_creates(self, *, limit: int = 20) -> int:
+        """处理已到期的 CRM create 重试及失效租约恢复。
+
+        参数：limit 为本轮最多扫描的同步记录数，必须为正整数。
+        返回值：本轮认领候选数；并发下候选可能已由其他 Worker 完成。
+        异常：数据库读写错误向 Celery 传播；单条 CRM 错误由同步状态机保存。
+        副作用：重用已冻结 payload 与幂等键调用 CRM，并登记最终结果通知。
+        """
+        if limit <= 0:
+            raise ValueError("CRM 重试扫描数量必须大于 0")
+        current_time = utc_now()
+        with self._session_factory() as session:
+            due_syncs = session.execute(
+                select(CrmSyncRecord.id, CrmSyncRecord.submitting_sales_user_id)
+                .where(
+                    CrmSyncRecord.operation == "create",
+                    or_(
+                        and_(
+                            CrmSyncRecord.status == "retrying",
+                            CrmSyncRecord.failure_category == "transient",
+                            CrmSyncRecord.next_retry_at <= current_time,
+                        ),
+                        and_(
+                            CrmSyncRecord.status == "processing",
+                            CrmSyncRecord.processing_lease_expires_at <= current_time,
+                        ),
+                    ),
+                )
+                .order_by(CrmSyncRecord.next_retry_at, CrmSyncRecord.id)
+                .limit(limit)
+            ).all()
+        for sync_id, sales_user_id in due_syncs:
+            # `_claim_and_call` 使用行锁和租约 fencing，多个 Beat/Worker 不会重复认领。
+            self._claim_and_call(sync_id, sales_user_id, notify_retry_result=True)
+        return len(due_syncs)
 
     def _resolve_crm_owner(
         self,
@@ -1562,7 +1605,9 @@ class CrmSubmissionService:
             ).order_by(CrmSyncRecord.id.asc()).limit(1)
         )
 
-    def _claim_and_call(self, sync_id: int, sales_user_id: str) -> str:
+    def _claim_and_call(
+        self, sync_id: int, sales_user_id: str, *, notify_retry_result: bool = False
+    ) -> str:
         """原子认领 pending/retrying 同步记录后调用 CRM，并持久化独立结果。"""
         claim_started_at: datetime
         claim_attempts: int
@@ -1607,6 +1652,8 @@ class CrmSubmissionService:
             if sync.attempts >= self._crm_create_retry_count and not is_unknown_outcome_recovery:
                 # 传输失败达到自动重试上限只能确认“外部结果未知”，不得结算废弃请求。
                 self._mark_unknown_crm_outcome(session, sync, sales_user_id)
+                if notify_retry_result:
+                    self._enqueue_crm_retry_result_notification(session, sync)
                 return "failed_pending_review"
             if sync.status == "awaiting_duplicate_confirmation":
                 # 历史查重记录尚未调用 CRM 写接口，可安全转换为统一提交操作。
@@ -1616,6 +1663,7 @@ class CrmSubmissionService:
                 sync.response_summary = None
             # 已登记 Sync 的 discard 已进入等待外部事实路径；create 继续使用原冻结操作。
             sync.status = "processing"
+            sync.next_retry_at = None
             sync.attempts += 1
             claim_attempts = sync.attempts
             claim_started_at = utc_now()
@@ -1633,6 +1681,7 @@ class CrmSubmissionService:
                 ValueError("CRM 同步记录缺少冻结提交身份"),
                 claim_started_at,
                 claim_attempts,
+                notify_retry_result=notify_retry_result,
             )
 
         try:
@@ -1644,18 +1693,38 @@ class CrmSubmissionService:
             # PermissionError 属于 OSError，但它是永久失败，必须先于传输重试分支终止。
             if classify_task_failure(error).value != "transient":
                 return self._record_crm_failure(
-                    sync_id, sales_user_id, error, claim_started_at, claim_attempts
+                    sync_id,
+                    sales_user_id,
+                    error,
+                    claim_started_at,
+                    claim_attempts,
+                    notify_retry_result=notify_retry_result,
                 )
             return self._record_crm_transport_failure(
-                sync_id, sales_user_id, error, claim_started_at, claim_attempts
+                sync_id,
+                sales_user_id,
+                error,
+                claim_started_at,
+                claim_attempts,
+                notify_retry_result=notify_retry_result,
             )
         except Exception as error:
             if classify_task_failure(error).value == "transient":
                 return self._record_crm_transport_failure(
-                    sync_id, sales_user_id, error, claim_started_at, claim_attempts
+                    sync_id,
+                    sales_user_id,
+                    error,
+                    claim_started_at,
+                    claim_attempts,
+                    notify_retry_result=notify_retry_result,
                 )
             return self._record_crm_failure(
-                sync_id, sales_user_id, error, claim_started_at, claim_attempts
+                sync_id,
+                sales_user_id,
+                error,
+                claim_started_at,
+                claim_attempts,
+                notify_retry_result=notify_retry_result,
             )
 
         with self._session_factory.begin() as session:
@@ -1679,6 +1748,7 @@ class CrmSubmissionService:
                 # 租约接管者已经提交了新事实；旧 worker 的迟到结果绝不能回写覆盖它。
                 return self._completed_sync_outcome(sync)
             sync.status = "succeeded"
+            sync.next_retry_at = None
             sync.processing_started_at = None
             sync.processing_lease_expires_at = None
             if crm_result.crm_lead_id is not None:
@@ -1744,6 +1814,8 @@ class CrmSubmissionService:
                 else f"crm_{sync.operation}_succeeded"
             )
             self._record_audit_for_sync(session, sync, sales_user_id, event_type)
+            if notify_retry_result:
+                self._enqueue_crm_retry_result_notification(session, sync)
         if completed_lead_id is not None:
             try:
                 # CRM 成功事实已提交后再更新审核表状态，避免远端成功被表格慢调用锁住。
@@ -2005,6 +2077,8 @@ class CrmSubmissionService:
         error: BaseException,
         claim_started_at: datetime,
         claim_attempts: int,
+        *,
+        notify_retry_result: bool = False,
     ) -> str:
         """将 CRM 永久失败及其废弃协调事实写入一个短事务。
 
@@ -2044,6 +2118,7 @@ class CrmSubmissionService:
                 sync.failure_code = protocol_code
             sync.failure_summary = safe_failure_summary(error)
             sync.failed_at = utc_now()
+            sync.next_retry_at = None
             sync.processing_started_at = None
             sync.processing_lease_expires_at = None
             if failure_category.value == "unknown" or (
@@ -2065,6 +2140,8 @@ class CrmSubmissionService:
                     f"crm_{sync.operation}_failed",
                     details=failure_evidence,
                 )
+            if notify_retry_result:
+                self._enqueue_crm_retry_result_notification(session, sync)
         return "failed_pending_review"
 
     def _record_crm_transport_failure(
@@ -2074,6 +2151,8 @@ class CrmSubmissionService:
         error: BaseException,
         claim_started_at: datetime,
         claim_attempts: int,
+        *,
+        notify_retry_result: bool = False,
     ) -> str:
         """在 claim fencing 通过时记录 CRM 传输失败，否则保留接管者结果。
 
@@ -2098,7 +2177,6 @@ class CrmSubmissionService:
                 return "failed_pending_review"
             if not self._claim_is_current(sync, claim_started_at, claim_attempts):
                 return sync.status
-            sync.status = "retrying"
             sync.failure_category = classify_task_failure(error).value
             failure_evidence = self._crm_failure_evidence(error)
             sync.failure_kind = failure_evidence.get("adapter_category") or type(error).__name__
@@ -2108,11 +2186,40 @@ class CrmSubmissionService:
             sync.failure_summary = safe_failure_summary(error)
             sync.processing_started_at = None
             sync.processing_lease_expires_at = None
-            sync.response_summary = "CRM transport error"
+            http_status = failure_evidence.get("http_status")
+            if isinstance(http_status, int):
+                protocol_summary = (
+                    f" code {protocol_code}" if isinstance(protocol_code, str) else ""
+                )
+                sync.response_summary = f"CRM gateway HTTP {http_status}{protocol_summary}"
+            elif isinstance(protocol_code, str):
+                sync.response_summary = f"CRM gateway code {protocol_code}"
+            else:
+                sync.response_summary = "CRM transport error"
             if sync.operation == "update":
                 # 即使异常被归为 transient，远端也可能已覆盖；只允许核对，禁止重复写。
                 self._mark_unknown_crm_outcome(session, sync, sales_user_id)
                 return "failed_pending_review"
+            if notify_retry_result and sync.attempts >= self._crm_create_retry_count:
+                # 最后一次传输失败的远端写入结果未知，立即转人工核对，不再显示虚假的“重试中”。
+                self._mark_unknown_crm_outcome(session, sync, sales_user_id)
+                if notify_retry_result:
+                    self._enqueue_crm_retry_result_notification(session, sync)
+                return "failed_pending_review"
+            retry_delay = self._crm_create_retry_delay_seconds * 2 ** (sync.attempts - 1)
+            sync.status = "retrying"
+            sync.next_retry_at = utc_now() + timedelta(seconds=retry_delay)
+            _LOGGER.warning(
+                "crm_submission_retry_scheduled",
+                extra={
+                    "crm_sync_record_id": sync.id,
+                    "attempt": sync.attempts,
+                    "retry_at": sync.next_retry_at.isoformat(),
+                    "failure_kind": sync.failure_kind,
+                    "failure_code": sync.failure_code,
+                    "http_status": http_status,
+                },
+            )
         return "retrying"
 
     @staticmethod
@@ -2146,6 +2253,7 @@ class CrmSubmissionService:
         副作用：结束当前租约并保留公司预留与废弃等待，不伪造永久失败或 CRM 删除事实。
         """
         sync.status = "failed_pending_review"
+        sync.next_retry_at = None
         sync.failure_category = "unknown"
         sync.failure_summary = "crm_external_outcome_unknown"
         sync.failed_at = utc_now()
@@ -2172,6 +2280,46 @@ class CrmSubmissionService:
                 "attempts": sync.attempts,
                 "retry_limit": self._crm_create_retry_count,
             },
+        )
+
+    @staticmethod
+    def _enqueue_crm_retry_result_notification(session: Session, sync: CrmSyncRecord) -> None:
+        """将自动重试的最终状态登记到现有企微通知 Outbox。
+
+        参数：session 为当前持久化事务；sync 为已完成或需人工核对的 CRM 操作。
+        返回值：无。
+        异常：数据库约束错误由事务层传播。
+        副作用：按 sync ID 幂等创建一条发给原提交人的通知，不直接调用企微。
+        """
+        key = hashlib.sha256(f"crm_retry_result:{sync.id}".encode()).hexdigest()
+        if session.get(NotificationRecord, key) is not None:
+            return
+        raw_name = sync.canonical_payload.get("name")
+        lead_name = safe_audit_text(
+            raw_name if isinstance(raw_name, str) else "该线索", max_length=120
+        )
+        if sync.status == "succeeded":
+            result = (
+                "CRM 已存在并跟进"
+                if "FOLLOW_UP" in (sync.response_summary or "")
+                else "CRM 提交成功"
+            )
+            content = f"CRM 自动重试完成：{lead_name}，{result}。"
+        elif sync.failure_category == "unknown":
+            content = (
+                f"CRM 自动重试已结束：{lead_name} 的提交结果仍无法确认，"
+                "请人工核对 CRM，避免重复提交。"
+            )
+        else:
+            content = f"CRM 自动重试失败：{lead_name}，需要人工处理。"
+        session.add(
+            NotificationRecord(
+                notification_key=key,
+                sales_user_id=sync.submitting_sales_user_id,
+                source_message_id=sync.request_message_id,
+                notification_type="crm_submission_retry_summary",
+                content=content,
+            )
         )
 
     def _finalize_pending_discard(self, session: Session, sync: CrmSyncRecord) -> None:
