@@ -673,7 +673,8 @@ def _link_unsubmitted_smart_table_records(
     异常：表格协议、数据库或授权错误向调用方传播；不调用 CRM。
     副作用：仅按稳定 record_id 新增缺失 Lead 和绑定审计事实，不覆盖已有 Lead。
     """
-    records = smart_table_adapter.get_records()
+    # 企业微信端先按负责人过滤，避免补链读取其他销售的表格记录。
+    records = smart_table_adapter.get_records(owner_user_ids=(command.sales_user_id,))
     with session_factory.begin() as session:
         linked_count = 0
         for record in records:
@@ -726,7 +727,9 @@ def prepare_company_submission_preview(
         # 重放只复用已冻结通知，不能因表格快照改变而再发行卡片或追加新页。
         _queue_submission_table_link(session_factory, command)
         return "本次提交确认消息已登记，请在原确认卡中操作。"
-    records, contains_match = _find_company_records(smart_table_adapter, company_name)
+    records, contains_match = _find_company_records(
+        smart_table_adapter, company_name, owner_user_ids=(command.sales_user_id,)
+    )
     if not records:
         return "未找到该公司名称的线索，请确认智能表格中的线索名称后重试。"
     # 指定线索候选必须仍是未提交；字段完整性不在预览阶段筛除。
@@ -987,16 +990,23 @@ def _link_existing_smart_table_record(
 
 
 def _find_company_records(
-    smart_table_adapter: SmartTableAdapter, company_name: str
+    smart_table_adapter: SmartTableAdapter,
+    company_name: str,
+    *,
+    owner_user_ids: tuple[str, ...],
 ) -> tuple[list[SmartTableRecord], bool]:
-    """先精确查询，失败后按公司名称包含关系返回候选记录。
+    """只在指定负责人范围内按公司名称精确或包含匹配表格记录。
 
-    参数：smart_table_adapter 为智能表格读取边界；company_name 为机器人解析出的公司名称。
+    参数：smart_table_adapter 为智能表格读取边界；company_name 为解析出的公司名称；
+    owner_user_ids 为当前已授权提交范围。
     返回值：记录列表及是否使用了包含匹配；精确命中时标记为 False。
     异常：智能表格读取失败时由适配器向上抛出。
-    副作用：精确无结果时读取当前子表快照，不执行任何写入或 CRM 调用。
+    副作用：仅读取指定负责人记录，不执行任何写入或 CRM 调用。
     """
-    exact_records = smart_table_adapter.find_records({"线索名称": company_name})
+    scoped_records = smart_table_adapter.get_records(owner_user_ids=owner_user_ids)
+    exact_records = [
+        record for record in scoped_records if record.fields.get("线索名称") == company_name
+    ]
     if exact_records:
         return exact_records, False
 
@@ -1004,7 +1014,7 @@ def _find_company_records(
     if len(normalized_query) < 2:
         return [], False
     contains_records: list[SmartTableRecord] = []
-    for record in smart_table_adapter.get_records():
+    for record in scoped_records:
         value = record.fields.get("线索名称")
         if not isinstance(value, str):
             continue
@@ -1100,6 +1110,7 @@ def _issue_duplicate_confirmation_card(
             actor_user_id=command.sales_user_id,
             request_message_id=command.request_message_id,
             duplicates=result.duplicate_confirmations,
+            owner_scope_user_ids=command.owner_scope_user_ids,
         )
     except CardCapabilityUnavailable:
         # readiness 在事务间变化时保留未提交状态，销售可稍后重新发起提交。

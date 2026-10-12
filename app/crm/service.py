@@ -391,12 +391,20 @@ class CrmSubmissionService:
             else robot_submission_confirmation_available
         )
 
-    def _resolve_crm_owner(self, lead: Lead) -> str | None:
+    def _resolve_crm_owner(
+        self,
+        lead: Lead,
+        *,
+        initial_record: SmartTableRecord | None = None,
+    ) -> str | None:
         """在 CRM 调用前把企微负责人 ID 转为姓名并解析唯一 employee.id。
 
         智能表格成员字段继续以 userId 作为权限和归属事实；只有企业微信响应附带的
         userName 才用于 EmployeeDirectory 姓名/花名解析。缺少可读姓名、姓名不唯一或
         记录归属不一致时返回 None，调用方必须 fail closed，不调用 CRM。
+        参数：lead 为当前线索；initial_record 为本次提交已回读的同一行快照（如有）。
+        返回值：唯一 CRM 员工标识；无法唯一解析时为 None。
+        副作用：无；必要时读取智能表格记录。
         """
         directory = self._employee_directory
         if directory is None:
@@ -404,9 +412,17 @@ class CrmSubmissionService:
             self._employee_directory = directory
         owner_name: str | None = None
         if lead.smart_table_record_id:
-            # 重新读取当前审核快照，避免使用 Lead 创建时保存的过期成员显示值。
-            record = self._smart_table_adapter.get_record(lead.smart_table_record_id)
+            # 批量提交复用同批回读的成员名称；单条提交仍从智能表格获取当前值。
+            record = (
+                initial_record
+                if initial_record is not None
+                and initial_record.record_id == lead.smart_table_record_id
+                else self._read_smart_table_record(lead.smart_table_record_id)
+            )
             if record is not None:
+                # 后台负责人和当前表格负责人不一致时，不读取或映射他人的成员身份。
+                if record.fields.get("负责人") != lead.smart_table_owner_user_id:
+                    return None
                 member_names = getattr(record, "member_names", {})
                 if isinstance(member_names, Mapping):
                     candidate = member_names.get("负责人")
@@ -420,6 +436,23 @@ class CrmSubmissionService:
             return directory.resolve(owner_name)
         except EmployeeDirectoryError:
             return None
+
+    def _read_smart_table_record(self, record_id: str) -> SmartTableRecord | None:
+        """按记录标识精确回读单条线索，禁止提交路径退化为整表扫描。
+
+        参数：record_id 为本次提交目标记录的智能表格标识。
+        返回值：标识完全匹配的当前记录；记录不存在时返回 None。
+        异常：适配器无法执行服务端精确过滤时向调用方传播。
+        副作用：仅读取指定记录。
+        """
+        return next(
+            (
+                record
+                for record in self._smart_table_adapter.get_records((record_id,))
+                if record.record_id == record_id
+            ),
+            None,
+        )
 
     def submit(self, command: SubmissionCommand) -> SubmissionBatchResult:
         """解析固定命令并逐条提交本人待创建 Lead，保持批次部分成功。
@@ -498,12 +531,8 @@ class CrmSubmissionService:
             raise ValueError("不支持待完善线索重提命令")
         selected = tuple(dict.fromkeys(selected_lead_ids))
         with self._session_factory() as session:
-            # 一次读取用于前置 fail-closed；真正创建前仍会在 _submit_create 重读 Final Snapshot。
-            smart_table_snapshot = {
-                record.record_id: record for record in self._smart_table_adapter.get_records()
-            }
-            eligible: set[str] = set()
             reasons: dict[str, str] = {}
+            eligible_leads: dict[str, Lead] = {}
             for lead_id in selected:
                 lead = session.get(Lead, lead_id)
                 if lead is None or lead.smart_table_owner_user_id != command.sales_user_id:
@@ -523,12 +552,27 @@ class CrmSubmissionService:
                 if lead.lifecycle_state not in {"temporary", "pending_create"}:
                     reasons[lead_id] = "candidate_state_changed"
                     continue
-                if not self._is_unsubmitted_smart_table_record(
-                    lead, snapshot=smart_table_snapshot
-                ):
-                    reasons[lead_id] = "candidate_state_changed"
-                    continue
+                eligible_leads[lead_id] = lead
+        # 只批量回读已通过负责人与状态校验的勾选记录，不拉取整张表。
+        requested_record_ids = {
+            lead.smart_table_record_id
+            for lead in eligible_leads.values()
+            if lead.smart_table_record_id is not None
+        }
+        smart_table_snapshot = (
+            {
+                record.record_id: record
+                for record in self._smart_table_adapter.get_records(requested_record_ids)
+            }
+            if requested_record_ids
+            else {}
+        )
+        eligible: set[str] = set()
+        for lead_id, lead in eligible_leads.items():
+            if self._is_unsubmitted_smart_table_record(lead, snapshot=smart_table_snapshot):
                 eligible.add(lead_id)
+            else:
+                reasons[lead_id] = "candidate_state_changed"
 
         result = SubmissionBatchResult()
         for lead_id in selected:
@@ -541,6 +585,9 @@ class CrmSubmissionService:
                             command.sales_user_id,
                             command.request_message_id,
                             target_lead_id=lead_id,
+                        ),
+                        initial_record=smart_table_snapshot.get(
+                            eligible_leads[lead_id].smart_table_record_id or ""
                         ),
                     )
                 except Exception as error:
@@ -600,10 +647,6 @@ class CrmSubmissionService:
                 or not self._can_submit_other_sales_leads(authorization)
             ):
                 raise ValueError("当前账号没有跨员工 CRM 提交权限")
-            # 授权通过后，一次卡片候选计算只读取一份当前表格快照。
-            smart_table_snapshot = {
-                record.record_id: record for record in self._smart_table_adapter.get_records()
-            }
             leads = list(
                 session.scalars(
                     select(Lead).where(
@@ -611,73 +654,85 @@ class CrmSubmissionService:
                     )
                 )
             )
-            candidates: list[SubmissionCandidate] = []
+            sync_statuses = {}
             for lead in leads:
                 sync = latest_crm_create_sync(session, lead.id)
-                if command_text == _ABANDONED_COMMAND:
-                    if (
-                        lead.lifecycle_state != "pending_create"
-                        or sync is None
-                        or sync.status != "abandoned"
-                    ):
-                        continue
-                elif command_text == _TODAY_COMMAND:
-                    # 候选资格只看所有权、日期、生命周期与实时未提交状态；字段完整性留给最终提交。
-                    if (
-                        lead.lifecycle_state not in {"pending_create", "temporary"}
-                        or not self._is_today_owned_candidate(lead, sales_user_id)
-                    ):
-                        continue
-                    if sync is not None and sync.status in {"succeeded", "abandoned"}:
-                        continue
-                    if not self._is_unsubmitted_smart_table_record(
-                        lead, snapshot=smart_table_snapshot
-                    ):
-                        continue
-                else:
-                    # 只有待创建和仍在补全的草稿能进入卡片；已同步、废弃或失败终态保持冻结。
-                    if lead.lifecycle_state not in {"pending_create", "temporary"}:
-                        continue
-                    if sync is not None and sync.status in {"succeeded", "abandoned"}:
-                        continue
-                    if not self._is_unsubmitted_smart_table_record(
-                        lead, snapshot=smart_table_snapshot
-                    ):
-                        continue
-                # 候选文案优先来自当前 Smart Table 快照，避免后台旧字段导致同名项无法区分。
-                record = smart_table_snapshot.get(lead.smart_table_record_id or "")
-                snapshot_fields = record.fields if record is not None else lead.field_values
-                company_name = snapshot_fields.get("线索名称") or lead.standard_company_name
-                if isinstance(company_name, str) and company_name.strip():
-                    contact_name = snapshot_fields.get("联系人")
-                    contact = contact_name.strip() if isinstance(contact_name, str) else ""
-                    created = lead.created_at
-                    if created.tzinfo is None:
-                        created = created.replace(tzinfo=UTC)
-                    created_text = created.astimezone(ZoneInfo("Asia/Shanghai")).strftime(
-                        "%Y-%m-%d"
+                sync_statuses[lead.id] = sync.status if sync is not None else None
+        # 卡片候选只需目标负责人已有记录；不读取表格中其他销售的行。
+        record_ids = {
+            lead.smart_table_record_id
+            for lead in leads
+            if lead.smart_table_record_id is not None
+        }
+        smart_table_snapshot = (
+            {
+                record.record_id: record
+                for record in self._smart_table_adapter.get_records(record_ids)
+            }
+            if record_ids
+            else {}
+        )
+        candidates: list[SubmissionCandidate] = []
+        for lead in leads:
+            sync_status = sync_statuses[lead.id]
+            if command_text == _ABANDONED_COMMAND:
+                if lead.lifecycle_state != "pending_create" or sync_status != "abandoned":
+                    continue
+            elif command_text == _TODAY_COMMAND:
+                # 候选资格只看所有权、日期、生命周期与实时未提交状态；字段完整性留给最终提交。
+                if (
+                    lead.lifecycle_state not in {"pending_create", "temporary"}
+                    or not self._is_today_owned_candidate(lead, sales_user_id)
+                ):
+                    continue
+                if sync_status in {"succeeded", "abandoned"}:
+                    continue
+                if not self._is_unsubmitted_smart_table_record(
+                    lead, snapshot=smart_table_snapshot
+                ):
+                    continue
+            else:
+                # 只有待创建和仍在补全的草稿能进入卡片；已同步、废弃或失败终态保持冻结。
+                if lead.lifecycle_state not in {"pending_create", "temporary"}:
+                    continue
+                if sync_status in {"succeeded", "abandoned"}:
+                    continue
+                if not self._is_unsubmitted_smart_table_record(
+                    lead, snapshot=smart_table_snapshot
+                ):
+                    continue
+            # 候选文案优先来自当前 Smart Table 快照，避免后台旧字段导致同名项无法区分。
+            record = smart_table_snapshot.get(lead.smart_table_record_id or "")
+            snapshot_fields = record.fields if record is not None else lead.field_values
+            company_name = snapshot_fields.get("线索名称") or lead.standard_company_name
+            if isinstance(company_name, str) and company_name.strip():
+                contact_name = snapshot_fields.get("联系人")
+                contact = contact_name.strip() if isinstance(contact_name, str) else ""
+                created = lead.created_at
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=UTC)
+                created_text = created.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+                # 展示文本来自当前后台快照，不参与身份判断；回调仍只接受冻结 lead_id。
+                display_text = "｜".join(
+                    part for part in (company_name.strip(), contact, created_text) if part
+                )
+                # 候选 Markdown 必须使用发行时的同一份 Smart Table 快照，避免卡片与明细错位。
+                display_snapshot = dict(snapshot_fields)
+                if record is not None:
+                    for member_field, display_name in record.member_names.items():
+                        if isinstance(display_name, str) and display_name.strip():
+                            display_snapshot[member_field] = display_name.strip()
+                candidates.append(
+                    SubmissionCandidate(
+                        lead.id,
+                        company_name.strip(),
+                        display_text,
+                        tuple(display_snapshot.items()),
+                        self._missing_crm_minimum(dict(snapshot_fields)),
+                        lead.smart_table_owner_user_id,
                     )
-                    # 展示文本来自当前后台快照，不参与身份判断；回调仍只接受冻结 lead_id。
-                    display_text = "｜".join(
-                        part for part in (company_name.strip(), contact, created_text) if part
-                    )
-                    # 候选 Markdown 必须使用发行时的同一份 Smart Table 快照，避免卡片与明细错位。
-                    display_snapshot = dict(snapshot_fields)
-                    if record is not None:
-                        for member_field, display_name in record.member_names.items():
-                            if isinstance(display_name, str) and display_name.strip():
-                                display_snapshot[member_field] = display_name.strip()
-                    candidates.append(
-                        SubmissionCandidate(
-                            lead.id,
-                            company_name.strip(),
-                            display_text,
-                            tuple(display_snapshot.items()),
-                            self._missing_crm_minimum(dict(snapshot_fields)),
-                            lead.smart_table_owner_user_id,
-                        )
-                    )
-            return tuple(candidates)
+                )
+        return tuple(candidates)
 
     def submit_selected(
         self,
@@ -692,7 +747,7 @@ class CrmSubmissionService:
         返回值：与普通批量提交相同的部分成功汇总。
         异常：actor 不存在/已停用或命令不支持时抛出 ValueError；结果回调异常向调用方传播。
         副作用：每个 callback 已接受的目标均得到结果；仅仍有效的目标调用首次提交流程，
-        并在单条处理结束后可选地持久化该条结果。
+        先按负责人权限批量回读勾选记录，并在单条处理结束后可选地持久化该条结果。
         """
         if command.text not in {
             _TODAY_COMMAND,
@@ -716,14 +771,23 @@ class CrmSubmissionService:
             )
             owner_scope = set(command.owner_scope_user_ids or ())
             valid_ids: set[str] = set()
+            selected_record_ids: dict[str, str] = {}
             for lead_id in selected:
                 lead = session.get(Lead, lead_id)
                 if lead is None:
                     continue
+                if lead.smart_table_record_id is not None:
+                    selected_record_ids[lead_id] = lead.smart_table_record_id
                 sync = latest_crm_create_sync(session, lead_id)
                 if command.text == _ABANDONED_COMMAND:
+                    # 确认卡可能跨越线索转交；只允许当前负责人或授权范围匹配的操作者继续。
                     if (
-                        lead.lifecycle_state == "pending_create"
+                        (
+                            lead.smart_table_owner_user_id in owner_scope
+                            if cross_owner and cross_owner_authorized
+                            else lead.smart_table_owner_user_id == command.sales_user_id
+                        )
+                        and lead.lifecycle_state == "pending_create"
                         and sync is not None
                         and sync.status == "abandoned"
                     ):
@@ -752,6 +816,24 @@ class CrmSubmissionService:
                     and (sync is None or sync.status not in {"succeeded", "abandoned"})
                 ):
                     valid_ids.add(lead_id)
+        # 每次确认卡回调都重新批量读取，缓存只包含本批目标记录并仅存活于本次调用。
+        requested_record_ids = {
+            selected_record_ids[lead_id]
+            for lead_id in valid_ids
+            if lead_id in selected_record_ids
+        }
+        snapshot_by_record_id: dict[str, SmartTableRecord] = {}
+        if requested_record_ids:
+            try:
+                for record in self._smart_table_adapter.get_records(requested_record_ids):
+                    if record.record_id in requested_record_ids:
+                        snapshot_by_record_id[record.record_id] = record
+            except Exception as error:
+                # 整批读取失败时保留逐条读取回退，单次表格故障不应中断整批提交。
+                _LOGGER.warning(
+                    "crm_submission_batch_snapshot_failed failure=%s",
+                    safe_failure_summary(error),
+                )
         result = SubmissionBatchResult()
         for lead_id in selected:
             if lead_id not in valid_ids:
@@ -773,6 +855,9 @@ class CrmSubmissionService:
                             command.request_message_id,
                             owner_scope_user_ids=command.owner_scope_user_ids,
                         ),
+                        initial_record=snapshot_by_record_id.get(
+                            selected_record_ids.get(lead_id, "")
+                        ),
                     )
                 except Exception as error:
                     # 单条最终快照读取失败只影响该线索，不能中止其它已勾选记录。
@@ -788,25 +873,77 @@ class CrmSubmissionService:
         return result
 
     def _submit_updates(self, command: SubmissionCommand) -> SubmissionBatchResult:
-        """扫描当前表格负责人的已同步记录，并仅提交规范业务快照差异。"""
+        """扫描当前负责人已同步记录，仅将有业务字段变化的快照提交到 CRM。
+
+        参数：command 为已鉴权的本人更新提交命令。
+        返回值：各线索更新结果及部分成功汇总。
+        异常：单条表格或 CRM 异常记录为待人工核对，并继续处理其它负责人记录。
+        副作用：只批量回读当前负责人的目标记录，并可能创建冻结 CRM 同步记录。
+        """
         with self._session_factory() as session:
-            candidate_ids = list(
+            candidates = list(
                 session.scalars(
-                    select(Lead.id).where(
+                    select(Lead).where(
                         Lead.smart_table_owner_user_id == command.sales_user_id,
                         Lead.lifecycle_state.in_(("synced", "pending_update")),
                         Lead.smart_table_record_id.is_not(None),
                     )
                 )
             )
+            # 冻结更新尚有未决结果时不得读取新表格快照替换原 CRM 请求。
+            record_ids = {
+                lead.smart_table_record_id
+                for lead in candidates
+                if lead.smart_table_record_id is not None
+                and self._last_successful_sync(session, lead.id) is not None
+                and self._unfinished_update(session, lead.id) is None
+            }
+        smart_table_snapshot: dict[str, SmartTableRecord] = {}
+        if record_ids:
+            try:
+                smart_table_snapshot = {
+                    record.record_id: record
+                    for record in self._smart_table_adapter.get_records(record_ids)
+                }
+            except Exception as error:
+                # 整批回读失败时逐条按记录 ID 重读，避免一个表格故障中止整个更新批次。
+                _LOGGER.warning(
+                    "crm_update_batch_snapshot_failed failure=%s",
+                    safe_failure_summary(error),
+                )
         result = SubmissionBatchResult()
-        for lead_id in candidate_ids:
-            outcome = self._submit_update(lead_id, command)
-            result = _append_update_result(result, lead_id, outcome)
+        for lead in candidates:
+            try:
+                outcome = self._submit_update(
+                    lead.id,
+                    command,
+                    initial_record=smart_table_snapshot.get(lead.smart_table_record_id or ""),
+                )
+            except Exception as error:
+                # 某条最终快照或 CRM 异常只影响本条；未知结果进入人工核对，不自动重复覆盖。
+                _LOGGER.warning(
+                    "crm_update_item_failed",
+                    extra={"lead_id": lead.id, "failure": safe_failure_summary(error)},
+                )
+                outcome = "failed_pending_review"
+            result = _append_update_result(result, lead.id, outcome)
         return result
 
-    def _submit_update(self, lead_id: str, command: SubmissionCommand) -> str:
-        """重读已同步线索，冻结更新快照并通过 CRM 统一接口提交。"""
+    def _submit_update(
+        self,
+        lead_id: str,
+        command: SubmissionCommand,
+        *,
+        initial_record: SmartTableRecord | None = None,
+    ) -> str:
+        """重读已同步线索，冻结更新快照并通过 CRM 统一接口提交。
+
+        参数：lead_id 为目标线索；command 为提交命令；initial_record 为本批负责人范围内
+        已读取的目标快照，缺失时由方法按记录标识读取。
+        返回值：标准 CRM 更新状态或业务校验结果。
+        异常：智能表格和数据库故障传播；CRM 传输结果由同步记录认领器处理。
+        副作用：读取目标表格记录、更新人工编辑审计，并可能调用 CRM。
+        """
         with self._session_factory() as session:
             lead = session.get(Lead, lead_id)
             if (
@@ -822,16 +959,27 @@ class CrmSubmissionService:
             unfinished = self._unfinished_update(session, lead_id)
             if unfinished is not None:
                 return self._claim_and_call(unfinished.id, command.sales_user_id)
-        reconciled = LeadReviewService(
+        review_service = LeadReviewService(
             self._session_factory,
             self._smart_table_adapter,
             robot_submission_confirmation_available=self._robot_submission_confirmation_available,
-        ).reconcile_submission(lead_id)
+        )
+        reconciled = review_service.reconcile_submission(
+            lead_id, initial_record=initial_record
+        )
+        previous = dict(latest.canonical_payload)
         try:
             payload = self._canonical_payload(
                 reconciled.fields,
                 tyc_customer_id=self._reliable_tyc_customer_id(lead, reconciled.fields),
             )
+            # 批量快照只用于筛出变化；真正创建 CRM 更新前，按当前记录 ID 刷新已变化的线索。
+            if payload != previous:
+                reconciled = review_service.reconcile_submission(lead_id)
+                payload = self._canonical_payload(
+                    reconciled.fields,
+                    tyc_customer_id=self._reliable_tyc_customer_id(lead, reconciled.fields),
+                )
         except CrmEnumMappingError as error:
             # 新增合法表格选项不能越过 CRM 字典边界；保存待更新状态，不调用远端接口。
             with self._session_factory.begin() as session:
@@ -846,7 +994,6 @@ class CrmSubmissionService:
             # 字典、日期或备注格式不合法时只阻止当前线索，不让批次或其他线索被异常打断。
             self._audit(command, "crm_update_payload_invalid")
             return "incomplete"
-        previous = dict(latest.canonical_payload)
         # 公司身份是全局去重键，变动绝不能伪装成普通字段更新。
         if payload.get("name") != previous.get("name"):
             with self._session_factory.begin() as session:
@@ -890,7 +1037,8 @@ class CrmSubmissionService:
         existing_sync_id: int | None = None
         with self._session_factory.begin() as session:
             lead = session.scalar(select(Lead).where(Lead.id == lead_id).with_for_update())
-            if lead is None:
+            # 候选读取后可能发生负责人转交；CRM 写入前必须在锁内再次确认操作人仍是负责人。
+            if lead is None or lead.smart_table_owner_user_id != command.sales_user_id:
                 return "incomplete"
             # 回读期间可能完成另一次覆盖，持有 Lead 锁后再次检查，禁止新快照绕过旧事实。
             unfinished = self._unfinished_update(session, lead_id)
@@ -899,7 +1047,7 @@ class CrmSubmissionService:
                     "failed_pending_review" if unfinished.status == "failed_pending_review"
                     else "processing"
                 )
-            crm_user_id = self._resolve_crm_owner(lead)
+            crm_user_id = self._resolve_crm_owner(lead, initial_record=reconciled.record)
             if crm_user_id is None:
                 return self._record_mapping_missing(
                     session, lead, command, payload, snapshot_hash, "update"
@@ -942,16 +1090,24 @@ class CrmSubmissionService:
                 sync_id = sync.id
         return self._claim_and_call(existing_sync_id or sync_id, command.sales_user_id)
 
-    def _submit_create(self, lead_id: str, command: SubmissionCommand) -> CreateSubmissionOutcome:
+    def _submit_create(
+        self,
+        lead_id: str,
+        command: SubmissionCommand,
+        *,
+        initial_record: SmartTableRecord | None = None,
+    ) -> CreateSubmissionOutcome:
         """隔离统一 CRM 提交异常，并判断是否能安全重试前置依赖。
 
-        参数：lead_id 为当前销售待提交线索；command 为固定提交命令事实。
+        参数：lead_id 为待提交线索；command 为固定提交命令事实；initial_record 为可选批量回读快照。
         返回值：单条提交结果；外部暂态故障以可安全重试的审核结果返回。
         异常：业务异常转换为受控结果；状态查询异常按不可安全重试处理。
         副作用：写入提交审计或 CRM 同步状态。
         """
         try:
-            return self._submit_create_once(lead_id, command)
+            return self._submit_create_once(
+                lead_id, command, initial_record=initial_record
+            )
         except Exception as error:
             failure_category = classify_task_failure(error)
             safe_before_crm = False
@@ -990,11 +1146,15 @@ class CrmSubmissionService:
             return _create_outcome("failed_pending_review")
 
     def _submit_create_once(
-        self, lead_id: str, command: SubmissionCommand
+        self,
+        lead_id: str,
+        command: SubmissionCommand,
+        *,
+        initial_record: SmartTableRecord | None = None,
     ) -> CreateSubmissionOutcome:
         """冻结首次提交快照并调用 CRM 统一线索接口。
 
-        参数：lead_id 为当前销售待提交线索；command 为固定提交命令事实。
+        参数：lead_id 为待提交线索；command 为固定提交命令事实；initial_record 为可选批量回读快照。
         返回值：单条提交结果；创建或跟进由 CRM 内部处理。
         异常：智能表格或数据库异常按既有同步状态转换并记录审计。
         副作用：读取最终表格快照，写入冻结 CRM 同步记录并调用统一提交接口。
@@ -1066,7 +1226,7 @@ class CrmSubmissionService:
             self._session_factory,
             self._smart_table_adapter,
             robot_submission_confirmation_available=self._robot_submission_confirmation_available,
-        ).reconcile_submission(lead_id)
+        ).reconcile_submission(lead_id, initial_record=initial_record)
         allowed_submission_statuses = {"未提交"}
         if command.text == _ABANDONED_COMMAND:
             allowed_submission_statuses.add("放弃提交")
@@ -1143,7 +1303,7 @@ class CrmSubmissionService:
                     return _create_outcome(
                         "failed_pending_review", reason_code="crm_outcome_unknown"
                     )
-                crm_user_id = self._resolve_crm_owner(lead)
+                crm_user_id = self._resolve_crm_owner(lead, initial_record=initial_record)
                 if crm_user_id is None:
                     return _create_outcome(
                         self._record_mapping_missing(
@@ -1211,11 +1371,14 @@ class CrmSubmissionService:
         *,
         continue_submission: bool,
         selected_lead_ids: tuple[str, ...] = (),
+        duplicate_lead_ids: tuple[str, ...] = (),
+        owner_scope_user_ids: tuple[str, ...] | None = None,
     ) -> DuplicateConfirmationResult:
         """执行重复线索卡片的继续或停止决定，并只更新服务端冻结的目标。
 
         参数：request_message_id 和 sales_user_id 定位原提交请求及操作者；
-        continue_submission 表示继续覆盖还是停止；selected_lead_ids 为销售勾选的本地线索。
+        duplicate_lead_ids 为确认卡冻结目标；owner_scope_user_ids 为已授权负责人范围；
+        continue_submission 表示继续覆盖还是停止；selected_lead_ids 为操作人勾选的本地线索。
         返回值：已覆盖、已放弃、未选择和失败数量汇总。
         异常：操作者不存在/已停用或目标不属于当前销售时抛出 ValueError。
         副作用：更新 CRM 同步状态、审计记录和智能表格提交状态，必要时调用 CRM update。
@@ -1225,17 +1388,34 @@ class CrmSubmissionService:
         abandoned_lead_ids: list[str] = []
         remaining = 0
         with self._session_factory.begin() as session:
-            rows = session.execute(
+            # 跨员工卡片可能延迟点击；执行时必须重新确认操作人仍有跨员工权限。
+            if owner_scope_user_ids is not None:
+                authorization = session.get(SalesAuthorization, sales_user_id)
+                if (
+                    not owner_scope_user_ids
+                    or authorization is None
+                    or not authorization.is_active
+                    or not (
+                        authorization.is_administrator
+                        or authorization.can_submit_other_sales_leads
+                    )
+                ):
+                    raise PermissionError("跨员工 CRM 提交权限已失效")
+            owner_scope = owner_scope_user_ids or (sales_user_id,)
+            statement = (
                 select(CrmSyncRecord, Lead)
                 .join(Lead, Lead.id == CrmSyncRecord.lead_id)
                 .where(
                     CrmSyncRecord.request_message_id == request_message_id,
                     CrmSyncRecord.operation == "create",
                     CrmSyncRecord.status == "awaiting_duplicate_confirmation",
-                    Lead.smart_table_owner_user_id == sales_user_id,
+                    Lead.smart_table_owner_user_id.in_(owner_scope),
                 )
-                .with_for_update()
-            ).all()
+            )
+            # 实际卡片回调只能作用于发行时冻结的重复目标集合。
+            if duplicate_lead_ids:
+                statement = statement.where(Lead.id.in_(duplicate_lead_ids))
+            rows = session.execute(statement.with_for_update()).all()
             for sync, lead in rows:
                 if not continue_submission:
                     sync.status = "abandoned"
@@ -1686,9 +1866,13 @@ class CrmSubmissionService:
         record = (
             snapshot.get(lead.smart_table_record_id)
             if snapshot is not None
-            else self._smart_table_adapter.get_record(lead.smart_table_record_id)
+            else self._read_smart_table_record(lead.smart_table_record_id)
         )
-        return record is not None and record.fields.get("提交状态") == "未提交"
+        return (
+            record is not None
+            and record.fields.get("负责人") == lead.smart_table_owner_user_id
+            and record.fields.get("提交状态") == "未提交"
+        )
 
     @staticmethod
     def _is_create_candidate(

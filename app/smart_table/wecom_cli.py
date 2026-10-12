@@ -8,10 +8,13 @@ import re
 import shutil
 import subprocess
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import datetime
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
+
+from redis import Redis
+from redis.exceptions import RedisError
 
 from app.core.config import get_settings
 from app.core.failures import PermanentTaskFailure, RetryableTaskFailure
@@ -39,6 +42,7 @@ from app.smart_table.registry import (
 )
 
 logger = logging.getLogger(__name__)
+_CLI_MIN_INTERVAL_SECONDS = 0.25
 
 CliRunner = Callable[[Sequence[str]], Mapping[str, object]]
 ReadResource = Literal["fields", "records"]
@@ -210,6 +214,16 @@ class WecomCliSmartTableAdapter:
         self._retry_count = retry_count
         self._require_owner_field = require_owner_field
         self._runner = runner or self._run_subprocess
+        self._pace_cli_calls = runner is None
+        self._rate_limit_redis: Any = (
+            Redis.from_url(
+                get_settings().redis_url,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+            )
+            if self._pace_cli_calls
+            else None
+        )
         self._schema: SmartTableSchema | None = None
         # 单一 TTL 由快照服务负责，写入和 AI 可固定同一处理版本。
         self._enum_snapshots = EnumSnapshotService(
@@ -314,17 +328,34 @@ class WecomCliSmartTableAdapter:
             if all(record.fields.get(name) == value for name, value in filters.items())
         ]
 
-    def get_records(self) -> list[SmartTableRecord]:
-        """分页读取当前子表中的全部记录快照。
+    def get_records(
+        self,
+        record_ids: Collection[str] | None = None,
+        *,
+        owner_user_ids: Collection[str] | None = None,
+    ) -> list[SmartTableRecord]:
+        """读取全部记录、指定记录或指定负责人范围的快照。
 
+        参数：record_ids 与 owner_user_ids 最多提供一个过滤集合。
         返回：按 CLI 页顺序合并的记录列表。
-        异常：记录响应缺少标识或字段值时抛出异常。
-        副作用：调用 wecom-cli 的 records list 接口。
+        异常：过滤配置冲突、缺少服务端过滤所需子表名称或 CLI 响应无效时抛出异常。
+        副作用：只读指定记录或负责人范围；未过滤调用才读取整个子表。
         """
+        requested = tuple(dict.fromkeys(record_ids)) if record_ids is not None else None
+        owners = tuple(dict.fromkeys(owner_user_ids)) if owner_user_ids is not None else None
+        if requested is not None and owners is not None:
+            raise ValueError("记录标识与负责人范围不能同时过滤")
+        if requested == () or owners == ():
+            return []
+        if (requested is not None or owners is not None) and not self._sheet_title:
+            # 没有完整子表名称时只能分页扫描全表，提交路径必须失败闭合，不能读取其他负责人的行。
+            raise SmartTableAdapterConfigurationError(
+                "负责人/记录过滤读取需要配置 WECOM_SMART_TABLE_SHEET_TITLE"
+            )
         schema = self.get_schema()
         if self._sheet_title:
-            # 记录列表接口会按当前可见范围返回子集；配置子表名称后优先使用完整 SQL 读取。
-            return self._query_records(schema)
+            # 查询条件在企微服务端执行，提交只会读取目标记录 ID 或负责人范围。
+            return self._query_records(schema, record_ids=requested, owner_user_ids=owners)
         return [self._parse_record(item, schema) for item in self._list_pages("records")]
 
     def create_record(
@@ -548,15 +579,70 @@ class WecomCliSmartTableAdapter:
         rows = self._query_rows(sql)
         return self._parse_query_record(rows[0], schema) if rows else None
 
-    def _query_records(self, schema: SmartTableSchema) -> list[SmartTableRecord]:
-        """使用完整查询接口读取目标子表的全部记录。
+    def _query_records(
+        self,
+        schema: SmartTableSchema,
+        *,
+        record_ids: tuple[str, ...] | None = None,
+        owner_user_ids: tuple[str, ...] | None = None,
+    ) -> list[SmartTableRecord]:
+        """使用服务端 SQL 过滤读取全部记录、目标记录或负责人记录。
 
-        参数：schema 为启动时校验过的字段结构。
+        参数：schema 为启动时校验过的字段结构；record_ids 或 owner_user_ids 为可选过滤项。
         返回值：按查询结果顺序转换后的记录快照。
-        异常：查询协议、权限或字段结构异常时抛出适配器异常。
-        副作用：启动一次只读的 wecom-cli records query，不修改智能表格。
+        异常：过滤冲突、查询协议或读取上限不确定时抛出适配器异常。
+        副作用：发起一项或多项只读 records query，不修改智能表格。
         """
-        sql = self._build_query_sql(schema, limit=1000)
+        if record_ids is not None and owner_user_ids is not None:
+            raise ValueError("记录标识与负责人范围不能同时过滤")
+        where: str | None = None
+        if record_ids is not None:
+            records: list[SmartTableRecord] = []
+            # 分块规避单条 SQL 长度及 CLI 的 1000 行上限，避免大批量勾选静默截断。
+            for start in range(0, len(record_ids), 500):
+                chunk = record_ids[start : start + 500]
+                where = " OR ".join(
+                    f"RECORD_ID = {self._quote_sql_string_literal(record_id)}"
+                    for record_id in chunk
+                )
+                sql = self._build_query_sql(schema, where=where, limit=len(chunk))
+                records.extend(
+                    self._parse_query_record(row, schema) for row in self._query_rows(sql)
+                )
+            return records
+
+        if owner_user_ids is not None:
+            owner_field = schema.get_field("负责人")
+            if owner_field is None:
+                raise SmartTableAdapterConfigurationError("负责人范围查询缺少负责人字段")
+            field_titles = [field.name for field in schema.fields]
+            filter_spec: dict[str, object] = {
+                "conjunction": "or",
+                "conditions": [
+                    {
+                        "field_title": owner_field.name,
+                        "field_type": "user",
+                        "operator": "is",
+                        "user_value": {"value": [owner_user_id]},
+                    }
+                    for owner_user_id in owner_user_ids
+                ],
+            }
+            # records list 对成员字段支持按 userid 精确过滤并分页，不读取相似 ID 的其他负责人记录。
+            page_limit = max(1, min(1000, 9999 // max(1, len(field_titles))))
+            rows = self._list_pages(
+                "records",
+                filter_spec=filter_spec,
+                field_titles=field_titles,
+                limit=page_limit,
+            )
+            records = [self._parse_record(row, schema) for row in rows]
+            allowed_owners = set(owner_user_ids)
+            if any(record.fields.get("负责人") not in allowed_owners for record in records):
+                raise WecomCliProtocolError("负责人精确过滤返回了范围外记录")
+            return records
+
+        sql = self._build_query_sql(schema, where=where, limit=1000)
         return [self._parse_query_record(row, schema) for row in self._query_rows(sql)]
 
     def _build_query_sql(
@@ -658,7 +744,7 @@ class WecomCliSmartTableAdapter:
         )
         for attempt in range(self._retry_count + 1):
             try:
-                response = self._runner(arguments)
+                response = self._run_cli(arguments)
             except WecomCliProcessError as error:
                 if not error.retryable:
                     self._log_final_failure(
@@ -778,10 +864,17 @@ class WecomCliSmartTableAdapter:
                 member_names[canonical_name] = member_name
         return SmartTableRecord(record_id=record_id, fields=normalized, member_names=member_names)
 
-    def _list_pages(self, resource: ReadResource) -> list[Mapping[str, object]]:
-        """按 CLI next_cursor 读取 fields 或 records 的所有分页响应。
+    def _list_pages(
+        self,
+        resource: ReadResource,
+        *,
+        filter_spec: Mapping[str, object] | None = None,
+        field_titles: Sequence[str] | None = None,
+        limit: int = 1000,
+    ) -> list[Mapping[str, object]]:
+        """按 CLI next_cursor 读取 fields 或 records 的全部匹配分页响应。
 
-        参数：resource 只能是 fields 或 records。
+        参数：resource 只能是 fields 或 records；filter_spec、field_titles、limit 供范围查询使用。
         返回：合并后的原始字段或记录对象列表。
         异常：游标循环、响应列表类型错误或 CLI 调用失败时抛出异常。
         副作用：对每一页调用一次对应的 wecom-cli list 接口。
@@ -794,7 +887,11 @@ class WecomCliSmartTableAdapter:
 
         # CLI 仅返回当前页，直到响应不再给出 next_cursor 才能形成完整快照。
         while True:
-            payload: dict[str, object] = {"limit": 1000}
+            payload: dict[str, object] = {"limit": limit}
+            if filter_spec is not None:
+                payload["filter_spec"] = filter_spec
+            if field_titles is not None:
+                payload["field_titles"] = list(field_titles)
             if cursor is not None:
                 # 续页必须回传服务端游标，不能使用本地偏移推算记录位置。
                 payload["cursor"] = cursor
@@ -848,7 +945,7 @@ class WecomCliSmartTableAdapter:
         # 仅网络层和进程层暂态失败重试；业务错误必须立即返回给调用方处理。
         for attempt in range(self._retry_count + 1):
             try:
-                response = self._runner(arguments)
+                response = self._run_cli(arguments)
             except WecomCliProcessError as error:
                 # records list/update 是幂等操作，进程异常可以安全重放；records add
                 # 可能已经在服务端成功，不能因客户端退出异常再次创建重复记录。
@@ -971,6 +1068,68 @@ class WecomCliSmartTableAdapter:
             return response
 
         raise AssertionError("已覆盖全部 CLI 重试分支")
+
+    def _run_cli(self, arguments: Sequence[str]) -> Mapping[str, object]:
+        """通过 Redis 共享锁串行并间隔执行生产 CLI 请求。
+
+        参数：arguments 为不经 shell 拼接的 CLI 参数序列。
+        返回值：CLI 返回的 JSON 映射。
+        异常：Redis 限流器不可用或排队超时时抛出可重试的适配器传输异常；CLI 异常原样传播。
+        副作用：所有 app/worker/scheduler 共享至少 250 毫秒请求间隔；注入 runner 不等待。
+        """
+        if not self._pace_cli_calls:
+            return self._runner(arguments)
+        client = self._rate_limit_redis
+        if client is None:
+            raise WecomCliTransportError("wecom-cli 共享限流器未初始化")
+        lock = None
+        lock_acquired = False
+        try:
+            # 同一部署的 app、worker 和 scheduler 用同一 Redis 键协调 CLI 调用。
+            lock = client.lock(
+                "crm-tool:wecom-cli:smart-table:request-lock",
+                timeout=max(30, self._timeout_seconds + 10),
+                blocking_timeout=max(30, self._timeout_seconds + 10),
+            )
+            if not lock.acquire():
+                raise WecomCliTransportError("wecom-cli 共享限流器排队超时")
+            lock_acquired = True
+            now = self._redis_timestamp(client)
+            previous = client.get("crm-tool:wecom-cli:smart-table:last-request-at")
+            if previous is not None:
+                delay = _CLI_MIN_INTERVAL_SECONDS - (now - float(previous))
+                if delay > 0:
+                    time.sleep(delay)
+            # 在锁内记录 Redis 服务端时间，容器时钟偏差不会破坏全局请求间隔。
+            client.set(
+                "crm-tool:wecom-cli:smart-table:last-request-at",
+                str(self._redis_timestamp(client)),
+                ex=60,
+            )
+            return self._runner(arguments)
+        except RedisError as error:
+            raise WecomCliTransportError("wecom-cli 共享限流器不可用") from error
+        finally:
+            if lock is not None and lock_acquired:
+                try:
+                    lock.release()
+                except RedisError:
+                    # CLI 可能已成功；不要把释放锁故障改写成结果未知并诱发重复远端操作。
+                    logger.error("wecom_cli_shared_rate_limiter_release_failed")
+
+    @staticmethod
+    def _redis_timestamp(client: Any) -> float:
+        """读取 Redis 服务端时间，供跨容器节流计算使用。
+
+        参数：client 为已连接的共享 Redis 客户端。
+        返回值：以秒为单位的服务端 Unix 时间戳。
+        异常：Redis 连接或响应失败时传播 RedisError。
+        副作用：执行一次只读 TIME 命令。
+        """
+        timestamp = client.time()
+        seconds = int(timestamp[0])
+        microseconds = int(timestamp[1])
+        return float(seconds) + microseconds / 1_000_000
 
     @staticmethod
     def _retry_delay_seconds(error_code: str, attempt: int) -> float:
@@ -1632,7 +1791,11 @@ class WecomCliSmartTableAdapter:
         )
         try:
             logger.error(
-                "wecom_cli_smart_table_failed",
+                "wecom_cli_smart_table_failed resource=%s action=%s error_code=%s retry_attempt=%s",
+                resource,
+                action,
+                error_code,
+                retry_attempt,
                 extra={
                     "smart_table_resource": resource,
                     "smart_table_action": action,
@@ -1656,7 +1819,11 @@ class WecomCliSmartTableAdapter:
         副作用：写入结构化警告日志。
         """
         logger.warning(
-            "wecom_cli_smart_table_retry",
+            "wecom_cli_smart_table_retry resource=%s action=%s retry_attempt=%s error_code=%s",
+            resource,
+            action,
+            attempt + 1,
+            error_code,
             extra={
                 "smart_table_resource": resource,
                 "smart_table_action": action,

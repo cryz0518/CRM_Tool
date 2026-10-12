@@ -109,6 +109,55 @@ def test_country_and_company_reference_prove_foreign_company() -> None:
     assert CompanyRegionResolver().resolve(evidence) is CompanyRegion.FOREIGN
 
 
+def test_customer_country_mention_without_company_suffix_proves_foreign_company() -> None:
+    """验证消息明确说明客户所在地时，无需“公司/企业”后缀也能识别外企。"""
+    evidence = CompanyRegionEvidence(message_text="客户总部位于巴西，正在评估协作机器人")
+
+    assert CompanyRegionResolver().resolve(evidence) is CompanyRegion.FOREIGN
+
+
+def test_english_customer_location_proves_foreign_company() -> None:
+    """验证英文消息明确说明客户总部所在地时可识别国外公司。"""
+    evidence = CompanyRegionEvidence(
+        message_text="Customer headquarters is located in Brazil; evaluating robotics"
+    )
+
+    assert CompanyRegionResolver().resolve(evidence) is CompanyRegion.FOREIGN
+
+
+@pytest.mark.parametrize(
+    "message_text",
+    (
+        "I am located in Germany and met the customer at the trade show",
+        "The exhibition venue is based in Brazil",
+    ),
+)
+def test_english_person_or_venue_location_does_not_prove_company_region(
+    message_text: str,
+) -> None:
+    """验证无公司主体的英语地点不能作为客户地域证据。
+
+    参数：message_text 为个人或展会地点描述。
+    返回值：无。
+    异常：错误地区判断时由 pytest 报告断言失败。
+    副作用：无。
+    """
+    assert (
+        CompanyRegionResolver().resolve(CompanyRegionEvidence(message_text=message_text))
+        is CompanyRegion.UNKNOWN
+    )
+
+
+def test_foreign_company_name_alone_does_not_prove_foreign_region() -> None:
+    """验证拉丁字母公司名仍不能单独作为国外地域证据。"""
+    evidence = CompanyRegionEvidence(
+        message_text="Acme Robotics Brazil Ltd.",
+        company_name="Acme Robotics Brazil Ltd.",
+    )
+
+    assert CompanyRegionResolver().resolve(evidence) is CompanyRegion.UNKNOWN
+
+
 def test_missing_company_creates_temporary_lead_until_a_verified_name_is_available(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -137,10 +186,10 @@ def test_missing_company_creates_temporary_lead_until_a_verified_name_is_availab
     assert adapter.get_records() == []
 
 
-def test_same_company_name_keeps_independent_smart_table_leads(
+def test_same_verified_company_name_reuses_the_current_sales_lead(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证智能表格阶段不按线索名称查重，两个来源保留两条记录。"""
+    """验证同销售的相同标准公司名更新既有记录并保留已有联系人。"""
     persist_source_message(session_factory, "same-name-1", "sales-1")
     persist_source_message(session_factory, "same-name-2", "sales-1")
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
@@ -167,9 +216,132 @@ def test_same_company_name_keeps_independent_smart_table_leads(
         )
     )
 
+    assert first.lead_id == second.lead_id
+    assert first.smart_table_record_id == second.smart_table_record_id
+    assert len(adapter.get_records()) == 1
+    assert adapter.get_record(first.smart_table_record_id).fields["联系人"] == "甲"
+
+
+def test_unverified_companies_deduplicate_by_the_first_standard_company_name(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证天眼查首选标准名参与去重，原始别名本身不作为身份键。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：去重结果不符合标准公司名时由 pytest 报告断言失败。
+    副作用：创建三条来源消息及其线索记录。
+    """
+    for message_id in ("ambiguous-1", "ambiguous-2", "ambiguous-3"):
+        persist_source_message(session_factory, message_id, "sales-1")
+    candidates = QCCLookupResult.ambiguous(
+        (
+            QCCCandidate("候选公司甲", "tyc-1"),
+            QCCCandidate("候选公司乙", "tyc-2"),
+        )
+    )
+    other_candidates = QCCLookupResult.ambiguous(
+        (
+            QCCCandidate("候选公司丙", "tyc-3"),
+            QCCCandidate("候选公司丁", "tyc-4"),
+        )
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = CompanyLeadService(
+        session_factory,
+        adapter,
+        MockQCCAdapter({"同一原名": candidates, "另一简称": other_candidates}),
+    )
+
+    first = service.upsert(
+        CompanyUpsertCommand(
+            source_message_id="ambiguous-1",
+            sales_user_id="sales-1",
+            fields={"线索名称": "同一原名"},
+        )
+    )
+    repeated = service.upsert(
+        CompanyUpsertCommand(
+            source_message_id="ambiguous-2",
+            sales_user_id="sales-1",
+            fields={"线索名称": "同一原名"},
+        )
+    )
+    another = service.upsert(
+        CompanyUpsertCommand(
+            source_message_id="ambiguous-3",
+            sales_user_id="sales-1",
+            fields={"线索名称": "另一简称"},
+        )
+    )
+
+    assert first.lead_id == repeated.lead_id
+    assert another.lead_id != first.lead_id
+
+
+def test_same_raw_name_with_different_standard_names_does_not_merge(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证相同原始简称核验为不同标准公司时不会误合并。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：不同标准名被合并时由 pytest 报告断言失败。
+    副作用：创建两个来源消息和两个独立线索。
+    """
+    persist_source_message(session_factory, "changed-standard-1", "sales-1")
+    persist_source_message(session_factory, "changed-standard-2", "sales-1")
+
+    class ChangingQCCAdapter:
+        """按调用顺序返回不同的天眼查标准名，模拟同一简称的候选变化。"""
+
+        def __init__(self) -> None:
+            """初始化两次确定的标准名称结果。
+
+            参数：无。
+            返回值：无。
+            异常：无。
+            副作用：保存两项供测试消耗的 QCC 查询结果。
+            """
+            self._results = iter(
+                (
+                    QCCLookupResult.matched(QCCCandidate("公司甲有限公司", "tyc-1")),
+                    QCCLookupResult.matched(QCCCandidate("公司乙有限公司", "tyc-2")),
+                )
+            )
+
+        def lookup(self, company_name: str) -> QCCLookupResult:
+            """返回下一项预设匹配结果。
+
+            参数：company_name 为本次待核验的原始简称。
+            返回值：按顺序预设的确定标准名称结果。
+            异常：名称不符或结果耗尽时由测试断言/迭代器抛出异常。
+            副作用：消费一项预设查询结果。
+            """
+            assert company_name == "同一简称"
+            return next(self._results)
+
+    service = CompanyLeadService(
+        session_factory,
+        MockSmartTableAdapter(schema=build_required_smart_table_schema()),
+        ChangingQCCAdapter(),
+    )
+    first = service.upsert(
+        CompanyUpsertCommand(
+            source_message_id="changed-standard-1",
+            sales_user_id="sales-1",
+            fields={"线索名称": "同一简称"},
+        )
+    )
+    second = service.upsert(
+        CompanyUpsertCommand(
+            source_message_id="changed-standard-2",
+            sales_user_id="sales-1",
+            fields={"线索名称": "同一简称"},
+        )
+    )
+
     assert first.lead_id != second.lead_id
-    assert first.smart_table_record_id != second.smart_table_record_id
-    assert len(adapter.get_records()) == 2
 
 
 def test_robot_update_resets_submission_status_to_unsubmitted(
@@ -283,10 +455,10 @@ def test_salesperson_can_confirm_only_own_temporary_lead_without_llm(
     assert provenance is not None
 
 
-def test_temporary_confirmation_keeps_independent_lead_when_same_sales_company_exists(
+def test_temporary_confirmation_reuses_same_sales_company_record(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证 temporary 确认同名公司时保留独立 Lead，不迁移既有表格记录。
+    """验证 temporary 确认同名公司时复用既有记录并迁移关联事实。
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
@@ -325,7 +497,7 @@ def test_temporary_confirmation_keeps_independent_lead_when_same_sales_company_e
     upgraded = service.confirm_temporary_company(temporary.lead_id, "sales-1", "长广溪")
 
     assert upgraded.lead_id == temporary.lead_id
-    assert upgraded.smart_table_record_id is None
+    assert upgraded.smart_table_record_id == existing.smart_table_record_id
     assert len(adapter.get_records()) == 1
     with session_factory() as session:
         survivor = session.get(Lead, temporary.lead_id)
@@ -334,13 +506,13 @@ def test_temporary_confirmation_keeps_independent_lead_when_same_sales_company_e
     assert existing_lead is not None
     assert survivor.field_values["线索名称"] == "无锡长广溪智能制造有限公司"
     assert survivor.field_values["电话"] == "0510-12345678"
-    assert existing_lead.lifecycle_state != "merged"
+    assert existing_lead.lifecycle_state == "merged"
 
 
-def test_verified_company_keeps_same_name_records_for_each_submission(
+def test_verified_company_deduplicates_within_sales_but_not_across_sales(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证标准公司名不在智能表格阶段查重，销售和公司均可保留独立记录。
+    """验证标准公司名按销售隔离查重，不会跨负责人合并。
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
@@ -391,9 +563,9 @@ def test_verified_company_keeps_same_name_records_for_each_submission(
 
     assert upgraded.lead_id == temporary.lead_id
     assert upgraded.standard_company_name == "无锡长广溪智能制造有限公司"
-    assert same_sales.lead_id != upgraded.lead_id
+    assert same_sales.lead_id == upgraded.lead_id
     assert other_sales.lead_id != upgraded.lead_id
-    assert len(adapter.get_records()) == 3
+    assert len(adapter.get_records()) == 2
     with session_factory() as session:
         first = session.get(Lead, upgraded.lead_id)
         same_sales_lead = session.get(Lead, same_sales.lead_id)
@@ -402,7 +574,7 @@ def test_verified_company_keeps_same_name_records_for_each_submission(
     assert same_sales_lead is not None
     assert second is not None
     assert first.field_values["联系人"] == "张三"
-    assert same_sales_lead.field_values["联系人"] == "李四"
+    assert same_sales_lead.field_values["联系人"] == "张三"
     assert same_sales_lead.field_values["电话"] == "0510-12345678"
     assert second.field_values["联系人"] == "王五"
 
@@ -552,7 +724,7 @@ def test_synced_company_name_change_requires_identity_review(
     assert changed.verification_status.value == "verification_conflict"
 
 
-def test_temporary_lead_upgrades_without_merging_existing_company(
+def test_temporary_lead_upgrade_reuses_existing_company_record(
     session_factory: sessionmaker[Session],
 ) -> None:
     """验证临时线索获得标准名后保留自身且不迁移同名正式目标。
@@ -600,10 +772,12 @@ def test_temporary_lead_upgrades_without_merging_existing_company(
     assert original_temporary is not None
     assert target is not None
     assert original_temporary.lifecycle_state != "merged"
-    assert target.lifecycle_state != "merged"
+    assert target.lifecycle_state == "merged"
     assert original_temporary.field_values["手机"] == "13800000001"
     assert original_temporary.field_values["电话"] == "0510-12345678"
-    assert original_temporary.smart_table_record_id != formal.smart_table_record_id
+    assert original_temporary.smart_table_record_id == formal.smart_table_record_id
+    assert target.smart_table_record_id is None
+    assert len(adapter.get_records()) == 1
 
 
 def test_qcc_timeout_keeps_a_company_unverified_without_blocking_temporary_capture(
@@ -648,7 +822,7 @@ def test_qcc_timeout_keeps_a_company_unverified_without_blocking_temporary_captu
     assert result.verification_status.value == "company_unverified"
 
 
-def test_user_modified_field_is_never_overwritten_by_new_same_name_lead(
+def test_user_modified_field_is_never_overwritten_when_reusing_same_company_lead(
     session_factory: sessionmaker[Session],
 ) -> None:
     """验证同名后续消息创建新 Lead，不覆盖原记录的人工字段。
@@ -691,13 +865,13 @@ def test_user_modified_field_is_never_overwritten_by_new_same_name_lead(
         )
     )
 
-    assert merged.lead_id != first.lead_id
+    assert merged.lead_id == first.lead_id
     assert adapter.get_record(first.smart_table_record_id or "").fields["联系人"] == "销售确认姓名"
-    assert adapter.get_record(merged.smart_table_record_id or "").fields["联系人"] == "李四"
+    assert len(adapter.get_records()) == 1
     with session_factory() as session:
         lead = session.get(Lead, first.lead_id)
     assert lead is not None
-    assert lead.enrichment_values == {}
+    assert lead.enrichment_values["联系人"] == "李四"
 
 
 def test_table_company_name_changed_by_salesperson_is_not_overwritten_during_qcc_upgrade(

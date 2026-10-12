@@ -74,6 +74,7 @@ class SubmissionReconcileResult:
 
     fields: dict[str, object]
     blocking_fields: tuple[str, ...]
+    record: SmartTableRecord
 
 
 @dataclass(frozen=True)
@@ -146,7 +147,7 @@ class LeadReviewService:
         record = initial_record
         if record is None:
             # 普通既有记录仍需从 T03 Adapter 重读，不能使用过期后台字段快照判断人工编辑。
-            record = self._smart_table_adapter.get_record(record_id)
+            record = self._read_smart_table_record(record_id)
             if record is None:
                 raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
         elif record.record_id != record_id:
@@ -163,7 +164,7 @@ class LeadReviewService:
 
         # 在外部写入前再读一次表格；并发的后续消息若已提交，必须基于最新状态重算补丁。
         if initial_record is None:
-            latest_record = self._smart_table_adapter.get_record(record_id)
+            latest_record = self._read_smart_table_record(record_id)
             if latest_record is None:
                 raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{record_id}")
             if dict(latest_record.fields) != current_fields:
@@ -476,15 +477,21 @@ class LeadReviewService:
         reconciled = self.reconcile_submission(lead_id)
         return SubmissionConfirmationState(reconciled.blocking_fields)
 
-    def reconcile_submission(self, lead_id: str) -> SubmissionReconcileResult:
+    def reconcile_submission(
+        self,
+        lead_id: str,
+        *,
+        initial_record: SmartTableRecord | None = None,
+    ) -> SubmissionReconcileResult:
         """重读表格、落实 T09 人工编辑并返回不含审核元数据的最终快照。
 
-        参数：lead_id 为准备首次 CRM 创建的线索标识。
+        参数：lead_id 为准备首次 CRM 创建的线索标识；initial_record 为批量回调的新鲜整表快照，
+        记录标识不匹配时会重新读取目标行。
         返回值：当前表格的业务字段和仍会阻塞 CRM minimum 的待确认字段。
         异常：线索或表格记录缺失时抛出 ValueError；适配器错误向调用方传播。
         副作用：发现人工编辑时更新 provenance、AI待确认 和审计记录。
         """
-        record, lead = self._read_record_for_lead(lead_id)
+        record, lead = self._read_record_for_lead(lead_id, initial_record=initial_record)
         protected = self._reconcile_user_edits(lead, record.fields, lead.source_message_id)
         # 若本轮移除了 AI待确认，必须再读一次，最终快照不能携带旧审核元数据。
         if protected:
@@ -497,6 +504,7 @@ class LeadReviewService:
         return SubmissionReconcileResult(
             fields=fields,
             blocking_fields=tuple(sorted(self._required_pending_fields(pending, fields))),
+            record=record,
         )
 
     def confirm_submission_fields(
@@ -641,13 +649,18 @@ class LeadReviewService:
             )
         return self.get_submission_confirmation_state(lead_id)
 
-    def _read_record_for_lead(self, lead_id: str) -> tuple[SmartTableRecord, Lead]:
+    def _read_record_for_lead(
+        self,
+        lead_id: str,
+        *,
+        initial_record: SmartTableRecord | None = None,
+    ) -> tuple[SmartTableRecord, Lead]:
         """读取目标线索及其当前智能表格快照。
 
-        参数：lead_id 为目标线索标识。
+        参数：lead_id 为目标线索标识；initial_record 为可复用的批量快照。
         返回值：智能表格记录和脱离会话的 Lead 事实。
-        异常：线索或记录定位缺失时抛出 ValueError。
-        副作用：读取数据库和智能表格。
+        异常：线索或记录定位缺失、表格负责人与后台负责人不一致时抛出 ValueError。
+        副作用：读取数据库；没有匹配的批量快照时读取智能表格单行。
         """
         with self._session_factory() as session:
             lead = self._require_lead(session, lead_id)
@@ -655,10 +668,36 @@ class LeadReviewService:
                 raise ValueError(f"线索缺少智能表格记录：{lead_id}")
             record_id = lead.smart_table_record_id
             session.expunge(lead)
-        record = self._smart_table_adapter.get_record(record_id)
+        # 只复用同一智能表格记录的本次批量快照，避免记录转移后沿用另一行的数据。
+        record = (
+            initial_record
+            if initial_record is not None
+            else self._read_smart_table_record(record_id)
+        )
         if record is None:
             raise ValueError(f"智能表格记录不存在：{record_id}")
+        if record.record_id != record_id:
+            raise ValueError(f"智能表格记录标识不一致：{record_id}")
+        if record.fields.get("负责人") != lead.smart_table_owner_user_id:
+            raise ValueError("智能表格负责人已变化，请先完成线索转交核对")
         return record, lead
+
+    def _read_smart_table_record(self, record_id: str) -> SmartTableRecord | None:
+        """按记录标识精确读取单条记录，避免在无法过滤时扫描整张表。
+
+        参数：record_id 为本次业务处理对应的智能表格记录标识。
+        返回值：标识匹配的当前记录；记录不存在时返回 None。
+        异常：服务端精确过滤不可用时由适配器抛出。
+        副作用：仅读取指定记录。
+        """
+        return next(
+            (
+                item
+                for item in self._smart_table_adapter.get_records((record_id,))
+                if item.record_id == record_id
+            ),
+            None,
+        )
 
     def _reconcile_user_edits(
         self, lead: Lead, current_fields: Mapping[str, object], source_message_id: str | None
