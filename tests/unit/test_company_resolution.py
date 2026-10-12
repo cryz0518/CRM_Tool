@@ -125,6 +125,29 @@ def test_english_customer_location_proves_foreign_company() -> None:
     assert CompanyRegionResolver().resolve(evidence) is CompanyRegion.FOREIGN
 
 
+@pytest.mark.parametrize(
+    "message_text",
+    (
+        "I am located in Germany and met the customer at the trade show",
+        "The exhibition venue is based in Brazil",
+    ),
+)
+def test_english_person_or_venue_location_does_not_prove_company_region(
+    message_text: str,
+) -> None:
+    """验证无公司主体的英语地点不能作为客户地域证据。
+
+    参数：message_text 为个人或展会地点描述。
+    返回值：无。
+    异常：错误地区判断时由 pytest 报告断言失败。
+    副作用：无。
+    """
+    assert (
+        CompanyRegionResolver().resolve(CompanyRegionEvidence(message_text=message_text))
+        is CompanyRegion.UNKNOWN
+    )
+
+
 def test_foreign_company_name_alone_does_not_prove_foreign_region() -> None:
     """验证拉丁字母公司名仍不能单独作为国外地域证据。"""
     evidence = CompanyRegionEvidence(
@@ -199,10 +222,16 @@ def test_same_verified_company_name_reuses_the_current_sales_lead(
     assert adapter.get_record(first.smart_table_record_id).fields["联系人"] == "甲"
 
 
-def test_unverified_companies_deduplicate_only_by_exact_raw_name(
+def test_unverified_companies_deduplicate_by_the_first_standard_company_name(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证模糊候选按相同原名合并，不能仅因共享候选首项误并不同公司。"""
+    """验证天眼查首选标准名参与去重，原始别名本身不作为身份键。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：去重结果不符合标准公司名时由 pytest 报告断言失败。
+    副作用：创建三条来源消息及其线索记录。
+    """
     for message_id in ("ambiguous-1", "ambiguous-2", "ambiguous-3"):
         persist_source_message(session_factory, message_id, "sales-1")
     candidates = QCCLookupResult.ambiguous(
@@ -211,11 +240,17 @@ def test_unverified_companies_deduplicate_only_by_exact_raw_name(
             QCCCandidate("候选公司乙", "tyc-2"),
         )
     )
+    other_candidates = QCCLookupResult.ambiguous(
+        (
+            QCCCandidate("候选公司丙", "tyc-3"),
+            QCCCandidate("候选公司丁", "tyc-4"),
+        )
+    )
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     service = CompanyLeadService(
         session_factory,
         adapter,
-        MockQCCAdapter({"同一原名": candidates, "另一简称": candidates}),
+        MockQCCAdapter({"同一原名": candidates, "另一简称": other_candidates}),
     )
 
     first = service.upsert(
@@ -242,6 +277,71 @@ def test_unverified_companies_deduplicate_only_by_exact_raw_name(
 
     assert first.lead_id == repeated.lead_id
     assert another.lead_id != first.lead_id
+
+
+def test_same_raw_name_with_different_standard_names_does_not_merge(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证相同原始简称核验为不同标准公司时不会误合并。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：不同标准名被合并时由 pytest 报告断言失败。
+    副作用：创建两个来源消息和两个独立线索。
+    """
+    persist_source_message(session_factory, "changed-standard-1", "sales-1")
+    persist_source_message(session_factory, "changed-standard-2", "sales-1")
+
+    class ChangingQCCAdapter:
+        """按调用顺序返回不同的天眼查标准名，模拟同一简称的候选变化。"""
+
+        def __init__(self) -> None:
+            """初始化两次确定的标准名称结果。
+
+            参数：无。
+            返回值：无。
+            异常：无。
+            副作用：保存两项供测试消耗的 QCC 查询结果。
+            """
+            self._results = iter(
+                (
+                    QCCLookupResult.matched(QCCCandidate("公司甲有限公司", "tyc-1")),
+                    QCCLookupResult.matched(QCCCandidate("公司乙有限公司", "tyc-2")),
+                )
+            )
+
+        def lookup(self, company_name: str) -> QCCLookupResult:
+            """返回下一项预设匹配结果。
+
+            参数：company_name 为本次待核验的原始简称。
+            返回值：按顺序预设的确定标准名称结果。
+            异常：名称不符或结果耗尽时由测试断言/迭代器抛出异常。
+            副作用：消费一项预设查询结果。
+            """
+            assert company_name == "同一简称"
+            return next(self._results)
+
+    service = CompanyLeadService(
+        session_factory,
+        MockSmartTableAdapter(schema=build_required_smart_table_schema()),
+        ChangingQCCAdapter(),
+    )
+    first = service.upsert(
+        CompanyUpsertCommand(
+            source_message_id="changed-standard-1",
+            sales_user_id="sales-1",
+            fields={"线索名称": "同一简称"},
+        )
+    )
+    second = service.upsert(
+        CompanyUpsertCommand(
+            source_message_id="changed-standard-2",
+            sales_user_id="sales-1",
+            fields={"线索名称": "同一简称"},
+        )
+    )
+
+    assert first.lead_id != second.lead_id
 
 
 def test_robot_update_resets_submission_status_to_unsubmitted(

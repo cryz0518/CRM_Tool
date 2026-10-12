@@ -99,7 +99,7 @@ def _requires_active_sales_authorization(
     副作用：无。
     """
     return action_type not in _CRM_SUBMISSION_ACTION_TYPES or (
-        action_type == ACTION_TYPE_CRM_BATCH_SUBMISSION
+        action_type in {ACTION_TYPE_CRM_BATCH_SUBMISSION, ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION}
         and context.get("owner_scope_user_ids") is not None
     )
 
@@ -1574,11 +1574,12 @@ class WecomActionService:
         actor_user_id: str,
         request_message_id: str,
         duplicates: tuple[object, ...],
+        owner_scope_user_ids: tuple[str, ...] | None = None,
     ) -> WecomAction:
         """发行可批量选择重复线索并继续或停止提交的确认卡。
 
-        参数：actor_user_id 为销售身份；request_message_id 为原提交消息；
-        duplicates 为服务端冻结命中集合。
+        参数：actor_user_id 为操作人；request_message_id 为原提交消息；duplicates 为冻结命中集合；
+        owner_scope_user_ids 为跨员工提交时已授权的负责人范围。
         返回值：已持久化的重复确认动作。
         异常：重复事实不完整、actor 不存在/已停用或卡片能力未就绪时抛出异常。
         副作用：写入动作、卡片通知和可靠发送 outbox，不直接执行 CRM 写操作。
@@ -1606,6 +1607,9 @@ class WecomActionService:
             context={
                 "duplicate_leads": duplicate_context,
                 "request_message_id": request_message_id,
+                "owner_scope_user_ids": (
+                    list(owner_scope_user_ids) if owner_scope_user_ids is not None else None
+                ),
             },
             title="CRM 重复线索确认",
             description=f"当前系统有{names}的信息，请问是进行覆盖还是停止提交",
@@ -2771,11 +2775,31 @@ class DeterministicWecomActionExecutor:
 
         decision = action.context.get("decision")
         selected = action.context.get("selected_lead_ids", [])
+        duplicates = action.context.get("duplicate_leads")
+        owner_scope = action.context.get("owner_scope_user_ids")
         request_message_id = action.context.get("request_message_id")
-        if decision not in {"continue", "stop"} or not isinstance(request_message_id, str):
+        if (
+            decision not in {"continue", "stop"}
+            or not isinstance(request_message_id, str)
+            or not isinstance(duplicates, list)
+        ):
             raise ValueError("重复确认动作 context 不完整")
         if not isinstance(selected, list) or not all(isinstance(item, str) for item in selected):
             raise ValueError("重复确认动作选择项非法")
+        duplicate_lead_ids = tuple(
+            item.get("lead_id") for item in duplicates if isinstance(item, dict)
+        )
+        if (
+            len(duplicate_lead_ids) != len(duplicates)
+            or not all(isinstance(item, str) and item for item in duplicate_lead_ids)
+        ):
+            raise ValueError("重复确认动作目标非法")
+        if owner_scope is not None and (
+            not isinstance(owner_scope, list)
+            or not owner_scope
+            or not all(isinstance(item, str) and item for item in owner_scope)
+        ):
+            raise ValueError("重复确认动作负责人范围非法")
         if self._action_service is not None:
             self._action_service.begin_domain_operation(action.id, action.claim_token)
         result = CrmSubmissionService(
@@ -2788,6 +2812,8 @@ class DeterministicWecomActionExecutor:
             action.bound_actor_wecom_user_id,
             continue_submission=decision == "continue",
             selected_lead_ids=tuple(selected),
+            duplicate_lead_ids=duplicate_lead_ids,
+            owner_scope_user_ids=(tuple(owner_scope) if isinstance(owner_scope, list) else None),
         )
         if decision == "stop":
             return (
@@ -2876,6 +2902,9 @@ class DeterministicWecomActionExecutor:
                 actor_user_id=action.bound_actor_wecom_user_id,
                 request_message_id=request_message_id,
                 duplicates=result.duplicate_confirmations,
+                owner_scope_user_ids=(
+                    tuple(owner_scope) if isinstance(owner_scope, list) else None
+                ),
             )
         candidate_leads = action.context.get("candidate_leads")
         labels: dict[str, str] = {}

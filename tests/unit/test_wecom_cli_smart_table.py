@@ -7,6 +7,8 @@ import logging
 import subprocess
 import time
 from collections.abc import Mapping, Sequence
+from threading import Lock
+from types import SimpleNamespace
 
 import pytest
 
@@ -88,20 +90,89 @@ def _adapter(
     )
 
 
+@pytest.fixture(autouse=True)
+def _shared_rate_limiter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """为适配器单测注入同进程共享的 Redis 节流替身。
+
+    参数：monkeypatch 为 pytest 提供的属性替换上下文。
+    返回值：无。
+    异常：无；Redis 交互均由内存状态承接。
+    副作用：替换 Redis 工厂，测试结束自动恢复。
+    """
+    state: dict[str, str] = {}
+    request_lock = Lock()
+
+    def redis_time() -> tuple[int, int]:
+        """返回测试进程时间，模拟 Redis TIME 响应。
+
+        参数：无。
+        返回值：秒与微秒组成的整数元组。
+        异常：无。
+        副作用：读取系统时钟，不访问外部服务。
+        """
+        current = time.time()
+        seconds = int(current)
+        return seconds, int((current - seconds) * 1_000_000)
+
+    fake_redis = SimpleNamespace(
+        lock=lambda *_args, **_kwargs: request_lock,
+        time=redis_time,
+        get=lambda key: state.get(key),
+        set=lambda key, value, **_kwargs: state.__setitem__(key, value),
+    )
+    monkeypatch.setattr(wecom_cli.Redis, "from_url", lambda *_args, **_kwargs: fake_redis)
+
+
 def test_production_cli_runner_spaces_requests(monkeypatch: pytest.MonkeyPatch) -> None:
-    """验证生产 runner 的连续请求之间会留出限流间隔。"""
+    """验证多个适配器实例共享 Redis 限流状态并保留最小请求间隔。
+
+    参数：monkeypatch 用于缩短测试间隔。
+    返回值：无。
+    异常：请求间隔或 runner 调用数量不符合要求时由 pytest 报告断言失败。
+    副作用：调用两个生产 runner 替身并等待一次短间隔。
+    """
     adapter = WecomCliSmartTableAdapter(doc_id="test-doc", sheet_id="test-sheet")
+    second_adapter = WecomCliSmartTableAdapter(doc_id="test-doc", sheet_id="test-sheet")
     calls: list[Sequence[str]] = []
     adapter._runner = lambda arguments: calls.append(arguments) or {}
+    second_adapter._runner = lambda arguments: calls.append(arguments) or {}
     monkeypatch.setattr(wecom_cli, "_CLI_MIN_INTERVAL_SECONDS", 0.03)
-    monkeypatch.setattr(wecom_cli, "_CLI_LAST_COMPLETED_AT", time.monotonic() - 1)
     started_at = time.monotonic()
 
     adapter._run_cli(("first",))
-    adapter._run_cli(("second",))
+    second_adapter._run_cli(("second",))
 
     assert len(calls) == 2
     assert time.monotonic() - started_at >= 0.025
+
+
+def test_production_cli_runner_fails_closed_when_redis_is_unavailable() -> None:
+    """验证共享限流器不可用时不绕过限流直接调用 CLI。
+
+    参数：无。
+    返回值：无。
+    异常：Redis 故障转换为 WecomCliTransportError。
+    副作用：仅调用内存替身，不运行 wecom-cli。
+    """
+    adapter = WecomCliSmartTableAdapter(doc_id="test-doc", sheet_id="test-sheet")
+    calls: list[Sequence[str]] = []
+
+    def redis_unavailable(*_args: object, **_kwargs: object) -> None:
+        """模拟 Redis 锁命令连接失败。
+
+        参数：任意锁参数，仅保持 Redis 替身调用签名兼容。
+        返回值：无正常返回。
+        异常：始终抛出 RedisError。
+        副作用：无；不触发真实 Redis 请求。
+        """
+        raise wecom_cli.RedisError("redis unavailable")
+
+    adapter._rate_limit_redis.lock = redis_unavailable
+    adapter._runner = lambda arguments: calls.append(arguments) or {}
+
+    with pytest.raises(WecomCliTransportError):
+        adapter._run_cli(("test",))
+    assert calls == []
 
 
 def _payload(arguments: Sequence[str]) -> dict[str, object]:
@@ -994,6 +1065,152 @@ def test_get_records_queries_only_the_requested_record_ids() -> None:
     assert 'RECORD_ID = "record-2"' in sql
     assert " OR " in sql
     assert "LIMIT 2" in sql
+
+
+def test_get_records_filters_owner_by_exact_user_id_and_paginates() -> None:
+    """验证负责人读取用服务端成员 ID 精确过滤并完整跟随分页。
+
+    参数：无。
+    返回值：无。
+    异常：筛选条件、负责人范围或分页不正确时由 pytest 报告断言失败。
+    副作用：消费字段结构及两页负责人筛选响应。
+    """
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "records": [
+                    {
+                        "record_id": "owner-record",
+                        "values": {"负责人": [{"userId": "sales-1", "userName": "销售一"}]},
+                    }
+                ],
+                "next_cursor": "owner-page-2",
+            },
+            {
+                "errcode": 0,
+                "records": [
+                    {
+                        "record_id": "owner-record-2",
+                        "values": {"负责人": [{"userId": "sales-1", "userName": "销售一"}]},
+                    }
+                ],
+            },
+        ]
+    )
+
+    records = _adapter(fake_cli, sheet_title="CRM线索").get_records(
+        owner_user_ids=("sales-1",)
+    )
+
+    assert [record.record_id for record in records] == ["owner-record", "owner-record-2"]
+    assert len(fake_cli.calls) == 3
+    first_payload = _payload(fake_cli.calls[1])
+    second_payload = _payload(fake_cli.calls[2])
+    assert first_payload["filter_spec"] == {
+        "conjunction": "or",
+        "conditions": [
+            {
+                "field_title": "负责人",
+                "field_type": "user",
+                "operator": "is",
+                "user_value": {"value": ["sales-1"]},
+            }
+        ],
+    }
+    assert second_payload["cursor"] == "owner-page-2"
+    assert second_payload["filter_spec"] == first_payload["filter_spec"]
+
+
+def test_filtered_reads_fail_closed_without_sheet_title() -> None:
+    """验证缺少子表名称时不会用全表扫描代替服务端范围过滤。
+
+    参数：无。
+    返回值：无。
+    异常：负责人和记录标识过滤均必须抛出配置错误。
+    副作用：创建空 Fake CLI 并断言未触发任何外部查询。
+    """
+    fake_cli = FakeCli([])
+
+    with pytest.raises(SmartTableAdapterConfigurationError):
+        _adapter(fake_cli).get_records(owner_user_ids=("sales-1",))
+    with pytest.raises(SmartTableAdapterConfigurationError):
+        _adapter(fake_cli).get_records(("record-1",))
+
+    assert fake_cli.calls == []
+
+
+def test_get_records_chunks_large_record_id_sets() -> None:
+    """验证超过单条 SQL 安全大小的勾选记录会分块读取而不静默截断。
+
+    参数：无。
+    返回值：无。
+    异常：读取次数或每块 LIMIT 不正确时由 pytest 报告断言失败。
+    副作用：消费一份字段结构和三份空查询响应。
+    """
+    empty_query = {"errcode": 0, "values": [json.dumps({"rows": []})]}
+    fake_cli = FakeCli([_field_response(), empty_query, empty_query, empty_query])
+    record_ids = tuple(f"record-{index}" for index in range(1001))
+
+    assert _adapter(fake_cli, sheet_title="CRM线索").get_records(record_ids) == []
+    assert len(fake_cli.calls) == 4
+    limits = [
+        fake_cli.calls[index][fake_cli.calls[index].index("--sql") + 1].rsplit("LIMIT ", 1)[1]
+        for index in range(1, 4)
+    ]
+    assert limits == ["500", "500", "1"]
+
+
+def test_owner_query_paginates_past_one_thousand_rows() -> None:
+    """验证超过一千条负责人线索时继续分页，不截断或退回整表读取。
+
+    参数：无。
+    返回值：无。
+    异常：分页缺失或记录数不完整时由 pytest 报告断言失败。
+    副作用：读取一份字段结构和两页负责人筛选响应。
+    """
+    owner = [{"userId": "sales-1", "userName": "销售一"}]
+    first_page = [
+        {"record_id": f"record-{index}", "values": {"负责人": owner}}
+        for index in range(1000)
+    ]
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {"errcode": 0, "records": first_page, "next_cursor": "owner-page-2"},
+            {"errcode": 0, "records": [{"record_id": "record-1000", "values": {"负责人": owner}}]},
+        ]
+    )
+
+    records = _adapter(fake_cli, sheet_title="CRM线索").get_records(
+        owner_user_ids=("sales-1",)
+    )
+
+    assert len(records) == 1001
+    assert [record.record_id for record in records[-2:]] == ["record-999", "record-1000"]
+    first_payload = _payload(fake_cli.calls[1])
+    assert first_payload["limit"] * len(first_payload["field_titles"]) < 10_000
+    assert _payload(fake_cli.calls[2])["cursor"] == "owner-page-2"
+
+
+def test_rate_limiter_redis_client_has_bounded_socket_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证共享限流 Redis 命令都设置连接和读取超时，避免 Worker 无限等待。"""
+    captured: dict[str, object] = {}
+
+    def create_redis(_url: str, **kwargs: object) -> object:
+        """记录 Redis 初始化参数并返回无需连接的测试替身。"""
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(wecom_cli.Redis, "from_url", create_redis)
+
+    WecomCliSmartTableAdapter(doc_id="test-doc", sheet_id="test-sheet")
+
+    assert captured["socket_connect_timeout"] == 2
+    assert captured["socket_timeout"] == 2
 
 
 @pytest.mark.parametrize(

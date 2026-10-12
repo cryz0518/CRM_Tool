@@ -164,12 +164,6 @@ class CompanyRegionResolver:
             flags=re.IGNORECASE,
         ):
             return CompanyRegion.FOREIGN
-        if re.search(
-            rf"\b(?:based in|located in|registered in)\s+(?:{english_countries})\b",
-            message_text,
-            flags=re.IGNORECASE,
-        ):
-            return CompanyRegion.FOREIGN
         return CompanyRegion.UNKNOWN
 
 
@@ -658,28 +652,11 @@ class CompanyLeadService:
             )
             .order_by(Lead.smart_table_record_id.is_(None), Lead.created_at, Lead.id)
         ).all()
-        incoming_name = self._normalize_company_name_for_comparison(company_name)
-        incoming_is_canonical = verification_status.value in canonical_statuses
         for existing in leads:
             if existing.id == exclude_lead_id:
                 continue
-            existing_name = existing.enrichment_values.get("原始企业名称") or (
-                existing.field_values.get("线索名称")
-            )
-            same_raw_name = (
-                bool(incoming_name)
-                and isinstance(existing_name, str)
-                and self._normalize_company_name_for_comparison(existing_name) == incoming_name
-            )
-            existing_is_canonical = existing.company_verification_status in canonical_statuses
-            same_canonical_name = (
-                incoming_is_canonical
-                and existing_is_canonical
-                and bool(standard_name)
-                and existing.standard_company_name == standard_name
-            )
-            # 模糊天眼查候选只按销售输入原名合并，不能按候选首项误并不同公司。
-            if same_raw_name or same_canonical_name:
+            # 国内未核验原名不能证明公司身份；相同的天眼查首选标准名仍按既定规则去重。
+            if standard_name and existing.standard_company_name == standard_name:
                 return existing
         return None
 

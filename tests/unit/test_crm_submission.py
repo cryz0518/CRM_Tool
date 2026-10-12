@@ -148,12 +148,22 @@ def _lead(
     adapter: MockSmartTableAdapter,
     *,
     crm_user_id: str | None = "crm-1",
+    company_name: str = "人工最终公司",
+    message_id: str = "message-12",
+    sequence: int = 1,
 ) -> str:
-    """创建一条当天、本人负责且可满足 CRM 创建条件的 Lead。"""
+    """创建一条当天、本人负责且可满足 CRM 创建条件的 Lead。
+
+    参数：session_factory 和 adapter 为测试依赖；crm_user_id、company_name、message_id、sequence
+    用于覆盖可选提交人映射、公司标识和独立来源消息。
+    返回值：新建后台 Lead 的主键。
+    异常：数据库约束失败时由会话层抛出。
+    副作用：新增智能表格记录、测试销售身份、来源消息和线索。
+    """
     record = adapter.create_record(
         {
             "负责人": "sales-1",
-            "线索名称": "人工最终公司",
+            "线索名称": company_name,
             "业务线": "协作机器人",
             "线索来源": "展会",
             "联系人": "王工",
@@ -167,26 +177,30 @@ def _lead(
         actor=SmartTableActor.ROBOT,
     )
     with session_factory.begin() as session:
-        session.add(
-            SalesAuthorization(
-                wecom_user_id="sales-1", crm_user_id=crm_user_id, is_authorized=True, is_active=True
+        if session.get(SalesAuthorization, "sales-1") is None:
+            session.add(
+                SalesAuthorization(
+                    wecom_user_id="sales-1",
+                    crm_user_id=crm_user_id,
+                    is_authorized=True,
+                    is_active=True,
+                )
             )
-        )
         # PostgreSQL 实际外键需要父事实先落库，SQLite 不会替我们证明这个顺序。
         session.flush()
         session.add(
             IncomingMessage(
-                message_id="message-12", sales_user_id="sales-1", sequence=1, raw_payload={}
+                message_id=message_id, sales_user_id="sales-1", sequence=sequence, raw_payload={}
             )
         )
         session.flush()
         lead = Lead(
-            source_message_id="message-12",
+            source_message_id=message_id,
             original_capturing_sales_user_id="sales-1",
             smart_table_owner_user_id="sales-1",
             smart_table_record_id=record.record_id,
             lifecycle_state="pending_create",
-            standard_company_name="人工最终公司",
+            standard_company_name=company_name,
             field_values={"线索名称": "过期 AI 公司", "手机": "13000000000"},
         )
         session.add(lead)
@@ -568,7 +582,6 @@ def test_owner_user_id_is_converted_to_employee_name_before_crm_submit(
         session.flush()
 
     original_get_records = adapter.get_records
-
     def get_records_with_member_name(
         record_ids: Collection[str] | None = None,
     ) -> list[SmartTableRecord]:
@@ -2156,6 +2169,49 @@ def test_selected_candidate_invalidated_before_worker_revalidation_returns_item(
     assert crm.search_calls == 0 and crm.calls == 0
 
 
+def test_abandoned_card_after_owner_transfer_does_not_read_new_owners_record(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证过期的放弃线索卡在负责人转交后不会回读新负责人的表格记录。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    record_id = adapter.get_records()[0].record_id
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.lifecycle_state = "pending_create"
+        lead.smart_table_owner_user_id = "sales-2"
+        session.add(SalesAuthorization(wecom_user_id="sales-2", is_active=True))
+        session.add(
+            CrmSyncRecord(
+                lead_id=lead_id,
+                operation="create",
+                generation=1,
+                smart_table_record_id=record_id,
+                idempotency_key=f"crm:create:{lead_id}",
+                canonical_payload={},
+                snapshot_hash="abandoned-owner-check",
+                request_message_id="previous-abandoned-request",
+                submitting_sales_user_id="sales-1",
+                status="abandoned",
+            )
+        )
+    read_records = Mock(wraps=adapter.get_records)
+    monkeypatch.setattr(adapter, "get_records", read_records)
+
+    result = service.submit_selected(
+        SubmissionCommand("帮我提交放弃提交的线索", "sales-1", "stale-abandoned-card"),
+        (lead_id,),
+    )
+
+    assert result.not_submitted == 1
+    assert result.items[0].status is SubmissionItemStatus.NOT_SUBMITTED
+    read_records.assert_not_called()
+    assert crm.calls == 0
+
+
 def test_today_submission_processes_only_card_selected_candidate(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -2474,11 +2530,23 @@ def test_company_preview_exactly_matches_table_and_does_not_call_crm(
         },
         actor=SmartTableActor.ROBOT,
     )
-    original_find_records = adapter.find_records
+    original_get_records = adapter.get_records
+    owner_scopes: list[tuple[str, ...] | None] = []
 
-    def find_records_with_member_names(filters: dict[str, object]) -> list[SmartTableRecord]:
-        """为预览测试补充企业微信成员显示名元数据。"""
-        records = original_find_records(filters)
+    def get_records_with_member_names(
+        record_ids: Collection[str] | None = None,
+        *,
+        owner_user_ids: tuple[str, ...] | None = None,
+    ) -> list[SmartTableRecord]:
+        """为负责人范围内的预览记录补充企微成员显示名元数据。
+
+        参数：record_ids 为可选记录范围；owner_user_ids 为服务端负责人筛选条件。
+        返回值：保持记录字段并添加成员显示名的快照。
+        异常：Mock 适配器读取失败时传播异常。
+        副作用：记录负责人范围供断言，并调用内存适配器读取。
+        """
+        owner_scopes.append(owner_user_ids)
+        records = original_get_records(record_ids, owner_user_ids=owner_user_ids)
         return [
             SmartTableRecord(
                 record_id=item.record_id,
@@ -2488,7 +2556,7 @@ def test_company_preview_exactly_matches_table_and_does_not_call_crm(
             for item in records
         ]
 
-    monkeypatch.setattr(adapter, "find_records", find_records_with_member_names)
+    monkeypatch.setattr(adapter, "get_records", get_records_with_member_names)
     with session_factory.begin() as session:
         session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
         session.add(
@@ -2524,6 +2592,7 @@ def test_company_preview_exactly_matches_table_and_does_not_call_crm(
 
     assert "确认卡" in reply
     assert crm.calls == 0
+    assert owner_scopes == [("sales-1",)]
     with session_factory() as session:
         action = session.scalar(select(WecomAction))
         assert action is not None and action.target_id == "preview-lead"
@@ -3002,6 +3071,10 @@ def test_batch_linking_multiple_records_writes_one_audit_event(
             },
             actor=SmartTableActor.ROBOT,
         )
+    adapter.create_record(
+        {"负责人": "sales-2", "线索名称": "其他负责人的线索", "提交状态": "未提交"},
+        actor=SmartTableActor.ROBOT,
+    )
     with session_factory.begin() as session:
         session.add(SalesAuthorization(wecom_user_id="sales-1", is_authorized=True, is_active=True))
         session.add(
@@ -3203,6 +3276,93 @@ def test_duplicate_crm_match_selected_continue_uses_update_and_marks_submitted(
     assert sync is not None and sync.status == "succeeded" and sync.operation == "update"
     assert lead is not None and lead.lifecycle_state == "synced"
     assert adapter.get_records()[0].fields["提交状态"] == "已提交"
+
+
+def test_cross_owner_duplicate_confirmation_rechecks_permission_and_frozen_scope(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证重复确认回调重新校验管理员权限，并只停止冻结范围中的负责人线索。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    first_lead_id = _lead(session_factory, adapter, message_id="owner-2-message", sequence=1)
+    second_lead_id = _lead(
+        session_factory,
+        adapter,
+        company_name="owner-3-company",
+        message_id="owner-3-message",
+        sequence=2,
+    )
+    records = adapter.get_records()
+    record_ids = {record.fields["线索名称"]: record.record_id for record in records}
+    adapter.update_record(record_ids["人工最终公司"], {"负责人": "owner-2"})
+    adapter.update_record(record_ids["owner-3-company"], {"负责人": "owner-3"})
+    with session_factory.begin() as session:
+        session.get(Lead, first_lead_id).smart_table_owner_user_id = "owner-2"
+        session.get(Lead, second_lead_id).smart_table_owner_user_id = "owner-3"
+        session.add_all(
+            [
+                SalesAuthorization(wecom_user_id="owner-2", is_active=True),
+                SalesAuthorization(wecom_user_id="owner-3", is_active=True),
+                SalesAuthorization(
+                    wecom_user_id="admin-1",
+                    is_active=True,
+                    is_administrator=False,
+                    can_submit_other_sales_leads=False,
+                ),
+            ]
+        )
+        for lead_id in (first_lead_id, second_lead_id):
+            lead = session.get(Lead, lead_id)
+            assert lead is not None and lead.smart_table_record_id is not None
+            session.add(
+                CrmSyncRecord(
+                    lead_id=lead_id,
+                    operation="create",
+                    generation=1,
+                    smart_table_record_id=lead.smart_table_record_id,
+                    idempotency_key=f"crm:create:{lead_id}",
+                    canonical_payload={"name": "人工最终公司"},
+                    snapshot_hash=f"duplicate-{lead_id}",
+                    request_message_id="admin-duplicate-request",
+                    submitting_sales_user_id="admin-1",
+                    submitting_crm_user_id="crm-owner",
+                    crm_lead_id=f"crm-{lead_id}",
+                    status="awaiting_duplicate_confirmation",
+                )
+            )
+    service = CrmSubmissionService(session_factory, adapter, MockCRMAdapter())
+
+    with pytest.raises(PermissionError, match="跨员工 CRM 提交权限已失效"):
+        service.resolve_duplicate_confirmation(
+            "admin-duplicate-request",
+            "admin-1",
+            continue_submission=False,
+            duplicate_lead_ids=(first_lead_id, second_lead_id),
+            owner_scope_user_ids=("owner-2",),
+        )
+
+    with session_factory.begin() as session:
+        admin = session.get(SalesAuthorization, "admin-1")
+        assert admin is not None
+        admin.is_administrator = True
+
+    stopped = service.resolve_duplicate_confirmation(
+        "admin-duplicate-request",
+        "admin-1",
+        continue_submission=False,
+        duplicate_lead_ids=(first_lead_id, second_lead_id),
+        owner_scope_user_ids=("owner-2",),
+    )
+
+    assert stopped.abandoned == 1
+    with session_factory() as session:
+        first = session.scalar(
+            select(CrmSyncRecord).where(CrmSyncRecord.lead_id == first_lead_id)
+        )
+        second = session.scalar(
+            select(CrmSyncRecord).where(CrmSyncRecord.lead_id == second_lead_id)
+        )
+    assert first is not None and first.status == "abandoned"
+    assert second is not None and second.status == "awaiting_duplicate_confirmation"
 
 
 @pytest.mark.parametrize(
@@ -3790,13 +3950,135 @@ def test_update_uses_current_table_values_once_and_skips_equal_snapshot(
 
     assert first.updated == 1 and second.unchanged == 1
     assert crm.submit_calls == 2 and crm.submit_payloads[1]["mobile"] == "13900000000"
-    assert bulk_read.call_count == 2
-    assert all(call.args[0] == {record_id} for call in bulk_read.call_args_list)
+    assert bulk_read.call_count == 3
+    assert [call.args[0] for call in bulk_read.call_args_list] == [
+        {record_id},
+        (record_id,),
+        {record_id},
+    ]
     with session_factory() as session:
         updates = session.scalars(
             select(CrmSyncRecord).where(CrmSyncRecord.operation == "update")
         ).all()
     assert len(updates) == 1 and updates[0].canonical_payload.get("AI待确认") is None
+
+
+def test_update_refreshes_changed_batch_snapshot_before_crm_write(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 CRM 更新使用批量读取后最新的单条回读值。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    _lead(session_factory, adapter)
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    assert submit_today_via_selection(service, "sales-1", "message-12").succeeded == 1
+    record_id = adapter.get_records()[0].record_id
+    adapter.update_record(record_id, {"手机": "13900000000"})
+    original_get_records = adapter.get_records
+    reads = 0
+
+    def mutate_after_batch_read(record_ids=None, *, owner_user_ids=None):
+        """在批量缓存返回后模拟销售编辑，逐条回读应看到新值。"""
+        nonlocal reads
+        records = original_get_records(record_ids, owner_user_ids=owner_user_ids)
+        reads += 1
+        if reads == 1:
+            adapter.update_record(record_id, {"手机": "13700000000"})
+        return records
+
+    monkeypatch.setattr(adapter, "get_records", mutate_after_batch_read)
+
+    result = service.submit(SubmissionCommand("提交我的更新", "sales-1", "update-fresh"))
+
+    assert result.updated == 1
+    assert crm.submit_payloads[-1]["mobile"] == "13700000000"
+    assert reads == 2
+
+
+def test_update_rechecks_owner_after_record_read_before_crm_write(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证回读之后发生负责人转交时，旧负责人不能继续提交 CRM 更新。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    assert submit_today_via_selection(service, "sales-1", "owner-race-create").succeeded == 1
+    record_id = adapter.get_records()[0].record_id
+    adapter.update_record(record_id, {"手机": "13900000000"})
+    original_get_records = adapter.get_records
+    reads = 0
+
+    def transfer_after_refresh(record_ids=None, *, owner_user_ids=None):
+        """在最终单条回读后转交负责人，模拟并发转交窗口。"""
+        nonlocal reads
+        records = original_get_records(record_ids, owner_user_ids=owner_user_ids)
+        reads += 1
+        if reads == 2:
+            with session_factory.begin() as session:
+                lead = session.get(Lead, lead_id)
+                assert lead is not None
+                lead.smart_table_owner_user_id = "sales-2"
+        return records
+
+    monkeypatch.setattr(adapter, "get_records", transfer_after_refresh)
+
+    result = service.submit(SubmissionCommand("提交我的更新", "sales-1", "owner-race-update"))
+
+    assert result.incomplete == 1
+    assert crm.submit_calls == 1
+    with session_factory() as session:
+        updates = session.scalars(
+            select(CrmSyncRecord).where(
+                CrmSyncRecord.lead_id == lead_id, CrmSyncRecord.operation == "update"
+            )
+        ).all()
+    assert updates == []
+
+
+def test_update_batch_read_failure_falls_back_per_record_and_keeps_partial_success(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证批量回读失败时逐条按记录 ID 重读，单条异常不阻断其它更新。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    failed_lead_id = _lead(session_factory, adapter)
+    _lead(
+        session_factory,
+        adapter,
+        company_name="第二家测试公司",
+        message_id="message-13",
+        sequence=2,
+    )
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    created = submit_today_via_selection(service, "sales-1", "update-partial-create")
+    assert created.succeeded == 2
+    records = adapter.get_records()
+    failed_record_id = next(
+        record.record_id for record in records if record.fields["线索名称"] == "人工最终公司"
+    )
+    for record in records:
+        adapter.update_record(record.record_id, {"手机": "13900000000"})
+    original_get_records = adapter.get_records
+
+    def get_records_with_item_failure(record_ids=None, *, owner_user_ids=None):
+        """让批量读取失败，并模拟其中一条记录的独立读取故障。"""
+        requested = set(record_ids or ())
+        if len(requested) > 1:
+            raise RuntimeError("batch read unavailable")
+        if failed_record_id in requested:
+            raise RuntimeError("one record unavailable")
+        return original_get_records(record_ids, owner_user_ids=owner_user_ids)
+
+    monkeypatch.setattr(adapter, "get_records", get_records_with_item_failure)
+
+    result = service.submit(SubmissionCommand("提交我的更新", "sales-1", "update-partial"))
+
+    assert result.updated == 1
+    assert result.failed_pending_review == 1
+    assert crm.submit_calls == 3
+    failed_item = next(item for item in result.items if item.lead_id == failed_lead_id)
+    assert failed_item.status is SubmissionItemStatus.FAILED_PENDING_REVIEW
 
 
 def test_update_mapping_missing_keeps_pending_update_until_a_later_submit(
@@ -4045,7 +4327,8 @@ def test_unknown_update_never_reads_table_or_retries_after_edit(
     monkeypatch.setattr(crm, "submit_lead", timeout_once)
     result = service.submit(SubmissionCommand("提交我的更新", "sales-1", "message-13"))
     assert result.failed_pending_review == 1
-    assert bulk_read.call_count == 1
+    # 批量快照筛出待提交记录后，真正更新前还会按记录 ID 刷新一次。
+    assert bulk_read.call_count == 2
     adapter.update_record(record_id, {"手机": "13700000000"})
     monkeypatch.setattr(adapter, "get_record", lambda _: pytest.fail("不得回读 Smart Table"))
     monkeypatch.setattr(adapter, "get_records", lambda *_: pytest.fail("不得批量回读 Smart Table"))

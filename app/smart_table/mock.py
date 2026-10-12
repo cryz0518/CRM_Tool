@@ -85,17 +85,29 @@ class MockSmartTableAdapter:
         ]
 
     def get_records(
-        self, record_ids: Collection[str] | None = None
+        self,
+        record_ids: Collection[str] | None = None,
+        *,
+        owner_user_ids: Collection[str] | None = None,
     ) -> list[SmartTableRecord]:
-        """返回按创建顺序保存的全部记录或指定记录快照。
+        """返回按创建顺序保存的全部记录、指定记录或负责人范围快照。
 
-        参数：record_ids 为可选的记录标识集合。
+        参数：record_ids 和 owner_user_ids 最多提供一个过滤集合。
         返回：当前请求范围内的内存记录快照列表。
+        异常：同时提供两种过滤集合时抛出 ValueError。
+        副作用：无；只从内存记录集中筛选。
         """
-        if record_ids is None:
-            return list(self._records.values())
-        requested = set(record_ids)
-        return [record for record in self._records.values() if record.record_id in requested]
+        if record_ids is not None and owner_user_ids is not None:
+            raise ValueError("记录标识与负责人范围不能同时过滤")
+        if record_ids is not None:
+            requested = set(record_ids)
+            return [record for record in self._records.values() if record.record_id in requested]
+        if owner_user_ids is not None:
+            owners = set(owner_user_ids)
+            return [
+                record for record in self._records.values() if record.fields.get("负责人") in owners
+            ]
+        return list(self._records.values())
 
     def create_record(
         self,

@@ -408,7 +408,9 @@ def test_duplicate_callback_freezes_vote_card_once_even_when_ack_fails(
         actor_user_id="sales-a",
         request_message_id="duplicate-freeze",
         duplicates=(DuplicateSubmission(lead_ids[0], "测试公司", "crm-a", "owner-a"),),
+        owner_scope_user_ids=("owner-a",),
     )
+    assert action.context["owner_scope_user_ids"] == ["owner-a"]
     updates: list[dict[str, object]] = []
 
     async def update_card(frame: object, card: dict[str, object]) -> dict[str, int]:

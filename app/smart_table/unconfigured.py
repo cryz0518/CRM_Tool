@@ -61,12 +61,16 @@ class UnconfiguredSmartTableAdapter:
         self._raise_not_configured()
 
     def get_records(
-        self, record_ids: Collection[str] | None = None
+        self,
+        record_ids: Collection[str] | None = None,
+        *,
+        owner_user_ids: Collection[str] | None = None,
     ) -> list[SmartTableRecord]:
-        """尝试列出全部或指定记录，但未配置时明确失败。
+        """尝试列出全部、指定记录或负责人范围记录，但未配置时明确失败。
 
-        参数：record_ids 为可选记录标识集合。
+        参数：record_ids 和 owner_user_ids 为可选过滤范围。
         异常：始终抛出 SmartTableAdapterConfigurationError。
+        副作用：阻止调用方读取或修改智能表格。
         """
         self._raise_not_configured()
 
