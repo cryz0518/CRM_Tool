@@ -50,6 +50,12 @@ def build_beat_schedule(settings: Settings) -> dict[str, dict[str, object]]:
             "task": "workers.schedule_lead_progress_reports",
             "schedule": settings.lead_outbox_poll_seconds,
         }
+    if settings.crm_adapter != "unconfigured":
+        # CRM 重试到期时间持久化在数据库，Worker 重启后仍可继续处理。
+        schedule["retry-pending-crm-submissions"] = {
+            "task": "workers.retry_pending_crm_submissions",
+            "schedule": settings.lead_outbox_poll_seconds,
+        }
     # 每日任务使用已配置的 Asia/Shanghai Beat 时区固定在晚上八点运行。
     schedule["schedule-daily-unsubmitted-lead-reminders"] = {
         "task": "workers.schedule_daily_unsubmitted_lead_reminders",

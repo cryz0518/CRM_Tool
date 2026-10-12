@@ -804,6 +804,17 @@ def test_sop_error_category_controls_submission_failure_semantics(
     assert sync is not None
     assert sync.status == expected_status
     assert sync.failure_category == expected_failure_category
+    if expected_status == "retrying":
+        expected_summary = (
+            f"CRM gateway HTTP {http_status} code {error_code}"
+            if category == "gateway" and http_status is not None and error_code is not None
+            else f"CRM gateway HTTP {http_status}"
+            if category == "gateway" and http_status is not None
+            else f"CRM gateway code {error_code}"
+            if category == "gateway" and error_code is not None
+            else "CRM transport error"
+        )
+        assert sync.response_summary == expected_summary
 
 
 def test_sop_transport_during_duplicate_search_reports_retrying(
@@ -3587,6 +3598,56 @@ def test_transport_retry_reuses_frozen_payload_and_key_after_table_edit(
     assert sync.idempotency_key == f"crm:create:{lead_id}"
     assert sync.canonical_payload["mobile"] == "13800000000"
     assert crm.crm_user_ids == ["crm-1"]
+
+
+def test_due_crm_retry_reuses_frozen_request_and_notifies_submitter(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 Beat 重试复用冻结请求，并通过现有企微通知 Outbox 反馈成功。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    crm = MockCRMAdapter()
+    original_submit = crm.submit_lead
+    attempts: list[tuple[dict[str, object], str, str]] = []
+
+    def fail_once(
+        payload: Mapping[str, object], *, idempotency_key: str, crm_user_id: str
+    ) -> CRMCreateResult:
+        """首次模拟暂时性 CRM 网关错误，后续使用 Mock 成功结果。"""
+        attempts.append((dict(payload), idempotency_key, crm_user_id))
+        if len(attempts) == 1:
+            raise SopCRMError("sanitized gateway error", category="gateway", http_status=503)
+        return original_submit(payload, idempotency_key=idempotency_key, crm_user_id=crm_user_id)
+
+    monkeypatch.setattr(crm, "submit_lead", fail_once)
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    first_result = submit_today_via_selection(service, "sales-1", "crm-retry-message")
+    assert first_result.retrying == 1
+    with session_factory.begin() as session:
+        sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
+        assert sync is not None and sync.next_retry_at is not None
+        sync.next_retry_at = utc_now() - timedelta(seconds=1)
+
+    assert service.retry_due_creates() == 1
+    assert attempts[0] == attempts[1]
+    with session_factory() as session:
+        sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
+        notice = session.scalar(
+            select(NotificationRecord).where(
+                NotificationRecord.source_message_id == "crm-retry-message",
+                NotificationRecord.notification_type == "crm_submission_retry_summary",
+            )
+        )
+    assert sync is not None and sync.status == "succeeded" and sync.attempts == 2
+    assert notice is not None and notice.status == "pending"
+    assert notice.content is not None and "CRM 自动重试完成" in notice.content
+
+    client = Mock()
+    client.send_message = AsyncMock()
+    sent = asyncio.run(WecomOutboundNotificationSender(session_factory, client).send_pending_once())
+    assert sent == 1
+    body = client.send_message.await_args.args[1]
+    assert "CRM 自动重试完成" in body["markdown"]["content"]
 
 
 def test_unknown_crm_failure_does_not_finalize_discard_request(

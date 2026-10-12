@@ -28,6 +28,7 @@ from app.crm.commands import (
     parse_company_submission_request,
 )
 from app.crm.dependencies import get_crm_adapter
+from app.crm.service import CrmSubmissionService
 from app.leads.models import Lead, LeadMessageResolution
 from app.leads.progress import LeadProgressService, activate_progress_intent_candidate
 from app.leads.reminders import DailyUnsubmittedLeadReminderService
@@ -705,6 +706,27 @@ def schedule_daily_unsubmitted_lead_reminders() -> int:
         return DailyUnsubmittedLeadReminderService(factory).schedule_due_reminders()
     finally:
         # 任务使用独立短连接池，结束时释放，避免每日调度长期占用连接。
+        engine.dispose()
+
+
+@celery_app.task(name="workers.retry_pending_crm_submissions")  # type: ignore[untyped-decorator]
+def retry_pending_crm_submissions() -> int:
+    """扫描到期 CRM create 重试并通过现有服务写入结果通知。
+
+    参数：无。
+    返回值：本轮扫描的到期同步记录数。
+    异常：数据库或适配器初始化错误向 Celery 传播；单条 CRM 失败由服务持久化处理。
+    副作用：重用冻结请求调用 CRM；最终结果进入企微通知 Outbox。
+    """
+    engine, factory = _session_factory()
+    try:
+        service = CrmSubmissionService(
+            factory,
+            get_smart_table_adapter(),
+            get_crm_adapter(),
+        )
+        return service.retry_due_creates()
+    finally:
         engine.dispose()
 
 

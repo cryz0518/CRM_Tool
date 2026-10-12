@@ -1150,8 +1150,18 @@ def test_config_range_and_beat_schedule_use_progress_settings() -> None:
     assert schedule["schedule-lead-progress-reports"]["task"] == (
         "workers.schedule_lead_progress_reports"
     )
+    crm_schedule = build_beat_schedule(
+        Settings(_env_file=None, crm_adapter="sop", lead_outbox_poll_seconds=7)
+    )["retry-pending-crm-submissions"]
+    assert crm_schedule == {
+        "task": "workers.retry_pending_crm_submissions",
+        "schedule": 7,
+    }
     disabled = build_beat_schedule(Settings(lead_progress_enabled=False))
     assert "schedule-lead-progress-reports" not in disabled
+    assert "retry-pending-crm-submissions" not in build_beat_schedule(
+        Settings(_env_file=None, crm_adapter="unconfigured")
+    )
 
 
 def test_progress_message_is_safe_and_retry_does_not_touch_business_adapters() -> None:
