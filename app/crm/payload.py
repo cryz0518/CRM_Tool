@@ -59,17 +59,23 @@ LEAD_SOURCE_IDS = {
     "信息渠道（异业合作）": 15,
 }
 INDUSTRY_IDS = {
-    "3C电子": 1,
-    "医疗": 2,
-    "机械加工": 3,
-    "汽车": 4,
-    "食品": 5,
-    "航空航天": 6,
-    "精密制造": 7,
-    "新能源": 8,
-    "纺织": 9,
-    "院校": 10,
-    "其他": 11,
+    "汽车主机厂": 1,
+    "汽车零部件": 2,
+    "3C电子": 3,
+    "机械加工": 4,
+    "新能源": 5,
+    "家电": 6,
+    "食品加工": 7,
+    "日化": 8,
+    "医疗": 9,
+    "科研教育": 10,
+    "零售": 11,
+    "服务业": 12,
+    "军工": 13,
+    "航空航天": 14,
+    "物流运输业": 15,
+    "半导体": 16,
+    "其他": 17,
 }
 COMMUNICATION_WAY_IDS = {
     "打电话": 1,
@@ -80,9 +86,9 @@ COMMUNICATION_WAY_IDS = {
     "微信": 6,
     "陪访": 7,
     "线上会议": 8,
-    # CRM 说明重复声明“技术支持工单”，当前按首个字典值保留。
-    "技术支持工单": 9,
-    "技术支持跟进": 11,
+    "简道云-售前工单": 100,
+    "简道云-售后工单": 200,
+    "简道云-技术支持日志": 300,
 }
 PROCESS_IDS = {
     "上下料": 1,
@@ -157,7 +163,7 @@ class CrmPayloadBuilder:
         if field_name == "线索来源":
             return self._dictionary_value(field_name, value, LEAD_SOURCE_IDS)
         if field_name == "客户行业":
-            # CRM 字典已明确给出“其他”为 11，允许表格选项进入正式接口值。
+            # CRM 字典已明确给出“其他”为 17，允许表格选项进入正式接口值。
             return self._dictionary_value(field_name, value, INDUSTRY_IDS)
         if field_name == "沟通方式":
             return self._dictionary_value(field_name, value, COMMUNICATION_WAY_IDS)
