@@ -39,6 +39,7 @@ _ALL_COMMAND = "提交我所有线索"
 _ABANDONED_COMMAND = "帮我提交放弃提交的线索"
 _UPDATES_COMMAND = "提交我的更新"
 _RETRY_INCOMPLETE_COMMAND = "重新提交待完善的线索"
+CROSS_OWNER_SUBMISSION_COMMAND = "提交授权范围线索"
 _BUSINESS_COMPLETENESS_FIELDS = (
     "业务线",
     "线索名称",
@@ -77,6 +78,8 @@ class SubmissionCommand:
     sales_user_id: str
     request_message_id: str
     target_lead_id: str | None = None
+    target_owner_name: str | None = None
+    owner_scope_user_ids: tuple[str, ...] | None = None
 
 
 class SubmissionItemStatus(StrEnum):
@@ -152,6 +155,7 @@ class SubmissionCandidate:
     display_text: str | None = None
     snapshot_fields: tuple[tuple[str, object], ...] = ()
     missing_fields: tuple[str, ...] = ()
+    owner_user_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -427,7 +431,12 @@ class CrmSubmissionService:
         """
         if command.text == _UPDATES_COMMAND:
             return self._submit_updates(command)
-        if command.text in {_TODAY_COMMAND, _ALL_COMMAND, _ABANDONED_COMMAND}:
+        if command.text in {
+            _TODAY_COMMAND,
+            _ALL_COMMAND,
+            _ABANDONED_COMMAND,
+            CROSS_OWNER_SUBMISSION_COMMAND,
+        }:
             # 批量命令只能发行候选确认动作，不能由服务层直接触发 CRM。
             raise ValueError("批量提交必须通过服务端候选确认动作")
         if command.text != "提交指定线索":
@@ -559,21 +568,39 @@ class CrmSubmissionService:
         return result
 
     def list_submission_candidates(
-        self, command_text: str, sales_user_id: str
+        self,
+        command_text: str,
+        sales_user_id: str,
+        *,
+        owner_scope_user_ids: tuple[str, ...] | None = None,
     ) -> tuple[SubmissionCandidate, ...]:
-        """列出当前销售可在机器人卡片中选择的线索，不调用 CRM。
+        """列出操作人获准在机器人卡片中选择的线索，不调用 CRM。
 
-        参数：command_text 为精确命令；sales_user_id 为当前销售身份。
-        返回值：只包含本人、日期与实时表格状态符合所选卡片范围的线索候选。
-        异常：actor 不存在/已停用或命令不支持时抛出 ValueError。
+        参数：command_text 为精确命令；sales_user_id 为操作人；owner_scope_user_ids 仅供
+        已获跨员工提交权限的调用指定负责人范围。
+        返回值：只包含指定负责人范围与实时表格状态符合卡片条件的候选。
+        异常：actor 不存在/已停用、权限不足或命令不支持时抛出 ValueError。
         副作用：只读取数据库及智能表格，不改变 Lead 生命周期。
         """
-        if command_text not in {_TODAY_COMMAND, _ALL_COMMAND, _ABANDONED_COMMAND}:
+        if command_text not in {
+            _TODAY_COMMAND,
+            _ALL_COMMAND,
+            _ABANDONED_COMMAND,
+            CROSS_OWNER_SUBMISSION_COMMAND,
+        }:
             raise ValueError("不支持候选卡片的 CRM 命令")
+        cross_owner = command_text == CROSS_OWNER_SUBMISSION_COMMAND
+        if cross_owner != (owner_scope_user_ids is not None):
+            raise ValueError("跨员工提交负责人范围缺失或不适用于当前命令")
+        owner_user_ids = (
+            owner_scope_user_ids if owner_scope_user_ids is not None else (sales_user_id,)
+        )
         with self._session_factory() as session:
             authorization = session.get(SalesAuthorization, sales_user_id)
             if authorization is None or not authorization.is_active:
                 raise ValueError("提交销售 actor 不存在或已停用")
+            if cross_owner and not self._can_submit_other_sales_leads(authorization):
+                raise ValueError("当前账号没有跨员工 CRM 提交权限")
             # 授权通过后，一次卡片候选计算只读取一份当前表格快照。
             smart_table_snapshot = {
                 record.record_id: record for record in self._smart_table_adapter.get_records()
@@ -581,7 +608,7 @@ class CrmSubmissionService:
             leads = list(
                 session.scalars(
                     select(Lead).where(
-                        Lead.smart_table_owner_user_id == sales_user_id,
+                        Lead.smart_table_owner_user_id.in_(owner_user_ids),
                     )
                 )
             )
@@ -648,6 +675,7 @@ class CrmSubmissionService:
                             display_text,
                             tuple(display_snapshot.items()),
                             self._missing_crm_minimum(dict(snapshot_fields)),
+                            lead.smart_table_owner_user_id,
                         )
                     )
             return tuple(candidates)
@@ -667,13 +695,25 @@ class CrmSubmissionService:
         副作用：每个 callback 已接受的目标均得到结果；仅仍有效的目标调用首次提交流程，
         并在单条处理结束后可选地持久化该条结果。
         """
-        if command.text not in {_TODAY_COMMAND, _ALL_COMMAND, _ABANDONED_COMMAND}:
+        if command.text not in {
+            _TODAY_COMMAND,
+            _ALL_COMMAND,
+            _ABANDONED_COMMAND,
+            CROSS_OWNER_SUBMISSION_COMMAND,
+        }:
             raise ValueError("不支持卡片选择提交")
+        cross_owner = command.text == CROSS_OWNER_SUBMISSION_COMMAND
+        if cross_owner != (command.owner_scope_user_ids is not None):
+            raise ValueError("跨员工提交负责人范围缺失或不适用于当前命令")
         selected = tuple(dict.fromkeys(selected_lead_ids))
         with self._session_factory() as session:
             authorization = session.get(SalesAuthorization, command.sales_user_id)
             if authorization is None or not authorization.is_active:
                 raise ValueError("提交销售 actor 不存在或已停用")
+            cross_owner_authorized = not cross_owner or self._can_submit_other_sales_leads(
+                authorization
+            )
+            owner_scope = set(command.owner_scope_user_ids or ())
             valid_ids: set[str] = set()
             for lead_id in selected:
                 lead = session.get(Lead, lead_id)
@@ -703,10 +743,25 @@ class CrmSubmissionService:
                     and (sync is None or sync.status not in {"succeeded", "abandoned"})
                 ):
                     valid_ids.add(lead_id)
+                elif (
+                    cross_owner
+                    and cross_owner_authorized
+                    and lead.smart_table_owner_user_id in owner_scope
+                    and lead.lifecycle_state in {"pending_create", "temporary"}
+                    and (sync is None or sync.status not in {"succeeded", "abandoned"})
+                ):
+                    valid_ids.add(lead_id)
         result = SubmissionBatchResult()
         for lead_id in selected:
             if lead_id not in valid_ids:
-                outcome = _create_outcome("not_submitted")
+                outcome = _create_outcome(
+                    "not_submitted",
+                    reason_code=(
+                        "crm_cross_owner_submission_not_authorized"
+                        if cross_owner and not cross_owner_authorized
+                        else None
+                    ),
+                )
             else:
                 try:
                     outcome = self._submit_create(
@@ -715,6 +770,7 @@ class CrmSubmissionService:
                             command.text,
                             command.sales_user_id,
                             command.request_message_id,
+                            owner_scope_user_ids=command.owner_scope_user_ids,
                         ),
                     )
                 except Exception as error:
@@ -951,20 +1007,36 @@ class CrmSubmissionService:
             in {
                 _ALL_COMMAND,
                 _ABANDONED_COMMAND,
+                CROSS_OWNER_SUBMISSION_COMMAND,
             }
             or command.target_lead_id is not None
         )
         # 单条确认卡已冻结唯一 Lead 目标；它可提交 temporary 草稿，但仍须通过后续字段校验。
-        allow_temporary = command.text in {_ALL_COMMAND, _TODAY_COMMAND} or (
+        allow_temporary = command.text in {
+            _ALL_COMMAND,
+            _TODAY_COMMAND,
+            CROSS_OWNER_SUBMISSION_COMMAND,
+        } or (
             command.text == "提交指定线索" and command.target_lead_id == lead_id
         )
         with self._session_factory() as session:
+            authorization = session.get(SalesAuthorization, command.sales_user_id)
+            if command.owner_scope_user_ids is not None and (
+                authorization is None
+                or not authorization.is_active
+                or not self._can_submit_other_sales_leads(authorization)
+            ):
+                return _create_outcome(
+                    "not_submitted",
+                    reason_code="crm_cross_owner_submission_not_authorized",
+                )
             lead = session.get(Lead, lead_id)
             if lead is None or not self._is_create_candidate(
                 lead,
                 command.sales_user_id,
                 allow_non_today_target,
                 allow_temporary=allow_temporary,
+                owner_scope_user_ids=command.owner_scope_user_ids,
             ):
                 return _create_outcome("not_submitted")
             # 未完成操作复用冻结快照，不能因重试而替换已经提交或结果未知的字段。
@@ -1043,6 +1115,15 @@ class CrmSubmissionService:
                     .where(SalesAuthorization.wecom_user_id == command.sales_user_id)
                     .with_for_update()
                 )
+                if command.owner_scope_user_ids is not None and (
+                    authorization is None
+                    or not authorization.is_active
+                    or not self._can_submit_other_sales_leads(authorization)
+                ):
+                    return _create_outcome(
+                        "not_submitted",
+                        reason_code="crm_cross_owner_submission_not_authorized",
+                    )
                 if (
                     lead is None
                     or authorization is None
@@ -1051,6 +1132,7 @@ class CrmSubmissionService:
                         command.sales_user_id,
                         allow_non_today_target,
                         allow_temporary=allow_temporary,
+                        owner_scope_user_ids=command.owner_scope_user_ids,
                     )
                 ):
                     return _create_outcome("incomplete")
@@ -1619,11 +1701,26 @@ class CrmSubmissionService:
         allow_non_today_target: bool,
         *,
         allow_temporary: bool = False,
+        owner_scope_user_ids: tuple[str, ...] | None = None,
     ) -> bool:
-        """判定批量或精确目标线索是否允许进入首次 CRM 提交。"""
+        """判定目标线索是否满足当前提交命令的负责人范围和生命周期。
 
+        参数：lead 为当前数据库线索；sales_user_id 为操作人企微标识；
+        allow_non_today_target 表示是否允许提交非今日线索；allow_temporary 表示是否允许临时草稿；
+        owner_scope_user_ids 为授权提交时由服务端冻结的负责人范围，None 表示仅本人。
+        返回值：负责人、线索状态和采集日期均符合本次命令时返回 True。
+        异常：无。
+        副作用：无，仅读取线索字段并在需要时检查今日采集资格。
+        """
+
+        # 只有带服务端冻结范围的授权命令才能跳过“本人负责”约束。
+        owner_matches = (
+            lead.smart_table_owner_user_id in owner_scope_user_ids
+            if owner_scope_user_ids is not None
+            else lead.smart_table_owner_user_id == sales_user_id
+        )
         if (
-            lead.smart_table_owner_user_id != sales_user_id
+            not owner_matches
             or (
                 lead.lifecycle_state != "pending_create"
                 and not (allow_temporary and lead.lifecycle_state == "temporary")
@@ -1633,6 +1730,17 @@ class CrmSubmissionService:
         return allow_non_today_target or CrmSubmissionService._is_today_owned_candidate(
             lead, sales_user_id
         )
+
+    @staticmethod
+    def _can_submit_other_sales_leads(authorization: SalesAuthorization) -> bool:
+        """判断当前 actor 是否可发起跨员工 CRM 提交。
+
+        参数：authorization 为数据库中的当前企微员工授权记录。
+        返回值：管理员或持有专用跨员工提交权限时返回 True。
+        异常：无。
+        副作用：无，仅读取授权状态。
+        """
+        return authorization.is_administrator or authorization.can_submit_other_sales_leads
 
     @staticmethod
     def _last_successful_sync(session: Session, lead_id: str) -> CrmSyncRecord | None:

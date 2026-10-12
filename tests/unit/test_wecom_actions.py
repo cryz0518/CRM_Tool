@@ -22,7 +22,7 @@ from app.crm.commands import (
     parse_crm_submission_command,
 )
 from app.crm.mock import MockCRMAdapter
-from app.crm.service import DuplicateSubmission
+from app.crm.service import CROSS_OWNER_SUBMISSION_COMMAND, DuplicateSubmission
 from app.leads.discard import LeadDiscardService
 from app.leads.models import (
     CrmSyncRecord,
@@ -722,6 +722,9 @@ def test_submission_command_aliases_normalize_to_confirmed_intents() -> None:
     assert parse_crm_submission_command("帮我提交放弃提交的线索") == "帮我提交放弃提交的线索"
     assert parse_crm_submission_command("提交我的更新") == "提交我的更新"
     assert parse_crm_submission_command("提交我所有的线索") == "提交我所有线索"
+    assert parse_crm_submission_command("提交负责人张三的线索") == CROSS_OWNER_SUBMISSION_COMMAND
+    assert parse_crm_submission_command("提交所有员工的线索") == CROSS_OWNER_SUBMISSION_COMMAND
+    assert parse_crm_submission_command("提交负责人张三的线索？") is None
     assert parse_crm_submission_command("请提交我所有线索") is None
     assert parse_crm_submission_command("帮我提交今天的线索") == "提交今天的线索"
     assert parse_crm_submission_command("提交今天的线索。") == "提交今天的线索"
@@ -956,6 +959,30 @@ def test_batch_markdown_and_checkbox_share_frozen_page_order() -> None:
     assert [option["text"] for option in options] == ["1. 候选一", "2. 候选二"]  # type: ignore[index]
 
 
+def test_cross_owner_batch_markdown_shows_only_lead_names() -> None:
+    """验证跨员工代提交的确认预览不暴露线索字段明细。"""
+
+    markdown = build_batch_submission_markdown(
+        [
+            {
+                "company_name": "无锡示例科技有限公司",
+                "display_text": "无锡示例科技有限公司｜李工",
+                "field_values": {"联系人": "李工", "手机": "13800000000"},
+                "missing_fields": ["备注"],
+            }
+        ],
+        page=1,
+        page_count=1,
+        name_only=True,
+    )[0]
+
+    assert "待提交线索（第 1/1 页）" in markdown
+    assert "无锡示例科技有限公司" in markdown
+    assert "李工" not in markdown
+    assert "13800000000" not in markdown
+    assert "缺少" not in markdown
+
+
 def test_batch_submission_action_accepts_single_candidate_and_freezes_context(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -980,6 +1007,32 @@ def test_batch_submission_action_accepts_single_candidate_and_freezes_context(
         )
     assert notice is not None
     assert notice.payload["template_card"]["checkbox"]["mode"] == 1  # type: ignore[index]
+
+
+def test_cross_owner_action_freezes_scope_and_accepts_selection(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证跨员工负责人范围只保存在服务端动作中并沿用原勾选回调。"""
+
+    _authorize(session_factory)
+    action_service = _service(session_factory)
+    action = action_service.issue_batch_submission_action(
+        actor_user_id="sales-a",
+        request_message_id="message-cross-owner",
+        command_text=CROSS_OWNER_SUBMISSION_COMMAND,
+        candidates=({"lead_id": "lead-a", "company_name": "目标公司"},),
+        owner_scope_user_ids=("owner-b",),
+    )
+    result = action_service.claim_callback(
+        _batch_frame_for_action(action, ("lead-a",), msgid="provider-cross-owner")
+    )
+
+    assert result.code == "claimed"
+    with session_factory() as session:
+        frozen = session.get(WecomAction, action.id)
+        assert frozen is not None
+        assert frozen.context["owner_scope_user_ids"] == ["owner-b"]
+        assert frozen.context["selected_lead_ids"] == ["lead-a"]
 
 
 def test_batch_submission_action_freezes_page_for_more_than_one_page(
