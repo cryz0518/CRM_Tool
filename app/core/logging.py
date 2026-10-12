@@ -120,7 +120,7 @@ class JsonFormatter(logging.Formatter):
             value = getattr(record, field, None)
             # CLI 操作失败需要显式保留“无外部码/类型/HTTP 状态”的空事实。
             if value is not None or (
-                record.getMessage() == "wecom_cli_smart_table_failed"
+                record.getMessage().startswith("wecom_cli_smart_table_failed")
                 and field in _CLI_FAILURE_NULLABLE_FIELDS
             ):
                 # 时序字段只接受非负纯整数，避免外部字符串或 bool 混入结构化日志。

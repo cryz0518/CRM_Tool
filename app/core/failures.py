@@ -49,9 +49,24 @@ def classify_task_failure(error: BaseException) -> TaskFailureCategory:
         }:
             return TaskFailureCategory.PERMANENT
         if adapter_category == "gateway":
-            # Gateway 已收到请求；仅明确的限流/服务端失败允许稍后重试，其余为永久拒绝。
+            # 部分网关把 HTTP 状态封装在 HTTP 200 的 JSON code/error_code 中。
             status = getattr(error, "http_status", None)
-            if isinstance(status, int) and (status in {408, 425, 429} or status >= 500):
+            response_code = getattr(error, "sub_code", None) or getattr(
+                error, "error_code", None
+            )
+            normalized_code = (
+                str(response_code).strip()
+                if type(response_code) is int or isinstance(response_code, str)
+                else ""
+            )
+            server_error_code = (
+                normalized_code.isascii()
+                and normalized_code.isdecimal()
+                and 500 <= int(normalized_code) < 600
+            )
+            if (
+                isinstance(status, int) and (status in {408, 425, 429} or status >= 500)
+            ) or server_error_code:
                 return TaskFailureCategory.TRANSIENT
             return TaskFailureCategory.PERMANENT
     # 参数、权限和业务校验失败即使重复执行也不会自行恢复。

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import NoReturn
 
 from app.smart_table.adapter import (
@@ -60,9 +60,12 @@ class UnconfiguredSmartTableAdapter:
         """
         self._raise_not_configured()
 
-    def get_records(self) -> list[SmartTableRecord]:
-        """尝试列出记录，但未配置时明确失败。
+    def get_records(
+        self, record_ids: Collection[str] | None = None
+    ) -> list[SmartTableRecord]:
+        """尝试列出全部或指定记录，但未配置时明确失败。
 
+        参数：record_ids 为可选记录标识集合。
         异常：始终抛出 SmartTableAdapterConfigurationError。
         """
         self._raise_not_configured()

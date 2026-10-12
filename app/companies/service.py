@@ -48,8 +48,15 @@ class CompanyRegionResolver:
         "海外客户",
         "境外客户",
         "外国客户",
+        "国外公司",
+        "境外公司",
         "外资公司",
         "海外公司",
+        "海外企业",
+        "foreign customer",
+        "overseas customer",
+        "foreign company",
+        "overseas company",
     )
     _domestic_markers = ("国内客户", "国内公司", "中国客户", "中国公司")
     _foreign_countries = (
@@ -66,6 +73,57 @@ class CompanyRegionResolver:
         "西班牙",
         "荷兰",
         "瑞士",
+        "巴西",
+        "印度",
+        "越南",
+        "泰国",
+        "马来西亚",
+        "印度尼西亚",
+        "印尼",
+        "俄罗斯",
+        "墨西哥",
+        "土耳其",
+        "阿联酋",
+        "沙特阿拉伯",
+        "南非",
+        "新西兰",
+        "瑞典",
+        "挪威",
+        "丹麦",
+        "芬兰",
+        "比利时",
+        "奥地利",
+        "波兰",
+        "捷克",
+    )
+    _foreign_countries_en = (
+        "United States",
+        "USA",
+        "Germany",
+        "France",
+        "United Kingdom",
+        "Japan",
+        "South Korea",
+        "Canada",
+        "Australia",
+        "Singapore",
+        "Italy",
+        "Spain",
+        "Netherlands",
+        "Switzerland",
+        "Brazil",
+        "India",
+        "Vietnam",
+        "Thailand",
+        "Malaysia",
+        "Indonesia",
+        "Russia",
+        "Mexico",
+        "Turkey",
+        "United Arab Emirates",
+        "Saudi Arabia",
+        "South Africa",
+        "New Zealand",
     )
 
     def resolve(self, evidence: CompanyRegionEvidence) -> CompanyRegion:
@@ -83,15 +141,33 @@ class CompanyRegionResolver:
         if evidence.explicit_foreign:
             return CompanyRegion.FOREIGN
         message_text = evidence.message_text or ""
-        # 只识别销售对客户/公司的直接地域表述，邮箱、电话和英文名称不会参与判断。
-        if any(marker in message_text for marker in self._foreign_markers):
+        # 名称、邮箱和电话不能证明国外；只接受明确客户/公司表述或所在地证据。
+        if any(marker.casefold() in message_text.casefold() for marker in self._foreign_markers):
             return CompanyRegion.FOREIGN
         if any(marker in message_text for marker in self._domestic_markers):
             return CompanyRegion.DOMESTIC
-        # 国家名必须与公司实体词同时出现，避免把展会地点或个人行程误当作公司地域。
-        if any(
-            re.search(rf"{country}(?:的)?(?:公司|企业|客户)", message_text)
-            for country in self._foreign_countries
+        countries = "|".join(re.escape(country) for country in self._foreign_countries)
+        # 国家名需与公司/客户所在地关系连用，避免把展会地点或个人行程误判为公司地域。
+        if re.search(
+            rf"(?:{countries})(?:的)?(?:公司|企业|客户|总部|工厂|分公司|办事处)",
+            message_text,
+        ) or re.search(
+            rf"(?:公司|企业|客户)(?:的)?(?:总部)?(?:位于|设在|坐落于|注册于|来自|在)(?:{countries})",
+            message_text,
+        ) or re.search(rf"总部(?:位于|设在|坐落于|注册于|在)(?:{countries})", message_text):
+            return CompanyRegion.FOREIGN
+        english_countries = "|".join(re.escape(country) for country in self._foreign_countries_en)
+        if re.search(
+            rf"\b(?:company|customer|headquarters|subsidiary|factory)\b[^.;!?]{{0,60}}"
+            rf"\b(?:based in|located in|registered in|in)\s+(?:{english_countries})\b",
+            message_text,
+            flags=re.IGNORECASE,
+        ):
+            return CompanyRegion.FOREIGN
+        if re.search(
+            rf"\b(?:based in|located in|registered in)\s+(?:{english_countries})\b",
+            message_text,
+            flags=re.IGNORECASE,
         ):
             return CompanyRegion.FOREIGN
         return CompanyRegion.UNKNOWN
@@ -347,9 +423,16 @@ class CompanyLeadService:
                     session, command, "company_tyc_ambiguous_first_candidate_selected"
                 )
             # 所有目标定位都带销售条件，避免表格阶段读取或推断其他销售的信息。
-            lead = self._get_requested_or_matching_lead(session, command, standard_name)
+            lead = self._get_requested_or_matching_lead(
+                session, command, company_name, standard_name, verification_status
+            )
             merge_target = self._get_temporary_merge_target(
-                session, lead, command.sales_user_id, standard_name
+                session,
+                lead,
+                command.sales_user_id,
+                company_name,
+                standard_name,
+                verification_status,
             )
             if merge_target is not None and lead is not None:
                 if lead.smart_table_record_id is None:
@@ -484,12 +567,17 @@ class CompanyLeadService:
         )
 
     def _get_requested_or_matching_lead(
-        self, session: Session, command: CompanyUpsertCommand, standard_name: str | None
+        self,
+        session: Session,
+        command: CompanyUpsertCommand,
+        company_name: str,
+        standard_name: str | None,
+        verification_status: CompanyVerificationStatus,
     ) -> Lead | None:
-        """只按显式 Lead 标识定位目标，不在智能表格阶段按公司名称查重。
+        """按显式标识或当前销售的安全公司身份定位目标 Lead。
 
-        参数：session 为事务；command 提供销售与可选目标；standard_name 为可靠去重键。
-        返回值：显式目标线索；没有显式目标时返回 None。
+        参数：session 为事务；command 提供销售与可选目标；其余参数为公司身份事实。
+        返回值：显式或已存在的同销售线索；没有安全匹配时返回 None。
         异常：显式目标不存在或不属于当前销售时抛出异常。
         副作用：仅读取当前销售范围内的 Lead，绝不查询其他销售数据。
         """
@@ -499,22 +587,100 @@ class CompanyLeadService:
                 raise ValueError(f"线索不存在：{command.existing_lead_id}")
             self._ensure_sales_boundary(lead, command.sales_user_id)
             return lead
-        # 线索名称不再是智能表格阶段的查重键；只有显式目标才允许更新旧线索。
-        return None
+        return self._find_matching_company_lead(
+            session,
+            command.sales_user_id,
+            company_name,
+            standard_name,
+            verification_status,
+        )
 
-    @staticmethod
     def _get_temporary_merge_target(
-        session: Session, lead: Lead | None, sales_user_id: str, standard_name: str | None
+        self,
+        session: Session,
+        lead: Lead | None,
+        sales_user_id: str,
+        company_name: str,
+        standard_name: str | None,
+        verification_status: CompanyVerificationStatus,
     ) -> Lead | None:
-        """保留兼容接口，但不再把临时草稿与同名线索合并。
+        """把尚未入表的同销售临时 Lead 指向既有安全匹配记录。
 
-        参数：session 为事务；lead 为显式升级的临时线索；sales_user_id 限制查找范围；
-        standard_name 为唯一可靠的公司去重键。
-        返回值：始终为 None，CRM 提交阶段才执行跨线索查重。
+        参数：session 为事务；lead 为当前目标；其余参数用于销售内公司身份匹配。
+        返回值：已有同销售表格记录；当前目标已入表或无匹配时返回 None。
         异常：数据库读取失败时由 SQLAlchemy 抛出。
         副作用：只读取当前销售的 Lead，绝不访问其他销售记录。
         """
-        # 解析同名公司也必须保留独立智能表格记录，CRM 查重统一在提交边界执行。
+        if lead is None or lead.smart_table_record_id is not None:
+            return None
+        return self._find_matching_company_lead(
+            session,
+            sales_user_id,
+            company_name,
+            standard_name,
+            verification_status,
+            exclude_lead_id=lead.id,
+        )
+
+    def _find_matching_company_lead(
+        self,
+        session: Session,
+        sales_user_id: str,
+        company_name: str,
+        standard_name: str | None,
+        verification_status: CompanyVerificationStatus,
+        *,
+        exclude_lead_id: str | None = None,
+    ) -> Lead | None:
+        """在同一智能表格负责人范围内查找可确定为同一公司的活动线索。
+
+        参数：session 为事务；sales_user_id 限定负责人；名称、核验状态和标准名构成身份键；
+        exclude_lead_id 为需要排除的当前临时线索。
+        返回值：首个匹配项，优先返回已有智能表格记录的 Lead。
+        异常：数据库读取失败时由 SQLAlchemy 抛出。
+        副作用：仅读取当前负责人下未合并、未废弃的线索。
+        """
+        canonical_statuses = (
+            CompanyVerificationStatus.TYC_VERIFIED.value,
+            CompanyVerificationStatus.FOREIGN_DECLARED.value,
+            CompanyVerificationStatus.USER_CONFIRMED_UNVERIFIED.value,
+        )
+        eligible_statuses = (
+            *canonical_statuses,
+            CompanyVerificationStatus.COMPANY_UNVERIFIED.value,
+        )
+        leads = session.scalars(
+            select(Lead)
+            .where(
+                Lead.smart_table_owner_user_id == sales_user_id,
+                Lead.lifecycle_state.not_in(("merged", "discarded")),
+                Lead.company_verification_status.in_(eligible_statuses),
+            )
+            .order_by(Lead.smart_table_record_id.is_(None), Lead.created_at, Lead.id)
+        ).all()
+        incoming_name = self._normalize_company_name_for_comparison(company_name)
+        incoming_is_canonical = verification_status.value in canonical_statuses
+        for existing in leads:
+            if existing.id == exclude_lead_id:
+                continue
+            existing_name = existing.enrichment_values.get("原始企业名称") or (
+                existing.field_values.get("线索名称")
+            )
+            same_raw_name = (
+                bool(incoming_name)
+                and isinstance(existing_name, str)
+                and self._normalize_company_name_for_comparison(existing_name) == incoming_name
+            )
+            existing_is_canonical = existing.company_verification_status in canonical_statuses
+            same_canonical_name = (
+                incoming_is_canonical
+                and existing_is_canonical
+                and bool(standard_name)
+                and existing.standard_company_name == standard_name
+            )
+            # 模糊天眼查候选只按销售输入原名合并，不能按候选首项误并不同公司。
+            if same_raw_name or same_canonical_name:
+                return existing
         return None
 
     @staticmethod
@@ -599,6 +765,12 @@ class CompanyLeadService:
             smart_table_owner_user_id=command.sales_user_id,
             lifecycle_state=self._lifecycle_state(fields, standard_name),
             field_values=fields,
+            enrichment_values=(
+                {"原始企业名称": command.fields["线索名称"]}
+                if isinstance(command.fields.get("线索名称"), str)
+                and command.fields["线索名称"] != fields.get("线索名称")
+                else {}
+            ),
             standard_company_name=standard_name,
             company_region=region.value,
             company_verification_status=verification_status.value,

@@ -298,10 +298,10 @@ def test_reassignment_never_overwrites_smart_table_manual_value(
     assert adapter.get_record(target_record_id).fields["手机"] == "13900000002"
 
 
-def test_multi_customer_same_sales_keeps_existing_company_as_a_new_table_record(
+def test_multi_customer_same_sales_reuses_existing_company_table_record(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证多客户分段同名时仍按分段创建独立 Lead 和智能表格记录。
+    """验证多客户分段命中本人同一标准公司时复用既有表格记录。
 
     参数：session_factory 提供隔离数据库。
     返回值：无。
@@ -330,8 +330,8 @@ def test_multi_customer_same_sales_keeps_existing_company_as_a_new_table_record(
 
     result = workspace.consume(event_id)
 
-    assert result.lead_ids[0] != existing.lead_id
-    assert len(adapter.get_records()) == 3
+    assert result.lead_ids[0] == existing.lead_id
+    assert len(adapter.get_records()) == 2
     with session_factory() as session:
         leads = session.scalars(select(Lead).where(Lead.lifecycle_state != "merged")).all()
         resolutions = session.scalars(
@@ -339,7 +339,7 @@ def test_multi_customer_same_sales_keeps_existing_company_as_a_new_table_record(
             .where(LeadMessageResolution.message_id == "multi-reuse")
             .order_by(LeadMessageResolution.segment_index)
         ).all()
-    assert len(leads) == 3
+    assert len(leads) == 2
     assert [(item.segment_index, item.lead_id) for item in resolutions] == [
         (0, result.lead_ids[0]),
         (1, result.lead_ids[1]),

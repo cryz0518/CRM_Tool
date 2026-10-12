@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import time
 from collections.abc import Mapping, Sequence
 
 import pytest
 
+import app.smart_table.wecom_cli as wecom_cli
 from app.core.failures import (
     PermanentTaskFailure,
     RetryableTaskFailure,
@@ -84,6 +86,22 @@ def _adapter(
         retry_count=retry_count,
         runner=fake_cli,
     )
+
+
+def test_production_cli_runner_spaces_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """验证生产 runner 的连续请求之间会留出限流间隔。"""
+    adapter = WecomCliSmartTableAdapter(doc_id="test-doc", sheet_id="test-sheet")
+    calls: list[Sequence[str]] = []
+    adapter._runner = lambda arguments: calls.append(arguments) or {}
+    monkeypatch.setattr(wecom_cli, "_CLI_MIN_INTERVAL_SECONDS", 0.03)
+    monkeypatch.setattr(wecom_cli, "_CLI_LAST_COMPLETED_AT", time.monotonic() - 1)
+    started_at = time.monotonic()
+
+    adapter._run_cli(("first",))
+    adapter._run_cli(("second",))
+
+    assert len(calls) == 2
+    assert time.monotonic() - started_at >= 0.025
 
 
 def _payload(arguments: Sequence[str]) -> dict[str, object]:
@@ -944,6 +962,40 @@ def test_configured_sheet_title_uses_full_query_and_parses_member_rows() -> None
     assert fake_cli.calls[1][0:5] == ("wecom-cli", "smartsheet", "records", "query", "--docid")
 
 
+def test_get_records_queries_only_the_requested_record_ids() -> None:
+    """验证批量提交回读只请求已选中的记录，并通过一次服务端查询完成。"""
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "values": [
+                    json.dumps(
+                        {
+                            "rows": [
+                                {"RECORD_ID": "record-1", "线索名称": "公司一"},
+                                {"RECORD_ID": "record-2", "线索名称": "公司二"},
+                            ]
+                        }
+                    )
+                ],
+            },
+        ]
+    )
+
+    records = _adapter(fake_cli, sheet_title="CRM线索").get_records(
+        {"record-1", "record-2"}
+    )
+
+    assert {record.record_id for record in records} == {"record-1", "record-2"}
+    assert len(fake_cli.calls) == 2
+    sql = fake_cli.calls[1][fake_cli.calls[1].index("--sql") + 1]
+    assert 'RECORD_ID = "record-1"' in sql
+    assert 'RECORD_ID = "record-2"' in sql
+    assert " OR " in sql
+    assert "LIMIT 2" in sql
+
+
 @pytest.mark.parametrize(
     ("record_id", "expected_literal"),
     [
@@ -1139,7 +1191,7 @@ def test_query_network_process_error_retries_then_succeeds(
     retry_log = next(
         record
         for record in caplog.records
-        if record.message == "wecom_cli_smart_table_retry"
+        if record.message.startswith("wecom_cli_smart_table_retry")
     )
     assert retry_log.error_code == "network_error"
 
@@ -1212,7 +1264,9 @@ def test_rate_limited_query_exhaustion_preserves_850005_cause(
     assert last_error.external_error_code == 850005
     assert len(fake_cli.calls) == 2
     failure_log = next(
-        record for record in caplog.records if record.message == "wecom_cli_smart_table_failed"
+        record
+        for record in caplog.records
+        if record.message.startswith("wecom_cli_smart_table_failed")
     )
     assert failure_log.smart_table_resource == "records"
     assert failure_log.smart_table_action == "query"
@@ -1250,7 +1304,9 @@ def test_850003_remains_unknown_remote_business_error_and_is_not_retried(
         "remote_business_error"
     )
     failure_log = next(
-        record for record in caplog.records if record.message == "wecom_cli_smart_table_failed"
+        record
+        for record in caplog.records
+        if record.message.startswith("wecom_cli_smart_table_failed")
     )
     assert failure_log.external_error_code == 850003
     assert failure_log.external_error_type is None

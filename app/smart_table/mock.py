@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 
 from app.smart_table.adapter import (
     SmartTableActor,
@@ -84,12 +84,18 @@ class MockSmartTableAdapter:
             if all(record.fields.get(name) == value for name, value in filters.items())
         ]
 
-    def get_records(self) -> list[SmartTableRecord]:
-        """返回按创建顺序保存的全部记录快照。
+    def get_records(
+        self, record_ids: Collection[str] | None = None
+    ) -> list[SmartTableRecord]:
+        """返回按创建顺序保存的全部记录或指定记录快照。
 
-        返回：当前内存记录集的快照列表。
+        参数：record_ids 为可选的记录标识集合。
+        返回：当前请求范围内的内存记录快照列表。
         """
-        return list(self._records.values())
+        if record_ids is None:
+            return list(self._records.values())
+        requested = set(record_ids)
+        return [record for record in self._records.values() if record.record_id in requested]
 
     def create_record(
         self,

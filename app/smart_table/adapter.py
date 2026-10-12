@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from enum import StrEnum
 from typing import Mapping, Protocol
 
@@ -74,10 +75,13 @@ class SmartTableAdapter(Protocol):
         """
         ...
 
-    def get_records(self) -> list[SmartTableRecord]:
-        """返回当前子表的记录快照列表。
+    def get_records(
+        self, record_ids: Collection[str] | None = None
+    ) -> list[SmartTableRecord]:
+        """返回当前子表或指定记录标识的快照列表。
 
-        返回：当前子表全部记录的快照列表。
+        参数：record_ids 为可选记录标识集合；未提供时读取当前子表全部记录。
+        返回：请求范围内的记录快照列表。
         异常：底层查询失败时由具体适配器抛出。
         """
         ...
