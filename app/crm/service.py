@@ -702,19 +702,11 @@ class CrmSubmissionService:
                 sync = latest_crm_create_sync(session, lead.id)
                 sync_statuses[lead.id] = sync.status if sync is not None else None
         # 卡片候选只需目标负责人已有记录；不读取表格中其他销售的行。
-        record_ids = {
-            lead.smart_table_record_id
-            for lead in leads
-            if lead.smart_table_record_id is not None
+        # 按负责人从当前可见范围批量回读，避免 records query 要求全表权限。
+        smart_table_snapshot = {
+            record.record_id: record
+            for record in self._smart_table_adapter.get_records(owner_user_ids=owner_user_ids)
         }
-        smart_table_snapshot = (
-            {
-                record.record_id: record
-                for record in self._smart_table_adapter.get_records(record_ids)
-            }
-            if record_ids
-            else {}
-        )
         candidates: list[SubmissionCandidate] = []
         for lead in leads:
             sync_status = sync_statuses[lead.id]

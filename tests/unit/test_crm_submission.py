@@ -582,8 +582,11 @@ def test_owner_user_id_is_converted_to_employee_name_before_crm_submit(
         session.flush()
 
     original_get_records = adapter.get_records
+
     def get_records_with_member_name(
         record_ids: Collection[str] | None = None,
+        *,
+        owner_user_ids: tuple[str, ...] | None = None,
     ) -> list[SmartTableRecord]:
         """给批量 Mock 记录补充真实 CLI 会返回的 userName 元数据。"""
         return [
@@ -592,7 +595,7 @@ def test_owner_user_id_is_converted_to_employee_name_before_crm_submit(
                 fields=current.fields,
                 member_names={"负责人": "sales-1"},
             )
-            for current in original_get_records(record_ids)
+            for current in original_get_records(record_ids, owner_user_ids=owner_user_ids)
         ]
 
     monkeypatch.setattr(adapter, "get_records", get_records_with_member_name)
@@ -618,11 +621,13 @@ def test_missing_member_display_name_rejects_opaque_owner_id(
 
     def get_records_without_member_name(
         record_ids: Collection[str] | None = None,
+        *,
+        owner_user_ids: tuple[str, ...] | None = None,
     ) -> list[SmartTableRecord]:
         """返回不含成员显示名的批量快照。"""
         return [
             SmartTableRecord(record.record_id, record.fields, member_names={})
-            for record in original_get_records(record_ids)
+            for record in original_get_records(record_ids, owner_user_ids=owner_user_ids)
         ]
 
     monkeypatch.setattr(adapter, "get_records", get_records_without_member_name)
@@ -2031,6 +2036,33 @@ def test_all_submission_shows_incomplete_temporary_candidate(
     ).list_submission_candidates("提交我所有线索", "sales-1")
 
     assert tuple(candidate.lead_id for candidate in candidates) == (lead_id,)
+
+
+def test_batch_candidates_read_only_the_requested_owner_scope(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证批量候选按负责人范围一次回读，不依赖全表 records query 权限。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    original_get_records = adapter.get_records
+    calls: list[tuple[Collection[str] | None, tuple[str, ...] | None]] = []
+
+    def capture_get_records(
+        record_ids: Collection[str] | None = None,
+        *,
+        owner_user_ids: tuple[str, ...] | None = None,
+    ) -> list[SmartTableRecord]:
+        """记录候选回读使用的安全负责人范围。"""
+        calls.append((record_ids, owner_user_ids))
+        return original_get_records(record_ids, owner_user_ids=owner_user_ids)
+
+    monkeypatch.setattr(adapter, "get_records", capture_get_records)
+    candidates = CrmSubmissionService(
+        session_factory, adapter, MockCRMAdapter()
+    ).list_submission_candidates("提交我所有线索", "sales-1")
+
+    assert tuple(candidate.lead_id for candidate in candidates) == (lead_id,)
+    assert calls == [(None, ("sales-1",))]
 
 
 def test_today_three_candidates_process_complete_and_incomplete_independently(

@@ -153,7 +153,7 @@ services:
       test: ["CMD", "python", "-m", "app.healthcheck", "app"]
       interval: 10s
       # readiness 会读取真实 CLI schema；给单次外部调用保留足够的容器探针时间。
-      timeout: 7s
+      timeout: 30s
       retries: 12
     restart: unless-stopped
 
