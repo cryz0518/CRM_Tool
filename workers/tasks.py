@@ -338,7 +338,7 @@ def _defer_audit_mirror(
     参数：session_factory 为数据库会话工厂；outbox_id 为镜像任务标识；claim_token 为当前认领令牌。
     返回值：无。
     异常：数据库更新错误向 Worker 传播。
-    副作用：仅在 ID、processing 状态和 claim token 同时匹配时重置为 pending；不记录失败。
+    副作用：仅在 ID、processing 状态和 claim token 同时匹配时标记等待来源消息；不记录失败。
     """
     with session_factory.begin() as session:
         # defer 与 finalize 一样必须做 token fencing，旧 Worker 不能释放新 Worker 的 claim。
@@ -353,8 +353,9 @@ def _defer_audit_mirror(
         )
         if outbox is None:
             return
-        outbox.status = "pending"
-        # 等待 source Lead 的消费没有调用 SmartTable，不应消耗外部镜像尝试额度。
+        # 已派发的重复 Celery 消息必须因该状态不可认领，避免等待来源时反复占用 Worker。
+        outbox.status = "waiting_source"
+        # 等待来源消息没有调用 SmartTable，不应消耗外部镜像尝试额度。
         outbox.attempts = max(0, outbox.attempts - 1)
         outbox.processing_started_at = None
         outbox.dispatch_lease_expires_at = None
@@ -464,6 +465,16 @@ def consume_pending_audit_mirrors() -> int:
         settings = get_settings()
         now = utc_now()
         expired_before = now - timedelta(seconds=settings.lead_processing_timeout_seconds)
+        # 业务消息尚未进入终态时，审计镜像留在数据库，避免每轮扫描都投递等待任务。
+        source_outbox_pending = (
+            select(OutboxEvent.id)
+            .join(BusinessAuditEvent, BusinessAuditEvent.message_id == OutboxEvent.message_id)
+            .where(
+                BusinessAuditEvent.id == AuditMirrorOutbox.audit_event_id,
+                OutboxEvent.status.not_in(COMPLETED_CHECKPOINT_STATUSES),
+            )
+            .exists()
+        )
         dispatch_due = or_(
             AuditMirrorOutbox.dispatch_lease_expires_at.is_(None),
             AuditMirrorOutbox.dispatch_lease_expires_at <= now,
@@ -474,8 +485,11 @@ def consume_pending_audit_mirrors() -> int:
                     select(AuditMirrorOutbox)
                     .where(
                         dispatch_due,
+                        ~source_outbox_pending,
                         or_(
                             AuditMirrorOutbox.status == "pending",
+                            # 来源消息进入终态后，重新激活此前被等待的审计镜像。
+                            AuditMirrorOutbox.status == "waiting_source",
                             and_(
                                 AuditMirrorOutbox.status == "retrying",
                                 _audit_mirror_retry_due_condition(now),
@@ -494,6 +508,8 @@ def consume_pending_audit_mirrors() -> int:
                 )
             )
             for outbox in outboxes:
+                if outbox.status == "waiting_source":
+                    outbox.status = "pending"
                 outbox.dispatch_lease_expires_at = now + timedelta(
                     seconds=settings.lead_processing_timeout_seconds
                 )
