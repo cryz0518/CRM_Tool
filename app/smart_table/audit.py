@@ -25,7 +25,7 @@ AUDIT_MIRROR_FIELD_NAMES = (
     "事件ID",
     "时间",
     "事件类型",
-    "操作人ID",
+    "操作人",
     "消息ID",
     "销售原始消息",
     "线索归属ID",
@@ -76,7 +76,12 @@ def build_mock_audit_schema() -> SmartTableSchema:
             SmartTableField(
                 field_id=f"mock-audit-field-{index}",
                 name=name,
-                field_type=SmartTableFieldType.TEXT,
+                # 人员单元格保留企微 userId，由适配器编码为 CLI 成员结构。
+                field_type=(
+                    SmartTableFieldType.MEMBER
+                    if name == "操作人"
+                    else SmartTableFieldType.TEXT
+                ),
             )
             for index, name in enumerate(AUDIT_MIRROR_FIELD_NAMES, start=1)
         )
@@ -132,7 +137,7 @@ class SmartTableAuditSink:
             "事件ID": str(event.id),
             "时间": event.created_at.isoformat(),
             "事件类型": event.event_type,
-            "操作人ID": event.sales_user_id,
+            "操作人": event.sales_user_id.strip(),
             "消息ID": event.message_id,
         }
         # 系统审计日志中的销售原始消息是管理员审计副本；Smart Table ACL 由管理员控制；
@@ -185,6 +190,12 @@ class SmartTableAuditSink:
             raise SmartTableAdapterConfigurationError(
                 f"审计子表缺少必需字段：{','.join(missing_fields)}"
             )
+        operator_field = schema.get_field("操作人")
+        if (
+            operator_field is None
+            or operator_field.field_type is not SmartTableFieldType.MEMBER
+        ):
+            raise SmartTableAdapterConfigurationError("审计子表字段“操作人”必须为人员类型")
         existing = self._adapter.find_records(
             {AUDIT_MIRROR_KEY_FIELD: fields[AUDIT_MIRROR_KEY_FIELD]}
         )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -21,8 +22,10 @@ from app.messaging.models import (
     SalesAuthorization,
     utc_now,
 )
+from app.smart_table.adapter import SmartTableAdapterConfigurationError
 from app.smart_table.audit import SmartTableAuditSink, build_mock_audit_schema
 from app.smart_table.mock import MockSmartTableAdapter
+from app.smart_table.models import SmartTableFieldType, SmartTableSchema
 from app.smart_table.wecom_cli import WecomCliProcessError, WecomCliTransportError
 from workers import tasks
 
@@ -289,6 +292,52 @@ def test_audit_mirror_retry_is_idempotent_and_drops_sensitive_details(
     assert "phone" not in fields
     assert "email" not in fields
     assert "raw_response" not in fields
+
+
+def test_audit_mirror_writes_wecom_user_id_to_operator_member_field(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证操作人人员字段使用企微发送人标识，不依赖 CRM 映射。"""
+    outbox_id = _persist_lead_audit_case(
+        session_factory,
+        events=(("message-1", {"status": "succeeded"}),),
+    )[0]
+    with session_factory.begin() as session:
+        authorization = session.get(SalesAuthorization, "sales-1")
+        assert authorization is not None
+        authorization.crm_user_id = "crm-employee-1"
+        authorization.display_name = "王工（Jack）"
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+
+    assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "succeeded"
+    fields = adapter.get_records()[0].fields
+    assert fields["操作人"] == "sales-1"
+    assert "操作人ID" not in fields
+    assert build_mock_audit_schema().get_field("操作人").field_type is SmartTableFieldType.MEMBER
+
+
+def test_audit_mirror_rejects_operator_field_that_is_not_personnel(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证审计表字段不是人员类型时，不会把企微标识写入其他字段类型。"""
+    _persist_event(session_factory)
+    with session_factory() as session:
+        event = session.scalar(select(BusinessAuditEvent))
+        assert event is not None
+    schema = build_mock_audit_schema()
+    invalid_schema = SmartTableSchema(
+        fields=tuple(
+            replace(field, field_type=SmartTableFieldType.TEXT)
+            if field.name == "操作人"
+            else field
+            for field in schema.fields
+        )
+    )
+    adapter = MockSmartTableAdapter(schema=invalid_schema, require_owner_field=False)
+
+    with pytest.raises(SmartTableAdapterConfigurationError, match="必须为人员类型"):
+        SmartTableAuditSink(adapter).mirror(event)
 
 
 def test_audit_mirror_maps_internal_details_to_chinese_fields(
