@@ -215,6 +215,37 @@ def test_different_sales_can_be_claimed_in_parallel(
     assert {claim.event_id for claim in claims} == {first_event_id, second_event_id}
 
 
+def test_dispatch_claims_only_available_in_flight_capacity(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证已有处理中事件占用容量，避免把待处理事件提前塞入 Celery 队列。"""
+    persist_event(
+        session_factory,
+        sales_user_id="sales-active",
+        sequence=1,
+        status="processing",
+        processing_started_at=utc_now(),
+    )
+    pending_ids = [
+        persist_event(session_factory, sales_user_id=f"sales-{index}", sequence=1)
+        for index in range(4)
+    ]
+
+    first_claims = claim_dispatchable_lead_outbox_events(
+        session_factory,
+        lease_timeout=timedelta(minutes=5),
+        max_in_flight=3,
+    )
+    second_claims = claim_dispatchable_lead_outbox_events(
+        session_factory,
+        lease_timeout=timedelta(minutes=5),
+        max_in_flight=3,
+    )
+
+    assert [claim.event_id for claim in first_claims] == pending_ids[:2]
+    assert second_claims == []
+
+
 def test_ten_same_sales_messages_follow_sequence_not_creation_time(
     session_factory: sessionmaker[Session],
 ) -> None:
