@@ -11,6 +11,8 @@ from app.core.heartbeat import HeartbeatPublisher
 from app.core.logging import configure_logging
 from app.media.retention import retention_policy_is_configured
 
+AUDIT_MIRROR_POLL_SECONDS = 60
+
 
 def build_beat_schedule(settings: Settings) -> dict[str, dict[str, object]]:
     """根据配置构建 Celery Beat 任务表，未配置保留策略时不注册清理任务。
@@ -31,7 +33,7 @@ def build_beat_schedule(settings: Settings) -> dict[str, dict[str, object]]:
         },
         "consume-pending-audit-mirrors": {
             "task": "workers.consume_pending_audit_mirrors",
-            "schedule": settings.lead_outbox_poll_seconds,
+            "schedule": AUDIT_MIRROR_POLL_SECONDS,
         },
         "reconcile-storage-ingest-operations": {
             "task": "workers.reconcile_storage_ingest_operations",
@@ -63,6 +65,7 @@ def build_beat_schedule(settings: Settings) -> dict[str, dict[str, object]]:
     }
     return schedule
 
+
 settings = get_settings()
 configure_logging(settings.log_level, environment=settings.app_env, service="worker")
 
@@ -81,7 +84,10 @@ celery_app.conf.update(
     enable_utc=False,
     beat_schedule=build_beat_schedule(settings),
     # 审计镜像会执行较慢的外部 CLI；隔离队列避免占用线索消费槽位。
-    task_routes={"workers.consume_audit_mirror_outbox": {"queue": "audit"}},
+    task_routes={
+        "workers.consume_audit_mirror_outbox": {"queue": "audit"},
+        "workers.consume_audit_mirror_batch": {"queue": "audit"},
+    },
 )
 
 

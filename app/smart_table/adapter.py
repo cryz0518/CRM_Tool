@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from enum import StrEnum
 from typing import Mapping, Protocol
 
@@ -75,6 +75,18 @@ class SmartTableAdapter(Protocol):
         """
         ...
 
+    def find_records_by_field_values(
+        self, field_name: str, values: Collection[str]
+    ) -> list[SmartTableRecord]:
+        """一次读取某字段匹配任一文本值的记录，供批量幂等写入查重。
+
+        参数：field_name 为字段展示名；values 为待匹配的文本值集合。
+        返回：匹配任一值的记录快照。
+        异常：字段类型不支持或底层查询失败时由适配器抛出。
+        副作用：仅执行只读查询。
+        """
+        ...
+
     def get_records(
         self,
         record_ids: Collection[str] | None = None,
@@ -102,6 +114,18 @@ class SmartTableAdapter(Protocol):
         返回：创建后的记录快照。
         异常：无权限或底层写入失败时由具体适配器抛出。
         副作用：在目标智能表格中新增记录。
+        """
+        ...
+
+    def create_records(
+        self, records: Sequence[Mapping[str, object]], *, actor: SmartTableActor
+    ) -> list[SmartTableRecord]:
+        """通过一次批量请求创建多条记录。
+
+        参数：records 为按请求顺序排列的字段映射；actor 为调用主体。
+        返回：按输入顺序排列且经适配器确认的记录快照。
+        异常：权限、协议或远端写入失败时由适配器抛出。
+        副作用：在目标智能表格新增记录。
         """
         ...
 

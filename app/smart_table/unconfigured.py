@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 from typing import NoReturn
 
 from app.smart_table.adapter import (
@@ -60,6 +60,17 @@ class UnconfiguredSmartTableAdapter:
         """
         self._raise_not_configured()
 
+    def find_records_by_field_values(
+        self, field_name: str, values: Collection[str]
+    ) -> list[SmartTableRecord]:
+        """尝试按一个字段的多个文本值查找记录，但未配置时明确失败。
+
+        参数：field_name 为字段名；values 为待匹配文本值集合。
+        异常：始终抛出 SmartTableAdapterConfigurationError。
+        副作用：阻止调用方误以为幂等查重已成功。
+        """
+        self._raise_not_configured()
+
     def get_records(
         self,
         record_ids: Collection[str] | None = None,
@@ -84,6 +95,17 @@ class UnconfiguredSmartTableAdapter:
 
         参数：fields 为待写字段；actor 为调用主体。
         异常：始终抛出 SmartTableAdapterConfigurationError。
+        """
+        self._raise_not_configured()
+
+    def create_records(
+        self, records: Sequence[Mapping[str, object]], *, actor: SmartTableActor
+    ) -> list[SmartTableRecord]:
+        """尝试批量创建记录，但未配置时明确失败。
+
+        参数：records 为批量字段映射；actor 为调用主体。
+        异常：始终抛出 SmartTableAdapterConfigurationError。
+        副作用：阻止调用方写入未配置的目标表。
         """
         self._raise_not_configured()
 

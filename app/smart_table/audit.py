@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 from app.messaging.models import BusinessAuditEvent
 from app.smart_table.adapter import (
@@ -169,19 +169,37 @@ class SmartTableAuditSink:
         sales_original_message: str | None = None,
         resolved_lead_id: str | None = None,
     ) -> SmartTableRecord:
-        """按稳定镜像键写前查重后创建一条审计子表记录。
+        """按稳定镜像键查重并写入一条审计子表记录。
 
         参数：event 为待镜像业务审计事实；sales_original_message 为未 scrub 的标准化销售文本；
         resolved_lead_id 为 Worker 从当前数据库归属事实解析出的 Lead.id。
         返回值：已存在或本次创建的审计子表记录。
         异常：审计子表缺少镜像键字段或外部写入失败时抛出适配器异常。
-        副作用：配合服务端 claim fencing，重复重试通过远端查重避免重复新增。
+        副作用：重复重试通过远端稳定键查重避免重复新增。
         """
-        fields = self.build_fields(
-            event,
-            sales_original_message=sales_original_message,
-            resolved_lead_id=resolved_lead_id,
-        )
+        return self.mirror_batch([(event, sales_original_message, resolved_lead_id)])[0]
+
+    def mirror_batch(
+        self,
+        events: Sequence[tuple[BusinessAuditEvent, str | None, str | None]],
+    ) -> list[SmartTableRecord]:
+        """以一次查重和一次批量新增镜像多条独立审计事件。
+
+        参数：events 为按处理顺序排列的审计事实、未 scrub 原文和线索归属 ID 元组。
+        返回值：按输入顺序排列的已存在或本次创建记录。
+        异常：结构缺失、查重、批量新增或写后核实失败时抛出适配器异常。
+        副作用：每个事件仍各占一行；远端查重及新增按批次执行。
+        """
+        if not events:
+            return []
+        fields_by_event = [
+            self.build_fields(
+                event,
+                sales_original_message=original_message,
+                resolved_lead_id=lead_id,
+            )
+            for event, original_message, lead_id in events
+        ]
         schema = self._adapter.get_schema()
         missing_fields = [
             name for name in AUDIT_MIRROR_FIELD_NAMES if schema.get_field(name) is None
@@ -196,10 +214,23 @@ class SmartTableAuditSink:
             or operator_field.field_type is not SmartTableFieldType.MEMBER
         ):
             raise SmartTableAdapterConfigurationError("审计子表字段“操作人”必须为人员类型")
-        existing = self._adapter.find_records(
-            {AUDIT_MIRROR_KEY_FIELD: fields[AUDIT_MIRROR_KEY_FIELD]}
-        )
-        if existing:
-            return existing[0]
+        keys = [str(fields[AUDIT_MIRROR_KEY_FIELD]) for fields in fields_by_event]
+        existing_by_key: dict[str, SmartTableRecord] = {}
+        for record in self._adapter.find_records_by_field_values(AUDIT_MIRROR_KEY_FIELD, keys):
+            key = record.fields.get(AUDIT_MIRROR_KEY_FIELD)
+            if isinstance(key, str):
+                existing_by_key.setdefault(key, record)
+        results: list[SmartTableRecord | None] = [existing_by_key.get(key) for key in keys]
+        missing_indexes = [index for index, record in enumerate(results) if record is None]
         # 审计子表 ACL 由管理员在企微端配置；代码只使用机器人身份写入，不管理 ACL。
-        return self._adapter.create_record(fields, actor=SmartTableActor.ROBOT)
+        created = self._adapter.create_records(
+            [fields_by_event[index] for index in missing_indexes],
+            actor=SmartTableActor.ROBOT,
+        )
+        if len(created) != len(missing_indexes):
+            raise RuntimeError("审计批量新增返回的记录数与请求不一致")
+        for index, record in zip(missing_indexes, created, strict=True):
+            results[index] = record
+        if any(record is None for record in results):
+            raise RuntimeError("审计批量新增未返回全部记录")
+        return [record for record in results if record is not None]

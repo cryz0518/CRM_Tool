@@ -12,6 +12,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.core.config import Settings
 from app.leads.models import Lead, LeadMessageResolution
 from app.messaging.models import (
     AuditMirrorOutbox,
@@ -28,6 +29,7 @@ from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.models import SmartTableFieldType, SmartTableSchema
 from app.smart_table.wecom_cli import WecomCliProcessError, WecomCliTransportError
 from workers import tasks
+from workers.celery_app import build_beat_schedule
 
 
 def test_audit_mirror_worker_tasks_use_a_separate_queue() -> None:
@@ -35,12 +37,22 @@ def test_audit_mirror_worker_tasks_use_a_separate_queue() -> None:
     audit_route = tasks.celery_app.amqp.router.route(
         {}, "workers.consume_audit_mirror_outbox", args=(1,), kwargs={}
     )
+    batch_route = tasks.celery_app.amqp.router.route(
+        {}, "workers.consume_audit_mirror_batch", args=([1, 2],), kwargs={}
+    )
     lead_route = tasks.celery_app.amqp.router.route(
         {}, "workers.consume_lead_outbox_event", args=(1,), kwargs={}
     )
 
     assert audit_route["queue"].name == "audit"
+    assert batch_route["queue"].name == "audit"
     assert lead_route["queue"].name == "celery"
+
+
+def test_audit_mirrors_are_scanned_once_per_minute() -> None:
+    """验证审计批次每分钟派发一次，不跟随高频线索扫描。"""
+    schedule = build_beat_schedule(Settings())
+    assert schedule["consume-pending-audit-mirrors"]["schedule"] == 60
 
 
 @pytest.fixture
@@ -330,6 +342,81 @@ def test_audit_mirror_writes_wecom_user_id_to_operator_member_field(
     assert build_mock_audit_schema().get_field("操作人").field_type is SmartTableFieldType.MEMBER
 
 
+def test_audit_batch_writes_independent_events_with_one_lookup_and_one_create(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证多条独立事件共用一次幂等查重和一次批量新增。"""
+    outbox_ids = _persist_mirror_jobs(session_factory, 3)
+    engine = session_factory.kw["bind"]
+    monkeypatch.setattr(engine, "dispose", lambda: None)
+    monkeypatch.setattr(tasks, "_session_factory", lambda: (engine, session_factory))
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+    lookup_calls: list[tuple[str, tuple[str, ...]]] = []
+    create_calls: list[int] = []
+    original_lookup = adapter.find_records_by_field_values
+    original_create = adapter.create_records
+
+    def track_lookup(field_name: str, values) -> list:
+        """记录一次批量查重调用并委托内存适配器。"""
+        lookup_calls.append((field_name, tuple(values)))
+        return original_lookup(field_name, values)
+
+    def track_create(records, *, actor):
+        """记录单次批量新增的行数并委托内存适配器。"""
+        create_calls.append(len(records))
+        return original_create(records, actor=actor)
+
+    monkeypatch.setattr(adapter, "find_records_by_field_values", track_lookup)
+    monkeypatch.setattr(adapter, "create_records", track_create)
+    monkeypatch.setattr(tasks, "get_smart_table_audit_adapter", lambda: adapter)
+
+    assert tasks.consume_audit_mirror_batch.run(outbox_ids) == "succeeded"
+
+    assert len(lookup_calls) == 1
+    assert lookup_calls[0][0] == "日志唯一键"
+    assert len(lookup_calls[0][1]) == 3
+    assert create_calls == [3]
+    records = adapter.get_records()
+    assert len(records) == 3
+    assert len({record.fields["事件ID"] for record in records}) == 3
+    with session_factory() as session:
+        rows = [session.get(AuditMirrorOutbox, outbox_id) for outbox_id in outbox_ids]
+        assert all(row is not None and row.status == "succeeded" for row in rows)
+
+
+def test_audit_batch_retry_reuses_rows_created_before_unknown_result(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证批量新增结果未知后，稳定键查重会保留已写行并只补缺行。"""
+    _persist_mirror_jobs(session_factory, 2)
+    with session_factory() as session:
+        events = list(session.scalars(select(BusinessAuditEvent).order_by(BusinessAuditEvent.id)))
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+    original_create = adapter.create_records
+    calls: list[int] = []
+
+    def create_partial(records, *, actor):
+        """模拟首个批量请求只写入一行后客户端连接中断。"""
+        calls.append(len(records))
+        if len(calls) == 1:
+            original_create(records[:1], actor=actor)
+            raise _rate_limited_transport_error()
+        return original_create(records, actor=actor)
+
+    monkeypatch.setattr(adapter, "create_records", create_partial)
+    sink = SmartTableAuditSink(adapter)
+    batch = [(event, None, None) for event in events]
+
+    with pytest.raises(WecomCliTransportError):
+        sink.mirror_batch(batch)
+    records = sink.mirror_batch(batch)
+
+    assert calls == [2, 1]
+    assert len(records) == 2
+    assert len(adapter.get_records()) == 2
+    assert {record.fields["日志唯一键"] for record in records} == {"audit:1", "audit:2"}
+
+
 def test_audit_mirror_rejects_operator_field_that_is_not_personnel(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -500,7 +587,7 @@ def test_audit_mirror_defers_until_source_outbox_terminal_then_resolves_lead(
         session_factory, monkeypatch, now=utc_now(), batch_size=10
     )
     assert tasks.consume_pending_audit_mirrors.run() == 1
-    assert dispatched == [outbox_id]
+    assert dispatched == [[outbox_id]]
     assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "succeeded"
     assert len(adapter.get_records()) == 1
     fields = adapter.get_records()[0].fields
@@ -569,7 +656,7 @@ def test_audit_mirror_defers_multiple_messages_then_keeps_one_lead_id(
         session_factory, monkeypatch, now=utc_now(), batch_size=10
     )
     assert tasks.consume_pending_audit_mirrors.run() == len(outbox_ids)
-    assert dispatched == outbox_ids
+    assert dispatched == [outbox_ids]
     for outbox_id in outbox_ids:
         assert (
             _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter)
@@ -862,7 +949,7 @@ def test_deferred_audit_claims_do_not_consume_retry_attempts(
         session_factory, monkeypatch, now=now, batch_size=10
     )
     assert tasks.consume_pending_audit_mirrors.run() == 1
-    assert dispatched == [outbox_id]
+    assert dispatched == [[outbox_id]]
 
     class TransientFailureAdapter:
         """模拟首次真正进入镜像调用后发生的可重试传输错误。"""
@@ -900,7 +987,7 @@ def test_deferred_audit_claims_do_not_consume_retry_attempts(
     assert dispatched == []
     monkeypatch.setattr(tasks, "utc_now", lambda: updated_at + timedelta(seconds=30))
     assert tasks.consume_pending_audit_mirrors.run() == 1
-    assert dispatched == [outbox_id]
+    assert dispatched == [[outbox_id]]
 
 
 def test_deferred_audit_mirrors_do_not_starve_later_pending_batch(
@@ -914,7 +1001,7 @@ def test_deferred_audit_mirrors_do_not_starve_later_pending_batch(
     )
 
     assert tasks.consume_pending_audit_mirrors.run() == 10
-    assert dispatched == ids[:10]
+    assert dispatched == [ids[:10]]
     original_timestamps: dict[int, tuple[datetime, datetime]] = {}
     for outbox_id in ids[:10]:
         with session_factory() as session:
@@ -939,7 +1026,7 @@ def test_deferred_audit_mirrors_do_not_starve_later_pending_batch(
     dispatched.clear()
     assert tasks.consume_pending_audit_mirrors.run() == 10
     # 新鲜 defer 的十条排到末尾，先投递此前未被选中的三条。
-    assert dispatched == [*ids[10:], *ids[:7]]
+    assert dispatched == [[*ids[10:], *ids[:7]]]
 
 
 @pytest.mark.parametrize(
@@ -959,19 +1046,12 @@ def _prepare_scanner(
     *,
     now: datetime,
     batch_size: int,
-    max_in_flight: int | None = None,
-) -> list[int]:
+) -> list[list[int]]:
     """将审计扫描器绑定到隔离数据库、固定时钟和只记录参数的投递函数。"""
     engine = session_factory.kw["bind"]
     monkeypatch.setattr(engine, "dispose", lambda: None)
     monkeypatch.setattr(tasks, "_session_factory", lambda: (engine, session_factory))
     monkeypatch.setattr(tasks, "utc_now", lambda: now)
-    # 默认让既有用例单独覆盖 batch 行为；容量限制由对应回归用例显式指定。
-    monkeypatch.setattr(
-        tasks,
-        "AUDIT_MIRROR_MAX_IN_FLIGHT",
-        max_in_flight if max_in_flight is not None else batch_size,
-    )
     monkeypatch.setattr(
         tasks,
         "get_settings",
@@ -980,8 +1060,8 @@ def _prepare_scanner(
             audit_mirror_batch_size=batch_size,
         ),
     )
-    dispatched: list[int] = []
-    monkeypatch.setattr(tasks.consume_audit_mirror_outbox, "delay", dispatched.append)
+    dispatched: list[list[int]] = []
+    monkeypatch.setattr(tasks.consume_audit_mirror_batch, "delay", dispatched.append)
     return dispatched
 
 
@@ -1015,7 +1095,7 @@ def test_audit_scanner_dispatches_pending_and_due_retries_only(
         session_factory, monkeypatch, now=now, batch_size=10
     )
     assert tasks.consume_pending_audit_mirrors.run() == 5
-    assert dispatched == [ids[8], ids[6], ids[4], ids[2], ids[0]]
+    assert dispatched == [[ids[8], ids[6], ids[4], ids[2], ids[0]]]
 
 
 def test_audit_scanner_applies_batch_limit_before_dispatch(
@@ -1029,10 +1109,10 @@ def test_audit_scanner_applies_batch_limit_before_dispatch(
     )
 
     assert tasks.consume_pending_audit_mirrors.run() == 10
-    assert dispatched == ids[:10]
+    assert dispatched == [ids[:10]]
 
 
-def test_audit_scanner_does_not_dispatch_past_active_worker_capacity(
+def test_audit_scanner_waits_for_the_current_batch_to_finish(
     session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """验证排队租约和有效 processing 都占用独立审计 Worker 槽位。"""
@@ -1050,12 +1130,10 @@ def test_audit_scanner_does_not_dispatch_past_active_worker_capacity(
         expired.processing_started_at = now - timedelta(seconds=600)
         expired.updated_at = now - timedelta(seconds=600)
 
-    dispatched = _prepare_scanner(
-        session_factory, monkeypatch, now=now, batch_size=10, max_in_flight=3
-    )
-    # 一个排队任务和一个有效 processing 占用两槽；过期 processing 可被回收占最后一槽。
-    assert tasks.consume_pending_audit_mirrors.run() == 1
-    assert dispatched == [ids[2]]
+    dispatched = _prepare_scanner(session_factory, monkeypatch, now=now, batch_size=10)
+    # 一个排队租约或有效 processing 都会阻止派发第二个批次。
+    assert tasks.consume_pending_audit_mirrors.run() == 0
+    assert dispatched == []
     assert tasks.consume_pending_audit_mirrors.run() == 0
 
 
@@ -1069,9 +1147,7 @@ def test_audit_scanner_waits_for_source_outbox_and_releases_deferred_mirror(
         source_outbox_status="processing",
     )
     now = utc_now()
-    dispatched = _prepare_scanner(
-        session_factory, monkeypatch, now=now, batch_size=10
-    )
+    dispatched = _prepare_scanner(session_factory, monkeypatch, now=now, batch_size=10)
 
     # 扫描器直接跳过未完成的来源，不向拥塞的共享队列增加等待任务。
     assert tasks.consume_pending_audit_mirrors.run() == 0
@@ -1093,7 +1169,7 @@ def test_audit_scanner_waits_for_source_outbox_and_releases_deferred_mirror(
         assert source is not None
         source.status = "succeeded"
     assert tasks.consume_pending_audit_mirrors.run() == 1
-    assert dispatched == [outbox_id]
+    assert dispatched == [[outbox_id]]
     with session_factory() as session:
         mirror = session.get(AuditMirrorOutbox, outbox_id)
         assert mirror is not None
@@ -1113,9 +1189,7 @@ def test_audit_scanner_skips_large_not_due_retry_backlog(
             row.status = "retrying"
             row.attempts = 1
             row.updated_at = now - timedelta(seconds=29)
-    dispatched = _prepare_scanner(
-        session_factory, monkeypatch, now=now, batch_size=10
-    )
+    dispatched = _prepare_scanner(session_factory, monkeypatch, now=now, batch_size=10)
 
     assert tasks.consume_pending_audit_mirrors.run() == 0
     assert dispatched == []
