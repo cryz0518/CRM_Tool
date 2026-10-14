@@ -742,11 +742,12 @@ def test_authorized_sales_text_creates_a_personal_review_record(
     异常：任一业务断言不成立时由 pytest 报告。
     副作用：在测试内创建并同步一条 Mock 智能表格记录。
     """
+    original_message = "客户：长广溪智造；联系人：张三；需求：码垛机器人"
     event_id = persist_outbox_text(
         session_factory,
         message_id="message-1",
         sales_user_id="sales-1",
-        text="客户：长广溪智造；联系人：张三；需求：码垛机器人",
+        text=original_message,
     )
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
 
@@ -778,7 +779,7 @@ def test_authorized_sales_text_creates_a_personal_review_record(
             "基本信息：长广溪智造；城市、主要产品、年销售额、所属行业未提供。\n"
             "线索需求：未提供。\n"
             "预算情况：未提供。\n"
-            "特殊要求：未提供。"
+            f"特殊要求：未提供。\n原始消息：\n{original_message}"
         ),
     }
     with session_factory() as session:
@@ -810,7 +811,7 @@ def test_authorized_sales_text_creates_a_personal_review_record(
             "基本信息：长广溪智造；城市、主要产品、年销售额、所属行业未提供。\n"
             "线索需求：未提供。\n"
             "预算情况：未提供。\n"
-            "特殊要求：未提供。"
+            f"特殊要求：未提供。\n原始消息：\n{original_message}"
         ),
     }
     assert {source.field_name for source in provenance} == {

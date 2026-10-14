@@ -2412,6 +2412,27 @@ def test_query_rejects_non_contract_text_cell_shapes() -> None:
         )
 
 
+def test_query_record_extracts_text_from_rich_url_in_long_text() -> None:
+    """验证智能表格备注中的富文本链接单元格仍可作为普通显示文本读取。"""
+    schema = SmartTableSchema(
+        fields=(SmartTableField("remark", "备注", SmartTableFieldType.LONG_TEXT),)
+    )
+
+    record = _adapter(FakeCli([]))._parse_query_record(
+        {
+            "RECORD_ID": "record-1",
+            "备注": {
+                "text": "contact@example.com",
+                "type": "url",
+                "url": "mailto:contact@example.com",
+            },
+        },
+        schema,
+    )
+
+    assert record.fields == {"备注": "contact@example.com"}
+
+
 def test_query_record_normalizes_sql_member_shape() -> None:
     """验证 SQL 查询返回的人员对象形状可归一化为成员标识和展示名。
 

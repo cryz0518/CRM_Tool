@@ -6,7 +6,7 @@ import asyncio
 import logging
 from collections.abc import Collection, Generator, Mapping
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -24,6 +24,7 @@ from app.crm.commands import (
     format_submission_reply,
     notification_key_for_message,
     parse_crm_submission_command,
+    parse_cross_owner_submission_request,
     prepare_batch_submission_selection,
     prepare_company_submission_preview,
     terminal_failure_notification_key_for_message,
@@ -582,8 +583,11 @@ def test_owner_user_id_is_converted_to_employee_name_before_crm_submit(
         session.flush()
 
     original_get_records = adapter.get_records
+
     def get_records_with_member_name(
         record_ids: Collection[str] | None = None,
+        *,
+        owner_user_ids: tuple[str, ...] | None = None,
     ) -> list[SmartTableRecord]:
         """给批量 Mock 记录补充真实 CLI 会返回的 userName 元数据。"""
         return [
@@ -592,7 +596,7 @@ def test_owner_user_id_is_converted_to_employee_name_before_crm_submit(
                 fields=current.fields,
                 member_names={"负责人": "sales-1"},
             )
-            for current in original_get_records(record_ids)
+            for current in original_get_records(record_ids, owner_user_ids=owner_user_ids)
         ]
 
     monkeypatch.setattr(adapter, "get_records", get_records_with_member_name)
@@ -618,11 +622,13 @@ def test_missing_member_display_name_rejects_opaque_owner_id(
 
     def get_records_without_member_name(
         record_ids: Collection[str] | None = None,
+        *,
+        owner_user_ids: tuple[str, ...] | None = None,
     ) -> list[SmartTableRecord]:
         """返回不含成员显示名的批量快照。"""
         return [
             SmartTableRecord(record.record_id, record.fields, member_names={})
-            for record in original_get_records(record_ids)
+            for record in original_get_records(record_ids, owner_user_ids=owner_user_ids)
         ]
 
     monkeypatch.setattr(adapter, "get_records", get_records_without_member_name)
@@ -1350,7 +1356,10 @@ def test_incomplete_retry_reloads_table_and_never_recreates_successful_lead(
     assert third.items[0].reason_code == "already_submitted"
     assert crm.search_calls == 0 and crm.calls == 1
     assert bulk_read.call_count == 2
-    assert all(call.args[0] == {record.record_id} for call in bulk_read.call_args_list)
+    assert [call.args[0] for call in bulk_read.call_args_list] == [
+        {record.record_id},
+        {record.record_id},
+    ]
 
 
 def test_incomplete_retry_fails_closed_after_owner_or_table_status_change(
@@ -2033,6 +2042,33 @@ def test_all_submission_shows_incomplete_temporary_candidate(
     assert tuple(candidate.lead_id for candidate in candidates) == (lead_id,)
 
 
+def test_batch_candidates_read_only_the_requested_owner_scope(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证批量候选按负责人范围一次回读，不依赖全表 records query 权限。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    original_get_records = adapter.get_records
+    calls: list[tuple[Collection[str] | None, tuple[str, ...] | None]] = []
+
+    def capture_get_records(
+        record_ids: Collection[str] | None = None,
+        *,
+        owner_user_ids: tuple[str, ...] | None = None,
+    ) -> list[SmartTableRecord]:
+        """记录候选回读使用的安全负责人范围。"""
+        calls.append((record_ids, owner_user_ids))
+        return original_get_records(record_ids, owner_user_ids=owner_user_ids)
+
+    monkeypatch.setattr(adapter, "get_records", capture_get_records)
+    candidates = CrmSubmissionService(
+        session_factory, adapter, MockCRMAdapter()
+    ).list_submission_candidates("提交我所有线索", "sales-1")
+
+    assert tuple(candidate.lead_id for candidate in candidates) == (lead_id,)
+    assert calls == [(None, ("sales-1",))]
+
+
 def test_today_three_candidates_process_complete_and_incomplete_independently(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
@@ -2085,7 +2121,7 @@ def test_today_three_candidates_process_complete_and_incomplete_independently(
     service = CrmSubmissionService(session_factory, adapter, crm)
 
     candidates = service.list_submission_candidates("提交今天的线索", "sales-1")
-    # 批量回调应一次读取本批勾选记录，不再逐条回读或读取其他负责人的记录。
+    # 提交回调只对勾选目标发起一次批量读取，并在本次动作中复用快照。
     bulk_read = Mock(wraps=adapter.get_records)
     single_read = Mock(wraps=adapter.get_record)
     monkeypatch.setattr(adapter, "get_records", bulk_read)
@@ -2115,7 +2151,7 @@ def test_today_three_candidates_process_complete_and_incomplete_independently(
     assert missing[leads[1][0]] == ("沟通方式",)
     assert bulk_read.call_count == 1
     assert bulk_read.call_args.args[0] == {"mock-record-1", leads[0][1], leads[1][1]}
-    # 唯一单行读取是成功后“提交中”状态写入的安全预读，不属于逐条最终快照回读。
+    # 唯一 get_record 是成功后“提交中”状态写入的安全预读。
     assert single_read.call_count == 1
     assert crm.search_calls == 0 and crm.calls == 1
 
@@ -2331,7 +2367,8 @@ def test_authorized_operator_can_submit_selected_other_owner_lead(
     assert tuple(item.lead_id for item in candidates) == (lead_id,)
     assert result.succeeded == 1
     assert bulk_read.call_count == 2
-    assert all(call.args[0] == {owner_record.record_id} for call in bulk_read.call_args_list)
+    assert bulk_read.call_args_list[0].kwargs == {"owner_user_ids": ("sales-2",)}
+    assert bulk_read.call_args_list[1].args[0] == {owner_record.record_id}
 
 
 @pytest.mark.parametrize("submit_by_selection", [False, True])
@@ -2410,6 +2447,26 @@ def test_submission_command_parser_routes_named_and_global_owner_scopes() -> Non
     assert parse_crm_submission_command("提交负责人*的线索") is None
 
 
+def test_cross_owner_submission_parser_resolves_shanghai_short_dates() -> None:
+    """验证短日期取上海当前年最近过去日期，显式年份和无效日期边界明确。"""
+    today = date(2026, 10, 14)
+    assert parse_cross_owner_submission_request("提交10月13号大海的线索", today=today) == (
+        "大海",
+        date(2026, 10, 13),
+    )
+    assert parse_cross_owner_submission_request("提交11月1日大海的线索", today=today) == (
+        "大海",
+        date(2025, 11, 1),
+    )
+    assert parse_cross_owner_submission_request("提交2024年2月29日大海的线索", today=today) == (
+        "大海",
+        date(2024, 2, 29),
+    )
+    assert parse_crm_submission_command("提交10月13号大海的线索") == CROSS_OWNER_SUBMISSION_COMMAND
+    assert parse_cross_owner_submission_request("提交2月30号大海的线索", today=today) is None
+    assert parse_crm_submission_command("提交2月30号大海的线索") == CROSS_OWNER_SUBMISSION_COMMAND
+
+
 def test_cross_owner_selection_card_freezes_target_and_shows_names_only(
     session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2437,6 +2494,7 @@ def test_cross_owner_selection_card_freezes_target_and_shows_names_only(
         actor=SmartTableActor.ROBOT,
         member_names={"负责人": "张三"},
     )
+    adapter.update_record(owner_record.record_id, {"负责人": "sales-2"})
     with session_factory.begin() as session:
         session.add_all(
             [
@@ -2454,6 +2512,11 @@ def test_cross_owner_selection_card_freezes_target_and_shows_names_only(
         assert lead is not None
         lead.smart_table_owner_user_id = "sales-2"
         lead.smart_table_record_id = owner_record.record_id
+        lead.created_at = datetime(2026, 10, 13, 16, tzinfo=UTC)
+        source_message = session.get(IncomingMessage, lead.source_message_id)
+        assert source_message is not None
+        source_message.received_at = datetime(2026, 10, 12, 16, tzinfo=UTC)
+        session.get(SalesAuthorization, "operator").is_administrator = True
 
     reply = prepare_batch_submission_selection(
         session_factory,
@@ -2464,6 +2527,7 @@ def test_cross_owner_selection_card_freezes_target_and_shows_names_only(
             "operator",
             "cross-owner-card-command",
             target_owner_name="张三",
+            target_capture_date=date(2026, 10, 13),
         ),
     )
 
@@ -2481,6 +2545,7 @@ def test_cross_owner_selection_card_freezes_target_and_shows_names_only(
         )
         assert action is not None and preview is not None and card is not None
         assert action.context["owner_scope_user_ids"] == ["sales-2"]
+        assert action.context["target_capture_date"] == date(2026, 10, 13).toordinal()
         assert action.context["candidate_leads"][0]["lead_id"] == lead_id
         markdown = preview.payload["markdown"]["content"]
         options = card.payload["template_card"]["checkbox"]["option_list"]
@@ -2490,6 +2555,110 @@ def test_cross_owner_selection_card_freezes_target_and_shows_names_only(
     assert "王工" not in markdown
     assert "13800000000" not in markdown
     assert options[0]["text"] == "1. 人工最终公司"
+
+
+def test_cross_owner_date_candidates_and_callback_recheck_current_date_scope(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证指定日候选按上海日期筛选，回调时重新核对管理员权限和线索日期。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter, message_id="dated-cross-owner-lead")
+    record = adapter.get_records()[0]
+    adapter.update_record(record.record_id, {"负责人": "sales-2"})
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.smart_table_owner_user_id = "sales-2"
+        # 来源消息时间优先：消息落在 10 月 13 日上海时间，Lead 创建时间已跨到 14 日。
+        lead.created_at = datetime(2026, 10, 13, 16, tzinfo=UTC)
+        source_message = session.get(IncomingMessage, lead.source_message_id)
+        assert source_message is not None
+        source_message.received_at = datetime(2026, 10, 12, 16, tzinfo=UTC)
+        session.add_all(
+            [
+                SalesAuthorization(wecom_user_id="sales-2", is_active=True),
+                SalesAuthorization(
+                    wecom_user_id="operator", is_active=True, is_administrator=True
+                ),
+            ]
+        )
+
+    # 历史表格行可能已补链成 Lead，但没有来源消息；应使用原“录入时间”，而非补链时间。
+    historical_lead_id = _lead(
+        session_factory,
+        adapter,
+        message_id="historical-backfill-message",
+        sequence=2,
+        company_name="历史补链公司",
+    )
+    historical_record = adapter.get_records()[1]
+    adapter.update_record(historical_record.record_id, {"负责人": "sales-2"})
+    with session_factory.begin() as session:
+        historical_lead = session.get(Lead, historical_lead_id)
+        assert historical_lead is not None
+        historical_lead.source_message_id = None
+        historical_lead.smart_table_owner_user_id = "sales-2"
+        historical_lead.created_at = datetime(2026, 10, 13, 16, tzinfo=UTC)
+        historical_lead.field_values = {
+            **historical_lead.field_values,
+            "录入时间": "2026-10-13",
+        }
+
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    candidates = service.list_submission_candidates(
+        CROSS_OWNER_SUBMISSION_COMMAND,
+        "operator",
+        owner_scope_user_ids=("sales-2",),
+        target_capture_date=date(2026, 10, 13),
+    )
+    assert {candidate.lead_id for candidate in candidates} == {lead_id, historical_lead_id}
+
+    # 模拟候选卡发送后来源消息被改到另一天；回调不能提交旧冻结候选。
+    with session_factory.begin() as session:
+        source_message = session.get(IncomingMessage, "dated-cross-owner-lead")
+        assert source_message is not None
+        source_message.received_at = datetime(2026, 10, 13, 16, tzinfo=UTC)
+    result = service.submit_selected(
+        SubmissionCommand(
+            CROSS_OWNER_SUBMISSION_COMMAND,
+            "operator",
+            "dated-cross-owner-request",
+            owner_scope_user_ids=("sales-2",),
+            target_capture_date=date(2026, 10, 13),
+        ),
+        (lead_id,),
+    )
+    assert result.not_submitted == 1
+    assert crm.search_calls == crm.calls == 0
+
+    with session_factory.begin() as session:
+        operator = session.get(SalesAuthorization, "operator")
+        assert operator is not None
+        operator.is_administrator = False
+        operator.can_submit_other_sales_leads = True
+        source_message = session.get(IncomingMessage, "dated-cross-owner-lead")
+        assert source_message is not None
+        source_message.received_at = datetime(2026, 10, 12, 16, tzinfo=UTC)
+    unauthorized_result = service.submit_selected(
+        SubmissionCommand(
+            CROSS_OWNER_SUBMISSION_COMMAND,
+            "operator",
+            "dated-cross-owner-request",
+            owner_scope_user_ids=("sales-2",),
+            target_capture_date=date(2026, 10, 13),
+        ),
+        (historical_lead_id,),
+    )
+    assert unauthorized_result.not_submitted == 1
+    assert crm.search_calls == crm.calls == 0
+    with pytest.raises(ValueError, match="跨员工 CRM 提交权限"):
+        service.list_submission_candidates(
+            CROSS_OWNER_SUBMISSION_COMMAND,
+            "operator",
+            owner_scope_user_ids=("sales-2",),
+            target_capture_date=date(2026, 10, 13),
+        )
 
 
 def test_crm_submission_cli_creates_actor_for_verified_wecom_member(
@@ -4011,11 +4180,12 @@ def test_update_uses_current_table_values_once_and_skips_equal_snapshot(
 
     assert first.updated == 1 and second.unchanged == 1
     assert crm.submit_calls == 2 and crm.submit_payloads[1]["mobile"] == "13900000000"
-    assert bulk_read.call_count == 3
+    assert bulk_read.call_count == 4
     assert [call.args[0] for call in bulk_read.call_args_list] == [
         {record_id},
         (record_id,),
         {record_id},
+        (record_id,),
     ]
     with session_factory() as session:
         updates = session.scalars(
@@ -4054,6 +4224,132 @@ def test_update_refreshes_changed_batch_snapshot_before_crm_write(
     assert result.updated == 1
     assert crm.submit_payloads[-1]["mobile"] == "13700000000"
     assert reads == 2
+
+
+def test_update_refreshes_even_when_batch_snapshot_was_unchanged(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证批量读取后才发生的编辑也会在更新前被发现。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    _lead(session_factory, adapter)
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    assert submit_today_via_selection(service, "sales-1", "late-edit-create").succeeded == 1
+    record_id = adapter.get_records()[0].record_id
+    original_get_records = adapter.get_records
+    reads = 0
+
+    def edit_after_unchanged_batch(record_ids=None, *, owner_user_ids=None):
+        """让批量快照保持旧值，然后模拟销售在批量读取后编辑表格。"""
+        nonlocal reads
+        records = original_get_records(record_ids, owner_user_ids=owner_user_ids)
+        reads += 1
+        if reads == 1:
+            adapter.update_record(record_id, {"手机": "13700000000"})
+        return records
+
+    monkeypatch.setattr(adapter, "get_records", edit_after_unchanged_batch)
+
+    result = service.submit(SubmissionCommand("提交我的更新", "sales-1", "late-edit-update"))
+
+    assert result.updated == 1
+    assert reads == 2
+    assert crm.submit_payloads[-1]["mobile"] == "13700000000"
+
+
+def test_selected_create_reuses_request_scoped_batch_snapshot(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证确认卡仅批量读取勾选记录一次，并在当前请求内复用该快照。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    record_id = adapter.get_records()[0].record_id
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    candidates = service.list_submission_candidates("提交今天的线索", "sales-1")
+    adapter.update_record(record_id, {"手机": "13700000000"})
+    reads: list[set[str] | None] = []
+    original_get_records = adapter.get_records
+
+    def capture_then_edit(record_ids=None, *, owner_user_ids=None):
+        """返回批量读取时的快照，再模拟提交过程中出现的新表格编辑。"""
+        reads.append(record_ids)
+        records = original_get_records(record_ids, owner_user_ids=owner_user_ids)
+        adapter.update_record(record_id, {"手机": "13900000000"})
+        return records
+
+    monkeypatch.setattr(adapter, "get_records", capture_then_edit)
+
+    result = service.submit_selected(
+        SubmissionCommand("提交今天的线索", "sales-1", "selected-fresh-snapshot"),
+        tuple(candidate.lead_id for candidate in candidates),
+    )
+
+    assert tuple(item.lead_id for item in candidates) == (lead_id,)
+    assert result.succeeded == 1
+    assert reads == [{record_id}]
+    assert crm.submit_payloads[-1]["mobile"] == "13700000000"
+
+
+def test_cross_owner_create_rechecks_frozen_owner_scope_under_lead_lock(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证表格读取后转交到授权范围外的负责人时，锁内复核会拒绝首次提交。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    record_id = adapter.get_records()[0].record_id
+    adapter.update_record(record_id, {"负责人": "sales-2"})
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.smart_table_owner_user_id = "sales-2"
+        session.add(
+            SalesAuthorization(wecom_user_id="operator", is_active=True,
+                               can_submit_other_sales_leads=True)
+        )
+        session.add(SalesAuthorization(wecom_user_id="sales-2", display_name="张三"))
+
+    directory = Mock()
+    directory.resolve.return_value = "crm-sales-2"
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(
+        session_factory, adapter, crm, employee_directory=directory
+    )
+    candidates = service.list_submission_candidates(
+        CROSS_OWNER_SUBMISSION_COMMAND,
+        "operator",
+        owner_scope_user_ids=("sales-2",),
+    )
+    original_hash = service._snapshot_hash
+
+    def transfer_out_of_scope(payload: dict[str, object]) -> str:
+        """在线索快照构造后、Lead 行锁获取前模拟负责人转交。"""
+        snapshot_hash = original_hash(payload)
+        adapter.update_record(record_id, {"负责人": "sales-3"})
+        with session_factory.begin() as session:
+            lead = session.get(Lead, lead_id)
+            assert lead is not None
+            lead.smart_table_owner_user_id = "sales-3"
+        return snapshot_hash
+
+    monkeypatch.setattr(service, "_snapshot_hash", transfer_out_of_scope)
+
+    result = service.submit_selected(
+        SubmissionCommand(
+            CROSS_OWNER_SUBMISSION_COMMAND,
+            "operator",
+            "cross-owner-transfer-race",
+            owner_scope_user_ids=("sales-2",),
+        ),
+        tuple(candidate.lead_id for candidate in candidates),
+    )
+
+    assert result.incomplete == 1
+    assert crm.calls == 0
+    with session_factory() as session:
+        assert session.scalar(
+            select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id)
+        ) is None
 
 
 def test_update_rechecks_owner_after_record_read_before_crm_write(

@@ -11,7 +11,12 @@ from sqlalchemy.pool import StaticPool
 
 from app.ai.models import ExtractedLeadPatch, LeadAnalysis
 from app.leads.completeness import LeadCompletenessService
-from app.leads.models import Lead, LeadFieldProvenance, UserConfirmationEvent
+from app.leads.models import (
+    Lead,
+    LeadFieldProvenance,
+    LeadMessageResolution,
+    UserConfirmationEvent,
+)
 from app.leads.review import LeadReviewService
 from app.messaging.models import Base, BusinessAuditEvent, IncomingMessage, SalesAuthorization
 from app.smart_table.adapter import SmartTableActor
@@ -475,6 +480,49 @@ def test_t09_generates_remark_with_provenance_and_completeness_after_sync(
 
     assert remark is not None
     assert remark.last_ai_synced_value == record.fields["备注"]
+
+
+def test_t09_appends_all_original_messages_including_ocr_text_to_remark(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证审核备注按原消息顺序保留完整正文，图片 OCR 文本也来自标准化正文。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead_with_record(session_factory, adapter)
+    record_id = next(iter(adapter.get_records())).record_id
+    first_message = "长广溪智造在展会上了解协作机器人。\n名片 OCR：王工，采购经理。"
+    second_message = "补充：客户希望下周安排现场沟通。"
+    with session_factory.begin() as session:
+        source = session.get(IncomingMessage, "message-9")
+        assert source is not None
+        source.normalized_text = first_message
+        session.add(
+            IncomingMessage(
+                message_id="message-10",
+                sales_user_id="sales-1",
+                sequence=2,
+                raw_payload={},
+                normalized_text=second_message,
+            )
+        )
+        session.add(
+            LeadMessageResolution(
+                message_id="message-10",
+                segment_index=0,
+                lead_id=lead_id,
+                status="assigned",
+            )
+        )
+
+    service = LeadReviewService(session_factory, adapter)
+    service.sync_ai_patch(lead_id, "message-9", _patch(fields={}))
+    service.sync_ai_patch(lead_id, "message-10", _patch(fields={}))
+
+    record = adapter.get_record(record_id)
+    assert record is not None
+    remark = str(record.fields["备注"])
+    assert remark.startswith("基本信息：长广溪智造；")
+    assert "特殊要求：未提供。\n原始消息：\n" in remark
+    assert remark.endswith(f"{first_message}\n\n{second_message}")
 
 
 def test_t09_never_overwrites_sales_edited_remark(

@@ -7,7 +7,7 @@ import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.ai.models import ExtractedLeadPatch, LeadFieldValue
@@ -15,6 +15,7 @@ from app.core.config import get_settings
 from app.leads.models import (
     Lead,
     LeadFieldProvenance,
+    LeadMessageResolution,
     UserConfirmationEvent,
     deserialize_field_value,
     field_values_equal,
@@ -442,7 +443,34 @@ class LeadReviewService:
                 )
             }
             enrichment = {**lead.enrichment_values, **patch.enrichment}
-            remark_value = RemarksBuilder().build(reviewed_fields, enrichment)
+            # 将本线索已归属消息按接收顺序完整写入备注；normalized_text 已含图片 OCR 文本。
+            source_messages = session.scalars(
+                select(IncomingMessage)
+                .outerjoin(
+                    LeadMessageResolution,
+                    LeadMessageResolution.message_id == IncomingMessage.message_id,
+                )
+                .where(
+                    or_(
+                        IncomingMessage.message_id == source_message_id,
+                        IncomingMessage.message_id == lead.source_message_id,
+                        LeadMessageResolution.lead_id == lead_id,
+                    )
+                )
+                .order_by(
+                    IncomingMessage.received_at,
+                    IncomingMessage.sequence,
+                    IncomingMessage.message_id,
+                )
+            ).unique().all()
+            original_message = "\n\n".join(
+                message.normalized_text.strip()
+                for message in source_messages
+                if isinstance(message.normalized_text, str) and message.normalized_text.strip()
+            )
+            remark_value = RemarksBuilder().build(
+                reviewed_fields, enrichment, original_message=original_message
+            )
             remark_source = provenance.get("备注")
             current_remark = current_fields.get("备注")
             if remark_source is not None and remark_source.is_user_modified:

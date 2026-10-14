@@ -823,6 +823,12 @@ class WecomCliSmartTableAdapter:
                 raw = row.get(field.name.removeprefix("*"))
             canonical_name = field.name.removeprefix("*")
             # SQL query 已返回各字段的原生类型；普通文本即使像 JSON 也必须原样保留。
+            if (
+                isinstance(raw, Mapping)
+                and field.field_type in {SmartTableFieldType.TEXT, SmartTableFieldType.LONG_TEXT}
+            ):
+                # 智能表格会把备注中的网址/邮箱单元格返回为 CellValue，领域备注只保留显示文本。
+                raw = self._cell_text(raw)
             if raw is not None and field.field_type in {
                 SmartTableFieldType.TEXT,
                 SmartTableFieldType.LONG_TEXT,

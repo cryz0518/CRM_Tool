@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -21,10 +22,25 @@ from app.messaging.models import (
     SalesAuthorization,
     utc_now,
 )
+from app.smart_table.adapter import SmartTableAdapterConfigurationError
 from app.smart_table.audit import SmartTableAuditSink, build_mock_audit_schema
 from app.smart_table.mock import MockSmartTableAdapter
+from app.smart_table.models import SmartTableFieldType, SmartTableSchema
 from app.smart_table.wecom_cli import WecomCliProcessError, WecomCliTransportError
 from workers import tasks
+
+
+def test_audit_mirror_worker_tasks_use_a_separate_queue() -> None:
+    """验证耗时的审计 CLI 镜像不会占用线索消费队列。"""
+    audit_route = tasks.celery_app.amqp.router.route(
+        {}, "workers.consume_audit_mirror_outbox", args=(1,), kwargs={}
+    )
+    lead_route = tasks.celery_app.amqp.router.route(
+        {}, "workers.consume_lead_outbox_event", args=(1,), kwargs={}
+    )
+
+    assert audit_route["queue"].name == "audit"
+    assert lead_route["queue"].name == "celery"
 
 
 @pytest.fixture
@@ -291,6 +307,52 @@ def test_audit_mirror_retry_is_idempotent_and_drops_sensitive_details(
     assert "raw_response" not in fields
 
 
+def test_audit_mirror_writes_wecom_user_id_to_operator_member_field(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证操作人人员字段使用企微发送人标识，不依赖 CRM 映射。"""
+    outbox_id = _persist_lead_audit_case(
+        session_factory,
+        events=(("message-1", {"status": "succeeded"}),),
+    )[0]
+    with session_factory.begin() as session:
+        authorization = session.get(SalesAuthorization, "sales-1")
+        assert authorization is not None
+        authorization.crm_user_id = "crm-employee-1"
+        authorization.display_name = "王工（Jack）"
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+
+    assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "succeeded"
+    fields = adapter.get_records()[0].fields
+    assert fields["操作人"] == "sales-1"
+    assert "操作人ID" not in fields
+    assert build_mock_audit_schema().get_field("操作人").field_type is SmartTableFieldType.MEMBER
+
+
+def test_audit_mirror_rejects_operator_field_that_is_not_personnel(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证审计表字段不是人员类型时，不会把企微标识写入其他字段类型。"""
+    _persist_event(session_factory)
+    with session_factory() as session:
+        event = session.scalar(select(BusinessAuditEvent))
+        assert event is not None
+    schema = build_mock_audit_schema()
+    invalid_schema = SmartTableSchema(
+        fields=tuple(
+            replace(field, field_type=SmartTableFieldType.TEXT)
+            if field.name == "操作人"
+            else field
+            for field in schema.fields
+        )
+    )
+    adapter = MockSmartTableAdapter(schema=invalid_schema, require_owner_field=False)
+
+    with pytest.raises(SmartTableAdapterConfigurationError, match="必须为人员类型"):
+        SmartTableAuditSink(adapter).mirror(event)
+
+
 def test_audit_mirror_maps_internal_details_to_chinese_fields(
     session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -406,7 +468,7 @@ def test_audit_mirror_defers_until_source_outbox_terminal_then_resolves_lead(
     with session_factory() as session:
         audit_outbox = session.get(AuditMirrorOutbox, outbox_id)
         assert audit_outbox is not None
-        assert audit_outbox.status == "pending"
+        assert audit_outbox.status == "waiting_source"
         assert audit_outbox.claim_token is None
 
     with session_factory.begin() as session:
@@ -434,6 +496,11 @@ def test_audit_mirror_defers_until_source_outbox_terminal_then_resolves_lead(
         assert source_outbox is not None
         source_outbox.status = "succeeded"
 
+    dispatched = _prepare_scanner(
+        session_factory, monkeypatch, now=utc_now(), batch_size=10
+    )
+    assert tasks.consume_pending_audit_mirrors.run() == 1
+    assert dispatched == [outbox_id]
     assert _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter) == "succeeded"
     assert len(adapter.get_records()) == 1
     fields = adapter.get_records()[0].fields
@@ -498,6 +565,11 @@ def test_audit_mirror_defers_multiple_messages_then_keeps_one_lead_id(
             assert source_outbox is not None
             source_outbox.status = "succeeded"
 
+    dispatched = _prepare_scanner(
+        session_factory, monkeypatch, now=utc_now(), batch_size=10
+    )
+    assert tasks.consume_pending_audit_mirrors.run() == len(outbox_ids)
+    assert dispatched == outbox_ids
     for outbox_id in outbox_ids:
         assert (
             _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter)
@@ -764,17 +836,33 @@ def test_unknown_audit_mirror_failure_requires_review_and_is_not_scanned(
 def test_deferred_audit_claims_do_not_consume_retry_attempts(
     session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """验证多次等待 source 不增加外部尝试，随后首次 transient failure 进入 30 秒档。"""
-    outbox_id = _persist_event(session_factory)
-    for _ in range(3):
-        token = tasks._claim_audit_mirror_outbox(session_factory, outbox_id)
-        assert token is not None
-        tasks._defer_audit_mirror(session_factory, outbox_id, token)
-        with session_factory() as session:
-            outbox = session.get(AuditMirrorOutbox, outbox_id)
-            assert outbox is not None
-            assert outbox.status == "pending"
-            assert outbox.attempts == 0
+    """验证等待来源不会消耗尝试或重复认领，来源完成后真正失败仍进入退避。"""
+    (outbox_id,) = _persist_lead_audit_case(
+        session_factory,
+        events=(("message-1", {}),),
+        source_outbox_status="processing",
+    )
+    token = tasks._claim_audit_mirror_outbox(session_factory, outbox_id)
+    assert token is not None
+    tasks._defer_audit_mirror(session_factory, outbox_id, token)
+    with session_factory() as session:
+        outbox = session.get(AuditMirrorOutbox, outbox_id)
+        assert outbox is not None
+        assert outbox.status == "waiting_source"
+        assert outbox.attempts == 0
+    # 已在 Redis 中排队的旧副本不能绕过等待状态再次认领同一条镜像。
+    assert tasks._claim_audit_mirror_outbox(session_factory, outbox_id) is None
+
+    with session_factory.begin() as session:
+        source = session.scalar(select(OutboxEvent))
+        assert source is not None
+        source.status = "succeeded"
+    now = utc_now()
+    dispatched = _prepare_scanner(
+        session_factory, monkeypatch, now=now, batch_size=10
+    )
+    assert tasks.consume_pending_audit_mirrors.run() == 1
+    assert dispatched == [outbox_id]
 
     class TransientFailureAdapter:
         """模拟首次真正进入镜像调用后发生的可重试传输错误。"""
@@ -937,6 +1025,47 @@ def test_audit_scanner_applies_batch_limit_before_dispatch(
     assert dispatched == ids[:10]
 
 
+def test_audit_scanner_waits_for_source_outbox_and_releases_deferred_mirror(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证来源消息未完成时不派发镜像，完成后只重新激活一次。"""
+    (outbox_id,) = _persist_lead_audit_case(
+        session_factory,
+        events=(("message-1", {}),),
+        source_outbox_status="processing",
+    )
+    now = utc_now()
+    dispatched = _prepare_scanner(
+        session_factory, monkeypatch, now=now, batch_size=10
+    )
+
+    # 扫描器直接跳过未完成的来源，不向拥塞的共享队列增加等待任务。
+    assert tasks.consume_pending_audit_mirrors.run() == 0
+    assert dispatched == []
+
+    # 旧队列中已有的重复消息最多把镜像转入等待态，后续副本无法再次认领。
+    token = tasks._claim_audit_mirror_outbox(session_factory, outbox_id)
+    assert token is not None
+    tasks._defer_audit_mirror(session_factory, outbox_id, token)
+    assert tasks._claim_audit_mirror_outbox(session_factory, outbox_id) is None
+    with session_factory() as session:
+        mirror = session.get(AuditMirrorOutbox, outbox_id)
+        assert mirror is not None
+        assert mirror.status == "waiting_source"
+
+    # 来源进入终态后，扫描器重新激活并投递该镜像。
+    with session_factory.begin() as session:
+        source = session.scalar(select(OutboxEvent))
+        assert source is not None
+        source.status = "succeeded"
+    assert tasks.consume_pending_audit_mirrors.run() == 1
+    assert dispatched == [outbox_id]
+    with session_factory() as session:
+        mirror = session.get(AuditMirrorOutbox, outbox_id)
+        assert mirror is not None
+        assert mirror.status == "pending"
+
+
 def test_audit_scanner_skips_large_not_due_retry_backlog(
     session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1007,7 +1136,7 @@ def test_stale_audit_mirror_worker_cannot_finalize_new_claim(
 def test_stale_audit_mirror_worker_cannot_defer_new_claim(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证旧 Worker 的 defer 不能把新 Worker 的认领释放为 pending。"""
+    """验证旧 Worker 的 defer 不能释放新认领，当前认领只能进入来源等待态。"""
     outbox_id = _persist_event(session_factory)
 
     token_a = tasks._claim_audit_mirror_outbox(session_factory, outbox_id)
@@ -1032,5 +1161,5 @@ def test_stale_audit_mirror_worker_cannot_defer_new_claim(
     with session_factory() as session:
         outbox = session.get(AuditMirrorOutbox, outbox_id)
         assert outbox is not None
-        assert outbox.status == "pending"
+        assert outbox.status == "waiting_source"
         assert outbox.claim_token is None

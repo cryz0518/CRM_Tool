@@ -78,6 +78,8 @@ celery_app.conf.update(
     timezone="Asia/Shanghai",
     enable_utc=False,
     beat_schedule=build_beat_schedule(settings),
+    # 审计镜像会执行较慢的外部 CLI；隔离队列避免占用线索消费槽位。
+    task_routes={"workers.consume_audit_mirror_outbox": {"queue": "audit"}},
 )
 
 

@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Generator, Mapping
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1024,6 +1024,7 @@ def test_cross_owner_action_freezes_scope_and_accepts_selection(
         command_text=CROSS_OWNER_SUBMISSION_COMMAND,
         candidates=({"lead_id": "lead-a", "company_name": "目标公司"},),
         owner_scope_user_ids=("owner-b",),
+        target_capture_date=date(2026, 10, 13),
     )
     result = action_service.claim_callback(
         _batch_frame_for_action(action, ("lead-a",), msgid="provider-cross-owner")
@@ -1034,6 +1035,7 @@ def test_cross_owner_action_freezes_scope_and_accepts_selection(
         frozen = session.get(WecomAction, action.id)
         assert frozen is not None
         assert frozen.context["owner_scope_user_ids"] == ["owner-b"]
+        assert frozen.context["target_capture_date"] == date(2026, 10, 13).toordinal()
         assert frozen.context["selected_lead_ids"] == ["lead-a"]
 
 
