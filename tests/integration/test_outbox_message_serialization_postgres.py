@@ -180,3 +180,41 @@ def test_next_message_waits_for_worker_exit_but_other_sales_can_progress(
         session_factory, lease_timeout=timedelta(minutes=5)
     )
     assert [claim.event_id for claim in claims] == [second_event_id]
+
+
+def test_locked_sales_head_does_not_starve_other_sales(
+    postgres_outbox_factory: tuple[Engine, sessionmaker[Session]],
+) -> None:
+    """验证过期任务仍被活跃 Worker 持锁时，跳过该销售并填满其他销售的名额。
+
+    参数：postgres_outbox_factory 为隔离 schema；返回：无；异常：断言或数据库错误。
+    副作用：仅在测试 schema 写入消息并持有临时销售顺序锁，结束时释放。
+    """
+    engine, session_factory = postgres_outbox_factory
+    locked_id = _persist_message_event(
+        session_factory,
+        sales_user_id="sales-locked",
+        sequence=1,
+        status="processing",
+        processing_started_at=utc_now() - timedelta(hours=1),
+    )
+    for sequence in range(2, 10):
+        # 待处理消息只能跟在同销售最早未完成事件之后。
+        _persist_message_event(session_factory, sales_user_id="sales-locked", sequence=sequence)
+    other_id = _persist_message_event(
+        session_factory, sales_user_id="sales-submit", sequence=197
+    )
+    with engine.connect() as worker_connection:
+        _acquire_sales_processing_lock(worker_connection, "sales-locked")
+        try:
+            claims = claim_dispatchable_lead_outbox_events(
+                session_factory, lease_timeout=timedelta(minutes=5), max_in_flight=1
+            )
+            assert [claim.event_id for claim in claims] == [other_id]
+            with session_factory() as session:
+                event = session.get(OutboxEvent, locked_id)
+                assert event is not None
+                # 仍在工作的旧任务不能因放行其他销售而被接管或改写租约。
+                assert event.processing_started_at < utc_now() - timedelta(minutes=5)
+        finally:
+            assert _release_sales_processing_lock(worker_connection, "sales-locked")

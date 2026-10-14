@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from sqlalchemy import Engine, and_, create_engine, func, or_, select, text, update
 from sqlalchemy.engine import Connection, CursorResult
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, aliased, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.ai.dependencies import get_ai_gateway
@@ -1071,6 +1071,7 @@ def claim_dispatchable_lead_outbox_events(
         available_slots = max_in_flight - in_flight_count
         if available_slots <= 0:
             return []
+        previous_event = aliased(OutboxEvent)
         candidate_ids = session.scalars(
             select(OutboxEvent.id)
             .where(
@@ -1081,10 +1082,18 @@ def claim_dispatchable_lead_outbox_events(
                         OutboxEvent.processing_started_at.is_not(None),
                         OutboxEvent.processing_started_at < expired_before,
                     ),
+                ),
+                # 同销售只扫描最早未完成事件，后续积压不能占满其他销售的扫描窗口。
+                ~select(previous_event.id)
+                .where(
+                    previous_event.sales_user_id == OutboxEvent.sales_user_id,
+                    previous_event.sequence < OutboxEvent.sequence,
+                    previous_event.status.not_in(COMPLETED_CHECKPOINT_STATUSES),
                 )
+                .exists(),
             )
-            .order_by(OutboxEvent.sequence, OutboxEvent.id)
-            .limit(available_slots)
+            # sequence 只描述同销售顺序；不同销售按接收时间公平调度。
+            .order_by(OutboxEvent.created_at, OutboxEvent.id)
         ).all()
 
     claims: list[LeadOutboxDispatchClaim] = []
@@ -1092,6 +1101,9 @@ def claim_dispatchable_lead_outbox_events(
         claim = _claim_lead_outbox_event(session_factory, event_id, now, lease_timeout)
         if claim is not None:
             claims.append(claim)
+            # 活跃 Worker 可能仍持有某销售的锁，跳过后继续扫描，直到填满真实可用名额。
+            if len(claims) >= available_slots:
+                break
     return claims
 
 
