@@ -1112,7 +1112,6 @@ class WecomCliSmartTableAdapter:
                 str(self._redis_timestamp(client)),
                 ex=60,
             )
-            return self._runner(arguments)
         except RedisError as error:
             raise WecomCliTransportError("wecom-cli 共享限流器不可用") from error
         finally:
@@ -1122,6 +1121,8 @@ class WecomCliSmartTableAdapter:
                 except RedisError:
                     # CLI 可能已成功；不要把释放锁故障改写成结果未知并诱发重复远端操作。
                     logger.error("wecom_cli_shared_rate_limiter_release_failed")
+        # 锁只协调请求起始间隔；等待远端 CLI 完成时释放锁，避免把并发压成串行。
+        return self._runner(arguments)
 
     @staticmethod
     def _redis_timestamp(client: Any) -> float:
