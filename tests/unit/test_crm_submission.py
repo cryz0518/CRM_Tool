@@ -2042,12 +2042,13 @@ def test_all_submission_shows_incomplete_temporary_candidate(
     assert tuple(candidate.lead_id for candidate in candidates) == (lead_id,)
 
 
-def test_batch_candidates_read_only_the_requested_owner_scope(
+def test_batch_candidates_read_only_linked_records_for_requested_owner_scope(
     session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """验证批量候选按负责人范围一次回读，不依赖全表 records query 权限。"""
+    """验证批量候选只按负责人线索已绑定的记录标识一次回读。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter)
+    record_id = adapter.get_records()[0].record_id
     original_get_records = adapter.get_records
     calls: list[tuple[Collection[str] | None, tuple[str, ...] | None]] = []
 
@@ -2066,7 +2067,7 @@ def test_batch_candidates_read_only_the_requested_owner_scope(
     ).list_submission_candidates("提交我所有线索", "sales-1")
 
     assert tuple(candidate.lead_id for candidate in candidates) == (lead_id,)
-    assert calls == [(None, ("sales-1",))]
+    assert calls == [((record_id,), None)]
 
 
 def test_today_three_candidates_process_complete_and_incomplete_independently(
@@ -2367,7 +2368,7 @@ def test_authorized_operator_can_submit_selected_other_owner_lead(
     assert tuple(item.lead_id for item in candidates) == (lead_id,)
     assert result.succeeded == 1
     assert bulk_read.call_count == 2
-    assert bulk_read.call_args_list[0].kwargs == {"owner_user_ids": ("sales-2",)}
+    assert bulk_read.call_args_list[0].kwargs == {"record_ids": (owner_record.record_id,)}
     assert bulk_read.call_args_list[1].args[0] == {owner_record.record_id}
 
 
