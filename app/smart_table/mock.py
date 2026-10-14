@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 
 from app.smart_table.adapter import (
     SmartTableActor,
@@ -84,6 +84,23 @@ class MockSmartTableAdapter:
             if all(record.fields.get(name) == value for name, value in filters.items())
         ]
 
+    def find_records_by_field_values(
+        self, field_name: str, values: Collection[str]
+    ) -> list[SmartTableRecord]:
+        """在内存记录集中匹配一个字段的任意给定文本值。
+
+        参数：field_name 为字段名；values 为待匹配文本值集合。
+        返回值：字段值命中集合的记录快照。
+        异常：无。
+        副作用：无，仅读取 Mock 内存记录。
+        """
+        requested = set(values)
+        return [
+            record
+            for record in self._records.values()
+            if record.fields.get(field_name) in requested
+        ]
+
     def get_records(
         self,
         record_ids: Collection[str] | None = None,
@@ -151,6 +168,18 @@ class MockSmartTableAdapter:
         )
         self._records[record_id] = record
         return record
+
+    def create_records(
+        self, records: Sequence[Mapping[str, object]], *, actor: SmartTableActor
+    ) -> list[SmartTableRecord]:
+        """通过现有 Mock 创建路径依次新增批量记录，保持单条校验语义。
+
+        参数：records 为按请求顺序排列的字段映射；actor 为调用主体。
+        返回值：按输入顺序创建的记录快照。
+        异常：单条创建权限、字段或负责人校验失败时向调用方传播。
+        副作用：向 Mock 内存记录集逐条添加记录。
+        """
+        return [self.create_record(fields, actor=actor) for fields in records]
 
     def update_record(
         self,

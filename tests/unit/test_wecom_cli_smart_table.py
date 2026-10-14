@@ -440,6 +440,129 @@ def test_record_add_normalizes_phone_and_skips_unrepresentable_location() -> Non
     ]
 
 
+def test_batch_record_lookup_uses_one_server_query_for_all_keys() -> None:
+    """验证一组幂等键由一次服务端查询匹配，而不分页扫描整张表。"""
+    schema = SmartTableSchema(
+        fields=(SmartTableField("audit-key", "日志唯一键", SmartTableFieldType.TEXT),)
+    )
+    fake_cli = FakeCli(
+        [
+            {
+                "errcode": 0,
+                "values": [
+                    json.dumps({"rows": [{"RECORD_ID": "record-1", "日志唯一键": "audit:1"}]})
+                ],
+            }
+        ]
+    )
+    adapter = _adapter(fake_cli, sheet_title="系统审计日志")
+    adapter.get_schema = lambda: schema
+
+    records = adapter.find_records_by_field_values("日志唯一键", ["audit:1", 'audit:"2'])
+
+    assert [record.fields["日志唯一键"] for record in records] == ["audit:1"]
+    assert len(fake_cli.calls) == 1
+    query = fake_cli.calls[0][fake_cli.calls[0].index("--sql") + 1]
+    assert '`日志唯一键` = "audit:1" OR `日志唯一键` = "audit:\\"2"' in query
+
+
+def test_batch_create_adds_and_verifies_multiple_records_in_one_request() -> None:
+    """验证批量新增只调用一次 add 和一次按记录 ID 的批量核实。"""
+    schema = SmartTableSchema(
+        fields=(
+            SmartTableField("audit-key", "日志唯一键", SmartTableFieldType.TEXT),
+            SmartTableField("operator", "操作人", SmartTableFieldType.MEMBER),
+        )
+    )
+    fake_cli = FakeCli(
+        [
+            {
+                "errcode": 0,
+                "records": [
+                    {"record_id": "record-1"},
+                    {"record_id": "record-2"},
+                ],
+            },
+            {
+                "errcode": 0,
+                "values": [
+                    json.dumps(
+                        {
+                            "rows": [
+                                {
+                                    "RECORD_ID": "record-1",
+                                    "日志唯一键": "audit:1",
+                                    "操作人": [{"userId": "sales-1", "userName": "销售一"}],
+                                },
+                                {
+                                    "RECORD_ID": "record-2",
+                                    "日志唯一键": "audit:2",
+                                    "操作人": [{"userId": "sales-2", "userName": "销售二"}],
+                                },
+                            ]
+                        }
+                    )
+                ],
+            },
+        ]
+    )
+    adapter = WecomCliSmartTableAdapter(
+        doc_id="test-doc",
+        sheet_id="test-sheet",
+        sheet_title="系统审计日志",
+        require_owner_field=False,
+        runner=fake_cli,
+    )
+    adapter.get_schema = lambda: schema
+
+    records = adapter.create_records(
+        [
+            {"日志唯一键": "audit:1", "操作人": "sales-1"},
+            {"日志唯一键": "audit:2", "操作人": "sales-2"},
+        ],
+        actor=SmartTableActor.ROBOT,
+    )
+
+    assert [record.record_id for record in records] == ["record-1", "record-2"]
+    assert len(fake_cli.calls) == 2
+    add_payload = _payload(fake_cli.calls[0])
+    assert add_payload["records"] == [
+        {
+            "values": {
+                "日志唯一键": "audit:1",
+                "操作人": [{"userId": "sales-1"}],
+            }
+        },
+        {
+            "values": {
+                "日志唯一键": "audit:2",
+                "操作人": [{"userId": "sales-2"}],
+            }
+        },
+    ]
+
+
+def test_idempotent_batch_add_leaves_unknown_transport_for_key_reconciliation() -> None:
+    """验证批量新增未知结果不会在 CLI 内重放，改由上层唯一键查重后重试。"""
+    schema = SmartTableSchema(
+        fields=(SmartTableField("key", "日志唯一键", SmartTableFieldType.TEXT),)
+    )
+    fake_cli = FakeCli([OSError("connection reset")])
+    adapter = WecomCliSmartTableAdapter(
+        doc_id="test-doc",
+        sheet_id="test-sheet",
+        sheet_title="系统审计日志",
+        require_owner_field=False,
+        runner=fake_cli,
+    )
+    adapter.get_schema = lambda: schema
+
+    with pytest.raises(WecomCliTransportError):
+        adapter.create_records([{"日志唯一键": "audit:1"}], actor=SmartTableActor.ROBOT)
+
+    assert len(fake_cli.calls) == 1
+
+
 def test_get_record_falls_back_to_recent_create_when_list_is_eventually_consistent() -> None:
     """验证写入成功但列表暂未反映新行时，读取可使用本进程的创建快照。
 

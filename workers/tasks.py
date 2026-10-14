@@ -67,8 +67,6 @@ from workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
-# 审计 Worker 当前为 solo，扫描器必须与单任务消费能力一致。
-AUDIT_MIRROR_MAX_IN_FLIGHT = 1
 # 对齐 Compose 主 Worker 的默认并发，避免 Beat 抢先认领超过可处理能力的消息。
 LEAD_OUTBOX_MAX_IN_FLIGHT = 4
 
@@ -371,85 +369,116 @@ def _defer_audit_mirror(
 
 @celery_app.task(name="workers.consume_audit_mirror_outbox")  # type: ignore[untyped-decorator]
 def consume_audit_mirror_outbox(outbox_id: int) -> str:
-    """消费一条审计镜像 Outbox，并用 claim fencing 与稳定镜像键控制重试。
+    """兼容已排入 Redis 的旧版单条镜像任务，统一复用批量安全处理路径。
 
-    参数：outbox_id 为审计镜像任务标识。
-    返回值：succeeded、retrying 或 already_processing 等安全状态文本。
-    异常：数据库异常向 Celery 传播；外部镜像异常转为 retrying。
-    副作用：最多向管理员审计子表写入一条记录，不影响原业务状态。
+    参数：outbox_id 为原有任务载荷中的审计镜像任务标识。
+    返回值：批量处理器对该条 Outbox 返回的状态文本。
+    异常：数据库错误按批量处理器语义传播；远端错误收敛为审计 Outbox 状态。
+    副作用：最多写入一条审计镜像，不影响原业务状态。
+    """
+    return consume_audit_mirror_batch.run([outbox_id])
+
+
+@celery_app.task(name="workers.consume_audit_mirror_batch")  # type: ignore[untyped-decorator]
+def consume_audit_mirror_batch(outbox_ids: list[int]) -> str:
+    """认领并批量镜像一组审计 Outbox，保留每个事件独立状态与重试。
+
+    参数：outbox_ids 为调度器在同一批次内租出的审计镜像任务 ID。
+    返回值：succeeded、retrying、failed_pending_review 或 already_processing。
+    异常：数据库错误向 Celery 传播；外部批量写失败按每条 Outbox 分类收敛。
+    副作用：一次性批量查重和写入审计子表，不改变原业务状态。
     """
     engine, factory = _session_factory()
     try:
-        claim_token = _claim_audit_mirror_outbox(factory, outbox_id)
-        if claim_token is None:
+        claims: list[tuple[int, str]] = []
+        for outbox_id in dict.fromkeys(outbox_ids):
+            claim_token = _claim_audit_mirror_outbox(factory, outbox_id)
+            if claim_token is not None:
+                claims.append((outbox_id, claim_token))
+        if not claims:
             return "already_processing"
+
+        ready: list[tuple[int, str, BusinessAuditEvent, str | None, str | None]] = []
+        missing_events: list[tuple[int, str]] = []
+        deferred_events: list[tuple[int, str]] = []
         with factory() as session:
-            outbox = session.get(AuditMirrorOutbox, outbox_id)
-            event = (
-                session.get(BusinessAuditEvent, outbox.audit_event_id)
-                if outbox is not None
-                else None
-            )
-            message = (
-                session.get(IncomingMessage, event.message_id)
-                if event is not None
-                else None
-            )
-            sales_original_message = (
-                message.normalized_text
-                if message is not None and message.scrubbed_at is None
-                else None
-            )
-            resolved_lead_id = (
-                _resolve_audit_lead_id(session, event) if event is not None else None
-            )
-            should_wait_for_lead = (
-                _should_wait_for_audit_lead_resolution(session, event, resolved_lead_id)
-                if event is not None
-                else False
-            )
-        if outbox is None or event is None:
-            return _finish_audit_mirror(
+            for outbox_id, claim_token in claims:
+                outbox = session.get(AuditMirrorOutbox, outbox_id)
+                event = (
+                    session.get(BusinessAuditEvent, outbox.audit_event_id)
+                    if outbox is not None
+                    else None
+                )
+                if outbox is None or event is None:
+                    missing_events.append((outbox_id, claim_token))
+                    continue
+                message = session.get(IncomingMessage, event.message_id)
+                original_message = (
+                    message.normalized_text
+                    if message is not None and message.scrubbed_at is None
+                    else None
+                )
+                lead_id = _resolve_audit_lead_id(session, event)
+                if _should_wait_for_audit_lead_resolution(session, event, lead_id):
+                    deferred_events.append((outbox_id, claim_token))
+                    continue
+                ready.append((outbox_id, claim_token, event, original_message, lead_id))
+
+        # 读取事务关闭后再独立写状态，避免同一批次内数据库事务互相占锁。
+        for outbox_id, claim_token in missing_events:
+            _finish_audit_mirror(
                 factory,
                 outbox_id,
                 claim_token,
                 succeeded=False,
                 error=ValueError("audit_event_missing"),
             )
-        if should_wait_for_lead:
+        for outbox_id, claim_token in deferred_events:
             _defer_audit_mirror(factory, outbox_id, claim_token)
-            return "deferred"
+
+        if not ready:
+            return "failed_pending_review" if missing_events else "deferred"
         try:
-            # 依靠服务端 claim fencing、稳定镜像键和写前远端查重，避免重试重复写行。
-            SmartTableAuditSink(get_smart_table_audit_adapter()).mirror(
-                event,
-                sales_original_message=sales_original_message,
-                resolved_lead_id=resolved_lead_id,
+            SmartTableAuditSink(get_smart_table_audit_adapter()).mirror_batch(
+                [
+                    (event, original_message, lead_id)
+                    for _, _, event, original_message, lead_id in ready
+                ]
             )
         except Exception as error:
-            final_status = _finish_audit_mirror(
-                factory, outbox_id, claim_token, succeeded=False, error=error
+            statuses = [
+                _finish_audit_mirror(
+                    factory,
+                    outbox_id,
+                    claim_token,
+                    succeeded=False,
+                    error=error,
+                )
+                for outbox_id, claim_token, *_ in ready
+            ]
+            status = (
+                "retrying"
+                if "retrying" in statuses
+                else "failed_pending_review"
+                if "failed_pending_review" in statuses
+                else "stale"
             )
-            logger_method = (
-                logger.warning
-                if final_status in {"retrying", "stale"}
-                else logger.error
-            )
+            logger_method = logger.warning if status in {"retrying", "stale"} else logger.error
             logger_method(
-                "audit_smart_table_mirror_retrying"
-                if final_status == "retrying"
-                else (
-                    "audit_smart_table_mirror_stale_finalize"
-                    if final_status == "stale"
-                    else "audit_smart_table_mirror_failed_pending_review"
-                ),
-                extra={"audit_mirror_outbox_id": outbox_id, "error_type": type(error).__name__},
+                "audit_smart_table_batch_mirror_failed",
+                extra={
+                    "event_count": len(ready),
+                    "status": status,
+                    "error_type": type(error).__name__,
+                },
             )
-            return final_status
-        _finish_audit_mirror(factory, outbox_id, claim_token, succeeded=True)
+            return status
+
+        for outbox_id, claim_token, *_ in ready:
+            _finish_audit_mirror(factory, outbox_id, claim_token, succeeded=True)
         logger.info(
-            "audit_smart_table_mirror_succeeded",
-            extra={"audit_mirror_outbox_id": outbox_id},
+            "audit_smart_table_batch_mirror_succeeded",
+            extra={"event_count": len(ready)},
         )
         return "succeeded"
     finally:
@@ -458,12 +487,12 @@ def consume_audit_mirror_outbox(outbox_id: int) -> str:
 
 @celery_app.task(name="workers.consume_pending_audit_mirrors")  # type: ignore[untyped-decorator]
 def consume_pending_audit_mirrors() -> int:
-    """扫描待处理或租约过期的审计镜像任务并投递独立 Worker。
+    """扫描待处理或租约过期的审计镜像任务并投递单个批次 Worker。
 
     参数：无。
-    返回值：本轮投递的镜像任务数量。
+    返回值：本轮纳入批次的镜像任务数量。
     异常：数据库读取失败时向 Celery 传播。
-    副作用：只投递任务，不执行外部 Smart Table 调用。
+    副作用：为选中事件设置租约并投递一个批量任务，不执行外部 Smart Table 调用。
     """
     engine, factory = _session_factory()
     dispatch_lock: Connection | None = None
@@ -500,22 +529,23 @@ def consume_pending_audit_mirrors() -> int:
         )
         with factory.begin() as session:
             # 派发租约覆盖 Redis 等待任务；processing 行则覆盖已被 solo Worker 接管的任务。
-            active_count = session.scalar(
-                select(func.count(AuditMirrorOutbox.id)).where(
-                    or_(
-                        AuditMirrorOutbox.dispatch_lease_expires_at > now,
-                        and_(
-                            AuditMirrorOutbox.status == "processing",
-                            AuditMirrorOutbox.processing_started_at.is_not(None),
-                            AuditMirrorOutbox.processing_started_at >= expired_before,
-                        ),
+            active_count = (
+                session.scalar(
+                    select(func.count(AuditMirrorOutbox.id)).where(
+                        or_(
+                            AuditMirrorOutbox.dispatch_lease_expires_at > now,
+                            and_(
+                                AuditMirrorOutbox.status == "processing",
+                                AuditMirrorOutbox.processing_started_at.is_not(None),
+                                AuditMirrorOutbox.processing_started_at >= expired_before,
+                            ),
+                        )
                     )
                 )
-            ) or 0
-            available_slots = min(
-                settings.audit_mirror_batch_size,
-                max(0, AUDIT_MIRROR_MAX_IN_FLIGHT - active_count),
+                or 0
             )
+            # solo 审计 Worker 同时只运行一个批次；批次中的事件数由配置限制。
+            available_slots = settings.audit_mirror_batch_size if not active_count else 0
             outboxes = (
                 list(
                     session.scalars(
@@ -568,9 +598,9 @@ def consume_pending_audit_mirrors() -> int:
                     logger.exception("audit_mirror_dispatch_lock_release_failed")
             dispatch_lock.close()
         engine.dispose()
-    for outbox_id in outbox_ids:
-        # 数据库派发租约在 Worker 启动后由 _claim_audit_mirror_outbox 清除。
-        consume_audit_mirror_outbox.delay(outbox_id)
+    if outbox_ids:
+        # 数据库派发租约在 Worker 启动后由批量任务逐条清除。
+        consume_audit_mirror_batch.delay(outbox_ids)
     return len(outbox_ids)
 
 

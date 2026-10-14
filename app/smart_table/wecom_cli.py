@@ -328,6 +328,48 @@ class WecomCliSmartTableAdapter:
             if all(record.fields.get(name) == value for name, value in filters.items())
         ]
 
+    def find_records_by_field_values(
+        self, field_name: str, values: Collection[str]
+    ) -> list[SmartTableRecord]:
+        """通过一条服务端查询匹配字段值集合，避免批量幂等检查逐条扫描。
+
+        参数：field_name 为规范文本字段名；values 为待精确匹配的字符串集合。
+        返回值：服务端返回且字段值确实属于集合的记录快照。
+        异常：缺少子表名、字段不为文本类型或 CLI 查询失败时抛出异常。
+        副作用：执行一次只读 records query。
+        """
+        requested_values = tuple(dict.fromkeys(values))
+        if not requested_values:
+            return []
+        if not self._sheet_title:
+            raise SmartTableAdapterConfigurationError(
+                "字段值批量查重需要配置 WECOM_SMART_TABLE_SHEET_TITLE"
+            )
+        schema = self.get_schema()
+        field = schema.get_field(field_name)
+        if field is None or field.field_type not in {
+            SmartTableFieldType.TEXT,
+            SmartTableFieldType.LONG_TEXT,
+        }:
+            raise SmartTableAdapterConfigurationError(
+                f"字段值批量查重要求字段“{field_name}”为文本类型"
+            )
+        identifier = self._quote_sql_identifier(field.name)
+        where = " OR ".join(
+            f"{identifier} = {self._quote_sql_string_literal(value)}" for value in requested_values
+        )
+        rows = self._query_rows(
+            self._build_query_sql(
+                schema,
+                where=where,
+                limit=1000,
+            )
+        )
+        requested = set(requested_values)
+        canonical_name = field.name.removeprefix("*")
+        records = [self._parse_query_record(row, schema) for row in rows]
+        return [record for record in records if record.fields.get(canonical_name) in requested]
+
     def get_records(
         self,
         record_ids: Collection[str] | None = None,
@@ -395,6 +437,86 @@ class WecomCliSmartTableAdapter:
         # 新增没有可安全重放的幂等键；只有远端逐字段回读匹配后才缓存并返回成功。
         return self._verify_remote_write(
             record_id, fields_to_verify, schema, operation="create"
+        )
+
+    def create_records(
+        self, records: Sequence[Mapping[str, object]], *, actor: SmartTableActor
+    ) -> list[SmartTableRecord]:
+        """一次新增多条记录，并通过一次批量回读核实实际写入结果。
+
+        参数：records 为按请求顺序排列的规范字段映射；actor 为调用主体。
+        返回值：按输入顺序排列的远端记录快照。
+        异常：权限、CLI 响应异常或远端字段未通过有限核实时抛出适配器异常。
+        副作用：最多发起一次批量新增和有限次批量只读核实。
+        """
+        if not records:
+            return []
+        if len(records) > 2000:
+            raise ValueError("智能表格单次批量新增最多支持 2000 条记录")
+        if actor is SmartTableActor.SALES:
+            raise SmartTablePermissionError("wecom-cli 使用机器人凭据，不能模拟销售直接新增记录")
+        if (
+            actor is SmartTableActor.ROBOT
+            and self._require_owner_field
+            and any(not fields.get("负责人") for fields in records)
+        ):
+            raise ValueError("机器人新增智能表格记录时必须写入负责人")
+
+        schema = self.get_schema()
+        cli_records: list[dict[str, object]] = []
+        fields_to_verify: list[dict[str, object]] = []
+        for fields in records:
+            cli_fields = self._to_cli_fields(fields, schema)
+            cli_records.append({"values": cli_fields})
+            # 只核实本次实际发出的字段；未映射的管理员字段不会被静默认作成功。
+            fields_to_verify.append(
+                {
+                    name: value
+                    for name, value in fields.items()
+                    if (field := schema.get_field(name)) is not None and field.name in cli_fields
+                }
+            )
+        response = self._call("records", "add", {"records": cli_records}, idempotent_add=True)
+        record_ids = self._parse_written_record_ids(response, len(records))
+
+        mismatched_fields: tuple[str, ...] = ()
+        mismatched_record_id: str | None = None
+        for delay in _WRITE_VERIFICATION_DELAYS:
+            if delay:
+                time.sleep(delay)
+            try:
+                remote_records = self.get_records(record_ids=record_ids)
+            except RetryableTaskFailure as error:
+                logger.error(
+                    "wecom_cli_batch_create_verification_read_failed",
+                    extra={"error_code": getattr(error, "error_code", type(error).__name__)},
+                )
+                continue
+            by_id = {record.record_id: record for record in remote_records}
+            mismatched_fields = ()
+            mismatched_record_id = None
+            for record_id, expected_fields in zip(record_ids, fields_to_verify, strict=True):
+                remote_record = by_id.get(record_id)
+                current_mismatches = (
+                    self._mismatched_write_fields(expected_fields, remote_record, schema)
+                    if remote_record is not None
+                    else tuple(expected_fields)
+                )
+                if current_mismatches:
+                    mismatched_fields = current_mismatches
+                    mismatched_record_id = record_id
+                    break
+            if mismatched_record_id is None:
+                for record in remote_records:
+                    self._remember_written_record(record.record_id, record.fields)
+                return [by_id[record_id] for record_id in record_ids]
+
+        logger.error(
+            "wecom_cli_batch_create_verification_failed",
+            extra={"missing_or_mismatched_fields": list(mismatched_fields)},
+        )
+        raise SmartTableWriteVerificationError(
+            mismatched_fields, remote_record_id=mismatched_record_id
         )
 
     def update_record(
@@ -926,10 +1048,13 @@ class WecomCliSmartTableAdapter:
         resource: ReadResource,
         action: WriteAction,
         payload: Mapping[str, object],
+        *,
+        idempotent_add: bool = False,
     ) -> Mapping[str, object]:
         """调用一个 CLI JSON 接口，并仅为临时网络错误执行有限重试。
 
-        参数：resource、action 构成 smartsheet 子命令；payload 为 CLI JSON 请求体。
+        参数：resource、action 构成 smartsheet 子命令；payload 为 CLI JSON 请求体；
+        idempotent_add 表示调用方会在重试前用稳定键核对未知新增结果。
         返回：已验证成功状态的 JSON 响应对象。
         异常：超时、网络失败、非零业务错误或非 JSON 响应时抛出异常。
         副作用：启动 wecom-cli 子进程；限流和网络错误按递增间隔有限重试。
@@ -969,6 +1094,10 @@ class WecomCliSmartTableAdapter:
                         fallback_error_code="remote_business_error",
                     )
                     if error.retryable:
+                        if idempotent_add:
+                            raise WecomCliTransportError(
+                                "wecom-cli 批量新增结果待稳定键核对"
+                            ) from error
                         raise WecomCliProtocolError(
                             "wecom-cli 新增结果无法确认，禁止自动重放"
                         ) from None
@@ -1011,6 +1140,10 @@ class WecomCliSmartTableAdapter:
                         attempt + 1,
                         fallback_error_code=fallback_code,
                     )
+                    if idempotent_add:
+                        raise WecomCliTransportError(
+                            "wecom-cli 批量新增结果待稳定键核对"
+                        ) from error
                     raise WecomCliProtocolError(
                         "wecom-cli 新增结果无法确认，禁止自动重放"
                     ) from None
@@ -1044,9 +1177,9 @@ class WecomCliSmartTableAdapter:
                         attempt + 1,
                         fallback_error_code="network_error",
                     )
-                    raise WecomCliProtocolError(
-                        "wecom-cli 新增结果无法确认，禁止自动重放"
-                    )
+                    if idempotent_add:
+                        raise WecomCliTransportError("wecom-cli 批量新增结果待稳定键核对")
+                    raise WecomCliProtocolError("wecom-cli 新增结果无法确认，禁止自动重放")
                 if attempt == self._retry_count:
                     self._log_final_failure(
                         resource,
@@ -1765,6 +1898,31 @@ class WecomCliSmartTableAdapter:
         if not isinstance(record_id, str) or not record_id:
             raise WecomCliProtocolError("wecom-cli 新增响应缺少 record_id")
         return record_id
+
+    def _parse_written_record_ids(
+        self, response: Mapping[str, object], expected_count: int
+    ) -> list[str]:
+        """校验批量新增响应的数量并提取不重复的服务端记录标识。
+
+        参数：response 为 CLI 返回的批量新增响应；expected_count 为请求记录数。
+        返回值：按响应顺序排列的唯一记录标识。
+        异常：响应数量不匹配、记录结构错误或记录标识重复时交给稳定键重试核对。
+        副作用：无。
+        """
+        raw_records = response.get("records")
+        if not isinstance(raw_records, list) or len(raw_records) != expected_count:
+            raise SmartTableWriteVerificationError(("批量新增结果",))
+        record_ids: list[str] = []
+        for raw_record in raw_records:
+            record_id = (
+                raw_record.get("record_id") if isinstance(raw_record, Mapping) else None
+            )
+            if not isinstance(record_id, str) or not record_id:
+                raise SmartTableWriteVerificationError(("批量新增结果",))
+            record_ids.append(record_id)
+        if len(set(record_ids)) != len(record_ids):
+            raise SmartTableWriteVerificationError(("批量新增结果",))
+        return record_ids
 
     @staticmethod
     def _log_final_failure(
