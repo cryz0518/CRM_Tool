@@ -92,10 +92,12 @@ class SmartTableAdapter(Protocol):
         record_ids: Collection[str] | None = None,
         *,
         owner_user_ids: Collection[str] | None = None,
+        owner_display_names: Mapping[str, str] | None = None,
     ) -> list[SmartTableRecord]:
         """返回当前子表、指定记录或指定负责人范围内的快照列表。
 
-        参数：record_ids 和 owner_user_ids 最多提供一个；未提供时读取当前子表全部记录。
+        参数：记录标识与负责人过滤最多提供一种；负责人显示名仅用于服务端预筛，
+        结果仍须按 user_id 精确校验。
         返回：请求范围内的记录快照列表。
         异常：两种过滤条件同时提供或底层查询失败时由具体适配器抛出。
         副作用：执行只读查询；受限读取不得退化为整表扫描。
