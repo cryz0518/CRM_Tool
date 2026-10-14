@@ -2585,6 +2585,23 @@ def test_cross_owner_selection_card_freezes_target_and_shows_names_only(
         actor=SmartTableActor.ROBOT,
         member_names={"负责人": "张三"},
     )
+    manual_dated_record = adapter.create_record(
+        {
+            **dict(source_record.fields),
+            "负责人": "sales-2",
+            "线索名称": "手工录入日期线索",
+            "备注": "人工录入的智能表格记录，没有机器人原始消息。",
+            "提交状态": "未提交",
+        },
+        actor=SmartTableActor.ROBOT,
+        member_names={"负责人": "张三"},
+    )
+    # 模拟企微读取到的只读系统时间，不允许通过正常写入接口伪造创建时间。
+    adapter._records[manual_dated_record.record_id] = SmartTableRecord(
+        manual_dated_record.record_id,
+        {**manual_dated_record.fields, "录入时间": "2026-10-13"},
+        manual_dated_record.member_names,
+    )
     next_day_duplicate_record = adapter.create_record(
         {
             **dict(source_record.fields),
@@ -2723,6 +2740,11 @@ def test_cross_owner_selection_card_freezes_target_and_shows_names_only(
                 select(Lead.id).where(Lead.smart_table_record_id == orphan_record.record_id)
             ),
             same_day_existing_lead_id,
+            session.scalar(
+                select(Lead.id).where(
+                    Lead.smart_table_record_id == manual_dated_record.record_id
+                )
+            ),
         }
         assert session.scalar(
             select(Lead.id).where(
@@ -2747,6 +2769,7 @@ def test_cross_owner_selection_card_freezes_target_and_shows_names_only(
     assert "人工最终公司" in markdown
     assert "当日表格漏链公司" in markdown
     assert "当日已有草稿公司" in markdown
+    assert "手工录入日期线索" in markdown
     assert "次日表格漏链公司" not in markdown
     assert "跨日重名公司" not in markdown
     assert "王工" not in markdown
@@ -2755,7 +2778,52 @@ def test_cross_owner_selection_card_freezes_target_and_shows_names_only(
         "人工最终公司",
         "当日表格漏链公司",
         "当日已有草稿公司",
+        "手工录入日期线索",
     }
+
+
+def test_manually_entered_smart_table_row_can_be_submitted_without_message_or_lead(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证人工录入且未关联后台 Lead 的表格行可进入同一 CRM 提交流程。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    record = adapter.create_record(
+        {
+            "负责人": "sales-1",
+            "线索名称": "人工录入客户",
+            "业务线": "协作机器人",
+            "线索来源": "展会",
+            "联系人": "王工",
+            "职务": "经理",
+            "沟通方式": "见面拜访",
+            "手机": "13800000000",
+            "客户行业": "其他",
+            "备注": "人工录入的完整备注，包含明确需求并达到 CRM 最小提交长度。",
+            "提交状态": "未提交",
+        },
+        actor=SmartTableActor.ROBOT,
+        member_names={"负责人": "sales-1"},
+    )
+    crm = MockCRMAdapter()
+    command = SubmissionCommand("提交我所有线索", "sales-1", "manual-row-submit")
+
+    prepare_batch_submission_selection(session_factory, adapter, crm, command)
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    candidates = service.list_submission_candidates(command.text, command.sales_user_id)
+    assert len(candidates) == 1
+    assert candidates[0].company_name == "人工录入客户"
+    with session_factory() as session:
+        mirrored_lead = session.scalar(
+            select(Lead).where(Lead.smart_table_record_id == record.record_id)
+        )
+        assert mirrored_lead is not None
+        assert mirrored_lead.source_message_id is None
+
+    result = service.submit_selected(
+        command, tuple(candidate.lead_id for candidate in candidates)
+    )
+    assert result.succeeded == 1
+    assert crm.calls == 1
 
 
 def test_cross_owner_date_candidates_and_callback_recheck_current_date_scope(
