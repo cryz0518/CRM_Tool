@@ -184,7 +184,7 @@ class WecomCliSmartTableAdapter:
         sales_can_create_records: bool | None = None,
         sales_can_delete_records: bool | None = None,
         command: str = "wecom-cli",
-        timeout_seconds: float = 20.0,
+        timeout_seconds: float = 120.0,
         retry_count: int = 1,
         require_owner_field: bool = True,
         runner: CliRunner | None = None,

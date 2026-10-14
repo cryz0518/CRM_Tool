@@ -38,6 +38,17 @@ def test_smart_table_stability_defaults_and_positive_validators() -> None:
         Settings(_env_file=None, smart_table_readiness_cache_seconds=0)
 
 
+def test_wecom_cli_defaults_cover_observed_smart_table_latency(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """验证企微 CLI 默认超时可覆盖实测响应，并限制单次安全重试。"""
+    monkeypatch.delenv("WECOM_CLI_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("WECOM_CLI_RETRY_COUNT", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.wecom_cli_timeout_seconds == 120.0
+    assert settings.wecom_cli_retry_count == 1
+
+
 def test_ai_gateway_timeout_environment_variable_overrides_default(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """验证环境变量可覆盖 AI Gateway 的默认超时。
 
