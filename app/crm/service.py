@@ -693,7 +693,6 @@ class CrmSubmissionService:
                 authorization is None
                 or not authorization.is_active
                 or not self._can_submit_other_sales_leads(authorization)
-                or (target_capture_date is not None and not authorization.is_administrator)
             ):
                 raise ValueError("当前账号没有跨员工 CRM 提交权限")
             leads = list(
@@ -838,10 +837,6 @@ class CrmSubmissionService:
                 authorization is not None
                 and authorization.is_active
                 and self._can_submit_other_sales_leads(authorization)
-                and (
-                    command.target_capture_date is None
-                    or authorization.is_administrator
-                )
             )
             owner_scope = set(command.owner_scope_user_ids or ())
             valid_ids: set[str] = set()
@@ -1294,10 +1289,6 @@ class CrmSubmissionService:
                     authorization is None
                     or not authorization.is_active
                     or not self._can_submit_other_sales_leads(authorization)
-                    or (
-                        command.target_capture_date is not None
-                        and not authorization.is_administrator
-                    )
                 ):
                     return _create_outcome(
                         "not_submitted",
@@ -1419,10 +1410,6 @@ class CrmSubmissionService:
                         authorization is None
                         or not authorization.is_active
                         or not self._can_submit_other_sales_leads(authorization)
-                        or (
-                            command.target_capture_date is not None
-                            and not authorization.is_administrator
-                        )
                     ):
                         return _create_outcome(
                             "not_submitted",
@@ -1549,11 +1536,7 @@ class CrmSubmissionService:
                     not owner_scope_user_ids
                     or authorization is None
                     or not authorization.is_active
-                    or not (
-                        authorization.is_administrator
-                        or authorization.can_submit_other_sales_leads
-                    )
-                    or (target_capture_date is not None and not authorization.is_administrator)
+                    or not authorization.can_submit_other_sales_leads
                 ):
                     raise PermissionError("跨员工 CRM 提交权限已失效")
             owner_scope = owner_scope_user_ids or (sales_user_id,)
@@ -2169,14 +2152,14 @@ class CrmSubmissionService:
 
     @staticmethod
     def _can_submit_other_sales_leads(authorization: SalesAuthorization) -> bool:
-        """判断当前 actor 是否可发起跨员工 CRM 提交。
+        """判断当前 actor 是否持有跨员工 CRM 提交授权。
 
         参数：authorization 为数据库中的当前企微员工授权记录。
-        返回值：管理员或持有专用跨员工提交权限时返回 True。
+        返回值：持有专用跨员工提交权限时返回 True。
         异常：无。
         副作用：无，仅读取授权状态。
         """
-        return authorization.is_administrator or authorization.can_submit_other_sales_leads
+        return authorization.can_submit_other_sales_leads
 
     @staticmethod
     def _last_successful_sync(session: Session, lead_id: str) -> CrmSyncRecord | None:

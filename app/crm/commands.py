@@ -695,13 +695,11 @@ def _resolve_cross_owner_submission_scope(
     owner_user_ids: tuple[str, ...] | None = None
     with session_factory() as session:
         actor = session.get(SalesAuthorization, command.sales_user_id)
-        # 操作人必须是启用成员且具有管理员或专用授权，不能由命令文本授予权限。
+        # 操作人必须是启用成员且持有专用跨员工提交授权，不能由命令文本授予权限。
         if actor is None or not actor.is_active:
             return None, "当前企微账号未启用，不能提交 CRM 线索。"
-        if command.target_capture_date is not None and not actor.is_administrator:
-            return None, "按日期提交其他员工线索仅限系统管理员使用，未发起提交。"
-        if not (actor.is_administrator or actor.can_submit_other_sales_leads):
-            return None, "当前账号没有跨员工 CRM 提交权限，请联系系统管理员授权。"
+        if not actor.can_submit_other_sales_leads:
+            return None, "当前账号没有跨员工 CRM 提交授权。"
         if target_name == _CROSS_OWNER_ALL_TARGET:
             # 将“所有员工”限制为数据库中已有线索的负责人，不把通配符传入提交服务。
             owner_user_ids = tuple(

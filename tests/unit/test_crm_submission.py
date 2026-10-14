@@ -2517,7 +2517,6 @@ def test_cross_owner_selection_card_freezes_target_and_shows_names_only(
         source_message = session.get(IncomingMessage, lead.source_message_id)
         assert source_message is not None
         source_message.received_at = datetime(2026, 10, 12, 16, tzinfo=UTC)
-        session.get(SalesAuthorization, "operator").is_administrator = True
 
     reply = prepare_batch_submission_selection(
         session_factory,
@@ -2561,7 +2560,7 @@ def test_cross_owner_selection_card_freezes_target_and_shows_names_only(
 def test_cross_owner_date_candidates_and_callback_recheck_current_date_scope(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证指定日候选按上海日期筛选，回调时重新核对管理员权限和线索日期。"""
+    """验证指定日提交只依赖跨员工授权，并在回调时重新核对线索日期。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter, message_id="dated-cross-owner-lead")
     record = adapter.get_records()[0]
@@ -2579,7 +2578,10 @@ def test_cross_owner_date_candidates_and_callback_recheck_current_date_scope(
             [
                 SalesAuthorization(wecom_user_id="sales-2", is_active=True),
                 SalesAuthorization(
-                    wecom_user_id="operator", is_active=True, is_administrator=True
+                    wecom_user_id="operator",
+                    is_active=True,
+                    is_administrator=False,
+                    can_submit_other_sales_leads=True,
                 ),
             ]
         )
@@ -2641,7 +2643,7 @@ def test_cross_owner_date_candidates_and_callback_recheck_current_date_scope(
         source_message = session.get(IncomingMessage, "dated-cross-owner-lead")
         assert source_message is not None
         source_message.received_at = datetime(2026, 10, 12, 16, tzinfo=UTC)
-    unauthorized_result = service.submit_selected(
+    authorized_result = service.submit_selected(
         SubmissionCommand(
             CROSS_OWNER_SUBMISSION_COMMAND,
             "operator",
@@ -2651,8 +2653,13 @@ def test_cross_owner_date_candidates_and_callback_recheck_current_date_scope(
         ),
         (historical_lead_id,),
     )
-    assert unauthorized_result.not_submitted == 1
-    assert crm.search_calls == crm.calls == 0
+    assert authorized_result.not_submitted == 0
+    # 系统管理员标记本身不能代替专用跨员工提交授权。
+    with session_factory.begin() as session:
+        operator = session.get(SalesAuthorization, "operator")
+        assert operator is not None
+        operator.is_administrator = True
+        operator.can_submit_other_sales_leads = False
     with pytest.raises(ValueError, match="跨员工 CRM 提交权限"):
         service.list_submission_candidates(
             CROSS_OWNER_SUBMISSION_COMMAND,
@@ -2660,6 +2667,17 @@ def test_cross_owner_date_candidates_and_callback_recheck_current_date_scope(
             owner_scope_user_ids=("sales-2",),
             target_capture_date=date(2026, 10, 13),
         )
+    denied_admin_only = service.submit_selected(
+        SubmissionCommand(
+            CROSS_OWNER_SUBMISSION_COMMAND,
+            "operator",
+            "dated-cross-owner-request",
+            owner_scope_user_ids=("sales-2",),
+            target_capture_date=date(2026, 10, 13),
+        ),
+        (historical_lead_id,),
+    )
+    assert denied_admin_only.not_submitted == 1
 
 
 def test_crm_submission_cli_creates_actor_for_verified_wecom_member(
@@ -3462,7 +3480,7 @@ def test_duplicate_crm_match_selected_continue_uses_update_and_marks_submitted(
 def test_cross_owner_duplicate_confirmation_rechecks_permission_and_frozen_scope(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证重复确认回调重新校验管理员权限，并只停止冻结范围中的负责人线索。"""
+    """验证重复确认回调重新校验跨员工授权，并只停止冻结范围中的负责人线索。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     first_lead_id = _lead(session_factory, adapter, message_id="owner-2-message", sequence=1)
     second_lead_id = _lead(
@@ -3524,7 +3542,7 @@ def test_cross_owner_duplicate_confirmation_rechecks_permission_and_frozen_scope
     with session_factory.begin() as session:
         admin = session.get(SalesAuthorization, "admin-1")
         assert admin is not None
-        admin.is_administrator = True
+        admin.can_submit_other_sales_leads = True
 
     stopped = service.resolve_duplicate_confirmation(
         "admin-duplicate-request",
