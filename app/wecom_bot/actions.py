@@ -8,7 +8,7 @@ import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -1575,6 +1575,7 @@ class WecomActionService:
         request_message_id: str,
         duplicates: tuple[object, ...],
         owner_scope_user_ids: tuple[str, ...] | None = None,
+        target_capture_date: date | None = None,
     ) -> WecomAction:
         """发行可批量选择重复线索并继续或停止提交的确认卡。
 
@@ -1610,6 +1611,9 @@ class WecomActionService:
                 "owner_scope_user_ids": (
                     list(owner_scope_user_ids) if owner_scope_user_ids is not None else None
                 ),
+                "target_capture_date": (
+                    target_capture_date.toordinal() if target_capture_date is not None else None
+                ),
             },
             title="CRM 重复线索确认",
             description=f"当前系统有{names}的信息，请问是进行覆盖还是停止提交",
@@ -1628,6 +1632,7 @@ class WecomActionService:
         page: int = 1,
         page_count: int = 1,
         owner_scope_user_ids: tuple[str, ...] | None = None,
+        target_capture_date: date | None = None,
     ) -> WecomAction:
         """发行批量提交候选卡，负责人范围只保存在服务端动作上下文。
 
@@ -1651,8 +1656,12 @@ class WecomActionService:
                 )
             ):
                 raise ValueError("跨员工候选缺少有效负责人范围")
+            if target_capture_date is not None and not isinstance(target_capture_date, date):
+                raise ValueError("跨员工候选日期格式非法")
         elif owner_scope_user_ids is not None:
             raise ValueError("普通批量候选不能携带跨员工负责人范围")
+        elif target_capture_date is not None:
+            raise ValueError("普通批量候选不能携带跨员工日期")
         target_id = hashlib.sha256(
             f"crm-batch-submission:{request_message_id}:{command_text}:page:{page}".encode()
         ).hexdigest()
@@ -1673,6 +1682,9 @@ class WecomActionService:
                     list(dict.fromkeys(owner_scope_user_ids))
                     if owner_scope_user_ids is not None
                     else None
+                ),
+                "target_capture_date": (
+                    target_capture_date.toordinal() if target_capture_date is not None else None
                 ),
             },
             title=title,
@@ -2267,6 +2279,7 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
         "duplicate_leads",
         "candidate_leads",
         "owner_scope_user_ids",
+        "target_capture_date",
         "page",
         "page_count",
     }
@@ -2282,6 +2295,12 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
             isinstance(value, int)
             and key in {"segment_index", "page", "page_count"}
             and value >= 0
+        ):
+            safe[key] = value
+        elif (
+            key == "target_capture_date"
+            and type(value) is int
+            and 1 <= value <= date.max.toordinal()
         ):
             safe[key] = value
         elif (
@@ -2365,6 +2384,8 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
                 safe_candidates.append(candidate)
             safe[key] = safe_candidates
         elif key == "owner_scope_user_ids" and value is None:
+            safe[key] = None
+        elif key == "target_capture_date" and value is None:
             safe[key] = None
         elif (
             key == "owner_scope_user_ids"
@@ -2778,6 +2799,7 @@ class DeterministicWecomActionExecutor:
         duplicates = action.context.get("duplicate_leads")
         owner_scope = action.context.get("owner_scope_user_ids")
         request_message_id = action.context.get("request_message_id")
+        raw_capture_date = action.context.get("target_capture_date")
         if (
             decision not in {"continue", "stop"}
             or not isinstance(request_message_id, str)
@@ -2800,6 +2822,15 @@ class DeterministicWecomActionExecutor:
             or not all(isinstance(item, str) and item for item in owner_scope)
         ):
             raise ValueError("重复确认动作负责人范围非法")
+        if raw_capture_date is None:
+            target_capture_date = None
+        elif owner_scope is None or type(raw_capture_date) is not int:
+            raise ValueError("重复确认动作日期范围非法")
+        else:
+            try:
+                target_capture_date = date.fromordinal(raw_capture_date)
+            except (ValueError, OverflowError) as error:
+                raise ValueError("重复确认动作日期范围非法") from error
         if self._action_service is not None:
             self._action_service.begin_domain_operation(action.id, action.claim_token)
         result = CrmSubmissionService(
@@ -2814,6 +2845,7 @@ class DeterministicWecomActionExecutor:
             selected_lead_ids=tuple(selected),
             duplicate_lead_ids=duplicate_lead_ids,
             owner_scope_user_ids=(tuple(owner_scope) if isinstance(owner_scope, list) else None),
+            target_capture_date=target_capture_date,
         )
         if decision == "stop":
             return (
@@ -2842,6 +2874,7 @@ class DeterministicWecomActionExecutor:
         request_message_id = action.context.get("request_message_id")
         selected = action.context.get("selected_lead_ids", [])
         owner_scope = action.context.get("owner_scope_user_ids")
+        raw_capture_date = action.context.get("target_capture_date")
         if (
             not isinstance(command_text, str)
             or not isinstance(request_message_id, str)
@@ -2859,6 +2892,15 @@ class DeterministicWecomActionExecutor:
                 raise ValueError("跨员工批量提交动作缺少负责人范围")
         elif owner_scope is not None:
             raise ValueError("普通批量提交动作包含非法负责人范围")
+        if raw_capture_date is None:
+            target_capture_date = None
+        elif command_text != CROSS_OWNER_SUBMISSION_COMMAND or type(raw_capture_date) is not int:
+            raise ValueError("批量提交动作日期范围非法")
+        else:
+            try:
+                target_capture_date = date.fromordinal(raw_capture_date)
+            except (ValueError, OverflowError) as error:
+                raise ValueError("批量提交动作日期范围非法") from error
         if self._action_service is not None:
             self._action_service.begin_domain_operation(action.id, action.claim_token)
         service = CrmSubmissionService(
@@ -2893,6 +2935,7 @@ class DeterministicWecomActionExecutor:
                 owner_scope_user_ids=(
                     tuple(owner_scope) if isinstance(owner_scope, list) else None
                 ),
+                target_capture_date=target_capture_date,
             ),
             tuple(selected),
             on_item_result=persist_item_result,
@@ -2905,6 +2948,7 @@ class DeterministicWecomActionExecutor:
                 owner_scope_user_ids=(
                     tuple(owner_scope) if isinstance(owner_scope, list) else None
                 ),
+                target_capture_date=target_capture_date,
             )
         candidate_leads = action.context.get("candidate_leads")
         labels: dict[str, str] = {}

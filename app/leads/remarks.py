@@ -10,11 +10,17 @@ from app.smart_table.enums import BUSINESS_ENUM_FIELDS
 class RemarksBuilder:
     """只使用已审核字段和有原文证据的补充信息生成备注。"""
 
-    def build(self, fields: Mapping[str, object], enrichment: Mapping[str, str]) -> str:
-        """生成不猜测缺失事实的固定四段式备注。
+    def build(
+        self,
+        fields: Mapping[str, object],
+        enrichment: Mapping[str, str],
+        original_message: str | None = None,
+    ) -> str:
+        """生成不猜测缺失事实的审核备注，并保留相关的来源消息。
 
-        参数：fields 为已通过 T09 保护的正式字段；enrichment 为单次提取中有文本证据的补充信息。
-        返回值：可写入智能表格“备注”字段的四段式文本。
+        参数：fields 为已通过 T09 保护的正式字段；enrichment 为有文本证据的补充信息；
+        original_message 为来源消息正文，图片消息传入包含 OCR 结果的标准化正文。
+        返回值：可写入智能表格“备注”字段的审核文本。
         异常：无。
         副作用：无。
         """
@@ -33,6 +39,9 @@ class RemarksBuilder:
             f"预算情况：{self._sentence(budget)}",
             f"特殊要求：{self._sentence(requirement)}",
         ]
+        # 原文直接取已持久化消息正文；媒体流程已将 OCR/ASR 结果追加到该正文。
+        if original_message and original_message.strip():
+            sections.append(f"原始消息：\n{original_message}")
         other_details = self._other_enum_details(fields, enrichment)
         if other_details:
             # 枚举字段的实际自由文本统一追加在备注尾部，保留字段名与“其他”选项语义。

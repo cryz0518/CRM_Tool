@@ -30,6 +30,19 @@ from app.smart_table.wecom_cli import WecomCliProcessError, WecomCliTransportErr
 from workers import tasks
 
 
+def test_audit_mirror_worker_tasks_use_a_separate_queue() -> None:
+    """验证耗时的审计 CLI 镜像不会占用线索消费队列。"""
+    audit_route = tasks.celery_app.amqp.router.route(
+        {}, "workers.consume_audit_mirror_outbox", args=(1,), kwargs={}
+    )
+    lead_route = tasks.celery_app.amqp.router.route(
+        {}, "workers.consume_lead_outbox_event", args=(1,), kwargs={}
+    )
+
+    assert audit_route["queue"].name == "audit"
+    assert lead_route["queue"].name == "celery"
+
+
 @pytest.fixture
 def session_factory() -> Generator[sessionmaker[Session], None, None]:
     """创建包含审计镜像模型的隔离内存数据库。"""

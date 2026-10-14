@@ -7,7 +7,7 @@ import logging
 import re
 from collections.abc import Mapping
 from dataclasses import asdict, replace
-from datetime import UTC
+from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
@@ -58,6 +58,10 @@ CRM_SUBMISSION_COMMANDS = frozenset(
     }
 )
 _CROSS_OWNER_ALL_TARGET = "*"
+_CROSS_OWNER_DATE_PATTERN = re.compile(
+    r"^提交(?:(?P<year>\d{4})年)?(?P<month>\d{1,2})月(?P<day>\d{1,2})(?:日|号)"
+    r"(?P<owner>[^\r\n:：]{1,128})的线索$"
+)
 _COMPANY_SUBMISSION_PATTERN = re.compile(r"^请帮我提交(?P<company>[^\r\n。]{1,128})这条线索$")
 _SUBMISSION_COMMAND_ALIASES = {
     "提交今天线索": "提交今天的线索",
@@ -149,7 +153,10 @@ def parse_crm_submission_command(text: str) -> str | None:
     alias = _SUBMISSION_COMMAND_ALIASES.get(candidate)
     if alias is not None:
         return alias
-    if parse_cross_owner_submission_target(candidate) is not None:
+    if parse_cross_owner_submission_request(candidate) is not None:
+        return CROSS_OWNER_SUBMISSION_COMMAND
+    if _CROSS_OWNER_DATE_PATTERN.fullmatch(candidate) is not None:
+        # 识别日期句式但日期本身无效时仍进入跨员工拒绝路径，避免 LLM 降级成普通提交命令。
         return CROSS_OWNER_SUBMISSION_COMMAND
     if parse_company_submission_request(candidate) is not None:
         return candidate
@@ -164,11 +171,50 @@ def parse_cross_owner_submission_target(text: str) -> str | None:
     异常：无；空姓名、过长姓名和含控制分隔符的文本返回 None。
     副作用：无，不查询数据库或触发提交。
     """
+    request = parse_cross_owner_submission_request(text)
+    return request[0] if request is not None else None
+
+
+def parse_cross_owner_submission_request(
+    text: str, *, today: date | None = None
+) -> tuple[str, date | None] | None:
+    """解析普通或指定日期的跨员工提交命令，并将短日期归一化到最近的过去日期。
+
+    参数：text 为用户原始命令；today 仅供确定性测试覆盖上海当前日期。
+    返回值：负责人姓名/全员哨兵及可选上海自然日；格式无效返回 None。
+    异常：无；越界日期作为无效文本返回 None。
+    副作用：无；不访问通讯录、数据库或 CRM。
+    """
     candidate = text.strip().rstrip("。").strip()
     if candidate in {"提交所有员工的线索", "提交所有人的线索", "提交全部员工的线索"}:
-        return _CROSS_OWNER_ALL_TARGET
+        return _CROSS_OWNER_ALL_TARGET, None
     if candidate in CRM_SUBMISSION_COMMANDS or candidate in _SUBMISSION_COMMAND_ALIASES:
         return None
+    dated = _CROSS_OWNER_DATE_PATTERN.fullmatch(candidate)
+    if dated is not None:
+        owner = dated.group("owner").strip()
+        if not owner:
+            return None
+        month, day = int(dated.group("month")), int(dated.group("day"))
+        year_text = dated.group("year")
+        try:
+            if year_text is not None:
+                capture_date = date(int(year_text), month, day)
+            else:
+                shanghai_today = today or datetime.now(ZoneInfo("Asia/Shanghai")).date()
+                # 日期落在今年未来时取上一年；闰日等日期逐年回溯到最近一次有效日期。
+                if (month, day) > (shanghai_today.month, shanghai_today.day):
+                    first_year = shanghai_today.year - 1
+                else:
+                    first_year = shanghai_today.year
+                capture_date = next(
+                    date(year, month, day)
+                    for year in range(first_year, first_year - 9, -1)
+                    if _valid_calendar_date(year, month, day)
+                )
+        except (ValueError, StopIteration):
+            return None
+        return owner, capture_date
     suffix = "的线索"
     prefix = next(
         (value for value in ("提交负责人", "提交") if candidate.startswith(value)), None
@@ -183,7 +229,22 @@ def parse_cross_owner_submission_target(text: str) -> str | None:
         or any(char in employee_name for char in "\r\n:：")
     ):
         return None
-    return employee_name
+    return employee_name, None
+
+
+def _valid_calendar_date(year: int, month: int, day: int) -> bool:
+    """判断年月日是否是有效公历日期。
+
+    参数：year、month、day 分别是公历年、月、日。
+    返回值：可构造公历日期时返回 True，超出日历范围时返回 False。
+    异常：无；日期构造抛出的 ValueError 被转换为 False。
+    副作用：无。
+    """
+    try:
+        date(year, month, day)
+    except ValueError:
+        return False
+    return True
 
 
 def looks_like_submission_intent(text: str) -> bool:
@@ -273,15 +334,17 @@ def consume_submission_command(
         raw_text = message.normalized_text or ""
         # 消费端再次归一化，确保自然说法仍进入既有候选卡流程，而不是绕过确认卡直写 CRM。
         resolved_command_text = command_text or parse_crm_submission_command(raw_text) or raw_text
+        cross_owner_request = (
+            parse_cross_owner_submission_request(raw_text)
+            if resolved_command_text == CROSS_OWNER_SUBMISSION_COMMAND
+            else None
+        )
         command = SubmissionCommand(
             text=resolved_command_text,
             sales_user_id=message.sales_user_id,
             request_message_id=message.message_id,
-            target_owner_name=(
-                parse_cross_owner_submission_target(raw_text)
-                if resolved_command_text == CROSS_OWNER_SUBMISSION_COMMAND
-                else None
-            ),
+            target_owner_name=cross_owner_request[0] if cross_owner_request else None,
+            target_capture_date=cross_owner_request[1] if cross_owner_request else None,
         )
     company_name = (
         None
@@ -533,6 +596,7 @@ def prepare_batch_submission_selection(
         command.text,
         command.sales_user_id,
         owner_scope_user_ids=command.owner_scope_user_ids,
+        target_capture_date=command.target_capture_date,
     )
     if not candidates:
         if command.text == "帮我提交放弃提交的线索":
@@ -603,6 +667,7 @@ def prepare_batch_submission_selection(
                     if command.text == CROSS_OWNER_SUBMISSION_COMMAND
                     else None
                 ),
+                target_capture_date=command.target_capture_date,
                 defer_delivery=True,
             )
     except CardCapabilityUnavailable:
@@ -633,6 +698,8 @@ def _resolve_cross_owner_submission_scope(
         # 操作人必须是启用成员且具有管理员或专用授权，不能由命令文本授予权限。
         if actor is None or not actor.is_active:
             return None, "当前企微账号未启用，不能提交 CRM 线索。"
+        if command.target_capture_date is not None and not actor.is_administrator:
+            return None, "按日期提交其他员工线索仅限系统管理员使用，未发起提交。"
         if not (actor.is_administrator or actor.can_submit_other_sales_leads):
             return None, "当前账号没有跨员工 CRM 提交权限，请联系系统管理员授权。"
         if target_name == _CROSS_OWNER_ALL_TARGET:
@@ -1111,6 +1178,7 @@ def _issue_duplicate_confirmation_card(
             request_message_id=command.request_message_id,
             duplicates=result.duplicate_confirmations,
             owner_scope_user_ids=command.owner_scope_user_ids,
+            target_capture_date=command.target_capture_date,
         )
     except CardCapabilityUnavailable:
         # readiness 在事务间变化时保留未提交状态，销售可稍后重新发起提交。
