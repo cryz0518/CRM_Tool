@@ -271,3 +271,63 @@ def test_ten_same_sales_messages_follow_sequence_not_creation_time(
             assert event is not None
             event.status = "succeeded"
             event.processing_started_at = None
+
+
+def test_blocked_sales_backlog_does_not_starve_submission_for_other_sales(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证一位销售积压十条消息时，另一销售的提交命令仍可立即认领。
+
+    参数：session_factory 为隔离测试数据库；返回：无；异常：断言失败。
+    副作用：写入模拟处理中消息、同销售积压和另一销售的提交命令。
+    """
+    persist_event(
+        session_factory,
+        sales_user_id="sales-busy",
+        sequence=1,
+        status="processing",
+        processing_started_at=utc_now(),
+    )
+    # 积压数量超过可用名额，复现旧扫描窗口被同一销售占满的情况。
+    blocked_ids = [
+        persist_event(session_factory, sales_user_id="sales-busy", sequence=sequence)
+        for sequence in range(2, 12)
+    ]
+    submission_id = persist_event(session_factory, sales_user_id="sales-submit", sequence=197)
+    with session_factory.begin() as session:
+        event = session.get(OutboxEvent, submission_id)
+        assert event is not None
+        event.event_type = "crm_submission_command"
+
+    claims = claim_dispatchable_lead_outbox_events(
+        session_factory, lease_timeout=timedelta(minutes=5), max_in_flight=4
+    )
+
+    assert [claim.event_id for claim in claims] == [submission_id]
+    with session_factory() as session:
+        # 放行另一销售不能破坏忙碌销售自己的消息顺序。
+        for event_id in blocked_ids:
+            event = session.get(OutboxEvent, event_id)
+            assert event is not None and event.status == "pending"
+
+
+def test_dispatch_prioritizes_oldest_sales_head_not_other_sales_sequence(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证不同销售按最早待处理时间公平调度，不拿各自 sequence 比较优先级。
+
+    参数：session_factory 为隔离数据库；返回：无；异常：断言失败。
+    副作用：保存两位销售的待处理消息并认领较早收到的一条。
+    """
+    old_id = persist_event(session_factory, sales_user_id="sales-long-history", sequence=197)
+    persist_event(session_factory, sales_user_id="sales-new", sequence=1)
+    with session_factory.begin() as session:
+        event = session.get(OutboxEvent, old_id)
+        assert event is not None
+        event.created_at = utc_now() - timedelta(minutes=20)
+
+    claims = claim_dispatchable_lead_outbox_events(
+        session_factory, lease_timeout=timedelta(minutes=5), max_in_flight=1
+    )
+
+    assert [claim.event_id for claim in claims] == [old_id]

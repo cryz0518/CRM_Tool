@@ -2884,13 +2884,14 @@ class FirstTextLeadWorkspaceService:
         """记录 T09 失败并按异常类别决定重试或人工检查点。
 
         参数：request 为当前审核请求；error 为最终一次同步异常；
-        field_patch_pending 表示远端行已绑定、仅待补写业务字段，必须保留为可恢复任务。
+        field_patch_pending 表示远端行已绑定、仅待补写业务字段；
+        保留原行和补丁，不绕过失败分类或重试上限。
         返回值：无。
         异常：数据库写入失败时向调用方传播。
         副作用：更新 Outbox、智能表格同步状态和业务审计，不伪造成功。
         """
         with self._session_factory.begin() as session:
-            event, _ = self._load_event_and_message(session, request.outbox_event_id)
+            event, message = self._load_event_and_message(session, request.outbox_event_id)
             sync = session.scalar(
                 select(SmartTableSync).where(SmartTableSync.lead_id == request.lead_id)
             )
@@ -2908,20 +2909,19 @@ class FirstTextLeadWorkspaceService:
                 retrying_event_type="ai_review_sync_retrying",
                 failed_event_type="ai_review_sync_failed_pending_review",
                 error=error,
-                force_retrying=field_patch_pending,
-                retry_reason="field_patch_pending" if field_patch_pending else None,
             )
             if sync is not None and sync.status != "succeeded":
                 # 既有 Lead 也可能在本轮首次补建远端记录；失败状态不能因 creates_lead=False 被丢掉。
-                sync.status = "retrying" if field_patch_pending else (
-                    "failed_pending_review" if failed_pending_review else "retrying"
-                )
+                sync.status = "failed_pending_review" if failed_pending_review else "retrying"
                 error_code = getattr(error, "error_code", None)
                 sync.error_summary = (
                     "field_patch_pending"
                     if field_patch_pending
                     else error_code if isinstance(error_code, str) else type(error).__name__
                 )
+            if failed_pending_review:
+                # 失败检查点释放销售顺序，但保留原行和待写字段供受保护恢复。
+                self._record_lead_processing_failed_notice(session, message)
         logger.exception("ai_review_sync_failed", extra={"error_type": type(error).__name__})
 
     def _ensure_ai_review_record(
@@ -3418,7 +3418,8 @@ class FirstTextLeadWorkspaceService:
     ) -> ExtractedLeadPatch:
         """用原文公司片段校验身份，并移除无法回指当前消息的公司与联系人候选。
 
-        参数：patch 为 AI 字段补丁；normalized_text 为当前消息原文；company_name_hint 为确定性标签提取值。
+        参数：patch 为 AI 字段补丁；normalized_text 为当前消息原文；
+        company_name_hint 为确定性标签提取值。
         返回值：公司名保留为原文片段、联系人与补充字段通过来源核验后的补丁。
         异常：无。
         副作用：无；仅构造副本，不调用模型或外部服务。
@@ -3429,7 +3430,8 @@ class FirstTextLeadWorkspaceService:
         pending = tuple(patch.pending_confirmation_fields)
         low_candidates = dict(patch.low_confidence_candidates)
         semantic_company = patch.analysis.crm_fields.get("线索名称")
-        # 企微引用字段已在 AI Gateway 逐字校验；这里再次核验并保留原文公司片段，工商标准化在归属后执行。
+        # 企微引用字段已在 AI Gateway 逐字校验；这里再次核验并保留原文公司片段。
+        # 工商标准化在归属后执行。
         source_company = company_name_hint
         if source_company is None and normalized_text is not None:
             company_reference_keys = {
@@ -4514,13 +4516,11 @@ class FirstTextLeadWorkspaceService:
         retrying_event_type: str,
         failed_event_type: str,
         error: BaseException | None = None,
-        force_retrying: bool = False,
-        retry_reason: str | None = None,
     ) -> bool:
         """记录一次外部同步失败，并在重试耗尽时将其变为顺序检查点。
 
         参数：session 为当前事务；event 为失败来源事件；两个 event_type 分别记录可重试和耗尽结论；
-        force_retrying 表示已绑定的字段补写不得收敛为人工检查点；retry_reason 为安全原因码。
+        error 保留真实失败分类；已绑定记录的字段补写同样遵守配置的重试上限。
         返回值：本次失败是否使事件进入 failed_pending_review。
         异常：数据库写入失败时由 SQLAlchemy 抛出。
         副作用：增加尝试次数，更新任务状态并写入对应业务审计事件。
@@ -4532,22 +4532,13 @@ class FirstTextLeadWorkspaceService:
             failure_details = self._failure_audit_details(error)
             failure_category = str(failure_details["failure_category"])
             failure_code = str(failure_details["failure_code"])
-            if force_retrying:
-                # 已绑定远端记录的字段补写不能丢失；即使本轮预算耗尽也保留可恢复任务。
-                failure_category = "transient"
-                failure_code = retry_reason or failure_code
             event.failure_category = failure_category
-            event.failure_summary = retry_reason or safe_failure_summary(error)
+            event.failure_summary = safe_failure_summary(error)
         audit_details: dict[str, object] | None = (
             {"failure_category": failure_category, "failure_code": failure_code}
             if failure_category is not None and failure_code is not None
             else None
         )
-        if force_retrying:
-            event.status = "retrying"
-            self._record_audit(session, event, retrying_event_type, details=audit_details)
-            logger.warning("lead_outbox_retrying", extra={"reason_code": retry_reason})
-            return False
         if failure_category is not None and failure_category != "transient":
             # 永久或未知失败不重复调用确定性失败的外部接口，直接成为可人工处理的检查点。
             event.status = "failed_pending_review"

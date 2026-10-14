@@ -1953,10 +1953,115 @@ def test_ai_create_verification_failure_persists_acknowledged_record_id_and_neve
     assert lead is not None and lead.smart_table_record_id == "acked-record-1"
     assert sync is not None
     assert sync.smart_table_record_id == "acked-record-1"
-    assert sync.status == "retrying"
+    # 同一已确认标识在回读中缺失是人工检查点，仍禁止重建另一行。
+    assert sync.status == "failed_pending_review"
     assert sync.error_summary == "field_patch_pending"
-    assert event is not None and event.status == "retrying"
+    assert event is not None and event.status == "failed_pending_review"
     assert notifications == []
+
+
+@pytest.mark.parametrize(
+    ("error", "attempt_limit", "failure_category", "failure_code"),
+    [
+        (
+            WecomCliProcessError(
+                "远端拒绝测试补丁", error_code="remote_business_error", external_error_code=640027
+            ),
+            1,
+            "permanent",
+            "640027",
+        ),
+        (RetryableTaskFailure("暂态测试补丁失败"), 2, "transient", "RetryableTaskFailure"),
+        (
+            SmartTableWriteVerificationError(("线索名称",)),
+            2,
+            "transient",
+            "write_verification_pending",
+        ),
+    ],
+    ids=["remote-rejection", "transport-exhausted", "verification-exhausted"],
+)
+def test_bound_ai_review_failure_respects_retry_budget_and_preserves_record(
+    session_factory: sessionmaker[Session],
+    error: Exception,
+    attempt_limit: int,
+    failure_category: str,
+    failure_code: str,
+) -> None:
+    """验证已建行的补写拒绝或耗尽成为检查点，保留原行、待写字段并发送一次失败反馈。"""
+    event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-bound-patch-failure",
+        sales_user_id="sales-1",
+        text="预算限次测试公司王总需要协作机器人",
+    )
+    response = json.dumps({
+        "intent": "NEW_LEAD",
+        "customer_reference": {},
+        "crm_fields": {"线索名称": "预算限次测试公司", "联系人": "王总"},
+        "enrichment": {},
+        "confidence_by_field": {"线索名称": 0.99, "联系人": 0.99},
+        "conflicts": [],
+        "warnings": [],
+    })
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        ai_gateway=AIGateway(MockLLMProvider([response] * (attempt_limit + 1))),
+    )
+    service._lead_message_retry_count = 1
+    # 通过真实建行与恢复调用覆盖 field_patch_pending，而不是只测异常分类工具。
+    with patch.object(adapter, "update_record", side_effect=error) as update_spy, patch.object(
+        adapter, "create_record", wraps=adapter.create_record
+    ) as create_spy:
+        for _ in range(attempt_limit):
+            result = service.consume(event_id)
+            assert result.status is LeadProcessingStatus.SYNC_FAILED
+        # 检查点重复消费不得继续调用表格接口，也不得重复登记失败反馈。
+        update_count = update_spy.call_count
+        assert service.consume(event_id).status is LeadProcessingStatus.ALREADY_PROCESSED
+        assert update_spy.call_count == update_count
+        assert create_spy.call_count == 1
+
+    with session_factory() as session:
+        event = session.get(OutboxEvent, event_id)
+        lead = session.get(Lead, result.lead_id)
+        sync = session.scalar(
+            select(SmartTableSync).where(SmartTableSync.lead_id == result.lead_id)
+        )
+        failure_audit = session.scalar(select(BusinessAuditEvent).where(
+            BusinessAuditEvent.message_id == "message-bound-patch-failure",
+            BusinessAuditEvent.event_type == "ai_review_sync_failed_pending_review",
+        ))
+        failed_notices = list(session.scalars(select(NotificationRecord).where(
+            NotificationRecord.notification_type == "lead_processing_failed",
+        )))
+        source = session.get(IncomingMessage, "message-bound-patch-failure")
+        provenance = session.scalar(select(LeadFieldProvenance).where(
+            LeadFieldProvenance.lead_id == result.lead_id,
+            LeadFieldProvenance.field_name == "线索名称",
+        ))
+    assert event is not None and event.status == "failed_pending_review"
+    assert event.attempts == attempt_limit and event.failed_at is not None
+    assert event.failure_category == failure_category
+    assert sync is not None and sync.status == "failed_pending_review"
+    assert sync.error_summary == "field_patch_pending"
+    assert lead is not None and lead.smart_table_record_id == sync.smart_table_record_id
+    assert lead.field_values["线索名称"] == "预算限次测试公司"
+    assert source is not None and source.normalized_text == "预算限次测试公司王总需要协作机器人"
+    assert provenance is not None and provenance.last_ai_synced_value is None
+    assert len(adapter.get_records()) == 1
+    assert failure_audit is not None and failure_audit.details["failure_code"] == failure_code
+    assert len(failed_notices) == 1
+    # 外部原因修复后，人工恢复只补原行；失败检查点没有丢失待写值。
+    with patch.object(adapter, "create_record", wraps=adapter.create_record) as recovery_create:
+        recovered = service.retry_failed_message("message-bound-patch-failure")
+    assert recovered.status.value == "succeeded"
+    assert recovered.lead_id == result.lead_id and recovery_create.call_count == 0
+    assert len(adapter.get_records()) == 1
+    assert adapter.get_records()[0].record_id == lead.smart_table_record_id
+    assert adapter.get_records()[0].fields["线索名称"] == "预算限次测试公司"
 
 
 def test_mismatched_outbox_sales_identity_cannot_create_another_sales_record(
@@ -4549,7 +4654,7 @@ def test_ai_review_patch_failure_does_not_issue_first_success_notice(
                 NotificationRecord.notification_type == "lead_first_smart_table_success"
             )
         ).all()
-    assert sync is not None and sync.status == "retrying"
+    assert sync is not None and sync.status == "failed_pending_review"
     assert len(adapter.get_records()) == 1
     assert notices == []
 
