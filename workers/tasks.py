@@ -66,6 +66,9 @@ from app.wecom_bot.actions import (
 from workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
+
+# 审计 Worker 当前为 solo，扫描器必须与单任务消费能力一致。
+AUDIT_MIRROR_MAX_IN_FLIGHT = 1
 # 对齐 Compose 主 Worker 的默认并发，避免 Beat 抢先认领超过可处理能力的消息。
 LEAD_OUTBOX_MAX_IN_FLIGHT = 4
 
@@ -463,10 +466,24 @@ def consume_pending_audit_mirrors() -> int:
     副作用：只投递任务，不执行外部 Smart Table 调用。
     """
     engine, factory = _session_factory()
+    dispatch_lock: Connection | None = None
+    dispatch_lock_acquired = False
     try:
         settings = get_settings()
         now = utc_now()
         expired_before = now - timedelta(seconds=settings.lead_processing_timeout_seconds)
+        if engine.dialect.name == "postgresql":
+            dispatch_lock = engine.connect()
+            # 并发扫描不能按同一份空闲槽位同时投递，避免再次堆满 Redis audit 队列。
+            dispatch_lock_acquired = bool(
+                dispatch_lock.scalar(
+                    text("SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0))"),
+                    {"lock_key": "crm:audit-mirror-dispatch"},
+                )
+            )
+            dispatch_lock.commit()
+            if not dispatch_lock_acquired:
+                return 0
         # 业务消息尚未进入终态时，审计镜像留在数据库，避免每轮扫描都投递等待任务。
         source_outbox_pending = (
             select(OutboxEvent.id)
@@ -482,32 +499,53 @@ def consume_pending_audit_mirrors() -> int:
             AuditMirrorOutbox.dispatch_lease_expires_at <= now,
         )
         with factory.begin() as session:
-            outboxes = list(
-                session.scalars(
-                    select(AuditMirrorOutbox)
-                    .where(
-                        dispatch_due,
-                        ~source_outbox_pending,
-                        or_(
-                            AuditMirrorOutbox.status == "pending",
-                            # 来源消息进入终态后，重新激活此前被等待的审计镜像。
-                            AuditMirrorOutbox.status == "waiting_source",
-                            and_(
-                                AuditMirrorOutbox.status == "retrying",
-                                _audit_mirror_retry_due_condition(now),
-                            ),
-                            and_(
-                                AuditMirrorOutbox.status == "processing",
-                                AuditMirrorOutbox.processing_started_at.is_not(None),
-                                AuditMirrorOutbox.processing_started_at < expired_before,
-                            ),
+            # 派发租约覆盖 Redis 等待任务；processing 行则覆盖已被 solo Worker 接管的任务。
+            active_count = session.scalar(
+                select(func.count(AuditMirrorOutbox.id)).where(
+                    or_(
+                        AuditMirrorOutbox.dispatch_lease_expires_at > now,
+                        and_(
+                            AuditMirrorOutbox.status == "processing",
+                            AuditMirrorOutbox.processing_started_at.is_not(None),
+                            AuditMirrorOutbox.processing_started_at >= expired_before,
                         ),
                     )
-                    # 同一事务领取派发租约，避免每个 Beat 周期重复向共享 Worker 队列塞入相同任务。
-                    .order_by(AuditMirrorOutbox.updated_at, AuditMirrorOutbox.id)
-                    .limit(settings.audit_mirror_batch_size)
-                    .with_for_update(skip_locked=True)
                 )
+            ) or 0
+            available_slots = min(
+                settings.audit_mirror_batch_size,
+                max(0, AUDIT_MIRROR_MAX_IN_FLIGHT - active_count),
+            )
+            outboxes = (
+                list(
+                    session.scalars(
+                        select(AuditMirrorOutbox)
+                        .where(
+                            dispatch_due,
+                            ~source_outbox_pending,
+                            or_(
+                                AuditMirrorOutbox.status == "pending",
+                                # 来源消息进入终态后，重新激活此前被等待的审计镜像。
+                                AuditMirrorOutbox.status == "waiting_source",
+                                and_(
+                                    AuditMirrorOutbox.status == "retrying",
+                                    _audit_mirror_retry_due_condition(now),
+                                ),
+                                and_(
+                                    AuditMirrorOutbox.status == "processing",
+                                    AuditMirrorOutbox.processing_started_at.is_not(None),
+                                    AuditMirrorOutbox.processing_started_at < expired_before,
+                                ),
+                            ),
+                        )
+                        # 同一事务领取派发租约，避免重复向共享 Worker 队列塞入同一任务。
+                        .order_by(AuditMirrorOutbox.updated_at, AuditMirrorOutbox.id)
+                        .limit(available_slots)
+                        .with_for_update(skip_locked=True)
+                    )
+                )
+                if available_slots
+                else []
             )
             for outbox in outboxes:
                 if outbox.status == "waiting_source":
@@ -517,6 +555,18 @@ def consume_pending_audit_mirrors() -> int:
                 )
             outbox_ids = [outbox.id for outbox in outboxes]
     finally:
+        if dispatch_lock is not None:
+            if dispatch_lock_acquired:
+                try:
+                    dispatch_lock.execute(
+                        text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
+                        {"lock_key": "crm:audit-mirror-dispatch"},
+                    )
+                    dispatch_lock.commit()
+                except Exception:
+                    dispatch_lock.invalidate()
+                    logger.exception("audit_mirror_dispatch_lock_release_failed")
+            dispatch_lock.close()
         engine.dispose()
     for outbox_id in outbox_ids:
         # 数据库派发租约在 Worker 启动后由 _claim_audit_mirror_outbox 清除。

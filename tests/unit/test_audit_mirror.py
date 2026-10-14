@@ -959,12 +959,19 @@ def _prepare_scanner(
     *,
     now: datetime,
     batch_size: int,
+    max_in_flight: int | None = None,
 ) -> list[int]:
     """将审计扫描器绑定到隔离数据库、固定时钟和只记录参数的投递函数。"""
     engine = session_factory.kw["bind"]
     monkeypatch.setattr(engine, "dispose", lambda: None)
     monkeypatch.setattr(tasks, "_session_factory", lambda: (engine, session_factory))
     monkeypatch.setattr(tasks, "utc_now", lambda: now)
+    # 默认让既有用例单独覆盖 batch 行为；容量限制由对应回归用例显式指定。
+    monkeypatch.setattr(
+        tasks,
+        "AUDIT_MIRROR_MAX_IN_FLIGHT",
+        max_in_flight if max_in_flight is not None else batch_size,
+    )
     monkeypatch.setattr(
         tasks,
         "get_settings",
@@ -1023,6 +1030,33 @@ def test_audit_scanner_applies_batch_limit_before_dispatch(
 
     assert tasks.consume_pending_audit_mirrors.run() == 10
     assert dispatched == ids[:10]
+
+
+def test_audit_scanner_does_not_dispatch_past_active_worker_capacity(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证排队租约和有效 processing 都占用独立审计 Worker 槽位。"""
+    ids = _persist_mirror_jobs(session_factory, 4)
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+    with session_factory.begin() as session:
+        queued = session.get(AuditMirrorOutbox, ids[0])
+        processing = session.get(AuditMirrorOutbox, ids[1])
+        expired = session.get(AuditMirrorOutbox, ids[2])
+        assert queued is not None and processing is not None and expired is not None
+        queued.dispatch_lease_expires_at = now + timedelta(minutes=5)
+        processing.status = "processing"
+        processing.processing_started_at = now - timedelta(seconds=30)
+        expired.status = "processing"
+        expired.processing_started_at = now - timedelta(seconds=600)
+        expired.updated_at = now - timedelta(seconds=600)
+
+    dispatched = _prepare_scanner(
+        session_factory, monkeypatch, now=now, batch_size=10, max_in_flight=3
+    )
+    # 一个排队任务和一个有效 processing 占用两槽；过期 processing 可被回收占最后一槽。
+    assert tasks.consume_pending_audit_mirrors.run() == 1
+    assert dispatched == [ids[2]]
+    assert tasks.consume_pending_audit_mirrors.run() == 0
 
 
 def test_audit_scanner_waits_for_source_outbox_and_releases_deferred_mirror(
