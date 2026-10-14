@@ -2043,7 +2043,7 @@ class CrmSubmissionService:
             captured_date = CrmSubmissionService._shanghai_date(source_received_at)
         if captured_date is None:
             captured_date = CrmSubmissionService._parse_capture_date(
-                lead.field_values.get("录入时间")
+                lead.field_values.get("录入时间") or lead.field_values.get("创建时间")
             )
         if captured_date is None:
             captured_date = CrmSubmissionService._shanghai_date(lead.created_at)
