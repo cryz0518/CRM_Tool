@@ -342,11 +342,16 @@ def test_audit_mirror_writes_wecom_user_id_to_operator_member_field(
     assert build_mock_audit_schema().get_field("操作人").field_type is SmartTableFieldType.MEMBER
 
 
-def test_audit_batch_writes_independent_events_with_one_lookup_and_one_create(
+def test_legacy_single_audit_task_coalesces_events_with_one_lookup_and_one_create(
     session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """验证多条独立事件共用一次幂等查重和一次批量新增。"""
+    """验证旧 Redis 单条任务可合并待处理事件并保留每条独立记录。"""
     outbox_ids = _persist_mirror_jobs(session_factory, 3)
+    with session_factory.begin() as session:
+        for outbox_id in outbox_ids:
+            outbox = session.get(AuditMirrorOutbox, outbox_id)
+            assert outbox is not None
+            outbox.dispatch_lease_expires_at = utc_now() + timedelta(minutes=5)
     engine = session_factory.kw["bind"]
     monkeypatch.setattr(engine, "dispose", lambda: None)
     monkeypatch.setattr(tasks, "_session_factory", lambda: (engine, session_factory))
@@ -370,7 +375,7 @@ def test_audit_batch_writes_independent_events_with_one_lookup_and_one_create(
     monkeypatch.setattr(adapter, "create_records", track_create)
     monkeypatch.setattr(tasks, "get_smart_table_audit_adapter", lambda: adapter)
 
-    assert tasks.consume_audit_mirror_batch.run(outbox_ids) == "succeeded"
+    assert tasks.consume_audit_mirror_outbox.run(outbox_ids[0]) == "succeeded"
 
     assert len(lookup_calls) == 1
     assert lookup_calls[0][0] == "日志唯一键"
@@ -657,11 +662,7 @@ def test_audit_mirror_defers_multiple_messages_then_keeps_one_lead_id(
     )
     assert tasks.consume_pending_audit_mirrors.run() == len(outbox_ids)
     assert dispatched == [outbox_ids]
-    for outbox_id in outbox_ids:
-        assert (
-            _run_worker_with_adapter(session_factory, monkeypatch, outbox_id, adapter)
-            == "succeeded"
-        )
+    assert tasks.consume_audit_mirror_batch.run(outbox_ids) == "succeeded"
     records = adapter.get_records()
     assert [record.fields["消息ID"] for record in records] == ["message-1", "message-2"]
     assert [record.fields["销售原始消息"] for record in records] == [

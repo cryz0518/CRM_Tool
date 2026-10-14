@@ -374,7 +374,7 @@ def consume_audit_mirror_outbox(outbox_id: int) -> str:
     参数：outbox_id 为原有任务载荷中的审计镜像任务标识。
     返回值：批量处理器对该条 Outbox 返回的状态文本。
     异常：数据库错误按批量处理器语义传播；远端错误收敛为审计 Outbox 状态。
-    副作用：最多写入一条审计镜像，不影响原业务状态。
+    副作用：可合并旧版队列对应的待处理 Outbox 批量镜像，不影响原业务状态。
     """
     return consume_audit_mirror_batch.run([outbox_id])
 
@@ -390,8 +390,33 @@ def consume_audit_mirror_batch(outbox_ids: list[int]) -> str:
     """
     engine, factory = _session_factory()
     try:
+        batch_ids = list(dict.fromkeys(outbox_ids))
+        if len(batch_ids) == 1:
+            # 旧 Redis 单条任务只含一个 ID；从持久化队列租约中收集同批伙伴，避免额外扫描全表。
+            now = utc_now()
+            peer_ids = []
+            with factory() as session:
+                peer_ids = list(
+                    session.scalars(
+                        select(AuditMirrorOutbox.id)
+                        .where(
+                            AuditMirrorOutbox.id != batch_ids[0],
+                            AuditMirrorOutbox.dispatch_lease_expires_at.is_not(None),
+                            or_(
+                                AuditMirrorOutbox.status == "pending",
+                                and_(
+                                    AuditMirrorOutbox.status == "retrying",
+                                    _audit_mirror_retry_due_condition(now),
+                                ),
+                            ),
+                        )
+                        .order_by(AuditMirrorOutbox.id)
+                        .limit(get_settings().audit_mirror_batch_size - 1)
+                    )
+                )
+            batch_ids.extend(peer_ids)
         claims: list[tuple[int, str]] = []
-        for outbox_id in dict.fromkeys(outbox_ids):
+        for outbox_id in batch_ids:
             claim_token = _claim_audit_mirror_outbox(factory, outbox_id)
             if claim_token is not None:
                 claims.append((outbox_id, claim_token))
