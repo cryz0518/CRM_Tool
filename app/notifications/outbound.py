@@ -35,6 +35,7 @@ _SUPPORTED_NOTIFICATION_TYPES = frozenset(
         "lead_first_smart_table_success",
         "crm_submission_summary",
         "crm_submission_retry_summary",
+        "crm_submission_selection",
         "crm_submission_preview",
         "crm_submission_table_link",
         "crm_submission_intent_unrecognized",
