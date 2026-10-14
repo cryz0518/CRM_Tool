@@ -2054,6 +2054,8 @@ def test_bound_ai_review_failure_respects_retry_budget_and_preserves_record(
     assert len(adapter.get_records()) == 1
     assert failure_audit is not None and failure_audit.details["failure_code"] == failure_code
     assert len(failed_notices) == 1
+    assert "智能表格字段同步失败" in failed_notices[0].content
+    assert "未能完成解析" not in failed_notices[0].content
     # 外部原因修复后，人工恢复只补原行；失败检查点没有丢失待写值。
     with patch.object(adapter, "create_record", wraps=adapter.create_record) as recovery_create:
         recovered = service.retry_failed_message("message-bound-patch-failure")

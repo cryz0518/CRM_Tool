@@ -2921,7 +2921,7 @@ class FirstTextLeadWorkspaceService:
                 )
             if failed_pending_review:
                 # 失败检查点释放销售顺序，但保留原行和待写字段供受保护恢复。
-                self._record_lead_processing_failed_notice(session, message)
+                self._record_lead_processing_failed_notice(session, message, sync_failure=True)
         logger.exception("ai_review_sync_failed", extra={"error_type": type(error).__name__})
 
     def _ensure_ai_review_record(
@@ -2983,10 +2983,13 @@ class FirstTextLeadWorkspaceService:
         return record.record_id, record, True
 
     @staticmethod
-    def _record_lead_processing_failed_notice(session: Session, message: IncomingMessage) -> None:
+    def _record_lead_processing_failed_notice(
+        session: Session, message: IncomingMessage, *, sync_failure: bool = False
+    ) -> None:
         """为失败待人工处理的线索消息登记一次不含客户内容的销售通知。
 
-        参数：session 为失败状态事务；message 为已持久化来源消息。
+        参数：session 为失败状态事务；message 为已持久化来源消息；
+        sync_failure 区分已解析但表格同步失败，避免误导销售重复发送。
         返回值：无。
         异常：数据库写入异常由事务调用方处理。
         副作用：按销售、来源消息和通知类型写入可靠出站通知，不保存原文或模型错误正文。
@@ -2996,13 +2999,20 @@ class FirstTextLeadWorkspaceService:
             f"{message.sales_user_id}:{message.message_id}:{notification_type}".encode()
         ).hexdigest()
         if session.get(NotificationRecord, key) is None:
+            # 表格补写失败不等于解析失败，保留相同幂等键但给出准确的恢复指引。
+            content = (
+                "这条线索消息已解析，但智能表格字段同步失败，已进入待人工处理。"
+                "原始消息和待写字段已保留，请联系管理员核对后恢复，无需重复发送。"
+                if sync_failure
+                else "这条线索消息未能完成解析，已进入待人工处理，请稍后重试或补充信息。"
+            )
             session.add(
                 NotificationRecord(
                     notification_key=key,
                     sales_user_id=message.sales_user_id,
                     source_message_id=message.message_id,
                     notification_type=notification_type,
-                    content="这条线索消息未能完成解析，已进入待人工处理，请稍后重试或补充信息。",
+                    content=content,
                 )
             )
 
