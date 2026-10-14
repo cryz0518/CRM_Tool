@@ -7,7 +7,7 @@ import logging
 import subprocess
 import time
 from collections.abc import Mapping, Sequence
-from threading import Lock
+from threading import Lock, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -144,6 +144,50 @@ def test_production_cli_runner_spaces_requests(monkeypatch: pytest.MonkeyPatch) 
 
     assert len(calls) == 2
     assert time.monotonic() - started_at >= 0.025
+
+
+def test_production_cli_runner_does_not_hold_rate_limit_lock_during_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 CLI 请求按间隔启动，但远端等待期间允许并发执行。"""
+    adapters = [
+        WecomCliSmartTableAdapter(doc_id="test-doc", sheet_id="test-sheet")
+        for _ in range(2)
+    ]
+    active = 0
+    max_active = 0
+    starts: list[float] = []
+    state_lock = Lock()
+
+    def slow_runner(_arguments: Sequence[str]) -> Mapping[str, object]:
+        """模拟等待中的远端 CLI 请求，并记录实际并发量和起始时间。"""
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+            starts.append(time.monotonic())
+        time.sleep(0.08)
+        with state_lock:
+            active -= 1
+        return {}
+
+    for adapter in adapters:
+        adapter._runner = slow_runner
+    monkeypatch.setattr(wecom_cli, "_CLI_MIN_INTERVAL_SECONDS", 0.03)
+    threads = [
+        Thread(target=adapter._run_cli, args=((f"request-{index}",),))
+        for index, adapter in enumerate(adapters)
+    ]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert max_active == 2
+    assert len(starts) == 2
+    assert abs(starts[1] - starts[0]) >= 0.025
 
 
 def test_production_cli_runner_fails_closed_when_redis_is_unavailable() -> None:
