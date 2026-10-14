@@ -75,6 +75,8 @@ celery_app = Celery(
 )
 celery_app.conf.update(
     broker_connection_retry_on_startup=True,
+    # 任务到槽位后再开始处理，避免预取队列提前消耗数据库 processing 租约。
+    worker_prefetch_multiplier=1,
     timezone="Asia/Shanghai",
     enable_utc=False,
     beat_schedule=build_beat_schedule(settings),

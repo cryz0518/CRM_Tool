@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import uuid4
 
-from sqlalchemy import Engine, and_, create_engine, or_, select, text, update
+from sqlalchemy import Engine, and_, create_engine, func, or_, select, text, update
 from sqlalchemy.engine import Connection, CursorResult
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
@@ -66,6 +66,8 @@ from app.wecom_bot.actions import (
 from workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
+# 对齐 Compose 主 Worker 的默认并发，避免 Beat 抢先认领超过可处理能力的消息。
+LEAD_OUTBOX_MAX_IN_FLIGHT = 4
 
 
 def audit_retry_delay_seconds(attempts: int) -> int:
@@ -935,18 +937,35 @@ def _try_claim_sales_processing_stream(session: Session, sales_user_id: str) -> 
 
 
 def claim_dispatchable_lead_outbox_events(
-    session_factory: sessionmaker[Session], *, lease_timeout: timedelta
+    session_factory: sessionmaker[Session],
+    *,
+    lease_timeout: timedelta,
+    max_in_flight: int = LEAD_OUTBOX_MAX_IN_FLIGHT,
 ) -> list[LeadOutboxDispatchClaim]:
     """原子认领可投递事件，并保持同销售消息的持久化顺序。
 
-    参数：session_factory 为数据库会话工厂；lease_timeout 为 processing 租约时长。
+    参数：session_factory 为数据库会话工厂；lease_timeout 为 processing 租约时长；
+    max_in_flight 为同时认领及等待处理的事件上限。
     返回值：本轮成功认领且可投递的事件及其认领事实。
     异常：数据库锁定或读写失败时由 SQLAlchemy 抛出。
     副作用：将 pending/retrying 或已过期 processing 事件置为新的 processing 租约。
     """
     now = utc_now()
     expired_before = now - lease_timeout
+    if max_in_flight < 1:
+        raise ValueError("max_in_flight 必须大于 0")
     with session_factory() as session:
+        # processing 覆盖已投递但仍在 Celery 队列等待的消息，因此它们也会占用并发名额。
+        in_flight_count = session.scalar(
+            select(func.count(OutboxEvent.id)).where(
+                OutboxEvent.status == "processing",
+                OutboxEvent.processing_started_at.is_not(None),
+                OutboxEvent.processing_started_at >= expired_before,
+            )
+        ) or 0
+        available_slots = max_in_flight - in_flight_count
+        if available_slots <= 0:
+            return []
         candidate_ids = session.scalars(
             select(OutboxEvent.id)
             .where(
@@ -960,6 +979,7 @@ def claim_dispatchable_lead_outbox_events(
                 )
             )
             .order_by(OutboxEvent.sequence, OutboxEvent.id)
+            .limit(available_slots)
         ).all()
 
     claims: list[LeadOutboxDispatchClaim] = []
@@ -1087,12 +1107,39 @@ def consume_pending_lead_outbox_events() -> int:
     副作用：为每条待处理事件异步投递 Celery 任务。
     """
     engine, factory = _session_factory()
+    dispatch_lock: Connection | None = None
+    dispatch_lock_acquired = False
     try:
+        dispatch_lock = engine.connect()
+        if dispatch_lock.dialect.name == "postgresql":
+            # 多个 Beat 扫描任务不能同时按同一份空闲容量认领，避免并发扫描突破全局上限。
+            dispatch_lock_acquired = bool(
+                dispatch_lock.scalar(
+                    text("SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0))"),
+                    {"lock_key": "crm:lead-outbox-dispatch"},
+                )
+            )
+            dispatch_lock.commit()
+            if not dispatch_lock_acquired:
+                return 0
         claims = claim_dispatchable_lead_outbox_events(
             factory,
             lease_timeout=timedelta(seconds=get_settings().lead_processing_timeout_seconds),
+            max_in_flight=LEAD_OUTBOX_MAX_IN_FLIGHT,
         )
     finally:
+        if dispatch_lock is not None:
+            if dispatch_lock_acquired:
+                try:
+                    dispatch_lock.execute(
+                        text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
+                        {"lock_key": "crm:lead-outbox-dispatch"},
+                    )
+                    dispatch_lock.commit()
+                except Exception:
+                    dispatch_lock.invalidate()
+                    logger.exception("lead_outbox_dispatch_lock_release_failed")
+            dispatch_lock.close()
         engine.dispose()
 
     for claim in claims:
