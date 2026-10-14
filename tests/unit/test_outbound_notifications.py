@@ -862,6 +862,37 @@ def test_company_submission_preview_notification_is_sent() -> None:
     ]
 
 
+def test_cross_owner_submission_selection_feedback_is_sent() -> None:
+    """验证跨员工提交没有候选线索时的状态反馈会发送给发起人。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    factory = sessionmaker(engine)
+    Base.metadata.create_all(engine)
+    with factory.begin() as session:
+        session.add(
+            NotificationRecord(
+                notification_key="submission-selection",
+                sales_user_id="sales-submitter",
+                source_message_id="message-selection",
+                notification_type="crm_submission_selection",
+                content="当前没有可提交的未提交线索。",
+            )
+        )
+    client = FakeClient()
+
+    assert asyncio.run(WecomOutboundNotificationSender(factory, client).send_pending_once()) == 1
+    assert client.calls == [
+        (
+            "sales-submitter",
+            {
+                "msgtype": "markdown",
+                "markdown": {"content": "当前没有可提交的未提交线索。"},
+            },
+        )
+    ]
+    with factory() as session:
+        assert session.get(NotificationRecord, "submission-selection").status == "succeeded"
+
+
 def test_legacy_text_payload_is_converted_to_supported_markdown() -> None:
     """验证历史 text 通知在主动发送边界转换为 AI Bot 支持的 Markdown。"""
     engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
