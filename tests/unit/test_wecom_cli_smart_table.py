@@ -1361,6 +1361,43 @@ def test_owner_query_paginates_past_one_thousand_rows() -> None:
     assert _payload(fake_cli.calls[2])["cursor"] == "owner-page-2"
 
 
+def test_owner_display_name_query_discards_same_name_records_for_other_ids() -> None:
+    """验证负责人姓名预筛后仍按企微 user_id 精确过滤同名记录。"""
+    fake_cli = FakeCli(
+        [
+            _field_response(),
+            {
+                "errcode": 0,
+                "values": [
+                    json.dumps(
+                        {
+                            "rows": [
+                                {
+                                    "RECORD_ID": "target-owner-row",
+                                    "负责人": [{"id": "sales-1", "name": "销售一"}],
+                                },
+                                {
+                                    "RECORD_ID": "same-name-other-owner",
+                                    "负责人": [{"id": "sales-2", "name": "销售一"}],
+                                },
+                            ]
+                        }
+                    )
+                ],
+            },
+        ]
+    )
+
+    records = _adapter(fake_cli, sheet_title="CRM线索").get_records(
+        owner_user_ids=("sales-1",),
+        owner_display_names={"sales-1": "销售一"},
+    )
+
+    assert [record.record_id for record in records] == ["target-owner-row"]
+    sql = fake_cli.calls[1][fake_cli.calls[1].index("--sql") + 1]
+    assert '`负责人` LIKE "%销售一%"' in sql
+
+
 def test_rate_limiter_redis_client_has_bounded_socket_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

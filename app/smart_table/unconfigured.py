@@ -76,10 +76,11 @@ class UnconfiguredSmartTableAdapter:
         record_ids: Collection[str] | None = None,
         *,
         owner_user_ids: Collection[str] | None = None,
+        owner_display_names: Mapping[str, str] | None = None,
     ) -> list[SmartTableRecord]:
         """尝试列出全部、指定记录或负责人范围记录，但未配置时明确失败。
 
-        参数：record_ids 和 owner_user_ids 为可选过滤范围。
+        参数：record_ids 和负责人身份/显示名为可选过滤范围。
         异常：始终抛出 SmartTableAdapterConfigurationError。
         副作用：阻止调用方读取或修改智能表格。
         """

@@ -375,21 +375,32 @@ class WecomCliSmartTableAdapter:
         record_ids: Collection[str] | None = None,
         *,
         owner_user_ids: Collection[str] | None = None,
+        owner_display_names: Mapping[str, str] | None = None,
     ) -> list[SmartTableRecord]:
         """读取全部记录、指定记录或指定负责人范围的快照。
 
-        参数：record_ids 与 owner_user_ids 最多提供一个过滤集合。
+        参数：记录标识与负责人过滤最多提供一种；显示名仅用于负责人服务端预筛。
         返回：按 CLI 页顺序合并的记录列表。
         异常：过滤配置冲突、缺少服务端过滤所需子表名称或 CLI 响应无效时抛出异常。
         副作用：只读指定记录或负责人范围；未过滤调用才读取整个子表。
         """
         requested = tuple(dict.fromkeys(record_ids)) if record_ids is not None else None
         owners = tuple(dict.fromkeys(owner_user_ids)) if owner_user_ids is not None else None
-        if requested is not None and owners is not None:
+        owner_names = dict(owner_display_names) if owner_display_names is not None else None
+        if requested is not None and (owners is not None or owner_names is not None):
             raise ValueError("记录标识与负责人范围不能同时过滤")
+        if owner_names is not None and (
+            owners is None
+            or set(owner_names) != set(owners)
+            or any(not name for name in owner_names.values())
+        ):
+            raise ValueError("负责人显示名必须与负责人 user_id 一一对应")
         if requested == () or owners == ():
             return []
-        if (requested is not None or owners is not None) and not self._sheet_title:
+        if (
+            (requested is not None or owners is not None or owner_names is not None)
+            and not self._sheet_title
+        ):
             # 没有完整子表名称时只能分页扫描全表，提交路径必须失败闭合，不能读取其他负责人的行。
             raise SmartTableAdapterConfigurationError(
                 "负责人/记录过滤读取需要配置 WECOM_SMART_TABLE_SHEET_TITLE"
@@ -397,7 +408,12 @@ class WecomCliSmartTableAdapter:
         schema = self.get_schema()
         if self._sheet_title:
             # 查询条件在企微服务端执行，提交只会读取目标记录 ID 或负责人范围。
-            return self._query_records(schema, record_ids=requested, owner_user_ids=owners)
+            return self._query_records(
+                schema,
+                record_ids=requested,
+                owner_user_ids=owners,
+                owner_display_names=owner_names,
+            )
         return [self._parse_record(item, schema) for item in self._list_pages("records")]
 
     def create_record(
@@ -707,6 +723,7 @@ class WecomCliSmartTableAdapter:
         *,
         record_ids: tuple[str, ...] | None = None,
         owner_user_ids: tuple[str, ...] | None = None,
+        owner_display_names: Mapping[str, str] | None = None,
     ) -> list[SmartTableRecord]:
         """使用服务端 SQL 过滤读取全部记录、目标记录或负责人记录。
 
@@ -715,8 +732,40 @@ class WecomCliSmartTableAdapter:
         异常：过滤冲突、查询协议或读取上限不确定时抛出适配器异常。
         副作用：发起一项或多项只读 records query，不修改智能表格。
         """
-        if record_ids is not None and owner_user_ids is not None:
+        if record_ids is not None and (
+            owner_user_ids is not None or owner_display_names is not None
+        ):
             raise ValueError("记录标识与负责人范围不能同时过滤")
+        if owner_display_names is not None:
+            if (
+                owner_user_ids is None
+                or set(owner_user_ids) != set(owner_display_names)
+                or any(
+                    not name or "%" in name or "_" in name
+                    for name in owner_display_names.values()
+                )
+            ):
+                raise ValueError("负责人显示名必须与负责人 user_id 一一对应且不含 LIKE 通配符")
+            owner_field = schema.get_field("负责人")
+            if owner_field is None:
+                raise SmartTableAdapterConfigurationError("负责人范围查询缺少负责人字段")
+            # 当前服务端未按 user filter_spec 返回记录，改用姓名预筛再严格核对 user_id。
+            where = " OR ".join(
+                f"{self._quote_sql_identifier(owner_field.name)} LIKE "
+                f"{self._quote_sql_string_literal('%' + name + '%')}"
+                for name in owner_display_names.values()
+            )
+            rows = self._query_rows(self._build_query_sql(schema, where=where, limit=1000))
+            if len(rows) >= 1000:
+                raise WecomCliProtocolError("负责人范围查询达到读取上限，结果可能被截断")
+            records = [self._parse_query_record(row, schema) for row in rows]
+            allowed_owners = set(owner_user_ids)
+            # 姓名可能重名或互为子串；服务端预筛后仍只向业务层返回精确 user_id 命中项。
+            return [
+                record
+                for record in records
+                if record.fields.get("负责人") in allowed_owners
+            ]
         where: str | None = None
         if record_ids is not None:
             records: list[SmartTableRecord] = []

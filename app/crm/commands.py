@@ -7,7 +7,7 @@ import logging
 import re
 from collections.abc import Mapping
 from dataclasses import asdict, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
@@ -589,8 +589,13 @@ def prepare_batch_submission_selection(
         crm_adapter,
         robot_submission_confirmation_available=get_settings().wecom_card_callback_ready(),
     )
-    if command.text == "提交我所有线索":
-        # 新数据库可能只保存了部分后台 Lead；按稳定 record_id 受控补齐当前销售的未提交表格行。
+    if command.text == "提交我所有线索" or (
+        command.text == CROSS_OWNER_SUBMISSION_COMMAND
+        and command.target_capture_date is not None
+        and command.target_owner_name is not None
+        and len(command.owner_scope_user_ids or ()) == 1
+    ):
+        # 日期跨员工提交也补齐目标负责人当日可由来源消息确认的既有表格行。
         _link_unsubmitted_smart_table_records(session_factory, smart_table_adapter, command)
     candidates = service.list_submission_candidates(
         command.text,
@@ -693,6 +698,7 @@ def _resolve_cross_owner_submission_scope(
     if target_name is None:
         return None, "没有解析到负责人姓名，请使用“提交负责人姓名的线索”或“提交所有员工的线索”。"
     owner_user_ids: tuple[str, ...] | None = None
+    resolved_owner_name: str
     with session_factory() as session:
         actor = session.get(SalesAuthorization, command.sales_user_id)
         # 操作人必须是启用成员且持有专用跨员工提交授权，不能由命令文本授予权限。
@@ -705,6 +711,7 @@ def _resolve_cross_owner_submission_scope(
             owner_user_ids = tuple(
                 sorted(set(session.scalars(select(Lead.smart_table_owner_user_id)).all()))
             )
+            resolved_owner_name = target_name
     if owner_user_ids is None:
         # 通过完整通讯录解析本名和花名；不依赖员工预登记，也不在姓名重合时猜测。
         settings = get_settings()
@@ -719,8 +726,13 @@ def _resolve_cross_owner_submission_scope(
         except WecomDirectoryError:
             return None, "企微通讯录当前不可查询，未发起提交，请稍后重试。"
         owner_user_ids = (member.user_id,)
+        resolved_owner_name = member.name
     return (
-        replace(command, target_owner_name=None, owner_scope_user_ids=owner_user_ids),
+        replace(
+            command,
+            target_owner_name=resolved_owner_name,
+            owner_scope_user_ids=owner_user_ids,
+        ),
         None,
     )
 
@@ -730,30 +742,198 @@ def _link_unsubmitted_smart_table_records(
     smart_table_adapter: SmartTableAdapter,
     command: SubmissionCommand,
 ) -> None:
-    """为批量候选补齐当前销售负责且仍未提交的既有表格行本地映射。
+    """为批量候选补齐负责人范围内仍未提交且日期可核实的表格行映射。
 
     参数：session_factory 为数据库会话工厂；smart_table_adapter 为真实表格边界；
-    command 提供销售身份和审计消息标识。
+    command 提供操作者、负责人范围、目标日期和审计消息标识。
     返回值：无。
     异常：表格协议、数据库或授权错误向调用方传播；不调用 CRM。
     副作用：仅按稳定 record_id 新增缺失 Lead 和绑定审计事实，不覆盖已有 Lead。
     """
-    # 企业微信端先按负责人过滤，避免补链读取其他销售的表格记录。
-    records = smart_table_adapter.get_records(owner_user_ids=(command.sales_user_id,))
+    cross_owner_date = (
+        command.text == CROSS_OWNER_SUBMISSION_COMMAND
+        and command.target_capture_date is not None
+    )
+    if cross_owner_date:
+        owner_user_ids = command.owner_scope_user_ids or ()
+        if len(owner_user_ids) != 1 or not command.target_owner_name:
+            return
+        owner_names = {owner_user_ids[0]: command.target_owner_name}
+    else:
+        owner_user_ids = (command.sales_user_id,)
+        with session_factory() as session:
+            actor = session.get(SalesAuthorization, command.sales_user_id)
+            display_name = actor.display_name if actor is not None else None
+        owner_names = (
+            {command.sales_user_id: display_name} if display_name else None
+        )
+    # 姓名只缩小企微服务端查询范围，适配器仍按成员 ID 精确校验返回记录。
+    records = smart_table_adapter.get_records(
+        owner_user_ids=owner_user_ids,
+        owner_display_names=owner_names,
+    )
+    target_owner_id = owner_user_ids[0] if len(owner_user_ids) == 1 else None
+    day_messages: list[IncomingMessage] = []
+    day_message_ids: tuple[str, ...] = ()
+    if cross_owner_date and target_owner_id is not None:
+        local_start = datetime.combine(
+            command.target_capture_date, datetime.min.time(), tzinfo=ZoneInfo("Asia/Shanghai")
+        )
+        utc_start = local_start.astimezone(UTC)
+        utc_end = (local_start + timedelta(days=1)).astimezone(UTC)
+        with session_factory() as session:
+            # 仅读取目标负责人、指定上海自然日的来源消息及其已有 Lead。
+            day_messages = list(
+                session.scalars(
+                    select(IncomingMessage).where(
+                        IncomingMessage.sales_user_id == target_owner_id,
+                        IncomingMessage.received_at >= utc_start,
+                        IncomingMessage.received_at < utc_end,
+                    )
+                )
+            )
+            day_message_ids = tuple(message.message_id for message in day_messages)
     with session_factory.begin() as session:
+        # 在当前事务加载并锁定候选 Lead，避免修改已关闭 Session 的脱离对象。
+        day_leads = (
+            list(
+                session.scalars(
+                    select(Lead)
+                    .where(Lead.source_message_id.in_(day_message_ids))
+                    .with_for_update()
+                )
+            )
+            if day_message_ids
+            else []
+        )
         linked_count = 0
+        source_matches: dict[str, str] = {}
+        source_match_counts: dict[str, int] = {}
+        if cross_owner_date:
+            # 仅当完整公司名位于消息首行且唯一匹配一条当日消息时，才允许建立新映射。
+            for record in records:
+                company_name = record.fields.get("线索名称")
+                remark = record.fields.get("备注")
+                original_message = (
+                    remark.rsplit("原始消息：", 1)[-1].strip()
+                    if isinstance(remark, str) and "原始消息：" in remark
+                    else None
+                )
+                if (
+                    record.fields.get("负责人") not in owner_user_ids
+                    or record.fields.get("提交状态") != "未提交"
+                    or not isinstance(company_name, str)
+                    or not company_name.strip()
+                    or not original_message
+                ):
+                    continue
+                normalized_name = company_name.strip()
+                matching_messages = []
+                for message in day_messages:
+                    # 公司名不能区分跨日重名；要求表格原始消息与目标日来源消息完全一致。
+                    if original_message != (message.normalized_text or "").strip():
+                        continue
+                    first_line = next(
+                        (
+                            line.strip()
+                            for line in (message.normalized_text or "").splitlines()
+                            if line.strip()
+                        ),
+                        "",
+                    )
+                    # 名称后的首字符必须是边界，避免把更长的另一个公司名当成命中。
+                    has_name_prefix = (
+                        first_line[: len(normalized_name)].casefold()
+                        == normalized_name.casefold()
+                    )
+                    has_boundary = (
+                        len(first_line) == len(normalized_name)
+                        or first_line[len(normalized_name) : len(normalized_name) + 1]
+                        in " \t,，:：;；(（"
+                    )
+                    if has_name_prefix and has_boundary:
+                        matching_messages.append(message)
+                if len(matching_messages) == 1:
+                    message_id = matching_messages[0].message_id
+                    source_matches[record.record_id] = message_id
+                    source_match_counts[message_id] = source_match_counts.get(message_id, 0) + 1
+        # 每条来源消息最多绑定一个尚未持久化 Lead，避免跨行重复占用唯一来源键。
         for record in records:
-            # 只补当前销售、状态仍为未提交的行；已提交和他人记录不进入本地候选范围。
+            # 只补指定负责人、状态仍为未提交的行；日期命令还要求消息或已有 Lead 证明日期。
             if (
-                record.fields.get("负责人") != command.sales_user_id
+                record.fields.get("负责人") not in owner_user_ids
                 or record.fields.get("提交状态") != "未提交"
             ):
                 continue
+            if session.scalar(
+                select(Lead.id).where(Lead.smart_table_record_id == record.record_id)
+            ) is not None:
+                continue
+            source_message_id: str | None = None
+            if cross_owner_date:
+                company_name = record.fields.get("线索名称")
+                if not isinstance(company_name, str) or not company_name.strip():
+                    continue
+                # 日期归属必须来自记录内的原始消息，不能仅凭同名公司推断。
+                source_message_id = source_matches.get(record.record_id)
+                if (
+                    source_message_id is None
+                    or source_match_counts.get(source_message_id) != 1
+                ):
+                    continue
+                # 已有同公司、同负责人、同日期且未绑定表格记录的 Lead 优先一对一补链。
+                matching_leads = [
+                    lead
+                    for lead in day_leads
+                    if lead.smart_table_record_id is None
+                    and lead.source_message_id == source_message_id
+                    and lead.smart_table_owner_user_id == target_owner_id
+                    and lead.lifecycle_state in {"pending_create", "temporary"}
+                    and (
+                        lead.standard_company_name == company_name
+                        or lead.field_values.get("线索名称") == company_name
+                    )
+                ]
+                if len(matching_leads) == 1:
+                    matching_leads[0].smart_table_record_id = record.record_id
+                    linked_count += 1
+                    continue
+                if len(matching_leads) > 1:
+                    continue
+                # 只有来源消息与表格行一对一对应时才允许按该行创建本地映射。
+                source_leads = [
+                    lead for lead in day_leads if lead.source_message_id == source_message_id
+                ]
+                matching_source_leads = [
+                    lead
+                    for lead in source_leads
+                    if lead.smart_table_record_id is None
+                    and (
+                        lead.standard_company_name == company_name
+                        or lead.field_values.get("线索名称") == company_name
+                    )
+                ]
+                if len(matching_source_leads) == 1:
+                    matching_source_leads[0].smart_table_record_id = record.record_id
+                    linked_count += 1
+                    continue
+                if source_leads:
+                    # 同一消息已有其他 Lead 时不猜测分段，也不制造来源唯一键冲突。
+                    continue
             linked = _link_existing_smart_table_record(
-                session, record, command, write_audit=False
+                session,
+                record,
+                command,
+                owner_user_id=target_owner_id,
+                source_message_id=source_message_id,
+                write_audit=False,
             )
-            if linked is not None and linked.source_message_id is None:
+            if linked is not None:
                 linked_count += 1
+                if source_message_id is not None and all(
+                    lead.id != linked.id for lead in day_leads
+                ):
+                    day_leads.append(linked)
         if linked_count and session.scalar(
             select(BusinessAuditEvent).where(
                 BusinessAuditEvent.message_id == command.request_message_id,
@@ -1001,6 +1181,8 @@ def _link_existing_smart_table_record(
     record: SmartTableRecord,
     command: SubmissionCommand,
     *,
+    owner_user_id: str | None = None,
+    source_message_id: str | None = None,
     write_audit: bool = True,
 ) -> Lead | None:
     """把当前销售负责的既有表格记录安全登记为待提交 Lead。
@@ -1010,27 +1192,30 @@ def _link_existing_smart_table_record(
     异常：数据库约束异常向调用方传播；不调用外部 CRM。
     副作用：写入一条 pending_create Lead；write_audit 为 True 时追加绑定审计事件。
     """
+    expected_owner_id = owner_user_id or command.sales_user_id
     owner = record.fields.get("负责人")
     company_name = record.fields.get("线索名称")
-    if owner != command.sales_user_id or not isinstance(company_name, str) or not company_name:
+    if owner != expected_owner_id or not isinstance(company_name, str) or not company_name:
         return None
     existing = session.scalar(
         select(Lead).where(Lead.smart_table_record_id == record.record_id).with_for_update()
     )
     if existing is not None:
         if (
-            existing.smart_table_owner_user_id == command.sales_user_id
+            existing.smart_table_owner_user_id == expected_owner_id
             and existing.lifecycle_state in {"pending_create", "temporary"}
         ):
+            if existing.source_message_id is None and source_message_id is not None:
+                existing.source_message_id = source_message_id
             return existing
         return None
     # 只按稳定表格记录标识绑定，不按名称猜测或把另一条 Lead 强行合并进来。
     field_values = {name: value for name, value in record.fields.items() if value is not None}
     lead = Lead(
         id=new_lead_id(),
-        source_message_id=None,
-        original_capturing_sales_user_id=command.sales_user_id,
-        smart_table_owner_user_id=command.sales_user_id,
+        source_message_id=source_message_id,
+        original_capturing_sales_user_id=expected_owner_id,
+        smart_table_owner_user_id=expected_owner_id,
         smart_table_record_id=record.record_id,
         lifecycle_state="pending_create",
         field_values=field_values,
