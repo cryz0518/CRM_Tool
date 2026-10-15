@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
@@ -376,10 +376,13 @@ class WecomCliSmartTableAdapter:
         *,
         owner_user_ids: Collection[str] | None = None,
         owner_display_names: Mapping[str, str] | None = None,
+        submission_status: str | None = None,
+        capture_date: date | None = None,
     ) -> list[SmartTableRecord]:
         """读取全部记录、指定记录或指定负责人范围的快照。
 
-        参数：记录标识与负责人过滤最多提供一种；显示名仅用于负责人服务端预筛。
+        参数：记录标识与负责人过滤最多提供一种；显示名仅用于负责人服务端预筛；
+        submission_status 和 capture_date 会与负责人条件一起写入服务端查询。
         返回：按 CLI 页顺序合并的记录列表。
         异常：过滤配置冲突、缺少服务端过滤所需子表名称或 CLI 响应无效时抛出异常。
         副作用：只读指定记录或负责人范围；未过滤调用才读取整个子表。
@@ -387,7 +390,10 @@ class WecomCliSmartTableAdapter:
         requested = tuple(dict.fromkeys(record_ids)) if record_ids is not None else None
         owners = tuple(dict.fromkeys(owner_user_ids)) if owner_user_ids is not None else None
         owner_names = dict(owner_display_names) if owner_display_names is not None else None
-        if requested is not None and (owners is not None or owner_names is not None):
+        scoped_filters = submission_status is not None or capture_date is not None
+        if requested is not None and (
+            owners is not None or owner_names is not None or scoped_filters
+        ):
             raise ValueError("记录标识与负责人范围不能同时过滤")
         if owner_names is not None and (
             owners is None
@@ -397,6 +403,10 @@ class WecomCliSmartTableAdapter:
             raise ValueError("负责人显示名必须与负责人 user_id 一一对应")
         if requested == () or owners == ():
             return []
+        if scoped_filters and (owners is None or owner_names is None):
+            raise SmartTableAdapterConfigurationError(
+                "提交状态/日期服务端筛选需要负责人 user_id 和显示名"
+            )
         if (
             (requested is not None or owners is not None or owner_names is not None)
             and not self._sheet_title
@@ -413,6 +423,8 @@ class WecomCliSmartTableAdapter:
                 record_ids=requested,
                 owner_user_ids=owners,
                 owner_display_names=owner_names,
+                submission_status=submission_status,
+                capture_date=capture_date,
             )
         return [self._parse_record(item, schema) for item in self._list_pages("records")]
 
@@ -724,16 +736,22 @@ class WecomCliSmartTableAdapter:
         record_ids: tuple[str, ...] | None = None,
         owner_user_ids: tuple[str, ...] | None = None,
         owner_display_names: Mapping[str, str] | None = None,
+        submission_status: str | None = None,
+        capture_date: date | None = None,
     ) -> list[SmartTableRecord]:
         """使用服务端 SQL 过滤读取全部记录、目标记录或负责人记录。
 
-        参数：schema 为启动时校验过的字段结构；record_ids 或 owner_user_ids 为可选过滤项。
+        参数：schema 为启动时校验过的字段结构；record_ids 或负责人范围为可选过滤项；
+        提交状态和录入日期仅与负责人范围组合查询。
         返回值：按查询结果顺序转换后的记录快照。
         异常：过滤冲突、查询协议或读取上限不确定时抛出适配器异常。
         副作用：发起一项或多项只读 records query，不修改智能表格。
         """
         if record_ids is not None and (
-            owner_user_ids is not None or owner_display_names is not None
+            owner_user_ids is not None
+            or owner_display_names is not None
+            or submission_status is not None
+            or capture_date is not None
         ):
             raise ValueError("记录标识与负责人范围不能同时过滤")
         if owner_display_names is not None:
@@ -750,11 +768,30 @@ class WecomCliSmartTableAdapter:
             if owner_field is None:
                 raise SmartTableAdapterConfigurationError("负责人范围查询缺少负责人字段")
             # 当前服务端未按 user filter_spec 返回记录，改用姓名预筛再严格核对 user_id。
-            where = " OR ".join(
+            owner_where = " OR ".join(
                 f"{self._quote_sql_identifier(owner_field.name)} LIKE "
                 f"{self._quote_sql_string_literal('%' + name + '%')}"
                 for name in owner_display_names.values()
             )
+            conditions = [f"({owner_where})"]
+            if submission_status is not None:
+                status_field = schema.get_field("提交状态")
+                if status_field is None:
+                    raise SmartTableAdapterConfigurationError("提交状态服务端筛选缺少提交状态字段")
+                conditions.append(
+                    f"{self._quote_sql_identifier(status_field.name)} = "
+                    f"{self._quote_sql_string_literal(submission_status)}"
+                )
+            if capture_date is not None:
+                entry_time = self._quote_sql_identifier("录入时间")
+                created_time = self._quote_sql_identifier("创建时间")
+                preferred_time = f"COALESCE(NULLIF({entry_time}, ''), NULLIF({created_time}, ''))"
+                date_value = self._quote_sql_string_literal(capture_date.isoformat())
+                conditions.append(
+                    f'(DATE_FORMAT({preferred_time}, "%Y-%m-%d") = {date_value} '
+                    f"OR {preferred_time} IS NULL)"
+                )
+            where = " AND ".join(conditions)
             sql = self._build_query_sql(
                 schema, where=where, limit=1000, include_entry_time=True
             )
@@ -768,7 +805,12 @@ class WecomCliSmartTableAdapter:
                 record
                 for record in records
                 if record.fields.get("负责人") in allowed_owners
+                and (
+                    submission_status is None or record.fields.get("提交状态") == submission_status
+                )
             ]
+        if submission_status is not None or capture_date is not None:
+            raise SmartTableAdapterConfigurationError("提交状态/日期服务端筛选需要负责人显示名")
         where: str | None = None
         if record_ids is not None:
             records: list[SmartTableRecord] = []
@@ -850,11 +892,14 @@ class WecomCliSmartTableAdapter:
             else:
                 columns.append(quoted_name)
         if include_entry_time:
-            # 负责人范围候选需要用系统录入时间覆盖无来源消息的人工表格行。
-            entry_time = self._quote_sql_identifier("录入时间")
-            columns.append(
-                f'DATE_FORMAT({entry_time}, "%Y-%m-%d %H:%i:%s") AS {entry_time}'
-            )
+            # 候选日期筛选需要返回两个只读系统时间，遵循录入时间优先、创建时间兜底。
+            schema_names = {field.name.removeprefix("*") for field in schema.fields}
+            for system_time in ("录入时间", "创建时间"):
+                if system_time not in schema_names:
+                    quoted_time = self._quote_sql_identifier(system_time)
+                    columns.append(
+                        f'DATE_FORMAT({quoted_time}, "%Y-%m-%d %H:%i:%s") AS {quoted_time}'
+                    )
         query = (
             f"SELECT {', '.join(columns)} FROM "
             f"{self._quote_sql_identifier(self._sheet_title)}"
@@ -1052,9 +1097,10 @@ class WecomCliSmartTableAdapter:
             member_name = self._member_display_name(field, raw)
             if member_name is not None:
                 member_names[canonical_name] = member_name
-        # “录入时间”是只读系统字段，不进入管理员维护的业务 Schema，但候选日期筛选需要它。
-        if row.get("录入时间") is not None:
-            normalized["录入时间"] = row["录入时间"]
+        # 系统时间字段不进入管理员维护的业务 Schema，但候选日期筛选需要它们。
+        for system_time in ("录入时间", "创建时间"):
+            if row.get(system_time) is not None:
+                normalized[system_time] = row[system_time]
         return SmartTableRecord(record_id=record_id, fields=normalized, member_names=member_names)
 
     def _list_pages(

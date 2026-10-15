@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping, Sequence
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from app.smart_table.adapter import (
     SmartTableActor,
@@ -107,18 +109,26 @@ class MockSmartTableAdapter:
         *,
         owner_user_ids: Collection[str] | None = None,
         owner_display_names: Mapping[str, str] | None = None,
+        submission_status: str | None = None,
+        capture_date: date | None = None,
     ) -> list[SmartTableRecord]:
         """返回按创建顺序保存的全部记录、指定记录或负责人范围快照。
 
-        参数：record_ids 和负责人过滤最多提供一种；显示名用于模拟服务端预筛。
+        参数：record_ids 和负责人过滤最多提供一种；显示名模拟服务端预筛；提交状态和日期
+        仅在负责人范围内筛选，缺少日期的行保留给来源消息回退。
         返回：当前请求范围内的内存记录快照列表。
         异常：同时提供两种过滤集合时抛出 ValueError。
         副作用：无；只从内存记录集中筛选。
         """
         if record_ids is not None and (
-            owner_user_ids is not None or owner_display_names is not None
+            owner_user_ids is not None
+            or owner_display_names is not None
+            or submission_status is not None
+            or capture_date is not None
         ):
             raise ValueError("记录标识与负责人范围不能同时过滤")
+        if (submission_status is not None or capture_date is not None) and not owner_user_ids:
+            raise ValueError("提交状态和日期筛选必须指定负责人范围")
         if owner_display_names is not None and (
             owner_user_ids is None or set(owner_user_ids) != set(owner_display_names)
         ):
@@ -138,8 +148,43 @@ class MockSmartTableAdapter:
                     or record.member_names.get("负责人")
                     == names_by_owner.get(record.fields.get("负责人"))
                 )
+                and (
+                    submission_status is None or record.fields.get("提交状态") == submission_status
+                )
+                and (
+                    capture_date is None
+                    or self._capture_date(record.fields) in {None, capture_date}
+                )
             ]
         return list(self._records.values())
+
+    @staticmethod
+    def _capture_date(fields: Mapping[str, object]) -> date | None:
+        """解析表格录入时间为上海自然日。
+
+        参数：fields 为智能表格字段快照。
+        返回值：可解析时返回自然日；缺失或无法解析时返回 None 供来源时间回退。
+        异常：无；格式不支持时按缺失处理。
+        副作用：无，仅转换快照中的时间值。
+        """
+        value = fields.get("录入时间") or fields.get("创建时间")
+        if isinstance(value, datetime):
+            local = value.astimezone(ZoneInfo("Asia/Shanghai")) if value.tzinfo else value
+            return local.date()
+        if isinstance(value, date):
+            return value
+        if isinstance(value, str) and value.strip():
+            normalized = value.strip().replace("Z", "+00:00")
+            try:
+                parsed = datetime.fromisoformat(normalized)
+            except ValueError:
+                try:
+                    return date.fromisoformat(normalized[:10])
+                except ValueError:
+                    return None
+            local = parsed.astimezone(ZoneInfo("Asia/Shanghai")) if parsed.tzinfo else parsed
+            return local.date()
+        return None
 
     def create_record(
         self,
