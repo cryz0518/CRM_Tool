@@ -734,6 +734,8 @@ class CrmSubmissionService:
         candidates: list[SubmissionCandidate] = []
         for lead in leads:
             sync_status = sync_statuses[lead.id]
+            record = smart_table_snapshot.get(lead.smart_table_record_id or "")
+            snapshot_fields = record.fields if record is not None else lead.field_values
             if command_text == _ABANDONED_COMMAND:
                 if lead.lifecycle_state != "pending_create" or sync_status != "abandoned":
                     continue
@@ -759,6 +761,8 @@ class CrmSubmissionService:
                     owner_user_ids,
                     target_capture_date,
                     source_received_at.get(lead.source_message_id),
+                    table_fields=snapshot_fields,
+                    prefer_table_date=True,
                 ):
                     continue
                 if sync_status in {"succeeded", "abandoned"}:
@@ -768,16 +772,20 @@ class CrmSubmissionService:
                 ):
                     continue
             # 候选文案优先来自当前 Smart Table 快照，避免后台旧字段导致同名项无法区分。
-            record = smart_table_snapshot.get(lead.smart_table_record_id or "")
-            snapshot_fields = record.fields if record is not None else lead.field_values
             company_name = snapshot_fields.get("线索名称") or lead.standard_company_name
             if isinstance(company_name, str) and company_name.strip():
                 contact_name = snapshot_fields.get("联系人")
                 contact = contact_name.strip() if isinstance(contact_name, str) else ""
-                created = lead.created_at
-                if created.tzinfo is None:
-                    created = created.replace(tzinfo=UTC)
-                created_text = created.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+                if target_capture_date is not None:
+                    # 日期命令的卡片日期必须与筛选条件一致，不能显示延迟建行日期。
+                    created_text = target_capture_date.isoformat()
+                else:
+                    created = lead.created_at
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=UTC)
+                    created_text = created.astimezone(ZoneInfo("Asia/Shanghai")).strftime(
+                        "%Y-%m-%d"
+                    )
                 # 展示文本来自当前后台快照，不参与身份判断；回调仍只接受冻结 lead_id。
                 display_text = "｜".join(
                     part for part in (company_name.strip(), contact, created_text) if part
@@ -847,11 +855,6 @@ class CrmSubmissionService:
                     continue
                 if lead.smart_table_record_id is not None:
                     selected_record_ids[lead_id] = lead.smart_table_record_id
-                source_message = (
-                    session.get(IncomingMessage, lead.source_message_id)
-                    if command.target_capture_date is not None and lead.source_message_id
-                    else None
-                )
                 sync = latest_crm_create_sync(session, lead_id)
                 if command.text == _ABANDONED_COMMAND:
                     # 确认卡可能跨越线索转交；只允许当前负责人或授权范围匹配的操作者继续。
@@ -887,17 +890,9 @@ class CrmSubmissionService:
                     and cross_owner_authorized
                     and lead.smart_table_owner_user_id in owner_scope
                     and lead.lifecycle_state in {"pending_create", "temporary"}
-                    and (
-                        command.target_capture_date is None
-                        or self._is_capture_date_owned_candidate(
-                            lead,
-                            owner_scope,
-                            command.target_capture_date,
-                            source_message.received_at if source_message is not None else None,
-                        )
-                    )
                     and (sync is None or sync.status not in {"succeeded", "abandoned"})
                 ):
+                    # 日期范围在批量读取到表格当前快照后校验，不能用可能过期的数据库字段提前排除。
                     valid_ids.add(lead_id)
         # 回调只批量读取仍有效的勾选记录；快照仅在当前请求内复用，不跨请求缓存。
         requested_record_ids = {
@@ -1308,14 +1303,6 @@ class CrmSubmissionService:
                 allow_non_today_target,
                 allow_temporary=allow_temporary,
                 owner_scope_user_ids=command.owner_scope_user_ids,
-            ) or (
-                command.target_capture_date is not None
-                and not self._is_capture_date_owned_candidate(
-                    lead,
-                    command.owner_scope_user_ids or (),
-                    command.target_capture_date,
-                    source_message.received_at if source_message is not None else None,
-                )
             ):
                 return _create_outcome("not_submitted")
             # 未完成操作复用冻结快照，不能因重试而替换已经提交或结果未知的字段。
@@ -1349,6 +1336,16 @@ class CrmSubmissionService:
             self._smart_table_adapter,
             robot_submission_confirmation_available=self._robot_submission_confirmation_available,
         ).reconcile_submission(lead_id, initial_record=initial_record)
+        if command.target_capture_date is not None and not self._is_capture_date_owned_candidate(
+            lead,
+            command.owner_scope_user_ids or (),
+            command.target_capture_date,
+            source_message.received_at if source_message is not None else None,
+            table_fields=reconciled.fields,
+            prefer_table_date=True,
+        ):
+            # 复核卡片时必须以此刻重读的表格录入日为准，越界项目不应显示为待完善。
+            return _create_outcome("not_submitted")
         allowed_submission_statuses = {"未提交"}
         if command.text == _ABANDONED_COMMAND:
             allowed_submission_statuses.add("放弃提交")
@@ -1415,24 +1412,23 @@ class CrmSubmissionService:
                             "not_submitted",
                             reason_code="crm_cross_owner_submission_not_authorized",
                         )
-                if (
-                    lead is None
-                    or not self._is_create_candidate(
+                if command.target_capture_date is not None and lead is not None and not (
+                    self._is_capture_date_owned_candidate(
                         lead,
-                        command.sales_user_id,
-                        allow_non_today_target,
-                        allow_temporary=allow_temporary,
-                        owner_scope_user_ids=command.owner_scope_user_ids,
+                        command.owner_scope_user_ids or (),
+                        command.target_capture_date,
+                        source_message.received_at if source_message is not None else None,
+                        table_fields=reconciled.fields,
+                        prefer_table_date=True,
                     )
-                    or (
-                        command.target_capture_date is not None
-                        and not self._is_capture_date_owned_candidate(
-                            lead,
-                            command.owner_scope_user_ids or (),
-                            command.target_capture_date,
-                            source_message.received_at if source_message is not None else None,
-                        )
-                    )
+                ):
+                    return _create_outcome("not_submitted")
+                if lead is None or not self._is_create_candidate(
+                    lead,
+                    command.sales_user_id,
+                    allow_non_today_target,
+                    allow_temporary=allow_temporary,
+                    owner_scope_user_ids=command.owner_scope_user_ids,
                 ):
                     return _create_outcome("incomplete")
                 if lead.lifecycle_state == "temporary":
@@ -1528,6 +1524,50 @@ class CrmSubmissionService:
         selected_sync_ids: list[int] = []
         abandoned_lead_ids: list[str] = []
         remaining = 0
+        owner_scope = owner_scope_user_ids or (sales_user_id,)
+        date_snapshot: dict[str, SmartTableRecord] = {}
+        source_received_at: dict[str, datetime] = {}
+        if target_capture_date is not None:
+            with self._session_factory() as session:
+                # 日期确认卡只回读本请求冻结的重复线索，不扫描整张表。
+                statement = (
+                    select(CrmSyncRecord, Lead)
+                    .join(Lead, Lead.id == CrmSyncRecord.lead_id)
+                    .where(
+                        CrmSyncRecord.request_message_id == request_message_id,
+                        CrmSyncRecord.operation == "create",
+                        CrmSyncRecord.status == "awaiting_duplicate_confirmation",
+                        Lead.smart_table_owner_user_id.in_(owner_scope),
+                    )
+                )
+                if duplicate_lead_ids:
+                    statement = statement.where(Lead.id.in_(duplicate_lead_ids))
+                date_rows = session.execute(statement).all()
+                record_ids = tuple(
+                    dict.fromkeys(
+                        lead.smart_table_record_id
+                        for _, lead in date_rows
+                        if lead.smart_table_record_id is not None
+                    )
+                )
+                source_ids = {
+                    lead.source_message_id
+                    for _, lead in date_rows
+                    if lead.source_message_id is not None
+                }
+                if source_ids:
+                    source_received_at = dict(
+                        session.execute(
+                            select(IncomingMessage.message_id, IncomingMessage.received_at).where(
+                                IncomingMessage.message_id.in_(source_ids)
+                            )
+                        ).all()
+                    )
+            if record_ids:
+                date_snapshot = {
+                    record.record_id: record
+                    for record in self._smart_table_adapter.get_records(record_ids=record_ids)
+                }
         with self._session_factory.begin() as session:
             # 跨员工卡片可能延迟点击；执行时必须重新确认操作人仍有跨员工权限。
             if owner_scope_user_ids is not None:
@@ -1539,7 +1579,6 @@ class CrmSubmissionService:
                     or not authorization.can_submit_other_sales_leads
                 ):
                     raise PermissionError("跨员工 CRM 提交权限已失效")
-            owner_scope = owner_scope_user_ids or (sales_user_id,)
             statement = (
                 select(CrmSyncRecord, Lead)
                 .join(Lead, Lead.id == CrmSyncRecord.lead_id)
@@ -1555,16 +1594,14 @@ class CrmSubmissionService:
                 statement = statement.where(Lead.id.in_(duplicate_lead_ids))
             rows = session.execute(statement.with_for_update()).all()
             for sync, lead in rows:
-                source_message = (
-                    session.get(IncomingMessage, lead.source_message_id)
-                    if target_capture_date is not None and lead.source_message_id
-                    else None
-                )
+                record = date_snapshot.get(lead.smart_table_record_id or "")
                 if target_capture_date is not None and not self._is_capture_date_owned_candidate(
                     lead,
                     owner_scope,
                     target_capture_date,
-                    source_message.received_at if source_message is not None else None,
+                    source_received_at.get(lead.source_message_id or ""),
+                    table_fields=record.fields if record is not None else lead.field_values,
+                    prefer_table_date=True,
                 ):
                     # 冻结确认卡可能已过期或线索日期被修正；绝不对范围外目标执行动作。
                     remaining += 1
@@ -2036,15 +2073,31 @@ class CrmSubmissionService:
         owner_user_ids: Collection[str],
         capture_date: date,
         source_received_at: datetime | None = None,
+        *,
+        table_fields: Mapping[str, object] | None = None,
+        prefer_table_date: bool = False,
     ) -> bool:
-        """按来源消息、表格录入时间、后台创建时间的优先级判断上海自然日。"""
-        captured_date = None
-        if source_received_at is not None:
+        """判断负责人线索是否属于指定上海自然日。
+
+        参数：lead 为待筛选线索；owner_user_ids 为允许的表格负责人；capture_date 为目标日期；
+        source_received_at 为原始消息接收时间；table_fields 为当前表格快照；prefer_table_date
+        为 True 时优先使用表格录入时间，否则优先使用消息接收时间。
+        返回值：负责人和所选日期口径均匹配时返回 True。
+        异常：无；不支持的表格日期格式按缺失处理。
+        副作用：无，仅解析内存中的时间值。
+        """
+        fields = table_fields if table_fields is not None else lead.field_values
+        table_date = CrmSubmissionService._parse_capture_date(
+            fields.get("录入时间")
+            or fields.get("创建时间")
+            or lead.field_values.get("录入时间")
+            or lead.field_values.get("创建时间")
+        )
+        captured_date = table_date if prefer_table_date else None
+        if captured_date is None and source_received_at is not None:
             captured_date = CrmSubmissionService._shanghai_date(source_received_at)
         if captured_date is None:
-            captured_date = CrmSubmissionService._parse_capture_date(
-                lead.field_values.get("录入时间") or lead.field_values.get("创建时间")
-            )
+            captured_date = table_date
         if captured_date is None:
             captured_date = CrmSubmissionService._shanghai_date(lead.created_at)
         return (
