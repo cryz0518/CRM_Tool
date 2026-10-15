@@ -755,7 +755,10 @@ class WecomCliSmartTableAdapter:
                 f"{self._quote_sql_string_literal('%' + name + '%')}"
                 for name in owner_display_names.values()
             )
-            rows = self._query_rows(self._build_query_sql(schema, where=where, limit=1000))
+            sql = self._build_query_sql(
+                schema, where=where, limit=1000, include_entry_time=True
+            )
+            rows = self._query_rows(sql)
             if len(rows) >= 1000:
                 raise WecomCliProtocolError("负责人范围查询达到读取上限，结果可能被截断")
             records = [self._parse_query_record(row, schema) for row in rows]
@@ -822,10 +825,12 @@ class WecomCliSmartTableAdapter:
         *,
         limit: int,
         where: str | None = None,
+        include_entry_time: bool = False,
     ) -> str:
         """根据字段结构构造只读 records query SQL。
 
-        参数：schema 为字段结构；limit 为服务端结果上限；where 为已安全编码的筛选子句。
+        参数：schema 为字段结构；limit 为服务端结果上限；where 为已安全编码的筛选子句；
+        include_entry_time 表示同时返回只读系统“录入时间”。
         返回值：供 wecom-cli records query 使用的 SELECT 语句。
         异常：未配置子表名称时抛出 SmartTableAdapterConfigurationError。
         副作用：无；不执行查询。
@@ -842,6 +847,12 @@ class WecomCliSmartTableAdapter:
                 )
             else:
                 columns.append(quoted_name)
+        if include_entry_time:
+            # 负责人范围候选需要用系统录入时间覆盖无来源消息的人工表格行。
+            entry_time = self._quote_sql_identifier("录入时间")
+            columns.append(
+                f'DATE_FORMAT({entry_time}, "%Y-%m-%d %H:%i:%s") AS {entry_time}'
+            )
         query = (
             f"SELECT {', '.join(columns)} FROM "
             f"{self._quote_sql_identifier(self._sheet_title)}"
@@ -1039,6 +1050,9 @@ class WecomCliSmartTableAdapter:
             member_name = self._member_display_name(field, raw)
             if member_name is not None:
                 member_names[canonical_name] = member_name
+        # “录入时间”是只读系统字段，不进入管理员维护的业务 Schema，但候选日期筛选需要它。
+        if row.get("录入时间") is not None:
+            normalized["录入时间"] = row["录入时间"]
         return SmartTableRecord(record_id=record_id, fields=normalized, member_names=member_names)
 
     def _list_pages(

@@ -2829,7 +2829,7 @@ def test_manually_entered_smart_table_row_can_be_submitted_without_message_or_le
 def test_cross_owner_date_candidates_and_callback_recheck_current_date_scope(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证指定日提交只依赖跨员工授权，并在回调时重新核对线索日期。"""
+    """验证指定日候选只包含未提交记录，并在回调时重新核对日期。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter, message_id="dated-cross-owner-lead")
     record = adapter.get_records()[0]
@@ -2875,6 +2875,26 @@ def test_cross_owner_date_candidates_and_callback_recheck_current_date_scope(
             **historical_lead.field_values,
             "录入时间": "2026-10-13",
         }
+
+    submitted_lead_id = _lead(
+        session_factory,
+        adapter,
+        message_id="already-submitted-cross-owner-lead",
+        sequence=3,
+        company_name="已提交历史公司",
+    )
+    submitted_record = adapter.get_records()[2]
+    adapter.update_record(
+        submitted_record.record_id,
+        {"负责人": "sales-2", "提交状态": "已提交"},
+    )
+    with session_factory.begin() as session:
+        submitted_lead = session.get(Lead, submitted_lead_id)
+        assert submitted_lead is not None
+        submitted_lead.smart_table_owner_user_id = "sales-2"
+        source_message = session.get(IncomingMessage, submitted_lead.source_message_id)
+        assert source_message is not None
+        source_message.received_at = datetime(2026, 10, 12, 16, tzinfo=UTC)
 
     crm = MockCRMAdapter()
     service = CrmSubmissionService(session_factory, adapter, crm)
