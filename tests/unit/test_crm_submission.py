@@ -2532,7 +2532,7 @@ def test_cross_owner_selection_card_freezes_target_and_shows_names_only(
     monkeypatch.setattr(
         crm_commands,
         "resolve_wecom_member",
-        lambda *_args: WecomDirectoryMember("sales-2", "张三"),
+        lambda *_args: WecomDirectoryMember("sales-2", "张三(花名)"),
     )
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter)

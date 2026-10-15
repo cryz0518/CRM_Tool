@@ -723,6 +723,10 @@ def _resolve_cross_owner_submission_scope(
             return None, "企微通讯录当前不可查询，未发起提交，请稍后重试。"
         owner_user_ids = (member.user_id,)
         resolved_owner_name = member.name
+        # 企微通讯录可能返回“本名(花名)”，而智能表格负责人预筛使用本名。
+        combined_name = re.fullmatch(r"(.+?)[(（]([^()（）]+)[)）]", resolved_owner_name.strip())
+        if combined_name is not None:
+            resolved_owner_name = combined_name.group(1).strip()
     return (
         replace(
             command,
