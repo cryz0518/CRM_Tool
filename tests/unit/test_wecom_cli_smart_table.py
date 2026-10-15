@@ -2568,6 +2568,40 @@ def test_owner_range_query_preserves_native_entry_time_for_date_selection() -> N
     assert 'DATE_FORMAT(`录入时间`, "%Y-%m-%d %H:%i:%s") AS `录入时间`' in sql
 
 
+def test_record_id_query_preserves_native_entry_time_for_date_selection() -> None:
+    """验证按记录标识批量回读时也包含只读系统录入时间。"""
+    schema = SmartTableSchema(
+        fields=(
+            SmartTableField("lead-name", "线索名称", SmartTableFieldType.TEXT),
+            SmartTableField("owner", "负责人", SmartTableFieldType.MEMBER),
+            SmartTableField("status", "提交状态", SmartTableFieldType.SINGLE_SELECT),
+        )
+    )
+    rows = {
+        "rows": [
+            {
+                "RECORD_ID": "record-1",
+                "线索名称": "按标识回读线索",
+                "负责人": [{"id": "sales-1", "name": "蒲春江"}],
+                "提交状态": "未提交",
+                "录入时间": "2026-10-13 23:59:59",
+            }
+        ]
+    }
+    fake_cli = FakeCli(
+        [{"errcode": 0, "values": [json.dumps(rows, ensure_ascii=False)]}]
+    )
+    adapter = _adapter(fake_cli, sheet_title="CRM线索")
+    adapter._enum_snapshots._schema = schema
+    adapter._enum_snapshots._deadline = float("inf")
+
+    records = adapter.get_records(record_ids=("record-1",))
+
+    assert records[0].fields["录入时间"] == "2026-10-13 23:59:59"
+    sql = fake_cli.calls[0][fake_cli.calls[0].index("--sql") + 1]
+    assert 'DATE_FORMAT(`录入时间`, "%Y-%m-%d %H:%i:%s") AS `录入时间`' in sql
+
+
 def test_query_record_normalizes_native_member_and_multi_select_cells() -> None:
     """验证 SQL 查询中的原生成员对象和多选字符串数组会还原为领域值。"""
     schema = SmartTableSchema(

@@ -2826,6 +2826,170 @@ def test_manually_entered_smart_table_row_can_be_submitted_without_message_or_le
     assert crm.calls == 1
 
 
+def test_cross_owner_date_filter_uses_smart_table_shanghai_entry_day(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证日期提交以表格上海录入日为准，并让候选卡显示同一日期。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    table_day_lead_id = _lead(
+        session_factory,
+        adapter,
+        message_id="table-day-cross-owner-lead",
+        sequence=1,
+        company_name="表格日期线索",
+    )
+    next_day_lead_id = _lead(
+        session_factory,
+        adapter,
+        message_id="next-day-cross-owner-lead",
+        sequence=2,
+        company_name="次日表格线索",
+    )
+    records = adapter.get_records()
+    adapter.update_record(records[0].record_id, {"负责人": "sales-2"})
+    adapter.update_record(records[1].record_id, {"负责人": "sales-2"})
+    table_dates = {
+        records[0].record_id: "2026-10-13T15:59:59Z",
+        records[1].record_id: "2026-10-13T16:00:00Z",
+    }
+    for record_id, table_date in table_dates.items():
+        record = adapter.get_record(record_id)
+        assert record is not None
+        # 模拟只读系统时间字段由智能表格返回，数据库中的副本可能尚未同步。
+        adapter._records[record_id] = replace(
+            record, fields={**record.fields, "录入时间": table_date}
+        )
+    with session_factory.begin() as session:
+        for lead_id in (table_day_lead_id, next_day_lead_id):
+            lead = session.get(Lead, lead_id)
+            assert lead is not None
+            lead.smart_table_owner_user_id = "sales-2"
+            # 两条消息均在 13 日上海时间收到，但处理/建行时间已跨到 14 日。
+            lead.created_at = datetime(2026, 10, 13, 16, tzinfo=UTC)
+            # 数据库副本刻意设为 14 日，验证筛选以最新表格快照为准。
+            lead.field_values = {
+                **lead.field_values,
+                "录入时间": "2026-10-14T00:00:00+08:00",
+            }
+            source_message = session.get(IncomingMessage, lead.source_message_id)
+            assert source_message is not None
+            source_message.received_at = datetime(2026, 10, 12, 16, 30, tzinfo=UTC)
+        session.add_all(
+            [
+                SalesAuthorization(wecom_user_id="sales-2", is_active=True),
+                SalesAuthorization(
+                    wecom_user_id="operator",
+                    is_active=True,
+                    is_administrator=False,
+                    can_submit_other_sales_leads=True,
+                ),
+            ]
+        )
+
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    candidates = service.list_submission_candidates(
+        CROSS_OWNER_SUBMISSION_COMMAND,
+        "operator",
+        owner_scope_user_ids=("sales-2",),
+        target_capture_date=date(2026, 10, 13),
+    )
+
+    assert {candidate.lead_id for candidate in candidates} == {table_day_lead_id}
+    assert "2026-10-13" in (candidates[0].display_text or "")
+
+    # 卡片发行后若表格录入日跨到 14 日，回调必须拒绝该冻结候选。
+    lead_record = adapter.get_record(records[0].record_id)
+    assert lead_record is not None
+    adapter._records[lead_record.record_id] = replace(
+        lead_record,
+        fields={**lead_record.fields, "录入时间": "2026-10-13T16:00:00Z"},
+    )
+    result = service.submit_selected(
+        SubmissionCommand(
+            CROSS_OWNER_SUBMISSION_COMMAND,
+            "operator",
+            "table-day-cross-owner-request",
+            owner_scope_user_ids=("sales-2",),
+            target_capture_date=date(2026, 10, 13),
+        ),
+        (table_day_lead_id,),
+    )
+    assert result.not_submitted == 1
+    assert crm.calls == 0
+
+
+def test_cross_owner_duplicate_confirmation_rechecks_current_table_day(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证重复线索确认卡不能在表格日期变为次日后继续提交。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    record = adapter.get_records()[0]
+    adapter.update_record(record.record_id, {"负责人": "sales-2"})
+    current_record = adapter.get_record(record.record_id)
+    assert current_record is not None
+    adapter._records[record.record_id] = replace(
+        current_record,
+        fields={**current_record.fields, "录入时间": "2026-10-13 23:59:59"},
+    )
+    with session_factory.begin() as session:
+        lead = session.get(Lead, lead_id)
+        assert lead is not None
+        lead.smart_table_owner_user_id = "sales-2"
+        lead.field_values = {**lead.field_values, "录入时间": "2026-10-13 23:59:59"}
+        source_message = session.get(IncomingMessage, lead.source_message_id)
+        assert source_message is not None
+        source_message.received_at = datetime(2026, 10, 12, 16, tzinfo=UTC)
+        session.add_all(
+            [
+                SalesAuthorization(wecom_user_id="sales-2", crm_user_id="crm-2"),
+                SalesAuthorization(
+                    wecom_user_id="operator",
+                    is_active=True,
+                    can_submit_other_sales_leads=True,
+                ),
+                CrmSyncRecord(
+                    lead_id=lead_id,
+                    operation="create",
+                    generation=1,
+                    smart_table_record_id=record.record_id,
+                    idempotency_key="dated-duplicate-confirmation-sync",
+                    canonical_payload={"name": "人工最终公司"},
+                    snapshot_hash="dated-duplicate-confirmation-hash",
+                    request_message_id="dated-duplicate-confirmation",
+                    submitting_sales_user_id="operator",
+                    submitting_crm_user_id="crm-2",
+                    status="awaiting_duplicate_confirmation",
+                    crm_lead_id="crm-existing",
+                ),
+            ]
+        )
+
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    current_record = adapter.get_record(record.record_id)
+    assert current_record is not None
+    adapter._records[record.record_id] = replace(
+        current_record,
+        fields={**current_record.fields, "录入时间": "2026-10-14 00:00:00"},
+    )
+    confirmation = service.resolve_duplicate_confirmation(
+        "dated-duplicate-confirmation",
+        "operator",
+        continue_submission=True,
+        selected_lead_ids=(lead_id,),
+        duplicate_lead_ids=(lead_id,),
+        owner_scope_user_ids=("sales-2",),
+        target_capture_date=date(2026, 10, 13),
+    )
+
+    assert confirmation.remaining == 1
+    assert confirmation.submitted == 0
+    assert crm.update_calls == 0
+    assert crm.submit_calls == 0
+
+
 def test_cross_owner_date_candidates_and_callback_recheck_current_date_scope(
     session_factory: sessionmaker[Session],
 ) -> None:

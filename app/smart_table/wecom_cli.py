@@ -779,7 +779,9 @@ class WecomCliSmartTableAdapter:
                     f"RECORD_ID = {self._quote_sql_string_literal(record_id)}"
                     for record_id in chunk
                 )
-                sql = self._build_query_sql(schema, where=where, limit=len(chunk))
+                sql = self._build_query_sql(
+                    schema, where=where, limit=len(chunk), include_entry_time=True
+                )
                 records.extend(
                     self._parse_query_record(row, schema) for row in self._query_rows(sql)
                 )
