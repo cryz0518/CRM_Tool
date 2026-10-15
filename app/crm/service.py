@@ -660,11 +660,12 @@ class CrmSubmissionService:
         *,
         owner_scope_user_ids: tuple[str, ...] | None = None,
         target_capture_date: date | None = None,
+        owner_display_names: Mapping[str, str] | None = None,
     ) -> tuple[SubmissionCandidate, ...]:
         """列出操作人获准在机器人卡片中选择的线索，不调用 CRM。
 
         参数：command_text 为精确命令；sales_user_id 为操作人；owner_scope_user_ids 仅供
-        已获跨员工提交权限的调用指定负责人范围。
+        已获跨员工提交权限的调用指定负责人范围；owner_display_names 仅用于服务端负责人预筛。
         返回值：只包含指定负责人范围与实时表格状态符合卡片条件的候选。
         异常：actor 不存在/已停用、权限不足或命令不支持时抛出 ValueError。
         副作用：只读取数据库及智能表格，不改变 Lead 生命周期。
@@ -684,6 +685,12 @@ class CrmSubmissionService:
         owner_user_ids = (
             owner_scope_user_ids if owner_scope_user_ids is not None else (sales_user_id,)
         )
+        # “今天”按来源消息/Lead 首次采集时间筛选；显式跨员工日期命令按表格日期筛选。
+        query_capture_date = target_capture_date
+        query_submission_status = (
+            "未提交" if command_text == _TODAY_COMMAND or query_capture_date is not None else None
+        )
+        query_owner_names = dict(owner_display_names or {})
         with self._session_factory() as session:
             authorization = (
                 session.get(SalesAuthorization, sales_user_id) if cross_owner else None
@@ -695,6 +702,20 @@ class CrmSubmissionService:
                 or not self._can_submit_other_sales_leads(authorization)
             ):
                 raise ValueError("当前账号没有跨员工 CRM 提交权限")
+            if query_submission_status is not None and not query_owner_names:
+                # 负责人姓名只用于服务端预筛，最终仍由表格成员 ID 与 owner_user_ids 精确校验。
+                query_owner_names = dict(
+                    session.execute(
+                        select(
+                            SalesAuthorization.wecom_user_id, SalesAuthorization.display_name
+                        ).where(SalesAuthorization.wecom_user_id.in_(owner_user_ids))
+                    ).all()
+                )
+                query_owner_names = {
+                    user_id: display_name
+                    for user_id, display_name in query_owner_names.items()
+                    if isinstance(display_name, str) and display_name.strip()
+                }
             leads = list(
                 session.scalars(
                     select(Lead).where(Lead.smart_table_owner_user_id.in_(owner_user_ids))
@@ -719,18 +740,25 @@ class CrmSubmissionService:
             for lead in leads:
                 sync = latest_crm_create_sync(session, lead.id)
                 sync_statuses[lead.id] = sync.status if sync is not None else None
-        # 只批量回读本次数据库候选对应的记录，避免负责人过滤接口返回空结果或扫描全表。
-        record_ids = tuple(
-            dict.fromkeys(
-                lead.smart_table_record_id
-                for lead in leads
-                if lead.smart_table_record_id is not None
+        if query_submission_status is not None:
+            # 日期命令直接按负责人、状态与目标日期回读目标行，避免拼接整批 record_id。
+            queried_records = self._smart_table_adapter.get_records(
+                owner_user_ids=owner_user_ids,
+                owner_display_names=query_owner_names or None,
+                submission_status=query_submission_status,
+                capture_date=query_capture_date,
             )
-        )
-        smart_table_snapshot = {
-            record.record_id: record
-            for record in self._smart_table_adapter.get_records(record_ids=record_ids)
-        }
+        else:
+            # 无日期的旧命令保持按本地候选 ID 回读，避免扩大读取范围。
+            record_ids = tuple(
+                dict.fromkeys(
+                    lead.smart_table_record_id
+                    for lead in leads
+                    if lead.smart_table_record_id is not None
+                )
+            )
+            queried_records = self._smart_table_adapter.get_records(record_ids=record_ids)
+        smart_table_snapshot = {record.record_id: record for record in queried_records}
         candidates: list[SubmissionCandidate] = []
         for lead in leads:
             sync_status = sync_statuses[lead.id]

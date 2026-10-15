@@ -7,6 +7,7 @@ import logging
 import subprocess
 import time
 from collections.abc import Mapping, Sequence
+from datetime import date
 from threading import Lock, Thread
 from types import SimpleNamespace
 
@@ -1396,6 +1397,47 @@ def test_owner_display_name_query_discards_same_name_records_for_other_ids() -> 
     assert [record.record_id for record in records] == ["target-owner-row"]
     sql = fake_cli.calls[1][fake_cli.calls[1].index("--sql") + 1]
     assert '`负责人` LIKE "%销售一%"' in sql
+
+
+def test_owner_submission_date_and_status_are_in_one_server_query() -> None:
+    """验证负责人、未提交状态和上海日期在同一条 SQL 中下推筛选。
+
+    参数：无。返回值：无。异常：SQL 条件未合并时由 pytest 报告断言失败。
+    副作用：消费字段结构和一条空的只读查询响应。
+    """
+    fields = dict(_field_response())
+    fields["fields"] = [
+        *_field_response()["fields"],
+        {
+            "field_id": "submit-status",
+            "field_title": "提交状态",
+            "field_type": "single_select",
+            "property_single_select": {"options": [{"id": "pending", "text": "未提交"}]},
+        },
+    ]
+    fake_cli = FakeCli(
+        [
+            fields,
+            {"errcode": 0, "values": [json.dumps({"rows": []})]},
+        ]
+    )
+
+    records = _adapter(fake_cli, sheet_title="CRM线索").get_records(
+        owner_user_ids=("sales-1",),
+        owner_display_names={"sales-1": "销售一"},
+        submission_status="未提交",
+        capture_date=date(2026, 10, 13),
+    )
+
+    assert records == []
+    assert len(fake_cli.calls) == 2
+    sql = fake_cli.calls[1][fake_cli.calls[1].index("--sql") + 1]
+    assert '`负责人` LIKE "%销售一%"' in sql
+    assert '`提交状态` = "未提交"' in sql
+    assert "DATE_FORMAT(COALESCE(NULLIF(" in sql
+    assert '"2026-10-13"' in sql
+    assert " OR COALESCE(NULLIF(`录入时间`" in sql
+    assert sql.count(" WHERE ") == 1
 
 
 def test_rate_limiter_redis_client_has_bounded_socket_timeout(

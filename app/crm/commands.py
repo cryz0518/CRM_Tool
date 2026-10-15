@@ -598,6 +598,13 @@ def prepare_batch_submission_selection(
         command.sales_user_id,
         owner_scope_user_ids=command.owner_scope_user_ids,
         target_capture_date=command.target_capture_date,
+        owner_display_names=(
+            {command.owner_scope_user_ids[0]: command.target_owner_name}
+            if command.target_capture_date is not None
+            and command.owner_scope_user_ids
+            and command.target_owner_name
+            else None
+        ),
     )
     if not candidates:
         if command.text == "帮我提交放弃提交的线索":
@@ -771,14 +778,16 @@ def _link_unsubmitted_smart_table_records(
         owner_names = (
             {command.sales_user_id: display_name} if display_name else None
         )
-    # 姓名只缩小企微服务端查询范围，适配器仍按成员 ID 精确校验返回记录。
-    records = smart_table_adapter.get_records(
-        owner_user_ids=owner_user_ids,
-        owner_display_names=owner_names,
-    )
     capture_date = command.target_capture_date if cross_owner_date else None
     if command.text == "提交今天的线索":
         capture_date = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    # 日期命令将负责人、未提交状态和上海自然日合并进同一条服务端查询。
+    records = smart_table_adapter.get_records(
+        owner_user_ids=owner_user_ids,
+        owner_display_names=owner_names,
+        submission_status="未提交" if capture_date is not None else None,
+        capture_date=capture_date,
+    )
     day_messages: list[IncomingMessage] = []
     if capture_date is not None:
         local_start = datetime.combine(

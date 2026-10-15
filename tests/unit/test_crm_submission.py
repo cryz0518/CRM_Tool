@@ -2887,6 +2887,42 @@ def test_cross_owner_date_filter_uses_smart_table_shanghai_entry_day(
         )
 
     crm = MockCRMAdapter()
+    original_get_records = adapter.get_records
+    query_calls: list[dict[str, object]] = []
+
+    def capture_get_records(
+        record_ids: Collection[str] | None = None,
+        *,
+        owner_user_ids: Collection[str] | None = None,
+        owner_display_names: Mapping[str, str] | None = None,
+        submission_status: str | None = None,
+        capture_date: date | None = None,
+    ) -> list[SmartTableRecord]:
+        """记录日期候选查询参数并复用原适配器。
+
+        参数：过滤参数与 SmartTableAdapter.get_records 一致。
+        返回值：原适配器读取到的记录快照。
+        异常：查询错误由原适配器传播。
+        副作用：向 query_calls 追加一次只读查询条件。
+        """
+        query_calls.append(
+            {
+                "record_ids": record_ids,
+                "owner_user_ids": owner_user_ids,
+                "owner_display_names": owner_display_names,
+                "submission_status": submission_status,
+                "capture_date": capture_date,
+            }
+        )
+        return original_get_records(
+            record_ids,
+            owner_user_ids=owner_user_ids,
+            owner_display_names=owner_display_names,
+            submission_status=submission_status,
+            capture_date=capture_date,
+        )
+
+    adapter.get_records = capture_get_records
     service = CrmSubmissionService(session_factory, adapter, crm)
     candidates = service.list_submission_candidates(
         CROSS_OWNER_SUBMISSION_COMMAND,
@@ -2897,6 +2933,13 @@ def test_cross_owner_date_filter_uses_smart_table_shanghai_entry_day(
 
     assert {candidate.lead_id for candidate in candidates} == {table_day_lead_id}
     assert "2026-10-13" in (candidates[0].display_text or "")
+    assert query_calls[0] == {
+        "record_ids": None,
+        "owner_user_ids": ("sales-2",),
+        "owner_display_names": None,
+        "submission_status": "未提交",
+        "capture_date": date(2026, 10, 13),
+    }
 
     # 卡片发行后若表格录入日跨到 14 日，回调必须拒绝该冻结候选。
     lead_record = adapter.get_record(records[0].record_id)
