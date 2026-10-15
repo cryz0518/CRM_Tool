@@ -2873,7 +2873,8 @@ def test_cross_owner_date_candidates_and_callback_recheck_current_date_scope(
         historical_lead.created_at = datetime(2026, 10, 13, 16, tzinfo=UTC)
         historical_lead.field_values = {
             **historical_lead.field_values,
-            "录入时间": "2026-10-13",
+            # 智能表格原生录入时间是上海本地时间文本，不含 UTC 时区后缀。
+            "录入时间": "2026-10-13 19:45:00",
         }
 
     submitted_lead_id = _lead(

@@ -2088,6 +2088,9 @@ class CrmSubmissionService:
                 return date.fromisoformat(normalized[:10])
             except ValueError:
                 return None
+        if parsed_datetime.tzinfo is None:
+            # 智能表格系统录入时间是不带时区的上海本地时间，不能当作 UTC 再偏移八小时。
+            return parsed_datetime.date()
         return CrmSubmissionService._shanghai_date(parsed_datetime)
 
     def _is_unsubmitted_smart_table_record(
