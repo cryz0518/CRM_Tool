@@ -171,7 +171,7 @@ DEFAULT_LEAD_BUSINESS_VALUES = {
     "客户行业": "其他",
 }
 DEFAULT_SMART_TABLE_FIELD_VALUES = {"是否为国际客户": "国内", "提交状态": "未提交"}
-# 原生创建时间只读；旧后台“录入时间”仅保留审计，不要求表格存在或映射其原生类型。
+# 当前表格将原生创建时间命名为“录入时间”；两种名称都视为只读系统字段。
 READ_ONLY_SYSTEM_TIME_FIELDS = frozenset({"创建时间", "录入时间"})
 _FieldValue = TypeVar("_FieldValue")
 
@@ -179,7 +179,7 @@ _FieldValue = TypeVar("_FieldValue")
 def writable_smart_table_fields(fields: Mapping[str, _FieldValue]) -> dict[str, _FieldValue]:
     """剔除系统时间后生成可写补丁，保留后台审计值。
 
-    参数：fields 为草稿或本轮补丁。返回：不含创建时间及旧录入时间的副本。
+    参数：fields 为草稿或本轮补丁。返回：不含只读系统时间字段的副本。
     异常：无。副作用：无，不修改输入或真实表格。
     """
     return {

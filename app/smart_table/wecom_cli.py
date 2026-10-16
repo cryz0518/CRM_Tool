@@ -784,12 +784,11 @@ class WecomCliSmartTableAdapter:
                 )
             if capture_date is not None:
                 entry_time = self._quote_sql_identifier("录入时间")
-                created_time = self._quote_sql_identifier("创建时间")
-                preferred_time = f"COALESCE(NULLIF({entry_time}, ''), NULLIF({created_time}, ''))"
+                entry_time_value = f"NULLIF({entry_time}, '')"
                 date_value = self._quote_sql_string_literal(capture_date.isoformat())
                 conditions.append(
-                    f'(DATE_FORMAT({preferred_time}, "%Y-%m-%d") = {date_value} '
-                    f"OR {preferred_time} IS NULL)"
+                    f'(DATE_FORMAT({entry_time_value}, "%Y-%m-%d") = {date_value} '
+                    f"OR {entry_time_value} IS NULL)"
                 )
             where = " AND ".join(conditions)
             sql = self._build_query_sql(
@@ -892,14 +891,13 @@ class WecomCliSmartTableAdapter:
             else:
                 columns.append(quoted_name)
         if include_entry_time:
-            # 候选日期筛选需要返回两个只读系统时间，遵循录入时间优先、创建时间兜底。
+            # 当前表格的“录入时间”就是原生创建时间字段。
             schema_names = {field.name.removeprefix("*") for field in schema.fields}
-            for system_time in ("录入时间", "创建时间"):
-                if system_time not in schema_names:
-                    quoted_time = self._quote_sql_identifier(system_time)
-                    columns.append(
-                        f'DATE_FORMAT({quoted_time}, "%Y-%m-%d %H:%i:%s") AS {quoted_time}'
-                    )
+            if "录入时间" not in schema_names:
+                quoted_time = self._quote_sql_identifier("录入时间")
+                columns.append(
+                    f'DATE_FORMAT({quoted_time}, "%Y-%m-%d %H:%i:%s") AS {quoted_time}'
+                )
         query = (
             f"SELECT {', '.join(columns)} FROM "
             f"{self._quote_sql_identifier(self._sheet_title)}"
@@ -1097,10 +1095,9 @@ class WecomCliSmartTableAdapter:
             member_name = self._member_display_name(field, raw)
             if member_name is not None:
                 member_names[canonical_name] = member_name
-        # 系统时间字段不进入管理员维护的业务 Schema，但候选日期筛选需要它们。
-        for system_time in ("录入时间", "创建时间"):
-            if row.get(system_time) is not None:
-                normalized[system_time] = row[system_time]
+        # “录入时间”是当前表格的原生创建时间字段，不属于管理员维护的业务 Schema。
+        if row.get("录入时间") is not None:
+            normalized["录入时间"] = row["录入时间"]
         return SmartTableRecord(record_id=record_id, fields=normalized, member_names=member_names)
 
     def _list_pages(
