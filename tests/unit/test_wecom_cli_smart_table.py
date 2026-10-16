@@ -1434,9 +1434,10 @@ def test_owner_submission_date_and_status_are_in_one_server_query() -> None:
     sql = fake_cli.calls[1][fake_cli.calls[1].index("--sql") + 1]
     assert '`负责人` LIKE "%销售一%"' in sql
     assert '`提交状态` = "未提交"' in sql
-    assert "DATE_FORMAT(COALESCE(NULLIF(" in sql
+    assert 'DATE_FORMAT(NULLIF(`录入时间`, \'\'), "%Y-%m-%d")' in sql
     assert '"2026-10-13"' in sql
-    assert " OR COALESCE(NULLIF(`录入时间`" in sql
+    assert " OR NULLIF(`录入时间`, '') IS NULL" in sql
+    assert "创建时间" not in sql
     assert sql.count(" WHERE ") == 1
 
 
