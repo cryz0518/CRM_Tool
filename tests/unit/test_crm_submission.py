@@ -3408,7 +3408,7 @@ def test_company_preview_contains_match_still_requires_confirmation_card(
 
 @pytest.mark.parametrize(
     "candidate_count, expected_pages",
-    [(0, 0), (1, 1), (19, 1), (20, 2), (21, 2), (38, 2), (39, 3), (41, 3)],
+    [(0, 0), (1, 1), (19, 1), (20, 1), (21, 2), (39, 2), (40, 2), (41, 3), (61, 4)],
 )
 def test_batch_submission_issues_server_frozen_pages(
     session_factory: sessionmaker[Session],
@@ -3416,7 +3416,7 @@ def test_batch_submission_issues_server_frozen_pages(
     candidate_count: int,
     expected_pages: int,
 ) -> None:
-    """验证全选控件占用卡片选项后，候选仍按每页 19 条安全分页。"""
+    """验证独立全选操作不占候选选项，每页最多冻结 20 条线索。"""
     import app.crm.commands as crm_commands
 
     settings = get_settings().model_copy(
@@ -3475,10 +3475,10 @@ def test_batch_submission_issues_server_frozen_pages(
     if candidate_count:
         ordered_actions = sorted(actions, key=lambda action: int(action.context["page"]))
         assert [len(action.context["candidate_leads"]) for action in ordered_actions] == [
-            min(19, max(0, candidate_count - index * 19))
+            min(20, max(0, candidate_count - index * 20))
             for index in range(expected_pages)
         ]
-        assert all("select_all_option_id" in action.context for action in actions)
+        assert all("select_all_option_id" not in action.context for action in actions)
     if expected_pages > 1:
         assert "张候选卡" in reply
 
