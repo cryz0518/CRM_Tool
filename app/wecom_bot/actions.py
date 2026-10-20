@@ -37,6 +37,7 @@ CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE = "crm.duplicate_confirmation.continue"
 CARD_EVENT_KEY_CRM_DUPLICATE_STOP = "crm.duplicate_confirmation.stop"
 CARD_EVENT_KEY_CRM_COMPANY_CONFIRM = "crm.company_submission.confirm"
 CARD_EVENT_KEY_CRM_BATCH_SUBMISSION = "crm.batch_submission.confirm"
+CARD_EVENT_KEY_CRM_BATCH_SELECT_ALL = "crm.batch_submission.select_all"
 CARD_EVENT_KEY_DISCARD_CONFIRM = "lead.discard.confirm"
 CARD_EVENT_KEY_REASSIGN_CONFIRM = "lead.reassignment.confirm"
 CARD_TYPE_BUTTON_INTERACTION = "button_interaction"
@@ -50,6 +51,7 @@ ALLOWED_CARD_EVENT_KEYS = frozenset(
         CARD_EVENT_KEY_CRM_DUPLICATE_STOP,
         CARD_EVENT_KEY_CRM_COMPANY_CONFIRM,
         CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
+        CARD_EVENT_KEY_CRM_BATCH_SELECT_ALL,
         CARD_EVENT_KEY_DISCARD_CONFIRM,
         CARD_EVENT_KEY_REASSIGN_CONFIRM,
     }
@@ -208,6 +210,9 @@ class FrozenCardUpdate:
     options: tuple[FrozenCardOption, ...]
     submit_text: str
     submit_key: str
+    disable: bool = True
+    replace_text: str | None = "已确认选择"
+    include_select_all_action: bool = False
 
     def as_payload(self) -> dict[str, object]:
         """构造同类型投票卡更新体，冻结选项并替换确认按钮文案。
@@ -216,7 +221,7 @@ class FrozenCardUpdate:
         异常：无。
         副作用：无。
         """
-        return {
+        payload: dict[str, object] = {
             "card_type": CARD_TYPE_VOTE_INTERACTION,
             "task_id": self.task_id,
             "main_title": {"title": self.title, "desc": self.description},
@@ -230,12 +235,21 @@ class FrozenCardUpdate:
                     }
                     for option in self.options
                 ],
-                "disable": True,
+                "disable": self.disable,
                 "mode": self.mode,
             },
             "submit_button": {"text": self.submit_text, "key": self.submit_key},
-            "replace_text": "已确认选择",
         }
+        if self.include_select_all_action:
+            payload["action_menu"] = {
+                "desc": "批量操作",
+                "action_list": [
+                    {"text": "全选本页", "key": CARD_EVENT_KEY_CRM_BATCH_SELECT_ALL}
+                ],
+            }
+        if self.replace_text is not None:
+            payload["replace_text"] = self.replace_text
+        return payload
 
 
 @dataclass(frozen=True)
@@ -292,7 +306,7 @@ class CallbackClaimResult:
         """
 
         # 首次合法提交类 callback 使用 claim 时从服务端事实构造同类型冻结更新卡。
-        if self.code == "claimed" and self.frozen_card_update is not None:
+        if self.code in {"claimed", "select_all"} and self.frozen_card_update is not None:
             return self.frozen_card_update.as_payload()
         # 非批量交互沿用现有状态回执；task_id 只回显服务端已解析的 opaque correlation。
         title = "已确认选择" if self.code == "claimed" else "操作状态"
@@ -736,7 +750,13 @@ class WecomActionService:
             event_key_matches = (
                 callback.event_key in duplicate_keys
                 if action.action_type == ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION
-                else callback.event_key == action.expected_action_key
+                else (
+                    callback.event_key == action.expected_action_key
+                    or (
+                        action.action_type == ACTION_TYPE_CRM_BATCH_SUBMISSION
+                        and callback.event_key == CARD_EVENT_KEY_CRM_BATCH_SELECT_ALL
+                    )
+                )
             )
             if not event_key_matches:
                 return self._deny_action(
@@ -756,6 +776,24 @@ class WecomActionService:
                     action.id,
                     action.result_summary or "该操作已受理，业务动作不会重复执行",
                     False,
+                )
+
+            # 待处理动作在读取候选或构造响应卡前统一过期，避免旧卡继续接受全选操作。
+            now = utc_now()
+            if _as_utc(now) >= _as_utc(action.expires_at):
+                _transition_action(action, WecomActionStatus.EXPIRED.value)
+                action.processed_at = now
+                action.result_code = "expired"
+                action.result_summary = "卡片已过期，请重新发起操作"
+                delivery.processing_status = WecomCallbackProcessingStatus.REJECTED.value
+                delivery.result_code = "expired"
+                delivery.processed_at = now
+                logger.info(
+                    "wecom_action_expired",
+                    extra={"action_id": action.id, "event": "action_expired"},
+                )
+                return CallbackClaimResult(
+                    "expired", action.task_id, action.id, action.result_summary, True
                 )
 
             frozen_card_update: FrozenCardUpdate | FrozenButtonCardUpdate | None = None
@@ -858,6 +896,33 @@ class WecomActionService:
                         "invalid_action_context",
                         "候选提交动作类型无效，请重新发起",
                     )
+                if callback.event_key == CARD_EVENT_KEY_CRM_BATCH_SELECT_ALL:
+                    # 全选只改卡片勾选状态，不认领 CRM 动作；最终提交仍由 submit_button 回调触发。
+                    frozen_card_update = _freeze_vote_card_update(
+                        action,
+                        candidate_ids,
+                        disable=False,
+                        replace_text=None,
+                        include_select_all_action=True,
+                    )
+                    if frozen_card_update is None:
+                        return self._deny_action(
+                            action,
+                            delivery,
+                            "invalid_action_context",
+                            "候选线索列表已失效，请重新发起",
+                        )
+                    delivery.processing_status = WecomCallbackProcessingStatus.COMPLETED.value
+                    delivery.result_code = "all_selected"
+                    delivery.processed_at = now
+                    return CallbackClaimResult(
+                        "select_all",
+                        action.task_id,
+                        action.id,
+                        "已勾选本页全部线索，请确认提交",
+                        True,
+                        frozen_card_update,
+                    )
                 selected = set(callback.selected_option_ids)
                 select_all_option_id = action.context.get("select_all_option_id")
                 allowed_option_ids = set(candidate_ids)
@@ -955,22 +1020,6 @@ class WecomActionService:
                     ),
                     "selected_lead_ids": list(callback.selected_option_ids),
                 }
-
-            if _as_utc(now) >= _as_utc(action.expires_at):
-                _transition_action(action, WecomActionStatus.EXPIRED.value)
-                action.processed_at = now
-                action.result_code = "expired"
-                action.result_summary = "卡片已过期，请重新发起操作"
-                delivery.processing_status = WecomCallbackProcessingStatus.REJECTED.value
-                delivery.result_code = "expired"
-                delivery.processed_at = now
-                logger.info(
-                    "wecom_action_expired",
-                    extra={"action_id": action.id, "event": "action_expired"},
-                )
-                return CallbackClaimResult(
-                    "expired", action.task_id, action.id, action.result_summary, True
-                )
 
             # 行锁保护下仅 pending 可以变为 processing；Outbox 与 claim 在同一事务中提交。
             _transition_action(action, WecomActionStatus.PROCESSING.value)
@@ -1670,14 +1719,14 @@ class WecomActionService:
         """发行批量提交候选卡，负责人范围只保存在服务端动作上下文。
 
         参数：actor_user_id 为销售身份；request_message_id 为命令消息；command_text 为固定命令；
-        candidates 仅含服务端线索标识和展示名称；每页至多 19 条时增加服务端“全选本页”选项。
+        candidates 仅含服务端线索标识和展示名称；每页最多 20 条，另提供独立的全选操作。
         preview_markdown_chunks 为同一页 Smart Table 快照的完整 Markdown 分片。
         返回值：已持久化的候选选择动作。
         异常：候选数据、卡片能力或权限不满足时抛出异常。
         副作用：写入动作、卡片通知和发送 outbox，不调用 CRM。
         """
 
-        if not candidates or len(candidates) > 19 or page < 1 or page_count < page:
+        if not candidates or len(candidates) > 20 or page < 1 or page_count < page:
             raise ValueError("批量提交候选数量非法")
         if command_text == CROSS_OWNER_SUBMISSION_COMMAND:
             if (
@@ -1698,16 +1747,11 @@ class WecomActionService:
         target_id = hashlib.sha256(
             f"crm-batch-submission:{request_message_id}:{command_text}:page:{page}".encode()
         ).hexdigest()
-        # 每页预留一个选项给“全选本页”，同时保持企业微信卡片最多 20 项。
-        select_all_option_id = f"{_BATCH_SELECT_ALL_OPTION_PREFIX}{target_id[:24]}"
-        if any(item.get("lead_id") == select_all_option_id for item in candidates):
-            raise ValueError("批量提交候选与全选选项标识冲突")
         title, description = _batch_submission_card_copy(command_text, page, page_count)
         context: dict[str, object] = {
             "command_text": command_text,
             "request_message_id": request_message_id,
             "candidate_leads": [dict(item) for item in candidates],
-            "select_all_option_id": select_all_option_id,
             "page": page,
             "page_count": page_count,
             "owner_scope_user_ids": (
@@ -2066,7 +2110,7 @@ def _batch_submission_card_copy(
     """
     title = "重新提交放弃线索" if "放弃提交" in command_text else "选择要提交的线索"
     page_suffix = f"（第 {page}/{page_count} 批）" if page_count > 1 else ""
-    description = "请勾选需要提交的线索，或选择“全选本页”提交本页全部线索" + page_suffix
+    description = "请勾选需要提交的线索，点击右上角“全选本页”可选择全部线索" + page_suffix
     return title + page_suffix, description
 
 
@@ -2153,11 +2197,22 @@ def build_action_card(
             "option_list": option_list,
         }
         payload.pop("button_list")
-        payload["submit_button"] = {
-            "text": "确认选择" if selection_options is not None else "继续提交",
-            "key": submit_key,
-        }
-        if selection_options is None:
+        if selection_key == CARD_EVENT_KEY_CRM_BATCH_SUBMISSION:
+            submit_text = "确认提交"
+        elif selection_options is not None:
+            submit_text = "确认选择"
+        else:
+            submit_text = "继续提交"
+        payload["submit_button"] = {"text": submit_text, "key": submit_key}
+        if selection_key == CARD_EVENT_KEY_CRM_BATCH_SUBMISSION:
+            # 投票卡仅支持一个底部提交按钮，全选操作放入右上角 action_menu。
+            payload["action_menu"] = {
+                "desc": "批量操作",
+                "action_list": [
+                    {"text": "全选本页", "key": CARD_EVENT_KEY_CRM_BATCH_SELECT_ALL}
+                ],
+            }
+        elif selection_options is None:
             payload["action_menu"] = {
                 "desc": "重复线索处理",
                 "action_list": [{"text": "停止提交", "key": CARD_EVENT_KEY_CRM_DUPLICATE_STOP}],
@@ -2168,7 +2223,12 @@ def build_action_card(
 
 
 def _freeze_vote_card_update(
-    action: WecomAction, selected_option_ids: tuple[str, ...]
+    action: WecomAction,
+    selected_option_ids: tuple[str, ...],
+    *,
+    disable: bool = True,
+    replace_text: str | None = "已确认选择",
+    include_select_all_action: bool = False,
 ) -> FrozenCardUpdate | None:
     """从持久化 action context 构造不可变、同类型投票卡更新。
 
@@ -2332,6 +2392,9 @@ def _freeze_vote_card_update(
         options=tuple(frozen_options),
         submit_text=submit_text,
         submit_key=submit_key,
+        disable=disable,
+        replace_text=replace_text,
+        include_select_all_action=include_select_all_action,
     )
 
 
