@@ -2774,7 +2774,11 @@ def test_cross_owner_selection_card_freezes_target_and_shows_names_only(
     assert "跨日重名公司" not in markdown
     assert "王工" not in markdown
     assert "13800000000" not in markdown
-    assert {option["text"].split(". ", 1)[-1] for option in options} == {
+    assert {
+        option["text"].split(". ", 1)[-1]
+        for option in options
+        if not option["text"].startswith("全选本页")
+    } == {
         "人工最终公司",
         "当日表格漏链公司",
         "当日已有草稿公司",
@@ -3403,7 +3407,8 @@ def test_company_preview_contains_match_still_requires_confirmation_card(
 
 
 @pytest.mark.parametrize(
-    "candidate_count, expected_pages", [(0, 0), (1, 1), (20, 1), (21, 2), (41, 3)]
+    "candidate_count, expected_pages",
+    [(0, 0), (1, 1), (19, 1), (20, 2), (21, 2), (38, 2), (39, 3), (41, 3)],
 )
 def test_batch_submission_issues_server_frozen_pages(
     session_factory: sessionmaker[Session],
@@ -3411,7 +3416,7 @@ def test_batch_submission_issues_server_frozen_pages(
     candidate_count: int,
     expected_pages: int,
 ) -> None:
-    """验证 20 条以上候选会发行可执行的服务端分页卡，而不是提示无法处理。"""
+    """验证全选控件占用卡片选项后，候选仍按每页 19 条安全分页。"""
     import app.crm.commands as crm_commands
 
     settings = get_settings().model_copy(
@@ -3467,7 +3472,14 @@ def test_batch_submission_issues_server_frozen_pages(
     with session_factory() as session:
         actions = session.scalars(select(WecomAction)).all()
     assert len(actions) == expected_pages
-    if candidate_count > 20:
+    if candidate_count:
+        ordered_actions = sorted(actions, key=lambda action: int(action.context["page"]))
+        assert [len(action.context["candidate_leads"]) for action in ordered_actions] == [
+            min(19, max(0, candidate_count - index * 19))
+            for index in range(expected_pages)
+        ]
+        assert all("select_all_option_id" in action.context for action in actions)
+    if expected_pages > 1:
         assert "张候选卡" in reply
 
 
@@ -3551,11 +3563,16 @@ def test_batch_submission_sends_full_snapshot_markdown_before_short_selection_ca
     assert "提交状态：未提交" in markdown
     assert "- 缺少：职务" in markdown
     assert "AI待确认" not in markdown
-    assert [option["id"] for option in options] == [
+    assert options[0]["id"].startswith("all-")
+    assert [option["id"] for option in options[1:]] == [
         "batch-detail-lead-0",
         "batch-detail-lead-1",
     ]
-    assert [option["text"] for option in options] == ["1. 冻结公司-0", "2. 冻结公司-1"]
+    assert [option["text"] for option in options] == [
+        "全选本页（2条）",
+        "1. 冻结公司-0",
+        "2. 冻结公司-1",
+    ]
 
 
 def test_company_preview_links_existing_owner_record_into_local_lead(

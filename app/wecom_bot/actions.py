@@ -42,6 +42,7 @@ CARD_EVENT_KEY_REASSIGN_CONFIRM = "lead.reassignment.confirm"
 CARD_TYPE_BUTTON_INTERACTION = "button_interaction"
 CARD_TYPE_VOTE_INTERACTION = "vote_interaction"
 _BATCH_SELECTION_QUESTION_KEY = "crm_submission_candidates"
+_BATCH_SELECT_ALL_OPTION_PREFIX = "all-"
 ALLOWED_CARD_EVENT_KEYS = frozenset(
     {
         CARD_EVENT_KEY_CRM_FIELD_CONFIRM,
@@ -631,6 +632,7 @@ class WecomActionService:
                             duplicate_leads=safe_context.get("duplicate_leads"),
                             selection_options=safe_context.get("candidate_leads"),
                             selection_key=expected_action_key,
+                            select_all_option_id=safe_context.get("select_all_option_id"),
                             preview_fields=preview_fields,
                         ),
                     },
@@ -857,16 +859,47 @@ class WecomActionService:
                         "候选提交动作类型无效，请重新发起",
                     )
                 selected = set(callback.selected_option_ids)
-                if not selected or selected - set(candidate_ids):
+                select_all_option_id = action.context.get("select_all_option_id")
+                allowed_option_ids = set(candidate_ids)
+                if select_all_option_id is not None:
+                    if (
+                        not isinstance(select_all_option_id, str)
+                        or _ID_PATTERN.fullmatch(select_all_option_id) is None
+                        or select_all_option_id
+                        != f"{_BATCH_SELECT_ALL_OPTION_PREFIX}{action.target_id[:24]}"
+                        or select_all_option_id in allowed_option_ids
+                        or len(candidate_ids) >= 20
+                    ):
+                        return self._deny_action(
+                            action,
+                            delivery,
+                            "invalid_action_context",
+                            "候选线索列表已失效，请重新发起",
+                        )
+                    allowed_option_ids.add(select_all_option_id)
+                if not selected or selected - allowed_option_ids:
                     return self._deny_action(
                         action,
                         delivery,
                         "selection_mismatch",
                         "请至少选择一条有效线索",
                     )
-                frozen_card_update = _freeze_vote_card_update(
-                    action, callback.selected_option_ids
+                # “全选本页”只展开为服务端冻结的候选，不接受客户端自带的目标列表。
+                selected_lead_ids = (
+                    candidate_ids
+                    if select_all_option_id is not None and select_all_option_id in selected
+                    else tuple(
+                        option_id
+                        for option_id in callback.selected_option_ids
+                        if option_id in candidate_ids
+                    )
                 )
+                card_selected_option_ids = (
+                    candidate_ids
+                    if select_all_option_id is not None and select_all_option_id in selected
+                    else callback.selected_option_ids
+                )
+                frozen_card_update = _freeze_vote_card_update(action, card_selected_option_ids)
                 if frozen_card_update is None:
                     return self._deny_action(
                         action,
@@ -876,7 +909,7 @@ class WecomActionService:
                     )
                 action.context = {
                     **action.context,
-                    "selected_lead_ids": list(callback.selected_option_ids),
+                    "selected_lead_ids": list(selected_lead_ids),
                 }
 
             if action.action_type == ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION:
@@ -1637,14 +1670,14 @@ class WecomActionService:
         """发行批量提交候选卡，负责人范围只保存在服务端动作上下文。
 
         参数：actor_user_id 为销售身份；request_message_id 为命令消息；command_text 为固定命令；
-        candidates 仅含服务端线索标识和展示名称。
+        candidates 仅含服务端线索标识和展示名称；每页至多 19 条时增加服务端“全选本页”选项。
         preview_markdown_chunks 为同一页 Smart Table 快照的完整 Markdown 分片。
         返回值：已持久化的候选选择动作。
         异常：候选数据、卡片能力或权限不满足时抛出异常。
         副作用：写入动作、卡片通知和发送 outbox，不调用 CRM。
         """
 
-        if not candidates or len(candidates) > 20 or page < 1 or page_count < page:
+        if not candidates or len(candidates) > 19 or page < 1 or page_count < page:
             raise ValueError("批量提交候选数量非法")
         if command_text == CROSS_OWNER_SUBMISSION_COMMAND:
             if (
@@ -1665,28 +1698,34 @@ class WecomActionService:
         target_id = hashlib.sha256(
             f"crm-batch-submission:{request_message_id}:{command_text}:page:{page}".encode()
         ).hexdigest()
+        # 每页预留一个选项给“全选本页”，同时保持企业微信卡片最多 20 项。
+        select_all_option_id = f"{_BATCH_SELECT_ALL_OPTION_PREFIX}{target_id[:24]}"
+        if any(item.get("lead_id") == select_all_option_id for item in candidates):
+            raise ValueError("批量提交候选与全选选项标识冲突")
         title, description = _batch_submission_card_copy(command_text, page, page_count)
+        context: dict[str, object] = {
+            "command_text": command_text,
+            "request_message_id": request_message_id,
+            "candidate_leads": [dict(item) for item in candidates],
+            "select_all_option_id": select_all_option_id,
+            "page": page,
+            "page_count": page_count,
+            "owner_scope_user_ids": (
+                list(dict.fromkeys(owner_scope_user_ids))
+                if owner_scope_user_ids is not None
+                else None
+            ),
+            "target_capture_date": (
+                target_capture_date.toordinal() if target_capture_date is not None else None
+            ),
+        }
         return self.issue_action(
             actor_user_id=actor_user_id,
             action_type=ACTION_TYPE_CRM_BATCH_SUBMISSION,
             target_type="crm_batch_submission",
             target_id=target_id,
             expected_action_key=CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
-            context={
-                "command_text": command_text,
-                "request_message_id": request_message_id,
-                "candidate_leads": [dict(item) for item in candidates],
-                "page": page,
-                "page_count": page_count,
-                "owner_scope_user_ids": (
-                    list(dict.fromkeys(owner_scope_user_ids))
-                    if owner_scope_user_ids is not None
-                    else None
-                ),
-                "target_capture_date": (
-                    target_capture_date.toordinal() if target_capture_date is not None else None
-                ),
-            },
+            context=context,
             title=title,
             description=description,
             source_message_id=request_message_id,
@@ -2027,7 +2066,7 @@ def _batch_submission_card_copy(
     """
     title = "重新提交放弃线索" if "放弃提交" in command_text else "选择要提交的线索"
     page_suffix = f"（第 {page}/{page_count} 批）" if page_count > 1 else ""
-    description = "请勾选需要提交的线索；未勾选的线索不会调用 CRM" + page_suffix
+    description = "请勾选需要提交的线索，或选择“全选本页”提交本页全部线索" + page_suffix
     return title + page_suffix, description
 
 
@@ -2040,12 +2079,14 @@ def build_action_card(
     duplicate_leads: object = None,
     selection_options: object = None,
     selection_key: str | None = None,
+    select_all_option_id: object = None,
     preview_fields: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """构造服务端生成的 template card body，字段详情由前置 Markdown 展示。
 
     参数：task_id 和 event_key 为服务端生成的关联值，title 和 description 为安全文案；
-    preview_fields 表示已有前置字段详情，卡片只显示纯文本提示；业务目标仍在服务端 action 中。
+    select_all_option_id 为服务端批量提交卡片的可选全选项标识；preview_fields 表示已有前置字段详情，
+    卡片只显示纯文本提示；业务目标仍在服务端 action 中。
     返回值：可交给企业微信发送接口的卡片 body。
     异常：无；调用方应先完成动作定义校验。
     副作用：无，不保存任何客户端业务字段。
@@ -2073,24 +2114,43 @@ def build_action_card(
         )
         # 公司候选使用单选，批量提交和重复处理使用多选；服务端 callback 会再次校验范围。
         payload["card_type"] = CARD_TYPE_VOTE_INTERACTION
+        option_list = [
+            {
+                "id": item["lead_id"],
+                # 完整字段已经在前置 Markdown 展示，checkbox 只保留页内序号和公司短名。
+                "text": f"{index}. {str(item['company_name'])[:56]}",
+                "is_checked": False,
+            }
+            for index, item in enumerate(options, start=1)
+            if isinstance(item, dict)
+            and isinstance(item.get("lead_id"), str)
+            and isinstance(item.get("company_name"), str)
+        ]
+        if select_all_option_id is not None:
+            if (
+                selection_key != CARD_EVENT_KEY_CRM_BATCH_SUBMISSION
+                or not isinstance(select_all_option_id, str)
+                or _ID_PATTERN.fullmatch(select_all_option_id) is None
+                or len(option_list) >= 20
+                or any(option["id"] == select_all_option_id for option in option_list)
+            ):
+                raise ValueError("批量提交全选选项非法")
+            # 将全选控件放入原有 20 项上限内；服务端回调再展开为完整候选页。
+            option_list.insert(
+                0,
+                {
+                    "id": select_all_option_id,
+                    "text": f"全选本页（{len(option_list)}条）",
+                    "is_checked": False,
+                },
+            )
         payload["checkbox"] = {
             "question_key": question_key,
             # 批量提交允许多选；公司候选仍保持单选，重复处理沿用既有多选契约。
             "mode": 1 if selection_key == CARD_EVENT_KEY_CRM_BATCH_SUBMISSION else (
                 0 if selection_options is not None else 1
             ),
-            "option_list": [
-                {
-                    "id": item["lead_id"],
-                    # 完整字段已经在前置 Markdown 展示，checkbox 只保留页内序号和公司短名。
-                    "text": f"{index}. {str(item['company_name'])[:56]}",
-                    "is_checked": False,
-                }
-                for index, item in enumerate(options, start=1)
-                if isinstance(item, dict)
-                and isinstance(item.get("lead_id"), str)
-                and isinstance(item.get("company_name"), str)
-            ],
+            "option_list": option_list,
         }
         payload.pop("button_list")
         payload["submit_button"] = {
@@ -2124,6 +2184,9 @@ def _freeze_vote_card_update(
         else "candidate_leads"
     )
     if not isinstance(candidates, list) or not candidates:
+        return None
+    candidate_ids = _context_lead_ids(candidates)
+    if not candidate_ids:
         return None
     if action.action_type == ACTION_TYPE_CRM_BATCH_SUBMISSION:
         command_text = context.get("command_text")
@@ -2177,6 +2240,16 @@ def _freeze_vote_card_update(
         return None
 
     # 复用发行时卡片 builder 的选项规则，避免更新时重排或改写冻结候选标签。
+    select_all_option_id = context.get("select_all_option_id")
+    if select_all_option_id is not None and (
+        not isinstance(select_all_option_id, str)
+        or _ID_PATTERN.fullmatch(select_all_option_id) is None
+        or select_all_option_id
+        != f"{_BATCH_SELECT_ALL_OPTION_PREFIX}{action.target_id[:24]}"
+        or select_all_option_id in candidate_ids
+        or len(candidate_ids) >= 20
+    ):
+        return None
     original_card = build_action_card(
         task_id=action.task_id,
         event_key=action.expected_action_key,
@@ -2186,6 +2259,7 @@ def _freeze_vote_card_update(
             None if action.action_type == ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION else candidates
         ),
         selection_key=action.expected_action_key,
+        select_all_option_id=select_all_option_id,
         duplicate_leads=candidates
         if action.action_type == ACTION_TYPE_CRM_DUPLICATE_CONFIRMATION
         else None,
@@ -2201,16 +2275,20 @@ def _freeze_vote_card_update(
     ):
         return None
     raw_options = checkbox.get("option_list")
-    candidate_ids = _context_lead_ids(candidates)
+    expected_option_ids = (
+        (select_all_option_id, *candidate_ids)
+        if isinstance(select_all_option_id, str)
+        else candidate_ids
+    )
     if (
         not isinstance(raw_options, list)
-        or len(raw_options) != len(candidate_ids)
+        or len(raw_options) != len(expected_option_ids)
         or tuple(
             option.get("id")
             for option in raw_options
             if isinstance(option, Mapping)
         )
-        != tuple(candidate_ids)
+        != tuple(expected_option_ids)
     ):
         return None
 
@@ -2282,11 +2360,20 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
         "target_capture_date",
         "page",
         "page_count",
+        "select_all_option_id",
     }
     if any(key not in allowed_keys for key in context):
         raise ValueError("动作 context 含未允许字段")
     safe: dict[str, object] = {}
     for key, value in context.items():
+        if (
+            key == "select_all_option_id"
+            and isinstance(value, str)
+            and re.fullmatch(rf"{_BATCH_SELECT_ALL_OPTION_PREFIX}[0-9a-f]{{24}}", value)
+        ):
+            # 服务端生成的哈希选项 ID 不能经过手机号脱敏，否则回调 ID 将与卡片不同。
+            safe[key] = value
+            continue
         if isinstance(value, str):
             if len(value) > 512 or "\n" in value or "\r" in value:
                 raise ValueError("动作 context 文本非法")
