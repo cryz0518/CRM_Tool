@@ -2722,11 +2722,12 @@ class FirstTextLeadWorkspaceService:
         *,
         refresh_context: bool = True,
         defer_batch: bool = True,
+        initial_record: SmartTableRecord | None = None,
     ) -> LeadProcessingResult:
         """为 AI 已安全决定的目标创建审核记录（如需）并经 T09 写入字段补丁。
 
         参数：request 为事务提交后可执行的 AI 结果及真实销售身份；defer_batch 控制新线索
-        是否进入持久化批次。
+        是否进入持久化批次；initial_record 为本轮批量新增接口返回并核实的当前记录快照。
         返回值：首次建档返回 CREATED 或 BATCH_QUEUED，既有上下文补充返回 UPDATED，
         外部失败返回 SYNC_FAILED。
         异常：关键数据库事实缺失时抛出 ValueError；其他外部失败转为失败待审事实。
@@ -2776,14 +2777,20 @@ class FirstTextLeadWorkspaceService:
                 LeadProcessingStatus.BATCH_QUEUED,
                 lead_id=request.lead_id,
             )
-        record_id, initial_record, preserve_record = self._ensure_ai_review_record(request)
+        record_id, created_record, preserve_record = self._ensure_ai_review_record(request)
         if record_id is None:
             return LeadProcessingResult(LeadProcessingStatus.SYNC_FAILED, lead_id=request.lead_id)
         try:
+            if created_record is not None and initial_record is not None:
+                if created_record.record_id != initial_record.record_id:
+                    raise ValueError("AI 审核创建响应与批量记录快照不一致")
+            review_record = created_record or initial_record
+            if review_record is not None and review_record.record_id != record_id:
+                raise ValueError(f"AI 审核记录快照标识不一致：{record_id}")
             # T09 负责人工编辑保护、中置信度 AI待确认与增量写入；不得由本层直接写模型字段。
             self._sync_ai_review_patch(
                 request,
-                initial_record=initial_record,
+                initial_record=review_record,
                 allow_recreate=not preserve_record,
             )
         except Exception as error:
@@ -3536,9 +3543,10 @@ class FirstTextLeadWorkspaceService:
                     "smart_table_lead_batch_disabled",
                     extra={"reason": "schema_unavailable", "error_type": type(error).__name__},
                 )
+        initial_records: dict[str, SmartTableRecord] = {}
         if can_batch:
-            # 新增结果通过系统线索 ID 回查，确保远端结果不明时可安全恢复。
-            self._create_multi_smart_table_batch(requests)
+            # 稳定键保障重试不重复建行；本轮新增响应快照可直接交给 T09。
+            initial_records = self._create_multi_smart_table_batch(requests)
 
         succeeded = 0
         last_ai_request_by_event: dict[int, int] = {}
@@ -3572,6 +3580,7 @@ class FirstTextLeadWorkspaceService:
                     ),
                     refresh_context=last_ai_request_by_event.get(request.outbox_event_id) == index,
                     defer_batch=False,
+                    initial_record=initial_records.get(request.lead_id),
                 )
             else:
                 result = self._create_smart_table_record(
@@ -3586,6 +3595,7 @@ class FirstTextLeadWorkspaceService:
                     request.segment_index,
                     pending_confirmation_fields=request.pending_confirmation_fields,
                     bypass_batch=True,
+                    initial_record=initial_records.get(request.lead_id),
                 )
             if result.status is not LeadProcessingStatus.SYNC_FAILED:
                 succeeded += 1
@@ -3641,16 +3651,18 @@ class FirstTextLeadWorkspaceService:
                     completed.append((event.id, tuple(sync.lead_id for sync in syncs)))
         return tuple(completed)
 
-    def _create_multi_smart_table_batch(self, requests: tuple[MultiLeadSyncRequest, ...]) -> bool:
+    def _create_multi_smart_table_batch(
+        self, requests: tuple[MultiLeadSyncRequest, ...]
+    ) -> dict[str, SmartTableRecord]:
         """批量新增多条消息的线索，并通过系统线索 ID 恢复不确定的远端结果。
 
         参数：requests 为持久化队列中的多个待写入线索，可来自不同消息和销售。
-        返回值：所有目标均已有或成功取得远端记录标识时返回 True。
+        返回值：仅包含本轮批量新增且已由适配器核实的记录快照，供 T09 避免重复读取。
         异常：本地数据库异常向调用方传播；适配器异常会持久化为重试或待人工处理状态。
         副作用：校验各自的销售归属，调用一次批量创建，并逐条保存远端记录 ID。
         """
         if not requests:
-            return True
+            return {}
 
         record_ids: dict[str, str] = {}
         fields_by_lead: dict[str, dict[str, object]] = {}
@@ -3698,7 +3710,7 @@ class FirstTextLeadWorkspaceService:
                 "smart_table_multi_lead_batch_preflight_failed",
                 extra={"error_type": type(error).__name__},
             )
-            return False
+            return {}
         self._persist_multi_smart_table_record_ids(unlinked_requests, existing_records)
         record_ids.update(
             {lead_id: record.record_id for lead_id, record in existing_records.items()}
@@ -3748,12 +3760,14 @@ class FirstTextLeadWorkspaceService:
                         "smart_table_multi_lead_batch_create_failed",
                         extra={"error_type": type(failure_error).__name__},
                     )
-                    return False
+                    return {}
             else:
                 self._persist_multi_smart_table_record_ids(
                     pending_requests, created_records
                 )
-        return True
+                # 仅复用本次 add 的核实响应；回查恢复到的旧行仍由 T09 再读一次。
+                return created_records
+        return {}
 
     def _find_multi_smart_table_records(
         self, requests: tuple[MultiLeadSyncRequest, ...]
@@ -4934,11 +4948,13 @@ class FirstTextLeadWorkspaceService:
         pending_confirmation_fields: tuple[str, ...] = (),
         *,
         bypass_batch: bool = False,
+        initial_record: SmartTableRecord | None = None,
     ) -> LeadProcessingResult:
         """以机器人身份新建销售可见表格记录，并持久化同步成功或失败事实。
 
         参数：sales_user_id 为当前有效 actor；fields 为确定性提取字段；
-        lead_id、事件和分段标识用于回写；bypass_batch 仅供批次 Worker 完成单条回退。
+        lead_id、事件和分段标识用于回写；bypass_batch 仅供批次 Worker 完成单条回退；
+        initial_record 为本轮批量新增响应中已核实的对应记录快照。
         返回值：包含表格记录标识的创建结果、批次排队结论，或表格失败结论。
         异常：数据库回写错误向调用方传播；表格适配器错误转换为可审计失败结果。
         副作用：调用 SmartTableAdapter，并更新 Lead、同步结果、Outbox 与审计。
@@ -5006,7 +5022,10 @@ class FirstTextLeadWorkspaceService:
         }
         logger.info("smart_table_first_lead_sync_started")
         record_id = existing_record_id
+        record = initial_record
         try:
+            if record is not None and record.record_id != record_id:
+                raise ValueError(f"智能表格批量记录快照标识不一致：{lead_id}")
             if record_id is None:
                 record = self._smart_table_adapter.create_record(
                     writable_smart_table_fields(record_fields), actor=SmartTableActor.ROBOT
@@ -5069,6 +5088,7 @@ class FirstTextLeadWorkspaceService:
                     pending_confirmation_fields=pending_confirmation_fields,
                     low_confidence_candidates={},
                 ),
+                initial_record=record,
             )
         except Exception as error:
             with self._session_factory.begin() as session:
