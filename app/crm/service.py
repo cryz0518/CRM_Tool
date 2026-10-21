@@ -405,7 +405,8 @@ class CrmSubmissionService:
         参数：limit 为本轮最多扫描的同步记录数，必须为正整数。
         返回值：本轮认领候选数；并发下候选可能已由其他 Worker 完成。
         异常：数据库读写错误向 Celery 传播；单条 CRM 错误由同步状态机保存。
-        副作用：重用已冻结 payload 与幂等键调用 CRM，并登记最终结果通知。
+        副作用：按配置上限并发重用已冻结 payload 与幂等键调用 CRM，并登记最终结果通知；
+        SQLite 保持串行。
         """
         if limit <= 0:
             raise ValueError("CRM 重试扫描数量必须大于 0")
@@ -430,9 +431,34 @@ class CrmSubmissionService:
                 .order_by(CrmSyncRecord.next_retry_at, CrmSyncRecord.id)
                 .limit(limit)
             ).all()
-        for sync_id, sales_user_id in due_syncs:
-            # `_claim_and_call` 使用行锁和租约 fencing，多个 Beat/Worker 不会重复认领。
-            self._claim_and_call(sync_id, sales_user_id, notify_retry_result=True)
+        if not due_syncs:
+            return 0
+        bind = self._session_factory.kw.get("bind")
+        max_workers = min(self._crm_submission_max_concurrency, len(due_syncs))
+        if len(due_syncs) == 1 or (
+            bind is not None and getattr(getattr(bind, "dialect", None), "name", None) == "sqlite"
+        ):
+            # 单条不启动线程；SQLite 开发库串行写入，避免共享连接争用。
+            for sync_id, sales_user_id in due_syncs:
+                self._claim_and_call(sync_id, sales_user_id, notify_retry_result=True)
+        else:
+            # 每条仍独立认领和提交，状态机通过行锁、租约 fencing 与幂等键防止重复写入。
+            with ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="crm-retry",
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        self._claim_and_call,
+                        sync_id,
+                        sales_user_id,
+                        notify_retry_result=True,
+                    )
+                    for sync_id, sales_user_id in due_syncs
+                ]
+                # CRM 单条错误已由状态机收敛；数据库异常仍传播给 Celery 重试任务。
+                for future in as_completed(futures):
+                    future.result()
         return len(due_syncs)
 
     def _resolve_crm_owner(
