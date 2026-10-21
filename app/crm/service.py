@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
@@ -391,6 +392,7 @@ class CrmSubmissionService:
             else crm_create_retry_count
         )
         self._crm_create_retry_delay_seconds = settings.crm_create_retry_delay_seconds
+        self._crm_submission_max_concurrency = settings.crm_submission_max_concurrency
         self._employee_directory = employee_directory
         # 当前销售只能提交本人负责且已从智能表格读取到的线索，CRM headerId 由负责人目录解析。
         self._crm_payload_builder = CrmPayloadBuilder(settings.crm_customer_level_scheme)
@@ -498,6 +500,73 @@ class CrmSubmissionService:
             ),
             None,
         )
+
+    def _submit_create_batch(
+        self,
+        submissions: Sequence[tuple[str, SubmissionCommand, SmartTableRecord | None]],
+        *,
+        on_item_result: Callable[[SubmissionItemResult], None] | None = None,
+    ) -> dict[str, CreateSubmissionOutcome]:
+        """并发处理已完成服务端校验的创建目标，并保留逐条结果与回调。
+
+        参数：submissions 为线索 ID、固定命令和本请求表格快照组成的序列；
+        on_item_result 为可选的逐条结果持久化回调。
+        返回值：按线索 ID 索引的独立提交结果。
+        异常：回调异常向调用方传播；单条提交流程的未捕获异常被收敛为待人工检查。
+        副作用：最多按 CRM_SUBMISSION_MAX_CONCURRENCY 并发调用已冻结的单条提交流程。
+        """
+        outcomes: dict[str, CreateSubmissionOutcome] = {}
+        if not submissions:
+            return outcomes
+        bind = self._session_factory.kw.get("bind")
+        max_workers = min(self._crm_submission_max_concurrency, len(submissions))
+        if len(submissions) == 1 or (
+            bind is not None and getattr(getattr(bind, "dialect", None), "name", None) == "sqlite"
+        ):
+            # 单条不启动线程；SQLite 开发库也串行写入，避免共享连接争用。
+            for lead_id, command, record in submissions:
+                try:
+                    outcome = self._submit_create(lead_id, command, initial_record=record)
+                except Exception as error:
+                    _LOGGER.warning(
+                        "crm_batch_submission_item_failed",
+                        extra={"lead_id": lead_id, "failure": safe_failure_summary(error)},
+                    )
+                    outcome = _create_outcome("failed_pending_review")
+                outcomes[lead_id] = outcome
+                if on_item_result is not None:
+                    item = _append_create_result(SubmissionBatchResult(), lead_id, outcome).items[0]
+                    on_item_result(item)
+            return outcomes
+        # 表格快照由调用方先批量读取；每条 CRM 操作仍使用原有幂等键与独立持久化状态。
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="crm-submit",
+        ) as executor:
+            futures = {
+                executor.submit(
+                    self._submit_create,
+                    lead_id,
+                    command,
+                    initial_record=record,
+                ): lead_id
+                for lead_id, command, record in submissions
+            }
+            for future in as_completed(futures):
+                lead_id = futures[future]
+                try:
+                    outcome = future.result()
+                except Exception as error:
+                    _LOGGER.warning(
+                        "crm_batch_submission_item_failed",
+                        extra={"lead_id": lead_id, "failure": safe_failure_summary(error)},
+                    )
+                    outcome = _create_outcome("failed_pending_review")
+                outcomes[lead_id] = outcome
+                if on_item_result is not None:
+                    item = _append_create_result(SubmissionBatchResult(), lead_id, outcome).items[0]
+                    on_item_result(item)
+        return outcomes
 
     def submit(self, command: SubmissionCommand) -> SubmissionBatchResult:
         """解析固定命令并逐条提交本人待创建 Lead，保持批次部分成功。
@@ -619,29 +688,27 @@ class CrmSubmissionService:
             else:
                 reasons[lead_id] = "candidate_state_changed"
 
+        submissions = [
+            (
+                lead_id,
+                SubmissionCommand(
+                    "提交指定线索",
+                    command.sales_user_id,
+                    command.request_message_id,
+                    target_lead_id=lead_id,
+                ),
+                smart_table_snapshot.get(
+                    eligible_leads[lead_id].smart_table_record_id or ""
+                ),
+            )
+            for lead_id in selected
+            if lead_id in eligible
+        ]
+        outcomes = self._submit_create_batch(submissions)
         result = SubmissionBatchResult()
         for lead_id in selected:
             if lead_id in eligible:
-                try:
-                    outcome = self._submit_create(
-                        lead_id,
-                        SubmissionCommand(
-                            "提交指定线索",
-                            command.sales_user_id,
-                            command.request_message_id,
-                            target_lead_id=lead_id,
-                        ),
-                        initial_record=smart_table_snapshot.get(
-                            eligible_leads[lead_id].smart_table_record_id or ""
-                        ),
-                    )
-                except Exception as error:
-                    # 单条快照/依赖异常不能中断其它线索；未知结果按人工检查点反馈。
-                    _LOGGER.warning(
-                        "crm_incomplete_retry_item_failed",
-                        extra={"lead_id": lead_id, "error_type": type(error).__name__},
-                    )
-                    outcome = _create_outcome("failed_pending_review")
+                outcome = outcomes[lead_id]
             elif reasons.get(lead_id) == "request_succeeded":
                 # 同一命令重放时保留真实成功；其它请求只报告已提交，绝不重复创建。
                 outcome = _create_outcome("succeeded")
@@ -877,13 +944,31 @@ class CrmSubmissionService:
             owner_scope = set(command.owner_scope_user_ids or ())
             valid_ids: set[str] = set()
             selected_record_ids: dict[str, str] = {}
+            # 将卡片勾选项的 Lead 与最新 create 状态各用一次查询读齐，避免逐条 N+1 查询。
+            selected_leads = {
+                lead.id: lead for lead in session.scalars(select(Lead).where(Lead.id.in_(selected)))
+            }
+            latest_sync_by_lead: dict[str, CrmSyncRecord] = {}
+            for sync in session.scalars(
+                select(CrmSyncRecord)
+                .where(
+                    CrmSyncRecord.lead_id.in_(selected),
+                    CrmSyncRecord.operation == "create",
+                )
+                .order_by(
+                    CrmSyncRecord.lead_id,
+                    CrmSyncRecord.generation.desc().nullslast(),
+                    CrmSyncRecord.id.desc(),
+                )
+            ):
+                latest_sync_by_lead.setdefault(sync.lead_id, sync)
             for lead_id in selected:
-                lead = session.get(Lead, lead_id)
+                lead = selected_leads.get(lead_id)
                 if lead is None:
                     continue
                 if lead.smart_table_record_id is not None:
                     selected_record_ids[lead_id] = lead.smart_table_record_id
-                sync = latest_crm_create_sync(session, lead_id)
+                sync = latest_sync_by_lead.get(lead_id)
                 if command.text == _ABANDONED_COMMAND:
                     # 确认卡可能跨越线索转交；只允许当前负责人或授权范围匹配的操作者继续。
                     if (
@@ -924,9 +1009,7 @@ class CrmSubmissionService:
                     valid_ids.add(lead_id)
         # 回调只批量读取仍有效的勾选记录；快照仅在当前请求内复用，不跨请求缓存。
         requested_record_ids = {
-            selected_record_ids[lead_id]
-            for lead_id in valid_ids
-            if lead_id in selected_record_ids
+            selected_record_ids[lead_id] for lead_id in valid_ids if lead_id in selected_record_ids
         }
         snapshot_by_record_id: dict[str, SmartTableRecord] = {}
         if requested_record_ids:
@@ -940,43 +1023,46 @@ class CrmSubmissionService:
                     "crm_submission_batch_snapshot_failed failure=%s",
                     safe_failure_summary(error),
                 )
+        invalid_outcomes = {
+            lead_id: _create_outcome(
+                "not_submitted",
+                reason_code=(
+                    "crm_cross_owner_submission_not_authorized"
+                    if cross_owner and not cross_owner_authorized
+                    else None
+                ),
+            )
+            for lead_id in selected
+            if lead_id not in valid_ids
+        }
+        for lead_id, outcome in invalid_outcomes.items():
+            if on_item_result is not None:
+                item = _append_create_result(SubmissionBatchResult(), lead_id, outcome).items[0]
+                on_item_result(item)
+        submission_command = SubmissionCommand(
+            command.text,
+            command.sales_user_id,
+            command.request_message_id,
+            owner_scope_user_ids=command.owner_scope_user_ids,
+            target_capture_date=command.target_capture_date,
+        )
+        submissions = [
+            (
+                lead_id,
+                submission_command,
+                snapshot_by_record_id.get(selected_record_ids.get(lead_id, "")),
+            )
+            for lead_id in selected
+            if lead_id in valid_ids
+        ]
+        outcomes = self._submit_create_batch(
+            submissions,
+            on_item_result=on_item_result,
+        )
         result = SubmissionBatchResult()
         for lead_id in selected:
-            if lead_id not in valid_ids:
-                outcome = _create_outcome(
-                    "not_submitted",
-                    reason_code=(
-                        "crm_cross_owner_submission_not_authorized"
-                        if cross_owner and not cross_owner_authorized
-                        else None
-                    ),
-                )
-            else:
-                try:
-                    outcome = self._submit_create(
-                        lead_id,
-                        SubmissionCommand(
-                            command.text,
-                            command.sales_user_id,
-                            command.request_message_id,
-                            owner_scope_user_ids=command.owner_scope_user_ids,
-                            target_capture_date=command.target_capture_date,
-                        ),
-                        initial_record=snapshot_by_record_id.get(
-                            selected_record_ids.get(lead_id, "")
-                        ),
-                    )
-                except Exception as error:
-                    # 单条最终快照读取失败只影响该线索，不能中止其它已勾选记录。
-                    _LOGGER.warning(
-                        "crm_selected_submission_item_failed",
-                        extra={"lead_id": lead_id, "failure": safe_failure_summary(error)},
-                    )
-                    outcome = _create_outcome("failed_pending_review")
+            outcome = outcomes[lead_id] if lead_id in outcomes else invalid_outcomes[lead_id]
             result = _append_create_result(result, lead_id, outcome)
-            if on_item_result is not None:
-                # _submit_create 已重新读取该条最终快照；先保存结果并续租，再开始下一条。
-                on_item_result(result.items[-1])
         return result
 
     def _submit_updates(self, command: SubmissionCommand) -> SubmissionBatchResult:

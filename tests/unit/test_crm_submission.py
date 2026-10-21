@@ -8,6 +8,9 @@ from collections.abc import Collection, Generator, Mapping
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from threading import Lock
+from time import sleep
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -485,6 +488,59 @@ def test_all_submission_includes_historical_pending_lead(
 
     assert all_result.succeeded == 1
     assert crm.calls == 1
+
+
+def test_crm_create_batch_respects_concurrency_limit_and_returns_each_result(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 CRM 批次并发数受配置约束，且每个目标均得到独立结果。"""
+    import app.crm.service as crm_service
+
+    settings = get_settings().model_copy(update={"crm_submission_max_concurrency": 2})
+    monkeypatch.setattr(crm_service, "get_settings", lambda: settings)
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = CrmSubmissionService(session_factory, adapter, MockCRMAdapter())
+    # 该用例只验证并发调度，模拟生产数据库方言；具体 SQLite 业务用例保持串行。
+    monkeypatch.setitem(
+        session_factory.kw,
+        "bind",
+        SimpleNamespace(dialect=SimpleNamespace(name="postgresql")),
+    )
+    lock = Lock()
+    active = 0
+    maximum_active = 0
+
+    def submit_one(
+        lead_id: str,
+        _command: SubmissionCommand,
+        *,
+        initial_record: SmartTableRecord | None = None,
+    ) -> crm_service.CreateSubmissionOutcome:
+        """模拟单条远程调用并记录同时运行的任务数量。"""
+        nonlocal active, maximum_active
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        sleep(0.02)
+        with lock:
+            active -= 1
+        return crm_service._create_outcome("succeeded")
+
+    monkeypatch.setattr(service, "_submit_create", submit_one)
+    command = SubmissionCommand("提交指定线索", "sales-1", "batch-message")
+    submissions = [(f"lead-{index}", command, None) for index in range(6)]
+    callback_results: list[str] = []
+
+    outcomes = service._submit_create_batch(
+        submissions,
+        on_item_result=lambda item: callback_results.append(item.lead_id),
+    )
+
+    assert maximum_active == 2
+    assert set(outcomes) == {lead_id for lead_id, _, _ in submissions}
+    assert all(outcome.status == "succeeded" for outcome in outcomes.values())
+    assert set(callback_results) == set(outcomes)
 
 
 def test_all_submission_does_not_reopen_abandoned_sync_after_table_tampering(

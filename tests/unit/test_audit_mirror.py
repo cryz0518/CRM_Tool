@@ -310,13 +310,56 @@ def test_audit_mirror_retry_is_idempotent_and_drops_sensitive_details(
     assert len(adapter.get_records()) == 1
     fields = adapter.get_records()[0].fields
     assert fields["线索归属ID"] == "lead-1"
+    assert fields["日志唯一键"] == "message:message-1"
     assert fields["缺失字段"] == "业务线"
+    assert "事件类型" not in fields
     assert "lead_id" not in fields
     assert "status" not in fields
     assert "missing_fields" not in fields
     assert "phone" not in fields
     assert "email" not in fields
     assert "raw_response" not in fields
+
+
+def test_audit_mirror_updates_one_row_for_multiple_events_from_same_message(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证同一消息的多个事件共用一行，并保留先前写入的受控原文。"""
+    _persist_event(session_factory)
+    adapter = MockSmartTableAdapter(schema=build_mock_audit_schema(), require_owner_field=False)
+    sink = SmartTableAuditSink(adapter)
+    with session_factory() as session:
+        first_event = session.scalar(select(BusinessAuditEvent))
+        assert first_event is not None
+        original = sink.mirror(
+            first_event,
+            sales_original_message="客户名称：测试公司",
+            resolved_lead_id="lead-1",
+        )
+    with session_factory.begin() as session:
+        session.add(
+            BusinessAuditEvent(
+                message_id="message-1",
+                sales_user_id="sales-1",
+                event_type="crm_submission_retrying",
+                details={"operation": "create", "status": "retrying"},
+                created_at=utc_now() + timedelta(seconds=1),
+            )
+        )
+    with session_factory() as session:
+        events = list(session.scalars(select(BusinessAuditEvent).order_by(BusinessAuditEvent.id)))
+
+    mirrored = sink.mirror_batch([(events[0], None, "lead-1"), (events[1], None, "lead-1")])
+
+    assert len(adapter.get_records()) == 1
+    assert mirrored[0].record_id == original.record_id == mirrored[1].record_id
+    fields = mirrored[1].fields
+    assert fields["日志唯一键"] == "message:message-1"
+    assert fields["事件ID"] == str(events[1].id)
+    assert fields["处理状态"] == "retrying"
+    assert fields["线索归属ID"] == "lead-1"
+    assert fields["销售原始消息"] == "客户名称：测试公司"
+    assert "事件类型" not in fields
 
 
 def test_audit_mirror_writes_wecom_user_id_to_operator_member_field(
@@ -378,7 +421,7 @@ def test_legacy_single_audit_task_coalesces_events_with_one_lookup_and_one_creat
     assert tasks.consume_audit_mirror_outbox.run(outbox_ids[0]) == "succeeded"
 
     assert len(lookup_calls) == 1
-    assert lookup_calls[0][0] == "日志唯一键"
+    assert lookup_calls[0][0] == "消息ID"
     assert len(lookup_calls[0][1]) == 3
     assert create_calls == [3]
     records = adapter.get_records()
@@ -419,7 +462,10 @@ def test_audit_batch_retry_reuses_rows_created_before_unknown_result(
     assert calls == [2, 1]
     assert len(records) == 2
     assert len(adapter.get_records()) == 2
-    assert {record.fields["日志唯一键"] for record in records} == {"audit:1", "audit:2"}
+    assert {record.fields["日志唯一键"] for record in records} == {
+        "message:mirror-message-0",
+        "message:mirror-message-1",
+    }
 
 
 def test_audit_mirror_rejects_operator_field_that_is_not_personnel(

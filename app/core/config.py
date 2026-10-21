@@ -75,6 +75,7 @@ class Settings(BaseSettings):
     ai_high_confidence_threshold: float = 0.85
     ai_medium_confidence_threshold: float = 0.60
     crm_create_retry_count: int = 3
+    crm_submission_max_concurrency: int = Field(default=10, gt=0, le=64)
     crm_create_retry_delay_seconds: int = Field(default=30, gt=0, le=3600)
     # CRM 客户级别存在历史值与当前值两套字典，按部署环境显式选择。
     crm_customer_level_scheme: Literal["legacy", "current"] = "current"

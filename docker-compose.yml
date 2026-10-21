@@ -42,6 +42,7 @@ services:
       CRM_APP_ID: ${CRM_APP_ID:-}
       CRM_APP_AUTH_TOKEN: ${CRM_APP_AUTH_TOKEN:-}
       CRM_PRIVATE_KEY: ${CRM_PRIVATE_KEY:-}
+      CRM_SUBMISSION_MAX_CONCURRENCY: ${CRM_SUBMISSION_MAX_CONCURRENCY:-10}
       # 外部 SOP Gateway 的认证头和代理继承策略必须显式注入容器。
       Authorization: ${Authorization:-}
       CRM_AUTHORIZATION: ${CRM_AUTHORIZATION:-}
