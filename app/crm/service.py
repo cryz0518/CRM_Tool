@@ -160,9 +160,6 @@ class SubmissionCandidate:
 
     lead_id: str
     company_name: str
-    display_text: str | None = None
-    snapshot_fields: tuple[tuple[str, object], ...] = ()
-    missing_fields: tuple[str, ...] = ()
     owner_user_id: str | None = None
 
 
@@ -866,38 +863,13 @@ class CrmSubmissionService:
                     lead, snapshot=smart_table_snapshot
                 ):
                     continue
-            # 候选文案优先来自当前 Smart Table 快照，避免后台旧字段导致同名项无法区分。
+            # 筛选以当前 Smart Table 快照为准；候选只保留名称，字段快照不进入确认通知。
             company_name = snapshot_fields.get("线索名称") or lead.standard_company_name
             if isinstance(company_name, str) and company_name.strip():
-                contact_name = snapshot_fields.get("联系人")
-                contact = contact_name.strip() if isinstance(contact_name, str) else ""
-                if target_capture_date is not None:
-                    # 日期命令的卡片日期必须与筛选条件一致，不能显示延迟建行日期。
-                    created_text = target_capture_date.isoformat()
-                else:
-                    created = lead.created_at
-                    if created.tzinfo is None:
-                        created = created.replace(tzinfo=UTC)
-                    created_text = created.astimezone(ZoneInfo("Asia/Shanghai")).strftime(
-                        "%Y-%m-%d"
-                    )
-                # 展示文本来自当前后台快照，不参与身份判断；回调仍只接受冻结 lead_id。
-                display_text = "｜".join(
-                    part for part in (company_name.strip(), contact, created_text) if part
-                )
-                # 候选 Markdown 必须使用发行时的同一份 Smart Table 快照，避免卡片与明细错位。
-                display_snapshot = dict(snapshot_fields)
-                if record is not None:
-                    for member_field, display_name in record.member_names.items():
-                        if isinstance(display_name, str) and display_name.strip():
-                            display_snapshot[member_field] = display_name.strip()
                 candidates.append(
                     SubmissionCandidate(
                         lead.id,
                         company_name.strip(),
-                        display_text,
-                        tuple(display_snapshot.items()),
-                        self._missing_crm_minimum(dict(snapshot_fields)),
                         lead.smart_table_owner_user_id,
                     )
                 )

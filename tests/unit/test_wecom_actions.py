@@ -858,8 +858,8 @@ def test_company_submission_candidate_card_uses_single_selection() -> None:
     assert card["submit_button"]["key"] == "crm.company_submission.confirm"  # type: ignore[index]
 
 
-def test_batch_preview_long_values_keep_three_groups_and_bounded_chunks() -> None:
-    """验证二十条超长候选仅展示十字段，缺项不改真实状态且每片不超过平台字节限制。"""
+def test_batch_preview_long_values_show_only_names_and_bound_chunks() -> None:
+    """验证批量候选只展示线索名称且每片不超过平台字节限制。"""
     names = (
         "业务线", "线索名称", "线索来源", "联系人", "职务", "沟通方式",
         "手机", "备注", "客户行业", "提交状态",
@@ -873,20 +873,14 @@ def test_batch_preview_long_values_keep_three_groups_and_bounded_chunks() -> Non
         }
         for index in range(20)
     ]
-    chunks = build_batch_submission_markdown(candidates, page=1, page_count=1)
+    chunks = build_batch_submission_markdown(candidates, page=1, page_count=1, name_only=True)
     assert len(chunks) > 1 and all(len(chunk.encode("utf-8")) <= 4096 for chunk in chunks)
     content = "\n".join(chunks)
-    assert all(content.count(name + "：") == 20 for name in names)
-    assert "邮箱" not in content and "AI待确认" not in content
-    assert content.count("提交状态：未提交") == 20
-    assert content.count("手机：**未填写**") == 20
-    assert content.count("- 缺少：手机") == 20
-    for block in content.split("【")[1:]:
-        rows = [
-            line for line in block.splitlines()
-            if line.startswith(("业务线：", "联系人：", "手机："))
-        ]
-        assert len(rows) == 3
+    assert content.count("【") == 20
+    assert "很长公司名称" in content
+    assert all(name + "：" not in content for name in names)
+    assert "AI待确认" not in content and "邮箱" not in content
+    assert "超长内容" not in content
     assert fields["备注"] == "*超长内容*" * 1000 and fields["提交状态"] == "未提交"
 
 
@@ -928,7 +922,7 @@ def test_batch_submission_card_allows_multi_selection() -> None:
 
 
 def test_batch_markdown_and_checkbox_share_frozen_page_order() -> None:
-    """验证批量 Markdown 完整字段与卡片短选项按同一页序号对应。"""
+    """验证名称预览与卡片选项按同一页序号对应且不展示线索明细。"""
 
     candidates = [
         {
@@ -945,7 +939,7 @@ def test_batch_markdown_and_checkbox_share_frozen_page_order() -> None:
             "field_values": {"业务线": "车载机器人", "联系人": "李工"},
         },
     ]
-    markdown = build_batch_submission_markdown(candidates, page=1, page_count=1)
+    markdown = build_batch_submission_markdown(candidates, page=1, page_count=1, name_only=True)
     card = build_action_card(
         task_id="task-batch-details",
         event_key=CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
@@ -959,11 +953,12 @@ def test_batch_markdown_and_checkbox_share_frozen_page_order() -> None:
     )
 
     assert len(markdown) == 1
-    assert "【1】候选一｜王工｜2026-09-30" in markdown[0]
-    assert "【2】候选二｜李工｜2026-09-30" in markdown[0]
-    assert "AI待确认" not in markdown[0]
-    assert "提交状态：**未填写**" in markdown[0]
-    assert "- 缺少：职务" in markdown[0]
+    assert "【1】候选一" in markdown[0]
+    assert "【2】候选二" in markdown[0]
+    assert all(
+        value not in markdown[0]
+        for value in ("王工", "李工", "2026-09-30", "职务", "AI待确认")
+    )
     options = card["checkbox"]["option_list"]  # type: ignore[index]
     assert [option["id"] for option in options] == ["lead-a", "lead-b"]  # type: ignore[index]
     assert [option["text"] for option in options] == ["1. 候选一", "2. 候选二"]  # type: ignore[index]

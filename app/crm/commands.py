@@ -622,25 +622,10 @@ def prepare_batch_submission_selection(
         ]
         for page_number, page in enumerate(pages, start=1):
             # 每一页都由服务端冻结候选 ID；销售只能在对应卡片内选择，不能传任意 offset。
-            page_details = tuple(
+            page_candidates = tuple(
                 {
                     "lead_id": item.lead_id,
                     "company_name": item.company_name,
-                    "display_text": (
-                        item.company_name
-                        if command.text == CROSS_OWNER_SUBMISSION_COMMAND
-                        else item.display_text or item.company_name
-                    ),
-                    "field_values": (
-                        {}
-                        if command.text == CROSS_OWNER_SUBMISSION_COMMAND
-                        else dict(item.snapshot_fields)
-                    ),
-                    "missing_fields": (
-                        ()
-                        if command.text == CROSS_OWNER_SUBMISSION_COMMAND
-                        else item.missing_fields
-                    ),
                 }
                 for item in page
             )
@@ -655,19 +640,12 @@ def prepare_batch_submission_selection(
                 actor_user_id=command.sales_user_id,
                 request_message_id=command.request_message_id,
                 command_text=command.text,
-                candidates=tuple(
-                    {
-                        "lead_id": item.lead_id,
-                        "company_name": item.company_name,
-                        "display_text": item.display_text or item.company_name,
-                    }
-                    for item in page
-                ),
+                candidates=page_candidates,
                 preview_markdown_chunks=build_batch_submission_markdown(
-                    page_details,
+                    page_candidates,
                     page=page_number,
                     page_count=len(pages),
-                    name_only=command.text == CROSS_OWNER_SUBMISSION_COMMAND,
+                    name_only=True,
                 ),
                 page=page_number,
                 page_count=len(pages),
