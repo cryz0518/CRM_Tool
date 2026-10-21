@@ -22,6 +22,7 @@ from app.crm.service import (
     CrmSubmissionService,
     SubmissionBatchResult,
     SubmissionCommand,
+    SubmissionItemResult,
     _append_create_result,
 )
 from app.leads.models import CrmSyncRecord, Lead, latest_crm_create_sync, new_lead_id
@@ -1619,6 +1620,41 @@ def _record_command_failure(
         return reply
 
 
+def _crm_duplicate_search_failure_detail(item: SubmissionItemResult) -> str | None:
+    """根据 CRM 查重失败的受控字段生成不含远端正文的逐条提示。
+
+    参数：item 为单条 CRM 提交状态和适配器白名单错误元数据。
+    返回值：查重失败说明；非查重错误返回 None，由既有文案处理。
+    异常：无。
+    副作用：无。
+    """
+    if item.reason_code not in {
+        "crm_duplicate_search_failed",
+        "crm_duplicate_search_retrying",
+        "duplicate_target_unavailable",
+    }:
+        return None
+    detail = {
+        "authentication": "CRM 鉴权失败",
+        "transport": "CRM 网络连接或超时异常",
+        "malformed_response": "CRM 返回格式异常",
+        "business": "CRM 返回业务错误",
+        "business_rejection": "CRM 返回业务错误",
+        "gateway": "CRM 网关异常",
+        "duplicate_target_unavailable": "CRM 检测到重复线索但未返回可操作的线索 ID",
+    }.get(item.adapter_category or "", "CRM 查重失败，需要人工处理")
+    if item.reason_code == "duplicate_target_unavailable":
+        return detail
+    if item.adapter_category == "transport":
+        return detail
+    suffix: list[str] = []
+    if item.http_status is not None:
+        suffix.append(f"HTTP {item.http_status}")
+    if item.failure_code:
+        suffix.append(f"错误码：{item.failure_code}")
+    return f"{detail}（{'，'.join(suffix)}）" if suffix else detail
+
+
 def format_submission_reply(
     result: SubmissionBatchResult,
     *,
@@ -1739,7 +1775,9 @@ def format_submission_reply(
             if status == "incomplete" and item.missing_fields:
                 detail_lines.append(f"- {label}：缺少「{'、'.join(item.missing_fields)}」")
             else:
-                detail = reason_text.get(item.reason_code or "", "")
+                detail = _crm_duplicate_search_failure_detail(item) or reason_text.get(
+                    item.reason_code or "", ""
+                )
                 detail_lines.append(f"- {label}：{detail}".rstrip("："))
     if detail_lines:
         lines.extend(["", "明细：", *detail_lines])

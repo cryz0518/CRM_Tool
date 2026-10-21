@@ -51,6 +51,7 @@ def isolate_settings_from_developer_env() -> None:
         {
             "PYDANTIC_SETTINGS_DISABLE_DOTENV": "1",
             "APP_ENV": "development",
+            "SMART_TABLE_LEAD_BATCH_WAIT_SECONDS": "0",
             "SMART_TABLE_ADAPTER": "mock",
             "CRM_ADAPTER": "mock",
             "TYC_PROVIDER": "mock",

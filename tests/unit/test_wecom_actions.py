@@ -1352,7 +1352,7 @@ def test_today_callback_claim_executor_submits_only_selected_lead(
     assert execution.executed is True
     replay_execution = action_service.execute_action(action.id, executor)
     assert replay_execution.executed is False
-    assert crm.search_calls == 0 and crm.submit_calls == 1 and crm.calls == 1
+    assert crm.search_calls == 1 and crm.submit_calls == 1 and crm.calls == 1
     assert crm.update_calls == 0
     assert [payload["name"] for payload in crm.payloads] == ["TODAY测试公司-0"]
     with session_factory() as session:
@@ -1487,7 +1487,7 @@ def test_follow_up_response_message_never_enters_result_notification(
 
     assert claim.code == "claimed"
     assert execution.executed is True
-    assert crm.submit_calls == 1 and crm.search_calls == 0 and crm.calls == 0
+    assert crm.submit_calls == 1 and crm.search_calls == 1 and crm.calls == 0
     with session_factory() as session:
         notifications = session.scalars(
             select(NotificationRecord).where(
@@ -2319,7 +2319,7 @@ def test_company_submission_result_uses_frozen_label_and_safe_reason(
     assert f"{frozen_label}：CRM 中已存在该线索，已进行跟进" in execution.summary
     assert "客户端注入名称" not in execution.summary
     assert "PRIVATE RAW SOP MESSAGE" not in execution.summary
-    assert crm.submit_calls == 1 and crm.search_calls == 0 and crm.calls == 0
+    assert crm.submit_calls == 1 and crm.search_calls == 1 and crm.calls == 0
     with session_factory() as session:
         assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
 
@@ -2388,7 +2388,7 @@ def test_company_candidate_submission_executes_only_selected_lead_and_uses_froze
     assert "CRM 提交结果（已选择 1 条）" in execution.summary
     assert f"{labels[1]}" in execution.summary
     assert "客户端注入名称" not in execution.summary
-    assert crm.search_calls == 0 and crm.submit_calls == 1 and crm.calls == 1
+    assert crm.search_calls == 1 and crm.submit_calls == 1 and crm.calls == 1
     assert crm.update_calls == 0
     assert [payload["name"] for payload in crm.payloads] == ["TODAY测试公司-1"]
     with session_factory() as session:

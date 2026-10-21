@@ -77,7 +77,14 @@ from app.smart_table.registry import (
 logger = logging.getLogger(__name__)
 
 COMPLETED_CHECKPOINT_STATUSES = frozenset(
-    {"succeeded", "ignored", "unauthorized", "invalid", "failed_pending_review"}
+    {
+        "succeeded",
+        "ignored",
+        "unauthorized",
+        "invalid",
+        "failed_pending_review",
+        "batch_pending",
+    }
 )
 
 
@@ -183,6 +190,7 @@ class MultiLeadSyncRequest:
     outbox_event_id: int
     ai_patch: ExtractedLeadPatch | None = None
     pending_confirmation_fields: tuple[str, ...] = ()
+    creates_lead: bool = True
 
 
 @dataclass(frozen=True)
@@ -441,6 +449,7 @@ class FirstTextLeadWorkspaceService:
         # 表格首次同步成功后才应用公司核验和销售内去重，避免失败重试中重放外部写入。
         if not result.company_resolution_applied:
             result = self._apply_company_resolution(outbox_event_id, result)
+        result = self._flush_immediate_smart_table_batch(result, outbox_event_id)
         progress_outcomes = {
             LeadProcessingStatus.CREATED: True,
             LeadProcessingStatus.BATCH_QUEUED: True,
@@ -471,6 +480,62 @@ class FirstTextLeadWorkspaceService:
         # 只在本事件已越过首次消费检查点后继续，防止 retrying/processing 事件被错误跳过。
         self._consume_next_after_checkpoint(outbox_event_id)
         return result
+
+    def _flush_immediate_smart_table_batch(
+        self, result: LeadProcessingResult, outbox_event_id: int
+    ) -> LeadProcessingResult:
+        """在零等待配置下完成当前消息已入队的批次并回传真实同步状态。
+
+        参数：result 为消费或受控确认结果；outbox_event_id 为对应持久化检查点。
+        返回值：批次已完成时填入表格记录标识；非零等待或未排队时原样返回。
+        异常：数据库或智能表格异常沿用批量同步服务的既有处理。
+        副作用：零等待且事件已排队时调用一次批量同步 Worker。
+        """
+        if self._smart_table_lead_batch_wait_seconds != 0:
+            return result
+        with self._session_factory() as session:
+            event = session.get(OutboxEvent, outbox_event_id)
+        if event is None or event.status != "batch_pending":
+            return result
+        # 零等待只影响配置了同步写入的环境；生产批量模式仍由 Worker 定时消费。
+        self.flush_smart_table_batch()
+        lead_ids = result.lead_ids or ((result.lead_id,) if result.lead_id else ())
+        if not lead_ids:
+            return result
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(SmartTableSync, Lead)
+                .join(Lead, Lead.id == SmartTableSync.lead_id)
+                .where(SmartTableSync.lead_id.in_(lead_ids))
+            ).all()
+        completed = {
+            sync.lead_id: (sync.status, lead.smart_table_record_id)
+            for sync, lead in rows
+        }
+        succeeded = all(
+            completed.get(lead_id, (None, None))[0] == "succeeded" for lead_id in lead_ids
+        )
+        status = (
+            result.status
+            if succeeded and result.status is not LeadProcessingStatus.BATCH_QUEUED
+            else LeadProcessingStatus.CREATED
+            if succeeded
+            else LeadProcessingStatus.SYNC_FAILED
+        )
+        return LeadProcessingResult(
+            status,
+            lead_id=result.lead_id,
+            smart_table_record_id=next(
+                (
+                    completed[lead_id][1]
+                    for lead_id in lead_ids
+                    if completed.get(lead_id, (None, None))[1]
+                ),
+                None,
+            ),
+            lead_ids=lead_ids,
+            company_resolution_applied=result.company_resolution_applied,
+        )
 
     @isolated_enum_snapshot_operation
     def retry_failed_message(
@@ -938,7 +1003,8 @@ class FirstTextLeadWorkspaceService:
                 user_confirmed_company=True,
                 defer_smart_table_sync=True,
             )
-        return self._finish_company_decision_before_smart_table(event_id, command, company_result)
+        result = self._finish_company_decision_before_smart_table(event_id, command, company_result)
+        return self._flush_immediate_smart_table_batch(result, event_id)
 
     def _apply_company_resolution(
         self, outbox_event_id: int, result: LeadProcessingResult
@@ -2723,12 +2789,14 @@ class FirstTextLeadWorkspaceService:
         refresh_context: bool = True,
         defer_batch: bool = True,
         initial_record: SmartTableRecord | None = None,
+        complete_sync: bool = True,
     ) -> LeadProcessingResult:
         """为 AI 已安全决定的目标创建审核记录（如需）并经 T09 写入字段补丁。
 
         参数：request 为事务提交后可执行的 AI 结果及真实销售身份；defer_batch 控制新线索
-        是否进入持久化批次；initial_record 为本轮批量新增接口返回并核实的当前记录快照。
-        返回值：首次建档返回 CREATED 或 BATCH_QUEUED，既有上下文补充返回 UPDATED，
+        是否进入持久化批次；initial_record 为本轮批量新增接口返回并核实的当前记录快照；
+        complete_sync 表示本线索持久化批次中的最后一条消息补丁。
+            返回值：首次建档返回 CREATED，已有线索补充返回 UPDATED，尚未写入的请求返回 BATCH_QUEUED，
         外部失败返回 SYNC_FAILED。
         异常：关键数据库事实缺失时抛出 ValueError；其他外部失败转为失败待审事实。
         副作用：可能创建智能表格记录、调用 T09，并完成消息归属和当前客户上下文。
@@ -2770,11 +2838,14 @@ class FirstTextLeadWorkspaceService:
                         fields=dict(request.patch.fields),
                         outbox_event_id=request.outbox_event_id,
                         ai_patch=request.patch,
+                        creates_lead=request.creates_lead,
                     ),
                 )
             )
             return LeadProcessingResult(
-                LeadProcessingStatus.BATCH_QUEUED,
+                LeadProcessingStatus.BATCH_QUEUED
+                if request.creates_lead
+                else LeadProcessingStatus.UPDATED,
                 lead_id=request.lead_id,
             )
         record_id, created_record, preserve_record = self._ensure_ai_review_record(request)
@@ -2810,16 +2881,21 @@ class FirstTextLeadWorkspaceService:
             if request.creates_lead and sync is None:
                 raise ValueError(f"AI 审核同步事实不存在：{lead.id}")
             first_success = (
-                sync is not None
+                complete_sync
+                and sync is not None
                 and sync.status != "succeeded"
                 and sync.completed_at is None
             )
-            if sync is not None and sync.status != "succeeded":
-                sync.status = "succeeded"
-                sync.completed_at = sync.completed_at or utc_now()
             if sync is not None:
                 sync.error_summary = None
-                sync.batch_payload = None
+                if complete_sync:
+                    sync.status = "succeeded"
+                    sync.completed_at = sync.completed_at or utc_now()
+                    sync.batch_payload = None
+                else:
+                    # 同一线索尚有后续消息补丁时保留可恢复的队列载荷。
+                    sync.status = "batch_pending"
+                    sync.completed_at = None
             self._mark_assigned(
                 session,
                 event,
@@ -3382,10 +3458,9 @@ class FirstTextLeadWorkspaceService:
         参数：requests 为需要首次创建智能表格记录的确定性或 AI 线索。
         返回值：无。
         异常：销售归属不匹配或任一 Lead/Sync/Outbox 事实缺失时抛出 ValueError。
-        副作用：更新消息归属、SmartTableSync 批次载荷和 Outbox processing 租约。
+        副作用：更新消息归属、SmartTableSync 批次载荷和可继续消费的批次检查点。
         """
         with self._session_factory.begin() as session:
-            queued_at = utc_now()
             for request in requests:
                 event, message = self._load_event_and_message(session, request.outbox_event_id)
                 if message.sales_user_id != request.sales_user_id:
@@ -3401,69 +3476,160 @@ class FirstTextLeadWorkspaceService:
                 self._pin_message_lead_before_external_sync(
                     session, event, message, lead.id, request.segment_index
                 )
-                if sync.status not in {"batch_pending", "retrying"} or sync.batch_payload is None:
-                    sync.batch_payload = {
-                        "fields": request.fields,
-                        "pending_confirmation_fields": list(request.pending_confirmation_fields),
-                        "ai_patch": (
-                            self._serialize_ai_patch(request.ai_patch)
-                            if request.ai_patch is not None
-                            else None
-                        ),
-                    }
-                # 外部批量写入状态不明时复用已接受的补丁，避免重跑 AI 改写恢复输入。
+                payload = sync.batch_payload if isinstance(sync.batch_payload, dict) else {}
+                queued = payload.get("requests")
+                if isinstance(queued, list):
+                    # JSON 列是可变对象；复制后追加才能让 SQLAlchemy 检测到深层变化。
+                    queued = list(queued)
+                else:
+                    # 将既有单补丁载荷升级为请求列表，兼容尚未刷新的旧批次。
+                    source_event = session.scalar(
+                        select(OutboxEvent).where(
+                            OutboxEvent.message_id == sync.source_message_id
+                        )
+                    )
+                    queued = []
+                    old_fields = payload.get("fields")
+                    if source_event is not None and isinstance(old_fields, dict):
+                        queued.append(
+                            {
+                                "sales_user_id": source_event.sales_user_id,
+                                "lead_id": lead.id,
+                                "segment_index": sync.source_segment_index,
+                                "fields": old_fields,
+                                "outbox_event_id": source_event.id,
+                                "ai_patch": payload.get("ai_patch"),
+                                "pending_confirmation_fields": payload.get(
+                                    "pending_confirmation_fields", []
+                                ),
+                                "creates_lead": True,
+                            }
+                        )
+                request_identity = (request.outbox_event_id, request.segment_index)
+                if not any(
+                    isinstance(item, dict)
+                    and (item.get("outbox_event_id"), item.get("segment_index"))
+                    == request_identity
+                    for item in queued
+                ):
+                    queued.append(
+                        {
+                            "sales_user_id": request.sales_user_id,
+                            "lead_id": request.lead_id,
+                            "segment_index": request.segment_index,
+                            "fields": request.fields,
+                            "outbox_event_id": request.outbox_event_id,
+                            "ai_patch": (
+                                self._serialize_ai_patch(request.ai_patch)
+                                if request.ai_patch is not None
+                                else None
+                            ),
+                            "pending_confirmation_fields": list(
+                                request.pending_confirmation_fields
+                            ),
+                            "creates_lead": request.creates_lead,
+                        }
+                    )
+                # 每条消息补丁独立保留来源，避免合并覆盖时丢失审计归属或字段值。
+                sync.batch_payload = {"requests": queued}
                 sync.status = "batch_pending"
                 sync.error_summary = None
                 sync.completed_at = None
-                event.status = "processing"
-                event.processing_started_at = queued_at
+                event.status = "batch_pending"
+                event.processing_started_at = None
                 event.failure_category = None
                 event.failure_summary = None
                 event.failed_at = None
                 self._record_audit(session, event, "smart_table_batch_queued")
 
-    def _batch_request_from_sync(
+    def _batch_requests_from_sync(
         self,
+        session: Session,
         sync: SmartTableSync,
         lead: Lead,
         event: OutboxEvent,
-    ) -> MultiLeadSyncRequest:
-        """从持久化载荷恢复单条批次请求并验证字段类型。
+    ) -> tuple[MultiLeadSyncRequest, ...]:
+        """从持久化载荷恢复每条独立补丁并验证字段类型。
 
-        参数：sync、lead、event 为已联结查询得到的同步、线索和来源事件。
-        返回值：供批量适配器及 T09 共用的同步请求。
+        参数：session 为读取批次事件的数据库会话；sync、lead、event 为已联结查询得到的同步、线索和来源事件。
+        返回值：按接收顺序供批量建行和 T09 处理的请求。
         异常：JSON 载荷缺失或业务字段类型非法时抛出 ValueError。
         副作用：无；仅读取数据库对象。
         """
         payload = sync.batch_payload
-        fields = payload.get("fields") if isinstance(payload, dict) else None
-        pending_fields = (
-            payload.get("pending_confirmation_fields") if isinstance(payload, dict) else None
-        )
-        patch_value = payload.get("ai_patch") if isinstance(payload, dict) else None
-        if (
-            not isinstance(fields, dict)
-            or not all(isinstance(name, str) for name in fields)
-            or not isinstance(pending_fields, list)
-            or not all(isinstance(name, str) for name in pending_fields)
-        ):
-            raise ValueError(f"持久化智能表格批次载荷非法：{lead.id}")
-        patch = self._deserialize_ai_patch(patch_value) if patch_value is not None else None
-        if any(
-            not isinstance(value, (str, list))
-            or (isinstance(value, list) and not all(isinstance(item, str) for item in value))
-            for value in fields.values()
-        ):
-            raise ValueError(f"持久化智能表格字段值非法：{lead.id}")
-        return MultiLeadSyncRequest(
-            sales_user_id=event.sales_user_id,
-            lead_id=lead.id,
-            segment_index=sync.source_segment_index,
-            fields=dict(fields),
-            outbox_event_id=event.id,
-            ai_patch=patch,
-            pending_confirmation_fields=tuple(pending_fields),
-        )
+        items = payload.get("requests") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            # 旧载荷保持可读，下一次追加时会由 enqueue 转成新格式。
+            items = [
+                {
+                    "sales_user_id": event.sales_user_id,
+                    "lead_id": lead.id,
+                    "segment_index": sync.source_segment_index,
+                    "fields": payload.get("fields") if isinstance(payload, dict) else None,
+                    "outbox_event_id": event.id,
+                    "ai_patch": payload.get("ai_patch") if isinstance(payload, dict) else None,
+                    "pending_confirmation_fields": payload.get(
+                        "pending_confirmation_fields", []
+                    ) if isinstance(payload, dict) else None,
+                    "creates_lead": True,
+                }
+            ]
+        requests: list[MultiLeadSyncRequest] = []
+        identities: set[tuple[int, int]] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError(f"持久化智能表格批次载荷非法：{lead.id}")
+            fields = item.get("fields")
+            pending_fields = item.get("pending_confirmation_fields")
+            event_id = item.get("outbox_event_id")
+            segment_index = item.get("segment_index")
+            sales_user_id = item.get("sales_user_id")
+            creates_lead = item.get("creates_lead", True)
+            patch_value = item.get("ai_patch")
+            if (
+                not isinstance(fields, dict)
+                or not all(isinstance(name, str) for name in fields)
+                or not isinstance(pending_fields, list)
+                or not all(isinstance(name, str) for name in pending_fields)
+                or not isinstance(event_id, int)
+                or isinstance(event_id, bool)
+                or not isinstance(segment_index, int)
+                or isinstance(segment_index, bool)
+                or segment_index < 0
+                or not isinstance(sales_user_id, str)
+                or not isinstance(creates_lead, bool)
+                or not all(
+                    isinstance(value, (str, list))
+                    and (not isinstance(value, list) or all(isinstance(part, str) for part in value))
+                    for value in fields.values()
+                )
+            ):
+                raise ValueError(f"持久化智能表格批次载荷非法：{lead.id}")
+            if (event_id, segment_index) in identities:
+                raise ValueError(f"持久化智能表格批次来源重复：{lead.id}")
+            identities.add((event_id, segment_index))
+            _, request_message = self._load_event_and_message(session, event_id)
+            if (
+                request_message.sales_user_id != sales_user_id
+                or lead.smart_table_owner_user_id != sales_user_id
+            ):
+                raise ValueError(f"持久化智能表格批次销售归属不匹配：{lead.id}")
+            patch = self._deserialize_ai_patch(patch_value) if patch_value is not None else None
+            requests.append(
+                MultiLeadSyncRequest(
+                    sales_user_id=sales_user_id,
+                    lead_id=lead.id,
+                    segment_index=segment_index,
+                    fields=dict(fields),
+                    outbox_event_id=event_id,
+                    ai_patch=patch,
+                    pending_confirmation_fields=tuple(pending_fields),
+                    creates_lead=creates_lead,
+                )
+            )
+        if len([request for request in requests if request.creates_lead]) != 1:
+            raise ValueError(f"持久化智能表格批次缺少建档请求：{lead.id}")
+        return tuple(requests)
 
     def flush_smart_table_batch(self) -> int:
         """按批量阈值或最长等待时间创建表格行并执行各线索的 T09 同步。
@@ -3498,6 +3664,7 @@ class FirstTextLeadWorkspaceService:
                 )
             ).all()
             requests_list: list[MultiLeadSyncRequest] = []
+            requests_by_lead: dict[str, tuple[MultiLeadSyncRequest, ...]] = {}
             invalid_requests: dict[int, list[MultiLeadSyncRequest]] = {}
             for sync, lead, event in rows:
                 if lead is None or event is None:
@@ -3513,7 +3680,14 @@ class FirstTextLeadWorkspaceService:
                         self._record_audit(session, event, "smart_table_batch_source_missing")
                     continue
                 try:
-                    requests_list.append(self._batch_request_from_sync(sync, lead, event))
+                    persisted_requests = self._batch_requests_from_sync(
+                        session, sync, lead, event
+                    )
+                    base_request = next(
+                        request for request in persisted_requests if request.creates_lead
+                    )
+                    requests_list.append(base_request)
+                    requests_by_lead[lead.id] = persisted_requests
                 except ValueError:
                     # 错误载荷进入现有永久失败审计，避免 Beat 周期性重复解析。
                     invalid_requests.setdefault(event.id, []).append(
@@ -3549,11 +3723,20 @@ class FirstTextLeadWorkspaceService:
             initial_records = self._create_multi_smart_table_batch(requests)
 
         succeeded = 0
+        work_requests = tuple(
+            request
+            for base_request in requests
+            for request in requests_by_lead.get(base_request.lead_id, (base_request,))
+        )
+        final_request_by_lead: dict[str, int] = {}
+        for index, request in enumerate(work_requests):
+            final_request_by_lead[request.lead_id] = index
         last_ai_request_by_event: dict[int, int] = {}
-        for index, request in enumerate(requests):
+        for index, request in enumerate(work_requests):
             if request.ai_patch is not None:
                 last_ai_request_by_event[request.outbox_event_id] = index
-        for index, request in enumerate(requests):
+        for index, request in enumerate(work_requests):
+            complete_sync = final_request_by_lead[request.lead_id] == index
             with self._session_factory() as session:
                 sync = session.scalar(
                     select(SmartTableSync).where(SmartTableSync.lead_id == request.lead_id)
@@ -3575,12 +3758,13 @@ class FirstTextLeadWorkspaceService:
                         lead_id=request.lead_id,
                         outbox_event_id=request.outbox_event_id,
                         patch=request.ai_patch,
-                        creates_lead=True,
+                        creates_lead=request.creates_lead,
                         segment_index=request.segment_index,
                     ),
                     refresh_context=last_ai_request_by_event.get(request.outbox_event_id) == index,
                     defer_batch=False,
                     initial_record=initial_records.get(request.lead_id),
+                    complete_sync=complete_sync,
                 )
             else:
                 result = self._create_smart_table_record(
@@ -3596,11 +3780,12 @@ class FirstTextLeadWorkspaceService:
                     pending_confirmation_fields=request.pending_confirmation_fields,
                     bypass_batch=True,
                     initial_record=initial_records.get(request.lead_id),
+                    complete_sync=complete_sync,
                 )
-            if result.status is not LeadProcessingStatus.SYNC_FAILED:
+            if complete_sync and result.status is not LeadProcessingStatus.SYNC_FAILED:
                 succeeded += 1
 
-        completed_events = self._reconcile_smart_table_batch_events(requests)
+        completed_events = self._reconcile_smart_table_batch_events(work_requests)
         for event_id, lead_ids in completed_events:
             self._apply_company_resolution(
                 event_id,
@@ -3619,21 +3804,24 @@ class FirstTextLeadWorkspaceService:
         副作用：更新事件成功、重试或待人工处理状态，避免拆分消息提前放行。
         """
         completed: list[tuple[int, tuple[str, ...]]] = []
-        message_ids = {self._source_message_id(request.outbox_event_id) for request in requests}
+        requests_by_event: dict[int, list[MultiLeadSyncRequest]] = {}
+        for request in requests:
+            requests_by_event.setdefault(request.outbox_event_id, []).append(request)
         with self._session_factory.begin() as session:
-            for message_id in message_ids:
-                event = session.scalar(
-                    select(OutboxEvent).where(OutboxEvent.message_id == message_id)
-                )
+            for event_id, event_requests in requests_by_event.items():
+                event = session.get(OutboxEvent, event_id)
                 if event is None:
-                    raise ValueError(f"批次来源 Outbox 不存在：{message_id}")
+                    raise ValueError(f"批次来源 Outbox 不存在：{event_id}")
+                lead_ids = {request.lead_id for request in event_requests}
                 syncs = list(
                     session.scalars(
-                        select(SmartTableSync).where(SmartTableSync.source_message_id == message_id)
+                        select(SmartTableSync).where(SmartTableSync.lead_id.in_(lead_ids))
                     ).all()
                 )
+                if len(syncs) != len(lead_ids):
+                    raise ValueError(f"批次来源 Lead 同步事实不存在：{event_id}")
                 statuses = {sync.status for sync in syncs}
-                if statuses & {"pending", "batch_pending", "processing"}:
+                if statuses & {"pending", "processing"}:
                     event.status = "processing"
                     event.processing_started_at = utc_now()
                 elif "retrying" in statuses:
@@ -3642,13 +3830,17 @@ class FirstTextLeadWorkspaceService:
                 elif "failed_pending_review" in statuses:
                     event.status = "failed_pending_review"
                     event.processing_started_at = None
+                elif "batch_pending" in statuses:
+                    event.status = "batch_pending"
+                    event.processing_started_at = None
                 elif syncs and all(sync.status == "succeeded" for sync in syncs):
                     event.status = "succeeded"
                     event.processing_started_at = None
                     event.failure_category = None
                     event.failure_summary = None
                     event.failed_at = None
-                    completed.append((event.id, tuple(sync.lead_id for sync in syncs)))
+                    if any(request.creates_lead for request in event_requests):
+                        completed.append((event.id, tuple(sorted(lead_ids))))
         return tuple(completed)
 
     def _create_multi_smart_table_batch(
@@ -4949,12 +5141,14 @@ class FirstTextLeadWorkspaceService:
         *,
         bypass_batch: bool = False,
         initial_record: SmartTableRecord | None = None,
+        complete_sync: bool = True,
     ) -> LeadProcessingResult:
         """以机器人身份新建销售可见表格记录，并持久化同步成功或失败事实。
 
         参数：sales_user_id 为当前有效 actor；fields 为确定性提取字段；
         lead_id、事件和分段标识用于回写；bypass_batch 仅供批次 Worker 完成单条回退；
-        initial_record 为本轮批量新增响应中已核实的对应记录快照。
+        initial_record 为本轮批量新增响应中已核实的对应记录快照；complete_sync 表示该 Lead 的
+        持久化批次是否已处理完全部来源消息补丁。
         返回值：包含表格记录标识的创建结果、批次排队结论，或表格失败结论。
         异常：数据库回写错误向调用方传播；表格适配器错误转换为可审计失败结果。
         副作用：调用 SmartTableAdapter，并更新 Lead、同步结果、Outbox 与审计。
@@ -4997,6 +5191,10 @@ class FirstTextLeadWorkspaceService:
                         fields=dict(fields),
                         outbox_event_id=outbox_event_id,
                         pending_confirmation_fields=pending_confirmation_fields,
+                        creates_lead=not (
+                            sync.status in {"batch_pending", "retrying"}
+                            and sync.batch_payload is not None
+                        ),
                     ),
                 )
             )
@@ -5115,10 +5313,16 @@ class FirstTextLeadWorkspaceService:
             sync = session.scalar(select(SmartTableSync).where(SmartTableSync.lead_id == lead_id))
             if lead is None or sync is None:
                 raise ValueError(f"线索同步事实不存在：{lead_id}")
-            first_success = sync.status != "succeeded" and sync.completed_at is None
-            sync.status = "succeeded"
-            sync.completed_at = sync.completed_at or utc_now()
-            sync.batch_payload = None
+            first_success = (
+                complete_sync and sync.status != "succeeded" and sync.completed_at is None
+            )
+            if complete_sync:
+                sync.status = "succeeded"
+                sync.completed_at = sync.completed_at or utc_now()
+                sync.batch_payload = None
+            else:
+                sync.status = "batch_pending"
+                sync.completed_at = None
             self._mark_assigned(
                 session,
                 event,

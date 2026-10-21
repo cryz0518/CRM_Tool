@@ -65,7 +65,7 @@ def test_dynamic_industry_and_process_write_then_preserve_user_edit_after_refres
 ) -> None:
     """新增行业与多选工艺走完整录入链路，刷新改名后仍永久保护销售人工修改。"""
     schema = build_required_smart_table_schema()
-    additions = {"客户行业": "半导体", "工艺": "激光切割"}
+    additions = {"客户行业": "芯片制造", "工艺": "激光切割"}
     schema = replace(schema, fields=tuple(
         replace(field, options=(*field.options, SmartTableOption("new-" + field.name, additions[
             field.name
@@ -75,7 +75,7 @@ def test_dynamic_industry_and_process_write_then_preserve_user_edit_after_refres
     provider = MockLLMProvider([
         json.dumps({
             "intent": "NEW_LEAD", "customer_reference": {"company": "测试制造公司"},
-            "crm_fields": {"线索名称": "测试制造公司", "客户行业": "半导体", "工艺": ["激光切割"]},
+            "crm_fields": {"线索名称": "测试制造公司", "客户行业": "芯片制造", "工艺": ["激光切割"]},
             "confidence_by_field": {"线索名称": 0.99, "客户行业": 0.99, "工艺": 0.99},
             "enrichment": {}, "conflicts": [], "warnings": [],
         }, ensure_ascii=False),
@@ -90,23 +90,23 @@ def test_dynamic_industry_and_process_write_then_preserve_user_edit_after_refres
     )
     event_id = persist_outbox_text(
         session_factory, message_id="dynamic-first", sales_user_id="sales-dynamic",
-        text="测试制造公司，客户行业：半导体，工艺：激光切割",
+        text="测试制造公司，客户行业：芯片制造，工艺：激光切割",
     )
     first = service.consume(event_id)
     assert first.status is LeadProcessingStatus.CREATED
     record = adapter.get_records()[0]
-    assert record.fields["客户行业"] == "半导体" and record.fields["工艺"] == ["激光切割"]
+    assert record.fields["客户行业"] == "芯片制造" and record.fields["工艺"] == ["激光切割"]
     adapter.update_record(record.record_id, {"客户行业": "医疗"})
     adapter._schema = replace(schema, fields=tuple(
         replace(field, options=tuple(
-            replace(option, name="芯片制造") if option.name == "半导体" else option
+            replace(option, name="芯片产业") if option.name == "芯片制造" else option
             for option in field.options
         )) if field.name == "客户行业" else field for field in schema.fields
     ))
     service._enum_snapshots._deadline = 0
     next_id = persist_outbox_text(
         session_factory, message_id="dynamic-next", sales_user_id="sales-dynamic",
-        text="测试制造公司补充，客户行业：芯片制造",
+        text="测试制造公司补充，客户行业：芯片产业",
     )
     assert service.consume(next_id).status is LeadProcessingStatus.UPDATED
     assert len(adapter.get_records()) == 1
@@ -131,7 +131,7 @@ def test_sequential_messages_refresh_enum_snapshot_after_ttl_expiry(
         fields=tuple(
             replace(
                 field,
-                options=(*field.options, SmartTableOption("industry-semiconductor", "半导体")),
+                options=(*field.options, SmartTableOption("industry-smart-equipment", "智能装备")),
             )
             if field.name == "客户行业"
             else field
@@ -161,7 +161,7 @@ def test_sequential_messages_refresh_enum_snapshot_after_ttl_expiry(
         [
             LLMProviderError("temporary"),
             response("甲公司", "医疗"),
-            response("西安芯汇半导体", "半导体"),
+            response("西安芯汇半导体", "智能装备"),
         ]
     )
     original_create = adapter.create_record
@@ -198,20 +198,20 @@ def test_sequential_messages_refresh_enum_snapshot_after_ttl_expiry(
         session_factory,
         message_id="enum-refresh-second",
         sales_user_id="enum-refresh-sales",
-        text="西安芯汇半导体，客户行业：半导体",
+        text="西安芯汇半导体，客户行业：智能装备",
     )
 
     first = service.consume(first_event_id)
 
     assert first.status is LeadProcessingStatus.CREATED
-    assert [record.fields["客户行业"] for record in adapter.get_records()] == ["医疗", "半导体"]
+    assert [record.fields["客户行业"] for record in adapter.get_records()] == ["医疗", "智能装备"]
     industry_schema = provider.requests[0].json_schema["properties"]["crm_fields"]["properties"][
         "客户行业"
     ]
     refreshed_industry_schema = provider.requests[2].json_schema["properties"]["crm_fields"]
-    assert "半导体" not in industry_schema["enum"]
+    assert "智能装备" not in industry_schema["enum"]
     assert provider.requests[0].json_schema == provider.requests[1].json_schema
-    assert "半导体" in refreshed_industry_schema["properties"]["客户行业"]["enum"]
+    assert "智能装备" in refreshed_industry_schema["properties"]["客户行业"]["enum"]
     assert len(provider.requests) == 3
     with session_factory() as session:
         events = list(session.scalars(select(OutboxEvent).order_by(OutboxEvent.sequence)))
@@ -221,6 +221,45 @@ def test_sequential_messages_refresh_enum_snapshot_after_ttl_expiry(
 
     service.consume(first_event_id)
     assert len(provider.requests) == 3
+    assert len(adapter.get_records()) == 2
+
+
+def test_batch_pending_message_checkpoint_allows_same_salesperson_to_continue(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """批次载荷已持久化后，同一销售可继续处理后续消息并由 Worker 一次性入表。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+    service._smart_table_lead_batch_wait_seconds = 30
+    service._smart_table_lead_batch_size = 10
+    first_id = persist_outbox_text(
+        session_factory,
+        message_id="batch-checkpoint-first",
+        sales_user_id="batch-sales",
+        text="公司：批次甲；联系人：张三；手机：13800000001",
+    )
+    persist_outbox_text(
+        session_factory,
+        message_id="batch-checkpoint-second",
+        sales_user_id="batch-sales",
+        text="公司：批次乙；联系人：李四；手机：13800000002",
+    )
+
+    assert service.consume(first_id).status is LeadProcessingStatus.BATCH_QUEUED
+    with session_factory() as session:
+        events = list(session.scalars(select(OutboxEvent).order_by(OutboxEvent.sequence)))
+        syncs = list(session.scalars(select(SmartTableSync).order_by(SmartTableSync.id)))
+    assert [event.status for event in events] == ["batch_pending", "batch_pending"]
+    assert len(syncs) == 2 and all(sync.status == "batch_pending" for sync in syncs)
+    assert adapter.get_records() == []
+
+    service._smart_table_lead_batch_wait_seconds = 0
+    assert service.flush_smart_table_batch() == 2
+    with session_factory() as session:
+        events = list(session.scalars(select(OutboxEvent).order_by(OutboxEvent.sequence)))
+        syncs = list(session.scalars(select(SmartTableSync).order_by(SmartTableSync.id)))
+    assert [event.status for event in events] == ["succeeded", "succeeded"]
+    assert all(sync.status == "succeeded" for sync in syncs)
     assert len(adapter.get_records()) == 2
 
 
@@ -473,7 +512,24 @@ def sync_ai_review_for_new_lead(
         ),
         creates_lead=True,
     )
-    result = FirstTextLeadWorkspaceService(session_factory, adapter)._sync_ai_review(request)
+    service = FirstTextLeadWorkspaceService(session_factory, adapter)
+    result = service._sync_ai_review(request)
+    if result.status is LeadProcessingStatus.BATCH_QUEUED:
+        # 该辅助流程模拟一次完整消费：先排入持久化批次，再由 Worker 完成表格同步。
+        service._smart_table_lead_batch_wait_seconds = 0
+        service.flush_smart_table_batch()
+        with session_factory() as session:
+            lead = session.get(Lead, lead_id)
+            sync = session.scalar(select(SmartTableSync).where(SmartTableSync.lead_id == lead_id))
+        result = replace(
+            result,
+            status=(
+                LeadProcessingStatus.CREATED
+                if sync is not None and sync.status == "succeeded"
+                else LeadProcessingStatus.SYNC_FAILED
+            ),
+            smart_table_record_id=lead.smart_table_record_id if lead is not None else None,
+        )
     return event_id, result
 
 
@@ -1005,7 +1061,7 @@ def test_consumer_repairs_stale_multiline_company_name_before_tyc_resolution(
     assert "temporary_lead_stale_company_name_repaired" in audits
 
 
-def test_consumer_keeps_same_sales_company_as_a_new_smart_table_record(
+def test_consumer_merges_same_sales_company_into_existing_smart_table_record(
     session_factory: sessionmaker[Session],
 ) -> None:
     """验证同销售重复公司在首个 Smart Table 副作用前定位既有 Lead。
@@ -1048,19 +1104,16 @@ def test_consumer_keeps_same_sales_company_as_a_new_smart_table_record(
     second = service.consume(second_event_id)
 
     assert first.smart_table_record_id is not None
-    assert second.lead_id != first.lead_id
-    assert second.smart_table_record_id != first.smart_table_record_id
-    assert [record.record_id for record in adapter.get_records()] == [
-        "mock-record-1",
-        "mock-record-2",
-    ]
+    assert second.lead_id == first.lead_id
+    assert second.smart_table_record_id == first.smart_table_record_id
+    assert [record.record_id for record in adapter.get_records()] == ["mock-record-1"]
     with session_factory() as session:
         leads = session.scalars(
             select(Lead).where(Lead.smart_table_owner_user_id == "sales-1")
         ).all()
-    assert len(leads) == 2
-    assert {lead.standard_company_name for lead in leads} == {"无锡长广溪智能制造有限公司"}
-    assert any(lead.field_values.get("电话") == "0510-12345678" for lead in leads)
+    assert len(leads) == 1
+    assert leads[0].standard_company_name == "无锡长广溪智能制造有限公司"
+    assert leads[0].field_values.get("电话") == "0510-12345678"
 
 
 def test_consumer_keeps_same_company_isolated_between_salespeople(
@@ -1391,6 +1444,9 @@ def test_retrying_ai_record_creation_does_not_block_followups_or_create_duplicat
     assert third.lead_id == first.lead_id
     assert create_attempts == 2
     assert len(adapter.get_records()) == 1
+    record = adapter.get_records()[0]
+    assert record.fields.get("手机") == "13600000000", record.fields
+    assert "预算16万" in record.fields["备注"]
 
     # 失败消息恢复时只能复用已经绑定的 Lead/record，不能再新增第二行。
     replayed = service.consume(first_event_id)
@@ -1406,6 +1462,9 @@ def test_retrying_ai_record_creation_does_not_block_followups_or_create_duplicat
     assert first_event is not None and first_event.status == "succeeded"
     assert second_event is not None and second_event.status == "succeeded"
     assert third_event is not None and third_event.status == "succeeded"
+    with session_factory() as session:
+        lead = session.get(Lead, first.lead_id)
+    assert lead is not None and lead.enrichment_values["预算"] == "预算16万"
 
 
 def test_existing_lead_without_record_reenters_create_path_after_transient_failure(
@@ -3616,14 +3675,12 @@ def test_controlled_confirmation_matching_existing_record_creates_independent_re
     )
 
     assert confirmed.lead_id == temporary_seed.lead_id
-    assert confirmed.smart_table_record_id != existing.smart_table_record_id
-    assert len(adapter.get_records()) == 2
+    assert confirmed.smart_table_record_id == existing.smart_table_record_id
+    assert len(adapter.get_records()) == 1
     record = adapter.get_record(existing.smart_table_record_id)
     assert record is not None
     assert record.fields["联系人"] == "销售手工联系人"
-    confirmed_record = adapter.get_record(confirmed.smart_table_record_id or "")
-    assert confirmed_record is not None
-    assert confirmed_record.fields["手机"] == "13800000001"
+    assert record.fields["手机"] == "13800000001"
 
 
 @pytest.mark.parametrize(
@@ -5033,9 +5090,9 @@ def test_system_defaults_reliable_replacement_and_immutable_capture_time(
         "业务线": "车载机器人",
         "职务": "工程师",
         "沟通方式": "微信",
-        "客户行业": "汽车",
+        "客户行业": "汽车主机厂",
     }
-    text = "甲科技的李工，业务线车载机器人，职务工程师，沟通方式微信，客户行业汽车。"
+    text = "甲科技的李工，业务线车载机器人，职务工程师，沟通方式微信，客户行业汽车主机厂。"
     response = json.loads(
         semantic_single_json(
             intent="UPDATE_LEAD",
@@ -5101,7 +5158,7 @@ def test_system_defaults_respect_human_changes_and_confirmation(
             "线索名称": "甲科技",
             "业务线": "车载机器人",
             "职务": "工程师",
-            "客户行业": "汽车",
+            "客户行业": "汽车主机厂",
         },
     )
     service = FirstTextLeadWorkspaceService(
@@ -5112,7 +5169,7 @@ def test_system_defaults_respect_human_changes_and_confirmation(
             session_factory,
             message_id="protected-defaults-update",
             sales_user_id="sales-1",
-            text="甲科技的李工，业务线车载机器人，职务工程师，客户行业汽车。",
+            text="甲科技的李工，业务线车载机器人，职务工程师，客户行业汽车主机厂。",
         )
     )
     assert result.status is LeadProcessingStatus.UPDATED

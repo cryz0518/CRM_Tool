@@ -251,7 +251,7 @@ def test_create_uses_stable_lead_key_and_current_smart_table_values(
 
     assert first.succeeded == 1
     assert second.succeeded == 0
-    assert crm.submit_calls == 1 and crm.search_calls == 0 and crm.calls == 1
+    assert crm.submit_calls == 1 and crm.search_calls == 1 and crm.calls == 1
     assert crm.payloads[0]["name"] == "人工最终公司"
     assert adapter.get_records()[0].fields["提交状态"] == "已提交"
     with session_factory() as session:
@@ -282,12 +282,17 @@ def test_duplicate_update_failure_is_safe_and_never_written_twice(
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter)
 
+    idempotency_keys: list[str] = []
+
     class FailingUpdateCRM(MockCRMAdapter):
         """模拟明确拒绝或响应丢失；参数同 Mock，记录调用数量且不访问 CRM。"""
 
         def update_lead(self, *args: object, **kwargs: object) -> CRMCreateResult:
             """模拟一次远端覆盖异常；返回无，抛出受控错误并增加计数。"""
             self.update_calls += 1
+            key = kwargs.get("idempotency_key")
+            if isinstance(key, str):
+                idempotency_keys.append(key)
             raise SopCRMError(
                 "secret response must stay private", category=category,
                 http_status=500 if category == "gateway" else None,
@@ -327,7 +332,9 @@ def test_duplicate_update_failure_is_safe_and_never_written_twice(
         adapter.update_record(adapter.get_records()[0].record_id, {"手机": "13900000000"})
         blocked = submit_today_via_selection(service, "sales-1", "new-attempt")
         assert blocked.failed_pending_review == 1
-    assert crm.update_calls == 1 and crm.calls == 0
+    expected_attempts = 2 if expected_category == "unknown" else 1
+    assert crm.update_calls == expected_attempts and crm.calls == 0
+    assert len(idempotency_keys) == expected_attempts and len(set(idempotency_keys)) == 1
 
 
 @pytest.mark.parametrize("duplicate", (True, False))
@@ -646,6 +653,8 @@ def test_owner_user_id_is_converted_to_employee_name_before_crm_submit(
         *,
         owner_user_ids: tuple[str, ...] | None = None,
         owner_display_names: Mapping[str, str] | None = None,
+        submission_status: str | None = None,
+        capture_date: date | None = None,
     ) -> list[SmartTableRecord]:
         """给批量 Mock 记录补充真实 CLI 会返回的 userName 元数据。"""
         return [
@@ -658,6 +667,8 @@ def test_owner_user_id_is_converted_to_employee_name_before_crm_submit(
                 record_ids,
                 owner_user_ids=owner_user_ids,
                 owner_display_names=owner_display_names,
+                submission_status=submission_status,
+                capture_date=capture_date,
             )
         ]
 
@@ -687,6 +698,8 @@ def test_missing_member_display_name_rejects_opaque_owner_id(
         *,
         owner_user_ids: tuple[str, ...] | None = None,
         owner_display_names: Mapping[str, str] | None = None,
+        submission_status: str | None = None,
+        capture_date: date | None = None,
     ) -> list[SmartTableRecord]:
         """返回不含成员显示名的批量快照。"""
         return [
@@ -695,6 +708,8 @@ def test_missing_member_display_name_rejects_opaque_owner_id(
                 record_ids,
                 owner_user_ids=owner_user_ids,
                 owner_display_names=owner_display_names,
+                submission_status=submission_status,
+                capture_date=capture_date,
             )
         ]
 
@@ -1107,7 +1122,6 @@ def test_duplicate_search_failure_reply_maps_safe_category(
 
     assert expected in reply
     assert "错误码：AUTH_DENIED" in reply if adapter_category == "authentication" else True
-    assert "本次未提交，请稍后重新提交" in reply if adapter_category == "transport" else True
     assert "traceback" not in reply.lower()
 
 
@@ -1133,10 +1147,10 @@ def test_duplicate_target_without_lead_id_has_its_own_safe_result_and_reply() ->
 
     assert item.reason_code == "duplicate_target_unavailable"
     assert item.duplicate_entity_type == "lead"
-    assert "❌ 重复待人工确认 1 条" in reply
+    assert "需人工处理 1 条" in reply
+    assert "CRM 检测到重复线索但未返回可操作的线索 ID" in reply
     expected_detail = (
-        "希捷国际科技（无锡）有限公司｜杨总：CRM 检测到重复线索，"
-        "但未返回可操作的线索 ID，请人工确认。"
+        "希捷国际科技（无锡）有限公司｜杨总：CRM 检测到重复线索但未返回可操作的线索 ID"
     )
     assert expected_detail in reply
     assert "CRM 返回业务错误" not in reply
@@ -1417,11 +1431,11 @@ def test_incomplete_retry_reloads_table_and_never_recreates_successful_lead(
     )
 
     assert second.succeeded == 1
-    assert crm.search_calls == 0 and crm.calls == 1
+    assert crm.search_calls == 1 and crm.calls == 1
     assert len(third.items) == 1
     assert third.items[0].status is SubmissionItemStatus.NOT_SUBMITTED
     assert third.items[0].reason_code == "already_submitted"
-    assert crm.search_calls == 0 and crm.calls == 1
+    assert crm.search_calls == 1 and crm.calls == 1
     assert bulk_read.call_count == 2
     assert [call.args[0] for call in bulk_read.call_args_list] == [
         {record.record_id},
@@ -1710,7 +1724,7 @@ def test_retry_feedback_covers_real_results_and_is_idempotent(
         session_factory, adapter, crm, event_id, command_text="重新提交待完善的线索",
     )
     if failure in {"once", "always"}:
-        assert "🔄 重试中 1 条" in first and "✅ 创建成功 0 条" in first
+        assert "🔄 重试中 1 条" in first and "✅ CRM 新增/更新成功 0 条" in first
         with session_factory() as session:
             assert session.get(OutboxEvent, event_id).status == "retrying"
     assert asyncio.run(sender.send_pending_once()) == 0
@@ -1726,11 +1740,11 @@ def test_retry_feedback_covers_real_results_and_is_idempotent(
     assert asyncio.run(sender.send_pending_once()) == (1 if failure in {"once", "always"} else 0)
     assert asyncio.run(sender.send_pending_once()) == 0
     if failure in {"none", "once"}:
-        assert "✅ 创建成功 1 条" in reply and crm.calls == 1
+        assert "✅ CRM 新增/更新成功 1 条" in reply and crm.calls == 1
     elif failure == "missing":
         assert "反馈线索1：缺少「职务」" in reply and crm.calls == crm.search_calls == 0
     else:
-        assert "需人工处理 1 条" in reply and "✅ 创建成功 0 条" in reply
+        assert "需人工处理 1 条" in reply and "✅ CRM 新增/更新成功 0 条" in reply
     call_count = len(attempts)
     assert consume_submission_command(
         session_factory, adapter, crm, event_id, command_text="重新提交待完善的线索",
@@ -1787,20 +1801,44 @@ def test_retry_freezes_scope_and_preserves_partial_success(
 
     monkeypatch.setattr(crm, "create_lead", create_with_second_failure)
     if failure == "snapshot":
-        get_record = adapter.get_record
+        get_records = adapter.get_records
 
-        def get_record_with_failure(record_id: str) -> SmartTableRecord | None:
-            """仅让第一条快照读取失败，验证后续条目依然创建。"""
-            if record_id == first_record.record_id:
-                raise ValueError("isolated snapshot failure")
-            return get_record(record_id)
+        def get_records_without_first_snapshot(
+            record_ids: Collection[str] | None = None,
+            *,
+            owner_user_ids: tuple[str, ...] | None = None,
+            owner_display_names: Mapping[str, str] | None = None,
+            submission_status: str | None = None,
+            capture_date: date | None = None,
+        ) -> list[SmartTableRecord]:
+            """模拟批量回读缺少第一条记录，验证逐条回退故障不阻塞其余线索。"""
+            return [
+                record
+                for record in get_records(
+                    record_ids,
+                    owner_user_ids=owner_user_ids,
+                    owner_display_names=owner_display_names,
+                    submission_status=submission_status,
+                    capture_date=capture_date,
+                )
+                if record.record_id != first_record.record_id
+            ]
 
-        monkeypatch.setattr(adapter, "get_record", get_record_with_failure)
+        monkeypatch.setattr(adapter, "get_records", get_records_without_first_snapshot)
     first = consume_submission_command(
         session_factory, adapter, crm, event_id, command_text="重新提交待完善的线索",
     )
-    assert "✅ 创建成功 1 条" in first
-    assert ("🔄 重试中 1 条" if failure == "once" else "需人工处理 1 条") in first
+    assert "✅ CRM 新增/更新成功 1 条" in first
+    expected_status = (
+        "🔄 重试中 1 条"
+        if failure == "once"
+        else "⚪ 未提交 1 条"
+        if failure == "snapshot"
+        else "需人工处理 1 条"
+    )
+    assert expected_status in first
+    if failure == "snapshot":
+        assert "反馈线索1：线索状态已变化，请重新发起提交" in first
     # 重放期间历史选择改变；冻结目标仍须继续原来的第二条，而不能回退/扩大。
     _retry_command_event(
         session_factory, ("unselected-later-lead",), message_id="later", sequence=3,
@@ -1809,7 +1847,7 @@ def test_retry_freezes_scope_and_preserves_partial_success(
         session_factory, adapter, crm, event_id, command_text="重新提交待完善的线索",
     )
     succeeded = 2 if failure == "once" else 1
-    assert f"✅ 创建成功 {succeeded} 条" in final
+    assert f"✅ CRM 新增/更新成功 {succeeded} 条" in final
     assert "反馈线索1" in final and "反馈线索2" in final
     assert "unselected-later-lead" not in final and crm.calls == succeeded
     with session_factory() as session:
@@ -1845,7 +1883,7 @@ def test_retry_recovers_committed_success_and_new_command_reports_already_submit
     monkeypatch.setattr(tasks, "get_crm_adapter", lambda: crm)
     monkeypatch.setattr(tasks, "get_ai_gateway", lambda: gateway)
     reply = tasks.consume_lead_outbox_event.run(event_id, utc_now().isoformat())
-    assert "✅ 创建成功 1 条" in reply and crm.calls == 1
+    assert "✅ CRM 新增/更新成功 1 条" in reply and crm.calls == 1
     gateway.classify_submission_intent.assert_called_once_with("重新提交")
     # 使用新的来源消息重复发命令时仍沿用历史选择，明确返回已提交而不创建新 generation。
     next_event = _retry_command_event(
@@ -1855,7 +1893,7 @@ def test_retry_recovers_committed_success_and_new_command_reports_already_submit
         session_factory, adapter, crm, next_event, command_text="重新提交待完善的线索",
     )
     assert "该线索已完成提交，本次未重复创建" in repeated
-    assert "✅ 创建成功 0 条" in repeated and crm.calls == 1
+    assert "✅ CRM 新增/更新成功 0 条" in repeated and crm.calls == 1
 
 
 def test_retry_history_uses_latest_selection_and_excludes_unselected_results(
@@ -2209,10 +2247,10 @@ def test_today_three_candidates_process_complete_and_incomplete_independently(
         leads[0][0],
         leads[1][0],
     }
-    assert {candidate.lead_id: candidate.missing_fields for candidate in candidates} == {
-        complete_id: (),
-        leads[0][0]: ("业务线", "职务"),
-        leads[1][0]: ("沟通方式",),
+    assert {candidate.company_name for candidate in candidates} == {
+        "人工最终公司",
+        "临时测试公司-1",
+        "临时测试公司-2",
     }
     assert len(result.items) == 3
     statuses = {item.lead_id: item.status for item in result.items}
@@ -2226,7 +2264,7 @@ def test_today_three_candidates_process_complete_and_incomplete_independently(
     assert bulk_read.call_args.args[0] == {"mock-record-1", leads[0][1], leads[1][1]}
     # 唯一 get_record 是成功后“提交中”状态写入的安全预读。
     assert single_read.call_count == 1
-    assert crm.search_calls == 0 and crm.calls == 1
+    assert crm.search_calls == 1 and crm.calls == 1
 
 
 def test_today_submission_promotes_temporary_lead_from_complete_table_snapshot(
@@ -2254,7 +2292,7 @@ def test_today_submission_promotes_temporary_lead_from_complete_table_snapshot(
     assert tuple(item.lead_id for item in candidates) == (lead_id,)
     assert result.succeeded == 1
     assert crm.calls == 1
-    assert crm.crm_user_ids == ["crm-sales-2"]
+    assert crm.crm_user_ids == ["crm-1"]
     assert crm.search_calls == 1
     assert crm.calls == 1
     with session_factory() as session:
@@ -2349,7 +2387,7 @@ def test_today_submission_processes_only_card_selected_candidate(
 
     assert tuple(item.lead_id for item in candidates) == (lead_id,)
     assert result.succeeded == 1
-    assert crm.search_calls == 0
+    assert crm.search_calls == 1
     assert crm.calls == 1
 
 
@@ -2889,7 +2927,7 @@ def test_manually_entered_smart_table_row_can_be_submitted_without_message_or_le
 def test_cross_owner_date_filter_uses_smart_table_shanghai_entry_day(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证日期提交以表格上海录入日为准，并让候选卡显示同一日期。"""
+    """验证日期提交按表格上海录入日过滤，并只返回匹配线索名称。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     table_day_lead_id = _lead(
         session_factory,
@@ -2992,7 +3030,7 @@ def test_cross_owner_date_filter_uses_smart_table_shanghai_entry_day(
     )
 
     assert {candidate.lead_id for candidate in candidates} == {table_day_lead_id}
-    assert "2026-10-13" in (candidates[0].display_text or "")
+    assert candidates[0].company_name == "表格日期线索"
     assert query_calls[0] == {
         "record_ids": None,
         "owner_user_ids": ("sales-2",),
@@ -3539,10 +3577,10 @@ def test_batch_submission_issues_server_frozen_pages(
         assert "张候选卡" in reply
 
 
-def test_batch_submission_sends_full_snapshot_markdown_before_short_selection_card(
+def test_batch_submission_sends_names_only_markdown_before_selection_card(
     session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """验证候选明细先发 Markdown，checkbox 只展示短编号且 ID 仍为 lead_id。"""
+    """验证只含线索名称的 Markdown 先于选择卡发送，卡片使用短编号和服务端线索 ID。"""
 
     import app.crm.commands as crm_commands
 
@@ -3614,18 +3652,17 @@ def test_batch_submission_sends_full_snapshot_markdown_before_short_selection_ca
     card = next(notice for notice in notices if notice.notification_type == "wecom_action_card")
     markdown = str(preview.payload["markdown"]["content"])
     options = card.payload["template_card"]["checkbox"]["option_list"]  # type: ignore[index]
-    assert "**待提交线索明细（第 1/1 页）**" in markdown
-    assert "客户行业：机械加工" in markdown
-    assert "提交状态：未提交" in markdown
-    assert "- 缺少：职务" in markdown
+    assert "**待提交线索（第 1/1 页）**" in markdown
+    assert "冻结公司-0" in markdown and "冻结公司-1" in markdown
+    assert "客户行业" not in markdown
+    assert "提交状态" not in markdown
+    assert "缺少：职务" not in markdown
     assert "AI待确认" not in markdown
-    assert options[0]["id"].startswith("all-")
-    assert [option["id"] for option in options[1:]] == [
+    assert [option["id"] for option in options] == [
         "batch-detail-lead-0",
         "batch-detail-lead-1",
     ]
     assert [option["text"] for option in options] == [
-        "全选本页（2条）",
         "1. 冻结公司-0",
         "2. 冻结公司-1",
     ]
@@ -4594,7 +4631,7 @@ def test_submission_reply_keeps_per_lead_results_and_frozen_display_labels() -> 
     )
 
     assert "CRM 提交结果（已选择 6 条）" in reply
-    assert "创建 4｜更新 0｜待完善 1｜处理中 1｜未提交 0｜失败 0" in reply
+    assert "提交完成 4｜新增/更新成功 4｜已存在并跟进 0｜待完善 1｜处理中 1｜未提交 0｜失败 0" in reply
     assert "公司E｜刘工：缺少「客户行业、职务」" in reply
     assert "公司F｜陈工：已有提交任务正在处理，本次未重复创建" in reply
     assert "injected-lead" not in reply
@@ -4652,13 +4689,6 @@ def test_mock_crm_idempotency_is_stable_across_adapter_instances() -> None:
         payload, idempotency_key="crm:create:lead-1", crm_user_id="crm-1"
     )
     assert first.crm_lead_id == second.crm_lead_id
-
-
-def test_company_advisory_lock_key_is_stable_without_python_hash() -> None:
-    """验证同一规范公司名称在不同调用中生成相同的 PostgreSQL 锁键。"""
-    assert CrmSubmissionService._company_advisory_lock_key("公司 X") == (
-        CrmSubmissionService._company_advisory_lock_key("公司 X")
-    )
 
 
 def test_expired_create_lease_recovers_remote_success_with_original_frozen_fact(
@@ -4749,9 +4779,6 @@ def test_t13_audit_and_logs_keep_identity_metadata_without_sensitive_payload(
     logged = caplog.text
     for sensitive in ("13800000000", "人工最终备注", "crm-1", "payload", "secret"):
         assert sensitive not in logged.lower()
-    assert CrmSubmissionService._company_advisory_lock_key("公司 X") != (
-        CrmSubmissionService._company_advisory_lock_key("公司 Y")
-    )
 
 
 def test_update_uses_current_table_values_once_and_skips_equal_snapshot(
@@ -5078,7 +5105,7 @@ def test_update_mapping_missing_keeps_pending_update_until_a_later_submit(
     blocked = service.submit(SubmissionCommand("提交我的更新", "sales-1", "message-13"))
 
     assert blocked.mapping_missing == 1
-    assert crm.update_calls == 0
+    assert crm.submit_calls == 1
     with session_factory() as session:
         lead = session.get(Lead, lead_id)
         validation = session.scalar(
@@ -5096,7 +5123,7 @@ def test_update_mapping_missing_keeps_pending_update_until_a_later_submit(
     ).submit(SubmissionCommand("提交我的更新", "sales-1", "message-14"))
 
     assert resumed.updated == 1
-    assert crm.update_calls == 1
+    assert crm.submit_calls == 2
 
 
 def test_update_company_identity_change_enters_review_without_crm_call(

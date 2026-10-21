@@ -764,7 +764,7 @@ def test_ticket15_offline_rejects_tcp_endpoint_before_compose(
 def test_ticket15_offline_diagnostic_when_compose_command_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Compose config 非零退出被定位到配置阶段且不打印命令输出。"""
+    """未知 Compose config 错误被安全分类且不打印命令输出。"""
     project_name, _ = _resolved_compose_for_offline_test()
     calls = _mock_ticket15_subprocess(
         monkeypatch,
@@ -786,7 +786,7 @@ def test_ticket15_offline_diagnostic_when_compose_command_fails(
     _assert_safe_t15_diagnostic(
         error,
         stage="compose_config",
-        error_code="COMPOSE_CONFIG_EXIT_NONZERO",
+        error_code="COMPOSE_ERROR_UNCLASSIFIED",
         external_command_executed=True,
         forbidden=("DATABASE_URL=hidden", "POSTGRES_PASSWORD=hidden"),
     )

@@ -25,6 +25,7 @@ COPY app ./app
 COPY workers ./workers
 COPY alembic ./alembic
 COPY alembic.ini ./
+COPY scripts ./scripts
 COPY tests ./tests
 
 # 国内服务器访问 PyPI 不稳定，构建使用镜像源并允许网络超时重试。

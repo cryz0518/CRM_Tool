@@ -40,6 +40,7 @@ from app.messaging.service import IncomingMessageCommand, MessageIntakeResult, M
 from app.notifications.outbound import WecomOutboundNotificationSender
 from app.smart_table.adapter import SmartTableActor
 from app.smart_table.mock import MockSmartTableAdapter
+from app.smart_table.models import SmartTableRecord
 from app.smart_table.registry import build_required_smart_table_schema
 from tests.crm_submission_test_utils import submit_today_via_selection
 
@@ -614,9 +615,9 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
                 creating_lead_id=lead.id,
             )
         )
-    # winner 在外部 CRM 调用中保持阻塞；loser 的 claim 边界必须在此期间抵达。
+    # winner 在外部 CRM 调用中保持阻塞；loser 应在此期间读到处理中并释放 Lead 锁。
     winner_crm_entered, winner_crm_release = Event(), Event()
-    loser_reached_claim_boundary, allow_loser_claim = Event(), Event()
+    loser_finished_update_check = Event()
     # 两个调用都先通过初始 unfinished 检查，才能进入同快照 create/find 竞态。
     reconcile_barrier = Barrier(2)
     reconcile_order_lock = Lock()
@@ -629,22 +630,25 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
         异常：五秒内未收到释放事件时断言失败。副作用：阻塞 winner 线程。
         """
 
-        def update_lead(self, *args: object, **kwargs: object) -> object:
-            """通知 CRM 已进入并等待测试显式释放后再执行模拟更新。
+        def submit_lead(self, *args: object, **kwargs: object) -> object:
+            """通知 CRM 已进入统一提交接口并等待测试显式释放。
 
-            参数：args/kwargs 透传给父类 update_lead。返回值：模拟 CRM 更新响应。
+            参数：args/kwargs 透传给父类 submit_lead。返回值：模拟 CRM 提交响应。
             异常：五秒内未释放时断言失败。副作用：设置 winner 到达事件并阻塞线程。
             """
             winner_crm_entered.set()
             assert winner_crm_release.wait(timeout=5)
-            return super().update_lead(*args, **kwargs)
+            return super().submit_lead(*args, **kwargs)
 
     crm = BlockingCRM()
     original_reconcile = LeadReviewService.reconcile_submission
-    original_claim = CrmSubmissionService._claim_and_call
+    original_submit_update = CrmSubmissionService._submit_update
 
     def order_same_snapshot_reconcile(
-        review_service: LeadReviewService, target_lead_id: str
+        review_service: LeadReviewService,
+        target_lead_id: str,
+        *,
+        initial_record: SmartTableRecord | None = None,
     ) -> object:
         """让两个请求通过 unfinished 检查后，winner 先创建并执行 frozen 操作。
 
@@ -663,25 +667,32 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
         # 第二个调用只能在 winner 已开始外部 CRM 调用后继续处理既有 snapshot。
         if position == 2:
             assert winner_crm_entered.wait(timeout=5)
-        return original_reconcile(review_service, target_lead_id)
+        return original_reconcile(
+            review_service, target_lead_id, initial_record=initial_record
+        )
 
-    def pause_loser_before_claim(
-        service: CrmSubmissionService, sync_id: int, sales_user_id: str
+    def observe_loser_update_check(
+        service: CrmSubmissionService,
+        target_lead_id: str,
+        command: SubmissionCommand,
+        *,
+        initial_record: SmartTableRecord | None = None,
     ) -> str:
-        """仅暂停 loser claim，保留 winner CRM 阻塞以验证 Lead 锁已释放。
+        """观察 loser 读到未完成更新后退出，验证 winner CRM 阻塞期间可释放 Lead 锁。
 
-        参数：service、sync_id 和 sales_user_id 均透传给原 claim 方法。返回值：
-        原方法的状态字符串。异常：五秒内未允许 loser 继续时断言失败。副作用：
-        设置 loser 边界事件，令第三会话可在其继续前执行 NOWAIT 验证。
+        参数：服务、线索、命令和初始快照透传给原更新提交方法。返回值：原状态字符串。
+        异常：原提交逻辑异常向测试传播。副作用：记录 loser 已结束状态检查的时点。
         """
+        outcome = original_submit_update(
+            service, target_lead_id, command, initial_record=initial_record
+        )
         if winner_crm_entered.is_set():
-            loser_reached_claim_boundary.set()
-            assert allow_loser_claim.wait(timeout=5)
-        return original_claim(service, sync_id, sales_user_id)
+            loser_finished_update_check.set()
+        return outcome
 
-    # 两个替换共同保证 loser 走既有 snapshot 分支，且在 claim 前可被确定性观察。
+    # 两个替换共同保证 loser 走既有快照分支，并在 CRM 阻塞期间完成状态检查。
     monkeypatch.setattr(LeadReviewService, "reconcile_submission", order_same_snapshot_reconcile)
-    monkeypatch.setattr(CrmSubmissionService, "_claim_and_call", pause_loser_before_claim)
+    monkeypatch.setattr(CrmSubmissionService, "_submit_update", observe_loser_update_check)
 
     def submit() -> object:
         """在独立线程和 SQLAlchemy 会话中提交同一冻结快照。
@@ -697,7 +708,7 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
         futures = [executor.submit(submit) for _ in range(2)]
         try:
             assert winner_crm_entered.wait(timeout=5)
-            assert loser_reached_claim_boundary.wait(timeout=5)
+            assert loser_finished_update_check.wait(timeout=5)
 
             # winner 仍在外部 CRM 调用中。此处 NOWAIT 成功才证明 loser 已提交短事务并释放 Lead 锁。
             with postgres_session_factory.begin() as lock_session:
@@ -706,15 +717,13 @@ def test_concurrent_same_update_snapshot_converges_without_lead_lock_wait(
                 )
                 assert locked_lead is not None
 
-            allow_loser_claim.set()
         finally:
-            # 无论断言是否失败都解除两个阻塞点，避免失败测试留下等待线程。
-            allow_loser_claim.set()
+            # 无论断言是否失败都释放 winner，避免失败测试留下等待线程。
             winner_crm_release.set()
         outcomes = [future.result(timeout=5) for future in futures]
     with postgres_session_factory() as session:
         updates = session.scalars(
             select(CrmSyncRecord).where(CrmSyncRecord.operation == "update")
         ).all()
-    assert len(updates) == 1 and crm.update_calls == 1
+    assert len(updates) == 1 and crm.submit_calls == 1
     assert sorted((result.updated, result.processing) for result in outcomes) == [(0, 1), (1, 0)]

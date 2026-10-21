@@ -914,13 +914,13 @@ def test_retry_lifecycle_fence_observes_discard_before_smart_table_patch(
             self._next_record_number = 2
             self._get_count = 0
 
-        def get_record(self, requested_record_id: str) -> SmartTableRecord | None:
-            """第二次读取完成前暂停，使 discard 能先提交生命周期变更。"""
+        def get_records(self, record_ids=None) -> list[SmartTableRecord]:
+            """第二次批量读取前暂停，使 discard 能先提交生命周期变更。"""
             self._get_count += 1
             if self._get_count == 2:
                 second_read_started.set()
                 assert release_second_read.wait(timeout=5)
-            return super().get_record(requested_record_id)
+            return super().get_records(record_ids)
 
     pausing_adapter = PausingAdapter()
     retry_service = FirstTextLeadWorkspaceService(session_factory, pausing_adapter)
