@@ -1555,7 +1555,10 @@ class CrmSubmissionService:
                 and identity_before_search.creating_lead_id != lead_id
             ):
                 return _create_outcome("processing", reason_code="crm_company_identity_processing")
-            if identity_before_search is not None and identity_before_search.state == "failed_pending_review":
+            if (
+                identity_before_search is not None
+                and identity_before_search.state == "failed_pending_review"
+            ):
                 return _create_outcome(
                     "company_identity_review", reason_code="crm_company_identity_pending_review"
                 )

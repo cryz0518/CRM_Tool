@@ -4631,7 +4631,10 @@ def test_submission_reply_keeps_per_lead_results_and_frozen_display_labels() -> 
     )
 
     assert "CRM 提交结果（已选择 6 条）" in reply
-    assert "提交完成 4｜新增/更新成功 4｜已存在并跟进 0｜待完善 1｜处理中 1｜未提交 0｜失败 0" in reply
+    assert (
+        "提交完成 4｜新增/更新成功 4｜"
+        "已存在并跟进 0｜待完善 1｜处理中 1｜未提交 0｜失败 0"
+    ) in reply
     assert "公司E｜刘工：缺少「客户行业、职务」" in reply
     assert "公司F｜陈工：已有提交任务正在处理，本次未重复创建" in reply
     assert "injected-lead" not in reply

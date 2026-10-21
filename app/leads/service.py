@@ -2796,8 +2796,8 @@ class FirstTextLeadWorkspaceService:
         参数：request 为事务提交后可执行的 AI 结果及真实销售身份；defer_batch 控制新线索
         是否进入持久化批次；initial_record 为本轮批量新增接口返回并核实的当前记录快照；
         complete_sync 表示本线索持久化批次中的最后一条消息补丁。
-            返回值：首次建档返回 CREATED，已有线索补充返回 UPDATED，尚未写入的请求返回 BATCH_QUEUED，
-        外部失败返回 SYNC_FAILED。
+            返回值：首次建档返回 CREATED，已有线索补充返回 UPDATED，尚未写入的请求返回
+        BATCH_QUEUED；外部失败返回 SYNC_FAILED。
         异常：关键数据库事实缺失时抛出 ValueError；其他外部失败转为失败待审事实。
         副作用：可能创建智能表格记录、调用 T09，并完成消息归属和当前客户上下文。
         """
@@ -3551,7 +3551,8 @@ class FirstTextLeadWorkspaceService:
     ) -> tuple[MultiLeadSyncRequest, ...]:
         """从持久化载荷恢复每条独立补丁并验证字段类型。
 
-        参数：session 为读取批次事件的数据库会话；sync、lead、event 为已联结查询得到的同步、线索和来源事件。
+        参数：session 为读取批次事件的数据库会话；sync、lead、event 为已联结查询得到的
+        同步、线索和来源事件。
         返回值：按接收顺序供批量建行和 T09 处理的请求。
         异常：JSON 载荷缺失或业务字段类型非法时抛出 ValueError。
         副作用：无；仅读取数据库对象。
@@ -3600,7 +3601,10 @@ class FirstTextLeadWorkspaceService:
                 or not isinstance(creates_lead, bool)
                 or not all(
                     isinstance(value, (str, list))
-                    and (not isinstance(value, list) or all(isinstance(part, str) for part in value))
+                    and (
+                        not isinstance(value, list)
+                        or all(isinstance(part, str) for part in value)
+                    )
                     for value in fields.values()
                 )
             ):

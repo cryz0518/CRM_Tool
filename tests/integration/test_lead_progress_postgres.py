@@ -7,8 +7,8 @@ import re
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
 from threading import Barrier
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, select, text

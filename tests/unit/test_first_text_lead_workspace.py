@@ -75,7 +75,11 @@ def test_dynamic_industry_and_process_write_then_preserve_user_edit_after_refres
     provider = MockLLMProvider([
         json.dumps({
             "intent": "NEW_LEAD", "customer_reference": {"company": "测试制造公司"},
-            "crm_fields": {"线索名称": "测试制造公司", "客户行业": "芯片制造", "工艺": ["激光切割"]},
+            "crm_fields": {
+                "线索名称": "测试制造公司",
+                "客户行业": "芯片制造",
+                "工艺": ["激光切割"],
+            },
             "confidence_by_field": {"线索名称": 0.99, "客户行业": 0.99, "工艺": 0.99},
             "enrichment": {}, "conflicts": [], "warnings": [],
         }, ensure_ascii=False),
