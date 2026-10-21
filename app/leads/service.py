@@ -62,9 +62,10 @@ from app.smart_table.enums import (
     get_enum_snapshot_service,
     isolated_enum_snapshot_operation,
 )
-from app.smart_table.models import SmartTableRecord
+from app.smart_table.models import SmartTableFieldType, SmartTableRecord
 from app.smart_table.registry import (
     DEFAULT_SMART_TABLE_FIELD_VALUES,
+    SYSTEM_LEAD_ID_FIELD,
     writable_smart_table_fields,
 )
 
@@ -405,6 +406,7 @@ class FirstTextLeadWorkspaceService:
         self._lead_context_ttl = timedelta(minutes=configured_ttl_minutes)
         self._lead_message_retry_count = settings.lead_message_retry_count
         self._lead_processing_timeout = timedelta(seconds=settings.lead_processing_timeout_seconds)
+        self._smart_table_lead_batch_size = settings.smart_table_lead_batch_size
 
     @isolated_enum_snapshot_operation
     def consume(
@@ -3182,30 +3184,291 @@ class FirstTextLeadWorkspaceService:
     def _create_multi_smart_table_records(
         self, requests: tuple[MultiLeadSyncRequest, ...]
     ) -> LeadProcessingResult:
-        """按消息分段顺序创建独立表格记录，并沿用既有失败检查点语义。
+        """先批量创建同一消息拆分出的新线索，再逐条完成审核同步。
 
         参数：requests 为已提交的多个分段同步请求。
         返回值：成功时返回所有 Lead 标识；任一外部失败时返回同步失败。
         异常：数据库错误向调用方传播。
-        副作用：逐个调用智能表格适配器，失败时保留同一 Outbox 的可重试状态。
+        副作用：批量写入时使用系统线索 ID 回查不确定结果；无关联字段时退回逐条创建。
         """
+        batch_size = 1
+        if len(requests) > 1:
+            # 批量新增的未知结果必须能按稳定线索 ID 回查；旧表结构继续走原有安全路径。
+            try:
+                correlation_field = self._smart_table_adapter.get_schema().get_field(
+                    SYSTEM_LEAD_ID_FIELD
+                )
+            except Exception as error:
+                logger.warning(
+                    "smart_table_lead_batch_disabled",
+                    extra={"reason": "schema_unavailable", "error_type": type(error).__name__},
+                )
+                correlation_field = None
+            if (
+                correlation_field is None
+                or correlation_field.field_type is not SmartTableFieldType.TEXT
+            ):
+                logger.info(
+                    "smart_table_lead_batch_disabled",
+                    extra={"reason": "correlation_field_missing_or_invalid"},
+                )
+            else:
+                batch_size = self._smart_table_lead_batch_size
+
         lead_ids: list[str] = []
-        for request in requests:
-            result = self._create_smart_table_record(
-                request.sales_user_id,
-                request.fields,
-                request.lead_id,
-                request.outbox_event_id,
-                request.segment_index,
-            )
-            if result.status is LeadProcessingStatus.SYNC_FAILED:
+        for start in range(0, len(requests), batch_size):
+            request_batch = requests[start : start + batch_size]
+            if len(request_batch) > 1 and not self._create_multi_smart_table_batch(
+                request_batch
+            ):
                 return LeadProcessingResult(
                     LeadProcessingStatus.SYNC_FAILED, lead_ids=tuple(lead_ids)
                 )
-            lead_ids.append(request.lead_id)
+            # 远端记录 ID 已先持久化；复用单条路径完成人工编辑保护、备注和成功通知。
+            for request in request_batch:
+                result = self._create_smart_table_record(
+                    request.sales_user_id,
+                    request.fields,
+                    request.lead_id,
+                    request.outbox_event_id,
+                    request.segment_index,
+                )
+                if result.status is LeadProcessingStatus.SYNC_FAILED:
+                    return LeadProcessingResult(
+                        LeadProcessingStatus.SYNC_FAILED, lead_ids=tuple(lead_ids)
+                    )
+                lead_ids.append(request.lead_id)
         return LeadProcessingResult(
             LeadProcessingStatus.CREATED, lead_id=lead_ids[0], lead_ids=tuple(lead_ids)
         )
+
+    def _create_multi_smart_table_batch(
+        self, requests: tuple[MultiLeadSyncRequest, ...]
+    ) -> bool:
+        """批量新增同一消息的线索，并通过系统线索 ID 恢复不确定的远端结果。
+
+        参数：requests 为同一来源消息中待写入的多个线索。
+        返回值：所有目标均已有或成功取得远端记录标识时返回 True。
+        异常：本地数据库异常向调用方传播；适配器异常会持久化为重试或待人工处理状态。
+        副作用：原子固定消息归属，调用一次批量创建，并逐条保存远端记录 ID。
+        """
+        if not requests:
+            return True
+
+        record_ids: dict[str, str] = {}
+        fields_by_lead: dict[str, dict[str, object]] = {}
+        with self._session_factory.begin() as session:
+            event, message = self._load_event_and_message(session, requests[0].outbox_event_id)
+            for request in requests:
+                if (
+                    request.outbox_event_id != event.id
+                    or request.sales_user_id != message.sales_user_id
+                ):
+                    raise ValueError("智能表格批量同步请求来源不一致")
+                lead = session.get(Lead, request.lead_id)
+                sync = session.scalar(
+                    select(SmartTableSync).where(SmartTableSync.lead_id == request.lead_id)
+                )
+                if lead is None or sync is None:
+                    raise ValueError(f"线索批量同步事实不存在：{request.lead_id}")
+                self._pin_message_lead_before_external_sync(
+                    session, event, message, lead.id, request.segment_index
+                )
+                if lead.smart_table_record_id:
+                    record_ids[lead.id] = lead.smart_table_record_id
+                    continue
+                if sync.status == "succeeded":
+                    raise ValueError("已成功同步的线索缺少智能表格记录标识")
+                fields_by_lead[lead.id] = writable_smart_table_fields(
+                    {
+                        **DEFAULT_SMART_TABLE_FIELD_VALUES,
+                        **self._enum_snapshots.source_defaults(),
+                        **lead.field_values,
+                        **request.fields,
+                        "提交状态": "未提交",
+                        "创建人": request.sales_user_id,
+                        "负责人": request.sales_user_id,
+                        SYSTEM_LEAD_ID_FIELD: lead.id,
+                    }
+                )
+
+        # 已本地关联的行无需远端查找；其余先按稳定键回查，防止重放新增操作。
+        unlinked_requests = tuple(
+            request for request in requests if request.lead_id not in record_ids
+        )
+        try:
+            existing_records = self._find_multi_smart_table_records(unlinked_requests)
+        except Exception as error:
+            self._record_multi_smart_table_batch_failure(unlinked_requests, error)
+            logger.exception(
+                "smart_table_multi_lead_batch_preflight_failed",
+                extra={"error_type": type(error).__name__},
+            )
+            return False
+        self._persist_multi_smart_table_record_ids(unlinked_requests, existing_records)
+        record_ids.update(
+            {lead_id: record.record_id for lead_id, record in existing_records.items()}
+        )
+
+        pending_requests = tuple(
+            request for request in unlinked_requests if request.lead_id not in record_ids
+        )
+        if pending_requests:
+            try:
+                created = self._smart_table_adapter.create_records(
+                    [fields_by_lead[request.lead_id] for request in pending_requests],
+                    actor=SmartTableActor.ROBOT,
+                )
+                created_records = self._index_multi_smart_table_records(
+                    created, pending_requests
+                )
+                if len(created_records) != len(pending_requests):
+                    raise ValueError("智能表格批量新增返回记录数不匹配")
+            except Exception as create_error:
+                # add 响应不明时仅按稳定键回查；下一次重试也会先执行同一回查。
+                failure_error = create_error
+                recovered_records: dict[str, SmartTableRecord] = {}
+                try:
+                    recovered_records = self._find_multi_smart_table_records(
+                        pending_requests
+                    )
+                except Exception as recovery_error:
+                    failure_error = recovery_error
+                self._persist_multi_smart_table_record_ids(
+                    pending_requests, recovered_records
+                )
+                record_ids.update(
+                    {
+                        lead_id: record.record_id
+                        for lead_id, record in recovered_records.items()
+                    }
+                )
+                unresolved = tuple(
+                    request
+                    for request in pending_requests
+                    if request.lead_id not in record_ids
+                )
+                if unresolved:
+                    self._record_multi_smart_table_batch_failure(unresolved, failure_error)
+                    logger.exception(
+                        "smart_table_multi_lead_batch_create_failed",
+                        extra={"error_type": type(failure_error).__name__},
+                    )
+                    return False
+            else:
+                self._persist_multi_smart_table_record_ids(
+                    pending_requests, created_records
+                )
+        return True
+
+    def _find_multi_smart_table_records(
+        self, requests: tuple[MultiLeadSyncRequest, ...]
+    ) -> dict[str, SmartTableRecord]:
+        """按系统线索 ID 批量查询远端行，并拒绝歧义关联。
+
+        参数：requests 为要核对的线索集合。
+        返回值：以后台 lead_id 为键的唯一远端记录映射；未找到的线索不返回。
+        异常：查询结果缺少稳定键、负责人不符或同一键命中多行时抛出 ValueError。
+        副作用：只读智能表格。
+        """
+        if not requests:
+            return {}
+        records = self._smart_table_adapter.find_records_by_field_values(
+            SYSTEM_LEAD_ID_FIELD, tuple(request.lead_id for request in requests)
+        )
+        return self._index_multi_smart_table_records(records, requests)
+
+    def _index_multi_smart_table_records(
+        self,
+        records: list[SmartTableRecord],
+        requests: tuple[MultiLeadSyncRequest, ...],
+    ) -> dict[str, SmartTableRecord]:
+        """校验批量新增响应中的稳定线索 ID、负责人及记录数量。
+
+        参数：records 为适配器返回的远端快照；requests 为本次批量请求。
+        返回值：以后台 lead_id 为键的远端记录映射，允许回查结果不完整。
+        异常：数量、键、负责人或唯一性不符时抛出 ValueError，调用方随后按键回查。
+        副作用：无。
+        """
+        expected = {request.lead_id: request.sales_user_id for request in requests}
+        indexed: dict[str, SmartTableRecord] = {}
+        for record in records:
+            lead_id = record.fields.get(SYSTEM_LEAD_ID_FIELD)
+            if not isinstance(lead_id, str) or lead_id not in expected:
+                raise ValueError("智能表格批量新增响应缺少有效系统线索 ID")
+            if lead_id in indexed or record.fields.get("负责人") != expected[lead_id]:
+                raise ValueError("智能表格批量新增响应关联不唯一或负责人不匹配")
+            if not record.record_id:
+                raise ValueError("智能表格批量新增响应缺少记录标识")
+            indexed[lead_id] = record
+        return indexed
+
+    def _persist_multi_smart_table_record_ids(
+        self,
+        requests: tuple[MultiLeadSyncRequest, ...],
+        records_by_lead_id: Mapping[str, SmartTableRecord],
+    ) -> None:
+        """将批量回查或新增确认的远端记录标识原子写回每条线索。
+
+        参数：requests 为关联来源；records_by_lead_id 为经稳定键校验的远端记录。
+        返回值：无。
+        异常：线索缺失、远端 ID 冲突或数据库写入失败时抛出异常。
+        副作用：更新 Lead 与 SmartTableSync 的远端记录 ID 和同步状态。
+        """
+        if not records_by_lead_id:
+            return
+        with self._session_factory.begin() as session:
+            for request in requests:
+                record = records_by_lead_id.get(request.lead_id)
+                if record is None:
+                    continue
+                lead = session.get(Lead, request.lead_id)
+                sync = session.scalar(
+                    select(SmartTableSync).where(SmartTableSync.lead_id == request.lead_id)
+                )
+                if lead is None or sync is None:
+                    raise ValueError(f"线索批量同步事实不存在：{request.lead_id}")
+                if lead.smart_table_record_id not in (None, record.record_id):
+                    raise ValueError("后台线索已关联不同的智能表格记录")
+                if sync.smart_table_record_id not in (None, record.record_id):
+                    raise ValueError("智能表格同步事实已关联不同的远端记录")
+                lead.smart_table_record_id = record.record_id
+                sync.smart_table_record_id = record.record_id
+                if sync.status != "succeeded":
+                    sync.status = "processing"
+                sync.error_summary = None
+
+    def _record_multi_smart_table_batch_failure(
+        self, requests: tuple[MultiLeadSyncRequest, ...], error: BaseException
+    ) -> None:
+        """为一个失败批次登记一次 Outbox 失败，并更新未关联线索的逐条状态。
+
+        参数：requests 为本轮尚未取得远端记录 ID 的线索；error 为安全分类的适配器异常。
+        返回值：无。
+        异常：数据库写入错误向调用方传播。
+        副作用：更新同一消息的重试/人工检查点和对应 SmartTableSync 状态。
+        """
+        if not requests:
+            return
+        with self._session_factory.begin() as session:
+            event, _ = self._load_event_and_message(session, requests[0].outbox_event_id)
+            failed_pending_review = self._record_sync_failure(
+                session,
+                event,
+                retrying_event_type="smart_table_sync_retrying",
+                failed_event_type="smart_table_sync_failed_pending_review",
+                error=error,
+            )
+            error_code = getattr(error, "error_code", None)
+            summary = error_code if isinstance(error_code, str) else type(error).__name__
+            for request in requests:
+                sync = session.scalar(
+                    select(SmartTableSync).where(SmartTableSync.lead_id == request.lead_id)
+                )
+                if sync is None or sync.status == "succeeded":
+                    continue
+                sync.status = "failed_pending_review" if failed_pending_review else "retrying"
+                sync.error_summary = summary
 
     def _consume_next_after_checkpoint(self, outbox_event_id: int) -> None:
         """在本事件成为检查点后串行消费同一销售的下一条待处理消息。
