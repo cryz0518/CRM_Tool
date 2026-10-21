@@ -831,7 +831,7 @@ class RetentionPayloadScrubService:
                 session.scalars(
                     select(CrmSyncRecord.request_message_id).where(
                         CrmSyncRecord.status.in_(
-                            ("pending", "processing", "retrying")
+                            ("pending", "batch_pending", "processing", "retrying")
                         )
                     )
                 ).all()

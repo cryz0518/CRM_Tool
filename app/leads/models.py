@@ -313,12 +313,16 @@ class SmartTableSync(Base):
     smart_table_record_id: Mapped[str | None] = mapped_column(String(128), unique=True)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     error_summary: Mapped[str | None] = mapped_column(String(256))
+    batch_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    __table_args__ = (UniqueConstraint("source_message_id", "source_segment_index"),)
+    __table_args__ = (
+        UniqueConstraint("source_message_id", "source_segment_index"),
+        Index("ix_smart_table_syncs_status_created_at", "status", "created_at"),
+    )
 
 
 class CrmSyncRecord(Base):

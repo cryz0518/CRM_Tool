@@ -27,6 +27,10 @@ def build_beat_schedule(settings: Settings) -> dict[str, dict[str, object]]:
             "task": "workers.consume_pending_lead_outbox_events",
             "schedule": settings.lead_outbox_poll_seconds,
         },
+        "flush-pending-smart-table-lead-batches": {
+            "task": "workers.flush_pending_smart_table_lead_batches",
+            "schedule": settings.smart_table_lead_batch_wait_seconds,
+        },
         "consume-pending-wecom-actions": {
             "task": "workers.consume_pending_wecom_actions",
             "schedule": settings.lead_outbox_poll_seconds,
