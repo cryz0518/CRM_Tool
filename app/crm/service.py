@@ -1076,8 +1076,10 @@ class CrmSubmissionService:
                     "crm_update_batch_snapshot_failed failure=%s",
                     safe_failure_summary(error),
                 )
-        result = SubmissionBatchResult()
-        for lead in candidates:
+        outcomes: dict[str, str] = {}
+
+        def submit_one(lead: Lead) -> tuple[str, str]:
+            """独立提交一条已同步线索，并将未预期异常收敛为待人工核对。"""
             try:
                 outcome = self._submit_update(
                     lead.id,
@@ -1091,7 +1093,38 @@ class CrmSubmissionService:
                     extra={"lead_id": lead.id, "failure": safe_failure_summary(error)},
                 )
                 outcome = "failed_pending_review"
-            result = _append_update_result(result, lead.id, outcome)
+            return lead.id, outcome
+
+        bind = self._session_factory.kw.get("bind")
+        max_workers = min(self._crm_submission_max_concurrency, len(candidates))
+        if len(candidates) <= 1 or (
+            bind is not None and getattr(getattr(bind, "dialect", None), "name", None) == "sqlite"
+        ):
+            # 单条不启动线程；SQLite 开发库串行写入，避免共享连接争用。
+            outcomes.update(submit_one(lead) for lead in candidates)
+        else:
+            # CRM 调用按配置限流；每条同步状态仍独立提交，批次部分成功。
+            with ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="crm-update",
+            ) as executor:
+                futures = {executor.submit(submit_one, lead): lead.id for lead in candidates}
+                for future in as_completed(futures):
+                    lead_id = futures[future]
+                    try:
+                        outcome_lead_id, outcome = future.result()
+                    except Exception as error:
+                        # 线程边界异常也只影响本条线索。
+                        _LOGGER.warning(
+                            "crm_update_item_failed",
+                            extra={"lead_id": lead_id, "failure": safe_failure_summary(error)},
+                        )
+                        outcome_lead_id, outcome = lead_id, "failed_pending_review"
+                    outcomes[outcome_lead_id] = outcome
+
+        result = SubmissionBatchResult()
+        for lead in candidates:
+            result = _append_update_result(result, lead.id, outcomes[lead.id])
         return result
 
     def _submit_update(

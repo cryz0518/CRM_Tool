@@ -84,6 +84,33 @@ class ConsoleQueryService:
         副作用：读取数据库并执行健康探针，不修改领域状态。
         """
         with self._session_factory() as session:
+            # 批次排队时间保存在来源事件上，避免用线索草稿创建时间误报等待时长。
+            batch_pending_count, oldest_batch_started_at = session.execute(
+                select(
+                    func.count(SmartTableSync.id),
+                    func.min(
+                        func.coalesce(OutboxEvent.processing_started_at, SmartTableSync.created_at)
+                    ),
+                )
+                .select_from(SmartTableSync)
+                .outerjoin(OutboxEvent, OutboxEvent.message_id == SmartTableSync.source_message_id)
+                .where(SmartTableSync.status == "batch_pending")
+            ).one()
+            crm_queue_counts = dict(
+                session.execute(
+                    select(CrmSyncRecord.status, func.count(CrmSyncRecord.id))
+                    .where(CrmSyncRecord.status.in_(("retrying", "failed_pending_review")))
+                    .group_by(CrmSyncRecord.status)
+                ).all()
+            )
+            oldest_batch_wait_seconds = 0
+            if oldest_batch_started_at is not None:
+                # SQLite 测试库可能返回无时区时间；统一按 UTC 计算并防止负等待值。
+                if oldest_batch_started_at.tzinfo is None:
+                    oldest_batch_started_at = oldest_batch_started_at.replace(tzinfo=UTC)
+                oldest_batch_wait_seconds = max(
+                    0, int((datetime.now(UTC) - oldest_batch_started_at).total_seconds())
+                )
             counts = {
                 "leads": session.scalar(select(func.count()).select_from(Lead)) or 0,
                 "messages": session.scalar(select(func.count()).select_from(IncomingMessage)) or 0,
@@ -99,6 +126,12 @@ class ConsoleQueryService:
                     )
                 )
                 or 0,
+                "smart_table_batch_pending": int(batch_pending_count or 0),
+                "smart_table_batch_oldest_wait_seconds": oldest_batch_wait_seconds,
+                "crm_retrying": int(crm_queue_counts.get("retrying", 0)),
+                "crm_failed_pending_review": int(
+                    crm_queue_counts.get("failed_pending_review", 0)
+                ),
             }
         services = self._health_provider.snapshot()
         readiness_issues = [
