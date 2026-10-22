@@ -8,6 +8,7 @@ from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from threading import Barrier
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, select, text
@@ -29,6 +30,8 @@ from app.messaging.models import (
     SalesAuthorization,
 )
 from app.smart_table.models import SmartTableRecord
+
+_CLAIMED_TEST_DATABASE_IDS: set[str] = set()
 
 
 def _validated_test_database_url(
@@ -99,7 +102,7 @@ def postgres_session_factory() -> Generator[sessionmaker[Session], None, None]:
     except ValueError as error:
         pytest.fail(str(error))
     engine = create_engine(test_database_url, pool_pre_ping=True)
-    schema_name = f"progress_test_{run_id}"
+    schema_name = f"progress_test_{run_id}_{uuid4().hex[:12]}"
     try:
         with engine.connect() as connection:
             database_name, actual_database_user, data_directory = connection.execute(
@@ -118,28 +121,30 @@ def postgres_session_factory() -> Generator[sessionmaker[Session], None, None]:
         engine.dispose()
         pytest.fail("PostgreSQL 实例身份或 tmpfs PGDATA 路径未通过安全校验")
     try:
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    "CREATE TABLE IF NOT EXISTS t15_progress_test_run_guard "
-                    "(run_id varchar(32) PRIMARY KEY)"
+        if run_id not in _CLAIMED_TEST_DATABASE_IDS:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "CREATE TABLE IF NOT EXISTS t15_progress_test_run_guard "
+                        "(run_id varchar(32) PRIMARY KEY)"
+                    )
                 )
-            )
-            claimed_id = connection.execute(
-                text(
-                    "INSERT INTO t15_progress_test_run_guard (run_id) VALUES (:run_id) "
-                    "ON CONFLICT DO NOTHING RETURNING run_id"
-                ),
-                {"run_id": run_id},
-            ).scalar_one_or_none()
-        if claimed_id != run_id:
-            engine.dispose()
-            pytest.fail("该 TEST_DATABASE_ID 已使用过，拒绝重复执行数据库集成测试")
+                claimed_id = connection.execute(
+                    text(
+                        "INSERT INTO t15_progress_test_run_guard (run_id) VALUES (:run_id) "
+                        "ON CONFLICT DO NOTHING RETURNING run_id"
+                    ),
+                    {"run_id": run_id},
+                ).scalar_one_or_none()
+            if claimed_id != run_id:
+                engine.dispose()
+                pytest.fail("该 TEST_DATABASE_ID 已使用过，拒绝重复执行数据库集成测试")
+            _CLAIMED_TEST_DATABASE_IDS.add(run_id)
     except Exception:
         engine.dispose()
         raise
     try:
-        # 同一个 TEST_DATABASE_ID 第二次运行会因 schema 已存在而失败，不会覆盖或清理旧对象。
+        # 每个 fixture 都使用独立 schema；重跑 pytest 仍由数据库级 guard 拒绝复用 ID。
         with engine.begin() as connection:
             connection.execute(CreateSchema(schema_name))
     except Exception:

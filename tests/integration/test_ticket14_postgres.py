@@ -395,13 +395,13 @@ def test_retry_patch_does_not_clobber_later_message_update(
             self._records.update({record.record_id: record for record in adapter.get_records()})
             self._read_count = 0
 
-        def get_record(self, record_id: str) -> SmartTableRecord | None:
-            """复制共享记录后在第二次读取前发出屏障并等待后续事务提交。"""
+        def get_records(self, record_ids=None) -> list[SmartTableRecord]:
+            """复制共享记录后在第二次批量读取前发出屏障并等待后续事务提交。"""
             self._read_count += 1
             if self._read_count == 2:
                 second_read_started.set()
                 assert release_second_read.wait(timeout=5)
-            return super().get_record(record_id)
+            return super().get_records(record_ids)
 
     pausing_adapter = PausingSmartTable()
     retry_service = LeadReviewService(postgres_session_factory, pausing_adapter)

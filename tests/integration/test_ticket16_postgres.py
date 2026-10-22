@@ -72,12 +72,12 @@ class BlockingTransferAdapter:
         """提供失败消息重试所需的隔离枚举快照；返回 Mock 结构，不访问真实表格。"""
         return build_required_smart_table_schema()
 
-    def get_records(self) -> list[SmartTableRecord]:
-        """返回已初始化的远端记录，供候选卡测试构建服务端 TODAY 列表。"""
+    def get_records(self, record_ids=None, **_filters: object) -> list[SmartTableRecord]:
+        """按当前 Adapter 契约返回目标快照，供重试和 CRM 候选测试使用。"""
 
         with self._lock:
-            record_ids = tuple(self.records)
-        return [self.get_record(record_id) for record_id in record_ids]
+            selected_ids = tuple(self.records) if record_ids is None else tuple(record_ids)
+        return [self.get_record(record_id) for record_id in selected_ids]
 
     def update_record(
         self, record_id: str, fields: dict[str, object], *, skip_preflight: bool = False

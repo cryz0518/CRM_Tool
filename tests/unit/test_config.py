@@ -30,12 +30,17 @@ def test_smart_table_stability_defaults_and_positive_validators() -> None:
     """验证 hotfix 配置默认值和防止关闭限流保护的正数约束。"""
     settings = Settings(_env_file=None)
     assert settings.audit_mirror_batch_size == 10
+    assert settings.crm_submission_max_concurrency == 10
     assert settings.smart_table_readiness_cache_seconds == 30
 
     with pytest.raises(ValueError, match="AUDIT_MIRROR_BATCH_SIZE"):
         Settings(_env_file=None, audit_mirror_batch_size=0)
     with pytest.raises(ValueError, match="SMART_TABLE_READINESS_CACHE_SECONDS"):
         Settings(_env_file=None, smart_table_readiness_cache_seconds=0)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, crm_submission_max_concurrency=0)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, crm_submission_max_concurrency=65)
 
 
 def test_wecom_cli_defaults_cover_observed_smart_table_latency(monkeypatch) -> None:  # type: ignore[no-untyped-def]

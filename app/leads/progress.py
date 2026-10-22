@@ -32,7 +32,7 @@ from app.smart_table.adapter import SmartTableAdapter
 logger = logging.getLogger(__name__)
 
 _ACTIVE_OUTBOX_STATUSES = frozenset({"pending", "processing", "retrying"})
-_ACTIVE_SYNC_STATUSES = frozenset({"pending", "processing", "retrying"})
+_ACTIVE_SYNC_STATUSES = frozenset({"pending", "batch_pending", "processing", "retrying"})
 _UNASSIGNED_RESOLUTION_STATUSES = frozenset({"unassigned", "quote_unresolved"})
 _SCHEDULER_BATCH_SIZE = 100
 

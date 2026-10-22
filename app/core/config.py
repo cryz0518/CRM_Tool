@@ -63,6 +63,8 @@ class Settings(BaseSettings):
     lead_first_success_link_enabled: bool = True
     lead_smart_table_url: str | None = None
     audit_mirror_batch_size: int = 10
+    smart_table_lead_batch_size: int = Field(default=5, ge=2, le=100)
+    smart_table_lead_batch_wait_seconds: int = Field(default=60, ge=0, le=60)
     smart_table_readiness_cache_seconds: int = 30
     smart_table_enum_cache_seconds: int = 300
     lead_processing_timeout_seconds: int = 300
@@ -75,6 +77,7 @@ class Settings(BaseSettings):
     ai_high_confidence_threshold: float = 0.85
     ai_medium_confidence_threshold: float = 0.60
     crm_create_retry_count: int = 3
+    crm_submission_max_concurrency: int = Field(default=10, gt=0, le=64)
     crm_create_retry_delay_seconds: int = Field(default=30, gt=0, le=3600)
     # CRM 客户级别存在历史值与当前值两套字典，按部署环境显式选择。
     crm_customer_level_scheme: Literal["legacy", "current"] = "current"

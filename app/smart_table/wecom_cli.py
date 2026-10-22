@@ -694,6 +694,13 @@ class WecomCliSmartTableAdapter:
             actual = remote_record.fields.get(canonical_name)
             if field.field_type is SmartTableFieldType.MULTI_SELECT and actual is None:
                 actual = []
+            # 企微把清空后的文本单元格回读为 null，与本次写入的空字符串语义相同。
+            if (
+                field.field_type in {SmartTableFieldType.TEXT, SmartTableFieldType.LONG_TEXT}
+                and target == ""
+                and actual is None
+            ):
+                continue
             if actual != expected:
                 mismatched.append(canonical_name)
         return tuple(mismatched)

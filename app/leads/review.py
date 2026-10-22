@@ -161,6 +161,7 @@ class LeadReviewService:
             current_fields,
             protected_supplement,
             acknowledged_but_unverified_fields,
+            accept_created_record_values=initial_record is not None,
         )
 
         # 在外部写入前再读一次表格；并发的后续消息若已提交，必须基于最新状态重算补丁。
@@ -177,6 +178,7 @@ class LeadReviewService:
                     current_fields,
                     protected_supplement,
                     acknowledged_but_unverified_fields,
+                    accept_created_record_values=initial_record is not None,
                 )
 
         # 先保存后台字段快照；外部表格失败时，后续消息仍能恢复这批待补写字段。
@@ -307,12 +309,14 @@ class LeadReviewService:
         current_fields: Mapping[str, object],
         protected_supplement: bool = False,
         acknowledged_but_unverified_fields: tuple[str, ...] = (),
+        accept_created_record_values: bool = False,
     ) -> _SafePatchPlan:
         """在短数据库事务中基于当前 Lead 与表格值生成受保护字段补丁。
 
         参数：lead_id 为目标线索；source_message_id 为来源消息；patch 为已校验 AI 补丁；
         current_fields 为刚从智能表格读取的当前字段；protected_supplement 表示历史失败补充；
-        acknowledged_but_unverified_fields 只用于识别旧版错误 ACK 后仍为空的原计划字段。
+        acknowledged_but_unverified_fields 只用于识别旧版错误 ACK 后仍为空的原计划字段；
+        accept_created_record_values 表示字段来自本次机器人建行响应，可用于补齐本地快照。
         返回值：包含外部写入补丁、字段保护结果和 Lead 并发比较基线的计划。
         异常：目标不存在、已废弃或来源消息不存在时抛出 ValueError。
         副作用：识别并持久化销售对字段的修改事实，但不调用外部适配器。
@@ -392,7 +396,13 @@ class LeadReviewService:
                     pending.discard(field_name)
                     continue
                 # 多选字段的空值由智能表格返回 []；空数组与 None/空字符串一样不能阻止首次写入。
-                if current_value and (
+                created_value_matches_patch = (
+                    accept_created_record_values
+                    and field_source is None
+                    and field_name in patch.fields
+                    and field_values_equal(current_value, value)
+                )
+                if current_value and not created_value_matches_patch and (
                     field_source is None
                     or not field_values_equal(current_value, field_source.last_ai_synced_value)
                 ):
@@ -443,47 +453,48 @@ class LeadReviewService:
                 )
             }
             enrichment = {**lead.enrichment_values, **patch.enrichment}
-            # 将本线索已归属消息按接收顺序完整写入备注；normalized_text 已含图片 OCR 文本。
-            source_messages = session.scalars(
-                select(IncomingMessage)
-                .outerjoin(
-                    LeadMessageResolution,
-                    LeadMessageResolution.message_id == IncomingMessage.message_id,
-                )
-                .where(
-                    or_(
-                        IncomingMessage.message_id == source_message_id,
-                        IncomingMessage.message_id == lead.source_message_id,
-                        LeadMessageResolution.lead_id == lead_id,
+            if not acknowledged_but_unverified_fields:
+                # 只恢复冻结字段计划时不重建备注，避免从重试时的消息文本扩展原计划。
+                source_messages = session.scalars(
+                    select(IncomingMessage)
+                    .outerjoin(
+                        LeadMessageResolution,
+                        LeadMessageResolution.message_id == IncomingMessage.message_id,
                     )
+                    .where(
+                        or_(
+                            IncomingMessage.message_id == source_message_id,
+                            IncomingMessage.message_id == lead.source_message_id,
+                            LeadMessageResolution.lead_id == lead_id,
+                        )
+                    )
+                    .order_by(
+                        IncomingMessage.received_at,
+                        IncomingMessage.sequence,
+                        IncomingMessage.message_id,
+                    )
+                ).unique().all()
+                original_message = "\n\n".join(
+                    message.normalized_text.strip()
+                    for message in source_messages
+                    if isinstance(message.normalized_text, str) and message.normalized_text.strip()
                 )
-                .order_by(
-                    IncomingMessage.received_at,
-                    IncomingMessage.sequence,
-                    IncomingMessage.message_id,
+                remark_value = RemarksBuilder().build(
+                    reviewed_fields, enrichment, original_message=original_message
                 )
-            ).unique().all()
-            original_message = "\n\n".join(
-                message.normalized_text.strip()
-                for message in source_messages
-                if isinstance(message.normalized_text, str) and message.normalized_text.strip()
-            )
-            remark_value = RemarksBuilder().build(
-                reviewed_fields, enrichment, original_message=original_message
-            )
-            remark_source = provenance.get("备注")
-            current_remark = current_fields.get("备注")
-            if remark_source is not None and remark_source.is_user_modified:
-                protected.add("备注")
-            elif current_remark not in (None, "") and (
-                remark_source is None or current_remark != remark_source.last_ai_synced_value
-            ):
-                # 已有非 AI 备注或销售改写后的备注均永久优先于后续自动生成内容。
-                protected.add("备注")
-            elif current_remark != remark_value:
-                fields_to_write["备注"] = remark_value
-                written_names.append("备注")
-                synced_values["备注"] = remark_value
+                remark_source = provenance.get("备注")
+                current_remark = current_fields.get("备注")
+                if remark_source is not None and remark_source.is_user_modified:
+                    protected.add("备注")
+                elif current_remark not in (None, "") and (
+                    remark_source is None or current_remark != remark_source.last_ai_synced_value
+                ):
+                    # 已有非 AI 备注或销售改写后的备注均永久优先于后续自动生成内容。
+                    protected.add("备注")
+                elif current_remark != remark_value:
+                    fields_to_write["备注"] = remark_value
+                    written_names.append("备注")
+                    synced_values["备注"] = remark_value
             return _SafePatchPlan(
                 fields_to_write=fields_to_write,
                 written_names=tuple(written_names),

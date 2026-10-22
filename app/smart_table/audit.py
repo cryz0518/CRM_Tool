@@ -24,7 +24,6 @@ AUDIT_MIRROR_FIELD_NAMES = (
     AUDIT_MIRROR_KEY_FIELD,
     "事件ID",
     "时间",
-    "事件类型",
     "操作人",
     "消息ID",
     "销售原始消息",
@@ -105,16 +104,18 @@ class SmartTableAuditSink:
 
     @staticmethod
     def mirror_key(event: BusinessAuditEvent) -> str:
-        """返回业务审计事件的稳定镜像键。
+        """返回来源消息对应的稳定镜像键。
 
         参数：event 为已持久化或即将镜像的业务审计事件。
-        返回值：以数据库审计事件 ID 组成的稳定键。
-        异常：事件尚未取得 ID 时抛出 ValueError。
+        返回值：以来源消息 ID 组成的稳定键，使同一消息的多个事件归并到一行。
+        异常：事件尚未持久化或消息 ID 为空时抛出 ValueError。
         副作用：无。
         """
         if event.id is None:
             raise ValueError("业务审计事件尚未获得持久化 ID")
-        return f"audit:{event.id}"
+        if not event.message_id:
+            raise ValueError("业务审计事件缺少来源消息 ID")
+        return f"message:{event.message_id}"
 
     def build_fields(
         self,
@@ -136,18 +137,17 @@ class SmartTableAuditSink:
             AUDIT_MIRROR_KEY_FIELD: self.mirror_key(event),
             "事件ID": str(event.id),
             "时间": event.created_at.isoformat(),
-            "事件类型": event.event_type,
             "操作人": event.sales_user_id.strip(),
             "消息ID": event.message_id,
         }
+        if isinstance(resolved_lead_id, str) and resolved_lead_id.strip():
+            fields["线索归属ID"] = resolved_lead_id.strip()
         # 系统审计日志中的销售原始消息是管理员审计副本；Smart Table ACL 由管理员控制；
         # 该副本不会因 IncomingMessage 后续 scrub 自动删除。正文只来自受控参数，不读取 raw_payload。
         if isinstance(sales_original_message, str):
             original_message = sales_original_message.strip()
             if original_message:
                 fields["销售原始消息"] = original_message[:MAX_AUDIT_ORIGINAL_MESSAGE_LENGTH]
-        if isinstance(resolved_lead_id, str) and resolved_lead_id.strip():
-            fields["线索归属ID"] = resolved_lead_id.strip()
         details = event.details if isinstance(event.details, Mapping) else {}
         for name in self._DETAIL_FIELDS:
             value = details.get(name)
@@ -157,9 +157,10 @@ class SmartTableAuditSink:
                     isinstance(item, str) for item in value
                 ):
                     fields[output_name] = "、".join(value)
+                else:
+                    fields[output_name] = ""
                 continue
-            if isinstance(value, str) and value:
-                fields[output_name] = value[:256]
+            fields[output_name] = value[:256] if isinstance(value, str) and value else ""
         return fields
 
     def mirror(
@@ -183,23 +184,31 @@ class SmartTableAuditSink:
         self,
         events: Sequence[tuple[BusinessAuditEvent, str | None, str | None]],
     ) -> list[SmartTableRecord]:
-        """以一次查重和一次批量新增镜像多条独立审计事件。
+        """按来源消息归并审计事件，并批量新增缺少镜像的消息行。
 
-        参数：events 为按处理顺序排列的审计事实、未 scrub 原文和线索归属 ID 元组。
-        返回值：按输入顺序排列的已存在或本次创建记录。
-        异常：结构缺失、查重、批量新增或写后核实失败时抛出适配器异常。
-        副作用：每个事件仍各占一行；远端查重及新增按批次执行。
+        参数：events 为审计事实、未 scrub 原文和线索归属 ID 元组。
+        返回值：按输入顺序返回对应消息的镜像行，同一消息的事件共用一行。
+        异常：结构缺失、查询、更新、批量新增或写后核实失败时抛出适配器异常。
+        副作用：更新每条消息最新事件的投影；业务审计事件本身仍逐事件保存在数据库。
         """
         if not events:
             return []
-        fields_by_event = [
-            self.build_fields(
+        latest_by_message: dict[str, tuple[BusinessAuditEvent, str | None, str | None]] = {}
+        for event, original_message, lead_id in events:
+            previous = latest_by_message.get(event.message_id)
+            if previous is None or (event.created_at, event.id or 0) >= (
+                previous[0].created_at,
+                previous[0].id or 0,
+            ):
+                latest_by_message[event.message_id] = (event, original_message, lead_id)
+        fields_by_message = {
+            message_id: self.build_fields(
                 event,
                 sales_original_message=original_message,
                 resolved_lead_id=lead_id,
             )
-            for event, original_message, lead_id in events
-        ]
+            for message_id, (event, original_message, lead_id) in latest_by_message.items()
+        }
         schema = self._adapter.get_schema()
         missing_fields = [
             name for name in AUDIT_MIRROR_FIELD_NAMES if schema.get_field(name) is None
@@ -214,23 +223,42 @@ class SmartTableAuditSink:
             or operator_field.field_type is not SmartTableFieldType.MEMBER
         ):
             raise SmartTableAdapterConfigurationError("审计子表字段“操作人”必须为人员类型")
-        keys = [str(fields[AUDIT_MIRROR_KEY_FIELD]) for fields in fields_by_event]
-        existing_by_key: dict[str, SmartTableRecord] = {}
-        for record in self._adapter.find_records_by_field_values(AUDIT_MIRROR_KEY_FIELD, keys):
-            key = record.fields.get(AUDIT_MIRROR_KEY_FIELD)
-            if isinstance(key, str):
-                existing_by_key.setdefault(key, record)
-        results: list[SmartTableRecord | None] = [existing_by_key.get(key) for key in keys]
-        missing_indexes = [index for index, record in enumerate(results) if record is None]
+        message_ids = list(fields_by_message)
+        rows_by_message: dict[str, list[SmartTableRecord]] = {}
+        for record in self._adapter.find_records_by_field_values("消息ID", message_ids):
+            message_id = record.fields.get("消息ID")
+            if isinstance(message_id, str) and message_id in fields_by_message:
+                rows_by_message.setdefault(message_id, []).append(record)
+        existing_by_message: dict[str, SmartTableRecord] = {}
+        for message_id, rows in rows_by_message.items():
+            stable_key = str(fields_by_message[message_id][AUDIT_MIRROR_KEY_FIELD])
+            # 优先复用新版消息键；迁移期复用一条旧事件行，避免再次新建。
+            existing_by_message[message_id] = next(
+                (row for row in rows if row.fields.get(AUDIT_MIRROR_KEY_FIELD) == stable_key),
+                min(rows, key=lambda row: row.record_id),
+            )
+        results_by_message: dict[str, SmartTableRecord] = {}
+        for message_id, record in existing_by_message.items():
+            fields = dict(fields_by_message[message_id])
+            # 兼容尚未删除该列的旧表结构，更新旧行时清空已废弃的事件类型值。
+            if schema.get_field("事件类型") is not None:
+                fields["事件类型"] = ""
+            if "线索归属ID" not in fields:
+                fields["线索归属ID"] = ""
+            results_by_message[message_id] = self._adapter.update_record(
+                record.record_id,
+                fields,
+                skip_preflight=True,
+            )
+        missing_message_ids = [
+            message_id for message_id in message_ids if message_id not in results_by_message
+        ]
         # 审计子表 ACL 由管理员在企微端配置；代码只使用机器人身份写入，不管理 ACL。
         created = self._adapter.create_records(
-            [fields_by_event[index] for index in missing_indexes],
+            [fields_by_message[message_id] for message_id in missing_message_ids],
             actor=SmartTableActor.ROBOT,
         )
-        if len(created) != len(missing_indexes):
+        if len(created) != len(missing_message_ids):
             raise RuntimeError("审计批量新增返回的记录数与请求不一致")
-        for index, record in zip(missing_indexes, created, strict=True):
-            results[index] = record
-        if any(record is None for record in results):
-            raise RuntimeError("审计批量新增未返回全部记录")
-        return [record for record in results if record is not None]
+        results_by_message.update(zip(missing_message_ids, created, strict=True))
+        return [results_by_message[event.message_id] for event, _, _ in events]

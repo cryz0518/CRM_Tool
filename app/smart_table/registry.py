@@ -171,6 +171,8 @@ DEFAULT_LEAD_BUSINESS_VALUES = {
     "客户行业": "其他",
 }
 DEFAULT_SMART_TABLE_FIELD_VALUES = {"是否为国际客户": "国内", "提交状态": "未提交"}
+# 仅用于智能表格批量新增结果核对，不进入 AI 字段或 CRM 业务字段。
+SYSTEM_LEAD_ID_FIELD = "系统线索ID"
 # 当前表格将原生创建时间命名为“录入时间”；两种名称都视为只读系统字段。
 READ_ONLY_SYSTEM_TIME_FIELDS = frozenset({"创建时间", "录入时间"})
 _FieldValue = TypeVar("_FieldValue")
@@ -227,7 +229,7 @@ ENUM_FIELDS_WITH_OTHER = frozenset(
 
 
 def build_required_smart_table_schema() -> SmartTableSchema:
-    """构造项目可写字段的 Mock 结构，不模拟尚未核实类型的原生系统时间列。
+    """构造必需业务字段及系统关联字段的 Mock 结构。
 
     返回：包含稳定字段与选项 ID 的 Mock 表结构。
     副作用：按字段注册表顺序生成仅用于 Mock 的底层标识。
@@ -248,5 +250,13 @@ def build_required_smart_table_schema() -> SmartTableSchema:
                 ),
             )
             for index, field in enumerate(REQUIRED_SMART_TABLE_FIELDS, start=1)
+        )
+        + (
+            # Mock 默认启用批量写入的稳定关联键；真实表格缺少此列时会安全退回逐条创建。
+            SmartTableField(
+                field_id="mock-system-lead-id",
+                name=SYSTEM_LEAD_ID_FIELD,
+                field_type=SmartTableFieldType.TEXT,
+            ),
         )
     )

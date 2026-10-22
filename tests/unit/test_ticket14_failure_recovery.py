@@ -527,6 +527,14 @@ def test_remote_640027_is_terminal_and_persists_only_safe_field_names(
     original_update = adapter.update_record
     service = FirstTextLeadWorkspaceService(session_factory, adapter)
     update_calls = 0
+    original_create = service._create_smart_table_record
+
+    def create_without_batch(*args, **kwargs):
+        """定向覆盖旧单行建档后的参数拒绝恢复，批量路径由独立用例验证。"""
+        kwargs["bypass_batch"] = True
+        return original_create(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_create_smart_table_record", create_without_batch)
 
     def reject_parameter(*_args: object, **_kwargs: object) -> object:
         """模拟不可重试的远端参数错误，拒绝正文只存在于模拟调用栈。"""
@@ -914,13 +922,13 @@ def test_retry_lifecycle_fence_observes_discard_before_smart_table_patch(
             self._next_record_number = 2
             self._get_count = 0
 
-        def get_record(self, requested_record_id: str) -> SmartTableRecord | None:
-            """第二次读取完成前暂停，使 discard 能先提交生命周期变更。"""
+        def get_records(self, record_ids=None) -> list[SmartTableRecord]:
+            """第二次批量读取前暂停，使 discard 能先提交生命周期变更。"""
             self._get_count += 1
             if self._get_count == 2:
                 second_read_started.set()
                 assert release_second_read.wait(timeout=5)
-            return super().get_record(requested_record_id)
+            return super().get_records(record_ids)
 
     pausing_adapter = PausingAdapter()
     retry_service = FirstTextLeadWorkspaceService(session_factory, pausing_adapter)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import date, datetime
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 
 class CrmPayloadError(ValueError):
@@ -35,6 +36,7 @@ CRM_FIELD_NAMES = {
     "客户级别": "customer_level",
     "工艺": "process",
     "下次联系时间": "contactDate",
+    "录入时间": "entryTime",
     "备注": "remark",
     "是否为国际客户": "isInternational",
 }
@@ -178,6 +180,8 @@ class CrmPayloadBuilder:
             return value == "国外" or value is True
         if field_name == "下次联系时间":
             return self._date_value(value)
+        if field_name == "录入时间":
+            return self._entry_time_value(value)
         if field_name == "备注":
             return self._remark_value(value)
         if not isinstance(value, str):
@@ -222,6 +226,34 @@ class CrmPayloadBuilder:
                 except ValueError as error:
                     raise CrmPayloadError(f"下次联系时间格式不合法：{value}") from error
         raise CrmPayloadError(f"下次联系时间类型不合法：{value}")
+
+    @staticmethod
+    def _entry_time_value(value: object) -> str:
+        """把智能表格录入时间转换为 CRM 要求的上海本地分钟格式。
+
+        参数：value 为智能表格录入时间或持久化线索时间。
+        返回值：格式固定为 YYYY-MM-DD HH:MM 的时间字符串。
+        异常：无法解析时抛出 CrmPayloadError，阻止错误时间进入 CRM。
+        副作用：无，仅解析并转换内存中的时间值。
+        """
+        shanghai = ZoneInfo("Asia/Shanghai")
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, date):
+            parsed = datetime.combine(value, datetime.min.time())
+        elif isinstance(value, str):
+            # 兼容 CLI 返回的斜杠日期和带 Z 标记的 ISO 时间。
+            normalized = value.strip().replace("/", "-").replace("Z", "+00:00")
+            try:
+                parsed = datetime.fromisoformat(normalized)
+            except ValueError as error:
+                raise CrmPayloadError("录入时间格式无效") from error
+        else:
+            raise CrmPayloadError("录入时间格式无效")
+        # 智能表格无时区时间按上海本地时间解释；数据库时间在调用前统一标记为 UTC。
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=shanghai)
+        return parsed.astimezone(shanghai).strftime("%Y-%m-%d %H:%M")
 
     @staticmethod
     def _remark_value(value: object) -> str:

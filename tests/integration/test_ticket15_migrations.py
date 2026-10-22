@@ -764,7 +764,7 @@ def test_ticket15_offline_rejects_tcp_endpoint_before_compose(
 def test_ticket15_offline_diagnostic_when_compose_command_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Compose config 非零退出被定位到配置阶段且不打印命令输出。"""
+    """未知 Compose config 错误被安全分类且不打印命令输出。"""
     project_name, _ = _resolved_compose_for_offline_test()
     calls = _mock_ticket15_subprocess(
         monkeypatch,
@@ -786,7 +786,7 @@ def test_ticket15_offline_diagnostic_when_compose_command_fails(
     _assert_safe_t15_diagnostic(
         error,
         stage="compose_config",
-        error_code="COMPOSE_CONFIG_EXIT_NONZERO",
+        error_code="COMPOSE_ERROR_UNCLASSIFIED",
         external_command_executed=True,
         forbidden=("DATABASE_URL=hidden", "POSTGRES_PASSWORD=hidden"),
     )
@@ -872,6 +872,9 @@ def test_current_migration_chain_reaches_single_head() -> None:
         key: os.environ[key]
         for key in (
             "PATH",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "ProgramW6432",
             "SYSTEMROOT",
             "WINDIR",
             "COMSPEC",
@@ -982,7 +985,7 @@ def test_current_migration_chain_reaches_single_head() -> None:
             heads, ("run", "--rm", "--no-deps", "migrate", "alembic", "heads")
         )
         # 当前最新迁移继续保持单一 migration head。
-        assert heads.stdout.count("0037_crm_submission_retry_schedule") == 1
+        assert heads.stdout.count("0038_persistent_smart_table_lead_batch") == 1
 
         # 只有 notification payload 的 T18 事实也必须阻止 downgrade，不能因没有 action 行而丢列。
         payload_seed = _run_compose(

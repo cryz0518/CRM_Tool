@@ -371,9 +371,13 @@ def test_multi_customer_only_formal_segment_enters_smart_table(
         "客户：正式客户；联系人：张三\n客户：待确认客户；联系人：李四",
     )
 
-    result = FirstTextLeadWorkspaceService(
+    workspace = FirstTextLeadWorkspaceService(
         session_factory, adapter, company_lead_service=company_service
-    ).consume(event_id)
+    )
+    result = workspace.consume(event_id)
+    # 测试中显式让持久化队列的等待窗口到期，再验证正式线索批量落表。
+    workspace._smart_table_lead_batch_wait_seconds = 0
+    assert workspace.flush_smart_table_batch() == 1
 
     assert len(result.lead_ids) == 2
     assert len(adapter.get_records()) == 1
@@ -414,6 +418,9 @@ def test_multi_customer_different_sales_keep_company_records_isolated(
 
     first = workspace.consume(first_event)
     second = workspace.consume(second_event)
+    # 两名销售的正式线索仍分别归属；等待窗口结束后由同一个批次写入。
+    workspace._smart_table_lead_batch_wait_seconds = 0
+    assert workspace.flush_smart_table_batch() == 2
 
     assert first.lead_ids[0] != second.lead_ids[0]
     assert len(adapter.get_records()) == 2

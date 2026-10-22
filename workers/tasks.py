@@ -174,7 +174,11 @@ def _claim_audit_mirror_outbox(
                     AuditMirrorOutbox.status == "pending",
                     and_(
                         AuditMirrorOutbox.status == "retrying",
-                        _audit_mirror_retry_due_condition(now),
+                        or_(
+                            # 调度器已按退避期限认领派发的任务，即使派发更新时间也必须允许消费。
+                            AuditMirrorOutbox.dispatch_lease_expires_at.is_not(None),
+                            _audit_mirror_retry_due_condition(now),
+                        ),
                     ),
                     and_(
                         AuditMirrorOutbox.status == "processing",
@@ -594,7 +598,12 @@ def consume_pending_audit_mirrors() -> int:
                             ),
                         )
                         # 同一事务领取派发租约，避免重复向共享 Worker 队列塞入同一任务。
-                        .order_by(AuditMirrorOutbox.updated_at, AuditMirrorOutbox.id)
+                        # 新审计记录优先于旧重试，避免历史故障占住唯一派发批次。
+                        .order_by(
+                            AuditMirrorOutbox.status != "pending",
+                            AuditMirrorOutbox.updated_at,
+                            AuditMirrorOutbox.id,
+                        )
                         .limit(available_slots)
                         .with_for_update(skip_locked=True)
                     )
@@ -792,6 +801,55 @@ def consume_lead_outbox_event(
                     logger.exception("lead_sales_processing_lock_release_failed")
             lock_connection.close()
         # 每个短任务释放独立连接池，避免 Beat 持续扫描时堆积空闲连接。
+        engine.dispose()
+
+
+@celery_app.task(name="workers.flush_pending_smart_table_lead_batches")  # type: ignore[untyped-decorator]
+def flush_pending_smart_table_lead_batches() -> int:
+    """消费达到批量数量或等待时限的智能表格新线索队列。
+
+    参数：无。
+    返回值：本轮完成 T09 同步的线索数；当前无到期批次时返回 0。
+    异常：数据库初始化或批次持久化事实损坏时向 Celery 传播。
+    副作用：取得全局 PostgreSQL 批次锁后，调用现有 Lead 服务批量建行并完成审核同步。
+    """
+    engine, factory = _session_factory()
+    lock_connection: Connection | None = None
+    lock_acquired = False
+    try:
+        lock_connection = engine.connect()
+        if lock_connection.dialect.name == "postgresql":
+            # 一次只允许一个 Worker 凑批，避免重复创建远端行或重复提交批次。
+            lock_acquired = bool(
+                lock_connection.scalar(
+                    text("SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0))"),
+                    {"lock_key": "crm:smart-table-lead-batch"},
+                )
+            )
+            lock_connection.commit()
+            if not lock_acquired:
+                return 0
+        adapter = get_smart_table_adapter()
+        service = FirstTextLeadWorkspaceService(
+            factory,
+            adapter,
+            company_lead_service=CompanyLeadService(factory, adapter, get_tyc_adapter()),
+            robot_submission_confirmation_available=get_settings().wecom_card_callback_ready(),
+        )
+        return service.flush_smart_table_batch()
+    finally:
+        if lock_connection is not None:
+            if lock_acquired:
+                try:
+                    lock_connection.execute(
+                        text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
+                        {"lock_key": "crm:smart-table-lead-batch"},
+                    )
+                    lock_connection.commit()
+                except Exception:
+                    lock_connection.invalidate()
+                    logger.exception("smart_table_lead_batch_lock_release_failed")
+            lock_connection.close()
         engine.dispose()
 
 
