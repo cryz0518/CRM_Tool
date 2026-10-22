@@ -7,6 +7,10 @@ from functools import lru_cache
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.ai.dependencies import get_ai_gateway
+from app.ai.persistence import DatabaseAIExecutionRecorder
+from app.companies.dependencies import get_tyc_adapter
+from app.companies.service import CompanyLeadService
 from app.console.auth import (
     AdminIdentityProvider,
     CapabilityAuthorizer,
@@ -121,13 +125,27 @@ def get_break_glass_access_service() -> BreakGlassAccessService:
 
 @lru_cache
 def get_console_maintenance_service() -> ConsoleMaintenanceService:
-    """组装 Console 管理写入口及其领域服务。"""
+    """组装具备真实解析与公司恢复依赖的 Console 管理写入口。
+
+    返回值：复用 Worker AI 网关、公司服务和智能表格适配器的维护服务。
+    异常：依赖配置或 Provider 策略不合法时由对应工厂传播配置错误。
+    副作用：首次调用时构造数据库、AI、天眼查和智能表格客户端，不发起线索处理请求。
+    """
 
     session_factory = get_console_session_factory()
     smart_table = get_smart_table_adapter()
     return ConsoleMaintenanceService(
         session_factory,
-        FirstTextLeadWorkspaceService(session_factory, smart_table),
+        FirstTextLeadWorkspaceService(
+            session_factory,
+            smart_table,
+            ai_gateway=get_ai_gateway(
+                execution_recorder=DatabaseAIExecutionRecorder(session_factory)
+            ),
+            company_lead_service=CompanyLeadService(
+                session_factory, smart_table, get_tyc_adapter()
+            ),
+        ),
         LeadReassignmentService(session_factory),
         LeadDiscardService(session_factory),
         AdminLeadCreationService(session_factory, smart_table),

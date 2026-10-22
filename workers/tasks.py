@@ -174,7 +174,11 @@ def _claim_audit_mirror_outbox(
                     AuditMirrorOutbox.status == "pending",
                     and_(
                         AuditMirrorOutbox.status == "retrying",
-                        _audit_mirror_retry_due_condition(now),
+                        or_(
+                            # 调度器已按退避期限认领派发的任务，即使派发更新时间也必须允许消费。
+                            AuditMirrorOutbox.dispatch_lease_expires_at.is_not(None),
+                            _audit_mirror_retry_due_condition(now),
+                        ),
                     ),
                     and_(
                         AuditMirrorOutbox.status == "processing",
@@ -594,7 +598,12 @@ def consume_pending_audit_mirrors() -> int:
                             ),
                         )
                         # 同一事务领取派发租约，避免重复向共享 Worker 队列塞入同一任务。
-                        .order_by(AuditMirrorOutbox.updated_at, AuditMirrorOutbox.id)
+                        # 新审计记录优先于旧重试，避免历史故障占住唯一派发批次。
+                        .order_by(
+                            AuditMirrorOutbox.status != "pending",
+                            AuditMirrorOutbox.updated_at,
+                            AuditMirrorOutbox.id,
+                        )
                         .limit(available_slots)
                         .with_for_update(skip_locked=True)
                     )

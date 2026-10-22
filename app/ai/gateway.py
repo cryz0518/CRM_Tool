@@ -38,6 +38,10 @@ logger = logging.getLogger(__name__)
 _FIELD_TYPES = {field.name: field.field_type for field in REQUIRED_SMART_TABLE_FIELDS}
 _PURCHASE_INTENT_PATTERN = re.compile(r"(?:采购|购买|买|想要|需要|计划采购|准备采购)")
 _PRODUCT_CATEGORY_TERMS = ("主营产品", "主要产品", "产品为", "产品是", "产品包括", "主营为")
+_LEADING_LEGAL_COMPANY_PATTERN = re.compile(
+    r"^\s*([\u3400-\u9fffA-Za-z0-9（）()·&.\-]{2,80}?"
+    r"(?:有限责任公司|股份有限公司|有限公司|有限合伙|股份公司))"
+)
 
 
 def _enum_option_evidence_terms(field_name: str, option: str) -> tuple[str, ...]:
@@ -353,6 +357,8 @@ class AIGateway:
         """对单个消息或单个语义分段复用同一套确定性字段校验。"""
         # PII 仅用于本地证据校验，不能传给模型或日志；模型无原文依据的联系人候选先行移除。
         identity_text = identity_source_text if identity_source_text is not None else source_text
+        # 法定全称位于消息开头且能从原文精确截取时，补上模型遗漏的公司身份。
+        analysis = self._recover_leading_company_name(analysis, identity_text)
         analysis = self._drop_contact_candidates_without_source_evidence(analysis, identity_text)
         # 通过本地原文恢复被模型遗漏的联系方式，确保 provenance 值也有真实来源。
         analysis = self._recover_verified_identity_fields(analysis, identity_text)
@@ -388,6 +394,47 @@ class AIGateway:
             low_candidates,
             validated_enrichment,
             pending_prefill_allowed,
+        )
+
+    @staticmethod
+    def _recover_leading_company_name(
+        analysis: LeadAnalysis, source_text: str
+    ) -> LeadAnalysis:
+        """从消息开头的法定公司全称恢复模型遗漏的线索名称。
+
+        参数：analysis 为模型结构化结果；source_text 为当前消息或分段的未脱敏原文。
+        返回值：只有公司全称能按受限法定后缀从原文开头精确截取时才补入线索名称。
+        异常：无；不确定或非开头位置的名称保持原样交由模型和人工处理。
+        副作用：可能记录一条不含客户内容的结构化诊断日志，不调用外部服务。
+        """
+        match = _LEADING_LEGAL_COMPANY_PATTERN.match(source_text)
+        if match is None:
+            return analysis
+        company_name = match.group(1).strip()
+        field_name = next(
+            (
+                name
+                for name in analysis.crm_fields
+                if AI_FIELD_ALIASES.get(name.strip().lower(), name) == "线索名称"
+            ),
+            "线索名称",
+        )
+        existing_value = analysis.crm_fields.get(field_name)
+        # 原文首部已经构成客户身份边界；与其冲突的模型值不由该窄规则覆盖。
+        if existing_value not in (None, "", company_name):
+            return analysis
+        if (
+            existing_value == company_name
+            and analysis.confidence_by_field.get(field_name) == 1.0
+        ):
+            return analysis
+        fields = dict(analysis.crm_fields)
+        fields[field_name] = company_name
+        confidence = dict(analysis.confidence_by_field)
+        confidence[field_name] = 1.0
+        logger.info("ai_company_name_recovered_from_source")
+        return analysis.model_copy(
+            update={"crm_fields": fields, "confidence_by_field": confidence}
         )
 
     @staticmethod

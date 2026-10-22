@@ -552,7 +552,7 @@ class FirstTextLeadWorkspaceService:
         省略时仅允许该消息所属销售执行。返回值：受保护补充的状态、目标线索和字段保护结果。
         异常：消息不存在、权限不足或非失败终态时抛出 ValueError/PermissionError；
         外部失败会保存失败事实；历史重试成功只有在 Outbox 与对应首条同步记录一致成功时才幂等返回，
-        否则会重新核实同一 Smart Table 行。
+        否则会重新核实同一 Smart Table 行；首次建行失败时复用公司服务恢复审核行。
         副作用：新增一次指定分段的 MessageRetryAttempt，最多调用一次当前消息的解析和
         T09 安全补丁同步；原始顺序检查点不变。
         """
@@ -788,6 +788,37 @@ class FirstTextLeadWorkspaceService:
                         low_confidence_candidates={},
                     )
                 )
+            initial_record = None
+            with self._session_factory() as session:
+                target = session.get(Lead, lead_id)
+                needs_initial_record = target is not None and target.smart_table_record_id is None
+            recovered_company_name = patch.fields.get("线索名称")
+            if (
+                needs_initial_record
+                and self._company_lead_service is not None
+                and isinstance(recovered_company_name, str)
+                and recovered_company_name.strip()
+            ):
+                # 首次 add 失败可能尚未建行；先保存公司事实，再由公司服务创建审核行。
+                company_result = self._company_lead_service.upsert(
+                    CompanyUpsertCommand(
+                        source_message_id=message_id,
+                        sales_user_id=source_sales_user_id,
+                        fields=dict(patch.fields),
+                        existing_lead_id=lead_id,
+                        defer_smart_table_sync=False,
+                        source_segment_index=segment_index,
+                    )
+                )
+                if company_result.lead_id != lead_id:
+                    raise ValueError("失败消息重试的公司归属发生变化")
+                # 恢复首次建行直接复用公司服务的单行创建，不依赖表中可选的系统线索 ID 列。
+                record_id = company_result.smart_table_record_id
+                initial_record = (
+                    self._smart_table_adapter.get_record(record_id) if record_id is not None else None
+                )
+                if initial_record is None:
+                    raise RuntimeError("失败消息重试未能恢复智能表格记录")
             sync_result = self._sync_ai_review_patch(
                 AIReviewRequest(
                     source_message_id=message_id,
@@ -799,6 +830,7 @@ class FirstTextLeadWorkspaceService:
                 ),
                 protected_supplement=True,
                 acknowledged_but_unverified_fields=tuple(persisted_retry_fields or ()),
+                initial_record=initial_record,
             )
         except Exception as error:
             with self._session_factory.begin() as session:
