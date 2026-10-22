@@ -46,6 +46,7 @@ from app.leads.quote_routing import (
     QuoteResolutionResult,
     resolve_message_quote,
 )
+from app.leads.remarks import RemarksBuilder
 from app.leads.review import LeadReviewService, ReviewSyncResult
 from app.messaging.models import (
     BusinessAuditEvent,
@@ -67,12 +68,13 @@ from app.smart_table.enums import (
     get_enum_snapshot_service,
     isolated_enum_snapshot_operation,
 )
-from app.smart_table.models import SmartTableFieldType, SmartTableRecord
+from app.smart_table.models import SmartTableRecord
 from app.smart_table.registry import (
     DEFAULT_SMART_TABLE_FIELD_VALUES,
     SYSTEM_LEAD_ID_FIELD,
     writable_smart_table_fields,
 )
+from app.smart_table.wecom_cli import SmartTableWriteVerificationError
 
 logger = logging.getLogger(__name__)
 
@@ -446,7 +448,7 @@ class FirstTextLeadWorkspaceService:
             claimed_for_processing=claimed_for_processing,
             recover_expired_lease=recover_expired_lease,
         )
-        # 表格首次同步成功后才应用公司核验和销售内去重，避免失败重试中重放外部写入。
+        # 新建批次已在入队前核验公司；仅旧恢复和已有线索补充沿用兼容收尾。
         if not result.company_resolution_applied:
             result = self._apply_company_resolution(outbox_event_id, result)
         result = self._flush_immediate_smart_table_batch(result, outbox_event_id)
@@ -815,7 +817,8 @@ class FirstTextLeadWorkspaceService:
                 # 恢复首次建行直接复用公司服务的单行创建，不依赖表中可选的系统线索 ID 列。
                 record_id = company_result.smart_table_record_id
                 initial_record = (
-                    self._smart_table_adapter.get_record(record_id) if record_id is not None else None
+                    self._smart_table_adapter.get_record(record_id)
+                    if record_id is not None else None
                 )
                 if initial_record is None:
                     raise RuntimeError("失败消息重试未能恢复智能表格记录")
@@ -1203,6 +1206,8 @@ class FirstTextLeadWorkspaceService:
                 )
             sales_user_id = lead.smart_table_owner_user_id
             fields = dict(lead.field_values)
+            # 临时草稿升级时沿用已核验名称，不能把历史简称带入首次表格补丁。
+            fields["线索名称"] = standard_company_name
         return self._create_smart_table_record(
             sales_user_id,
             fields,
@@ -1740,6 +1745,36 @@ class FirstTextLeadWorkspaceService:
                     self._record_audit(session, event, "lead_actor_inactive")
                     logger.warning("lead_outbox_actor_inactive")
                     return LeadProcessingResult(LeadProcessingStatus.UNAUTHORIZED)
+
+                # 批量新增暂态失败只恢复已解析载荷，不再消耗模型和天眼查调用。
+                batch_retries = session.scalars(select(SmartTableSync).where(
+                    SmartTableSync.source_message_id == message.message_id,
+                    SmartTableSync.status == "retrying",
+                    SmartTableSync.batch_payload.is_not(None),
+                )).all()
+                if batch_retries:
+                    for retry_sync in batch_retries:
+                        retry_lead = session.get(Lead, retry_sync.lead_id)
+                        if retry_lead is None:
+                            raise ValueError("待恢复批次的线索事实缺失")
+                        requests = self._batch_requests_from_sync(
+                            session, retry_sync, retry_lead, event
+                        )
+                        retry_sync.status = "batch_pending"
+                        for item in requests:
+                            retry_event = session.get(OutboxEvent, item.outbox_event_id)
+                            if retry_event is not None and retry_event.status == "retrying":
+                                retry_event.status = "batch_pending"
+                                retry_event.processing_started_at = None
+                        self._record_audit(session, event, "smart_table_batch_resumed")
+                    event.status = "batch_pending"
+                    event.processing_started_at = None
+                    return LeadProcessingResult(
+                        LeadProcessingStatus.BATCH_QUEUED,
+                        lead_id=batch_retries[0].lead_id,
+                        lead_ids=tuple(item.lead_id for item in batch_retries),
+                        company_resolution_applied=True,
+                    )
 
                 extractor = DeterministicFirstTextLeadExtractor(
                     self._enum_snapshots.get_snapshot().options["工艺"]
@@ -2812,6 +2847,69 @@ class FirstTextLeadWorkspaceService:
                 None,
             ),
             lead_ids=lead_ids,
+            company_resolution_applied=all(item.company_resolution_applied for item in results),
+        )
+
+    def _resolve_ai_company_before_smart_table(self, request: AIReviewRequest) -> AIReviewRequest:
+        """先持久化 AI 公司核验与字段事实，再把最终名称交给表格批次。
+
+        参数：request 为尚未首次写表的 AI 请求。
+        返回值：已完成销售内去重、名称标准化及待确认标记合并的请求。
+        异常：公司服务与数据库异常原样传播，禁止带未完成的公司决策写表。
+        副作用：查询天眼查、保存草稿与字段来源；不创建或更新智能表格。
+        """
+        assert self._company_lead_service is not None
+        with self._session_factory() as session:
+            _, message = self._load_event_and_message(session, request.outbox_event_id)
+            message_text = message.normalized_text
+        text_fields = {name: value for name, value in request.patch.fields.items()
+                       if isinstance(value, str)}
+        company = self._company_lead_service.upsert(CompanyUpsertCommand(
+            source_message_id=request.source_message_id,
+            sales_user_id=request.sales_user_id,
+            fields=dict(request.patch.fields),
+            existing_lead_id=request.lead_id,
+            source_segment_index=request.segment_index,
+            region_evidence=CompanyRegionEvidence(
+                message_text=message_text,
+                company_name=text_fields.get("线索名称"),
+                email=text_fields.get("邮箱"),
+                phone=text_fields.get("手机") or text_fields.get("电话"),
+            ),
+            defer_smart_table_sync=True,
+        ))
+        fields = dict(request.patch.fields)
+        if (
+            company.standard_company_name
+            and company.verification_status.value != "foreign_declared"
+        ):
+            # 工商标准名已由确定性公司服务决定，首次入表不能再使用原始简称。
+            fields["线索名称"] = company.standard_company_name
+        pending = tuple(dict.fromkeys((
+            *request.patch.pending_confirmation_fields, *company.pending_confirmation_fields,
+        )))
+        with self._session_factory.begin() as session:
+            if company.lead_id != request.lead_id:
+                # 合并后的消息改指唯一目标，原先尚未建行的同步占位不再参与批次。
+                old_sync = session.scalar(select(SmartTableSync).where(
+                    SmartTableSync.lead_id == request.lead_id
+                ))
+                if old_sync is not None:
+                    old_sync.status = "succeeded"
+                    old_sync.completed_at = utc_now()
+                    old_sync.batch_payload = None
+            sync = session.scalar(select(SmartTableSync).where(
+                SmartTableSync.lead_id == company.lead_id
+            ))
+            if sync is None:
+                session.add(SmartTableSync(
+                    lead_id=company.lead_id, source_message_id=request.source_message_id,
+                    source_segment_index=request.segment_index,
+                ))
+        return replace(
+            request, lead_id=company.lead_id,
+            creates_lead=company.smart_table_record_id is None,
+            patch=replace(request.patch, fields=fields, pending_confirmation_fields=pending),
         )
 
     def _sync_ai_review(
@@ -2833,6 +2931,11 @@ class FirstTextLeadWorkspaceService:
         异常：关键数据库事实缺失时抛出 ValueError；其他外部失败转为失败待审事实。
         副作用：可能创建智能表格记录、调用 T09，并完成消息归属和当前客户上下文。
         """
+        company_resolved = (
+            defer_batch and request.creates_lead and self._company_lead_service is not None
+        )
+        if company_resolved:
+            request = self._resolve_ai_company_before_smart_table(request)
         # 先固定业务归属和销售会话，再允许 T09/Smart Table 产生任何外部副作用。
         should_defer = False
         with self._session_factory.begin() as session:
@@ -2879,8 +2982,11 @@ class FirstTextLeadWorkspaceService:
                 if request.creates_lead
                 else LeadProcessingStatus.UPDATED,
                 lead_id=request.lead_id,
+                company_resolution_applied=company_resolved,
             )
         record_id, created_record, preserve_record = self._ensure_ai_review_record(request)
+        # 本轮批量新增已确认原行，后续补丁失败也只能在同一行恢复。
+        preserve_record = preserve_record or initial_record is not None
         if record_id is None:
             return LeadProcessingResult(LeadProcessingStatus.SYNC_FAILED, lead_id=request.lead_id)
         try:
@@ -2912,6 +3018,8 @@ class FirstTextLeadWorkspaceService:
             sync = session.scalar(select(SmartTableSync).where(SmartTableSync.lead_id == lead.id))
             if request.creates_lead and sync is None:
                 raise ValueError(f"AI 审核同步事实不存在：{lead.id}")
+            # 批次事件由所有分段统一收尾；旧单行恢复则必须自行释放销售顺序检查点。
+            batch_managed = sync is not None and sync.batch_payload is not None
             first_success = (
                 complete_sync
                 and sync is not None
@@ -2933,7 +3041,7 @@ class FirstTextLeadWorkspaceService:
                 event,
                 lead.id,
                 request.segment_index,
-                complete_event=defer_batch,
+                complete_event=not batch_managed,
             )
             if refresh_context:
                 self._refresh_context(session, message, lead.id)
@@ -2947,6 +3055,7 @@ class FirstTextLeadWorkspaceService:
             LeadProcessingStatus.CREATED if request.creates_lead else LeadProcessingStatus.UPDATED,
             lead_id=request.lead_id,
             smart_table_record_id=record_id,
+            company_resolution_applied=company_resolved,
         )
 
     def _sync_ai_review_patch(
@@ -3508,6 +3617,32 @@ class FirstTextLeadWorkspaceService:
                 self._pin_message_lead_before_external_sync(
                     session, event, message, lead.id, request.segment_index
                 )
+                if lead.smart_table_record_id is None:
+                    # 未建行时先持久化安全字段和来源；网络失败不能让已解析的公司重新变为空。
+                    sources = {source.field_name: source for source in session.scalars(
+                        select(LeadFieldProvenance).where(
+                            LeadFieldProvenance.lead_id == lead.id
+                        ).order_by(LeadFieldProvenance.id)
+                    )}
+                    values = dict(lead.field_values)
+                    for name, value in request.fields.items():
+                        source = sources.get(name)
+                        if values.get(name) and source is not None and not source.is_system_default:
+                            continue
+                        values[name] = value
+                        if source is None:
+                            session.add(LeadFieldProvenance(
+                                lead_id=lead.id, source_message_id=message.message_id,
+                                field_name=name, value=serialize_field_value(value),
+                            ))
+                        else:
+                            source.value = serialize_field_value(value)
+                            source.is_system_default = False
+                    lead.field_values = values
+                    if request.ai_patch is not None:
+                        lead.enrichment_values = {
+                            **lead.enrichment_values, **request.ai_patch.enrichment,
+                        }
                 payload = sync.batch_payload if isinstance(sync.batch_payload, dict) else {}
                 queued = payload.get("requests")
                 if isinstance(queued, list):
@@ -3677,23 +3812,23 @@ class FirstTextLeadWorkspaceService:
         """
         now = utc_now()
         with self._session_factory.begin() as session:
-            pending_count = (
-                session.scalar(
-                    select(func.count(SmartTableSync.id)).where(
-                        SmartTableSync.status == "batch_pending"
-                    )
+            pending_count, oldest = session.execute(
+                select(func.count(SmartTableSync.id), func.min(SmartTableSync.created_at)).where(
+                    SmartTableSync.status == "batch_pending"
                 )
-                or 0
-            )
+            ).one()
             cutoff = now - timedelta(seconds=self._smart_table_lead_batch_wait_seconds)
+            if pending_count < self._smart_table_lead_batch_size and (
+                oldest is None or self._as_utc(oldest) > cutoff
+            ):
+                return 0
             statement = (
                 select(SmartTableSync, Lead, OutboxEvent)
                 .outerjoin(Lead, Lead.id == SmartTableSync.lead_id)
                 .outerjoin(OutboxEvent, OutboxEvent.message_id == SmartTableSync.source_message_id)
                 .where(SmartTableSync.status == "batch_pending")
             )
-            if pending_count < self._smart_table_lead_batch_size:
-                statement = statement.where(SmartTableSync.created_at <= cutoff)
+            # 最早一条到期就带走当前已完成的整个批次，不能逐条等待各自满一分钟。
             rows = session.execute(
                 statement.order_by(SmartTableSync.created_at, SmartTableSync.id).limit(
                     self._smart_table_lead_batch_size
@@ -3719,9 +3854,26 @@ class FirstTextLeadWorkspaceService:
                     persisted_requests = self._batch_requests_from_sync(
                         session, sync, lead, event
                     )
+                    if lead.standard_company_name and lead.company_verification_status in {
+                        "tyc_verified", "user_confirmed_unverified",
+                    }:
+                        # 兼容旧批次中的原始简称；已完成的公司决策必须贯穿建行和后续补丁。
+                        persisted_requests = tuple(replace(
+                            item, fields={**item.fields, "线索名称": lead.standard_company_name},
+                            ai_patch=(replace(item.ai_patch, fields={
+                                **item.ai_patch.fields, "线索名称": lead.standard_company_name,
+                            }) if item.ai_patch is not None else None),
+                        ) for item in persisted_requests)
                     base_request = next(
                         request for request in persisted_requests if request.creates_lead
                     )
+                    base_request = replace(base_request, pending_confirmation_fields=tuple(
+                        dict.fromkeys(name for item in persisted_requests for name in (
+                            *item.pending_confirmation_fields,
+                            *(item.ai_patch.pending_confirmation_fields
+                              if item.ai_patch is not None else ()),
+                        ))
+                    ))
                     requests_list.append(base_request)
                     requests_by_lead[lead.id] = persisted_requests
                 except ValueError:
@@ -3743,20 +3895,8 @@ class FirstTextLeadWorkspaceService:
         if not requests:
             return 0
 
-        can_batch = False
-        if len(requests) > 1:
-            try:
-                field = self._smart_table_adapter.get_schema().get_field(SYSTEM_LEAD_ID_FIELD)
-                can_batch = field is not None and field.field_type is SmartTableFieldType.TEXT
-            except Exception as error:
-                logger.warning(
-                    "smart_table_lead_batch_disabled",
-                    extra={"reason": "schema_unavailable", "error_type": type(error).__name__},
-                )
-        initial_records: dict[str, SmartTableRecord] = {}
-        if can_batch:
-            # 稳定键保障重试不重复建行；本轮新增响应快照可直接交给 T09。
-            initial_records = self._create_multi_smart_table_batch(requests)
+        # 无系统列时按“负责人 + 公司名称”回查，同样通过一次批量新增完成。
+        initial_records = self._create_multi_smart_table_batch(requests)
 
         succeeded = 0
         work_requests = tuple(
@@ -3768,7 +3908,9 @@ class FirstTextLeadWorkspaceService:
         for index, request in enumerate(work_requests):
             final_request_by_lead[request.lead_id] = index
         last_ai_request_by_event: dict[int, int] = {}
+        first_request_by_lead: dict[str, int] = {}
         for index, request in enumerate(work_requests):
+            first_request_by_lead.setdefault(request.lead_id, index)
             if request.ai_patch is not None:
                 last_ai_request_by_event[request.outbox_event_id] = index
         for index, request in enumerate(work_requests):
@@ -3783,7 +3925,6 @@ class FirstTextLeadWorkspaceService:
                     or lead is None
                     or sync.status != "batch_pending"
                     or lead.smart_table_record_id is None
-                    and can_batch
                 ):
                     continue
             if request.ai_patch is not None:
@@ -3799,7 +3940,8 @@ class FirstTextLeadWorkspaceService:
                     ),
                     refresh_context=last_ai_request_by_event.get(request.outbox_event_id) == index,
                     defer_batch=False,
-                    initial_record=initial_records.get(request.lead_id),
+                    initial_record=(initial_records.get(request.lead_id)
+                                    if first_request_by_lead[request.lead_id] == index else None),
                     complete_sync=complete_sync,
                 )
             else:
@@ -3821,12 +3963,8 @@ class FirstTextLeadWorkspaceService:
             if complete_sync and result.status is not LeadProcessingStatus.SYNC_FAILED:
                 succeeded += 1
 
-        completed_events = self._reconcile_smart_table_batch_events(work_requests)
-        for event_id, lead_ids in completed_events:
-            self._apply_company_resolution(
-                event_id,
-                LeadProcessingResult(LeadProcessingStatus.CREATED, lead_ids=lead_ids),
-            )
+        # 公司核验在进入批次前已完成；写后不得再查询工商并逐行改名。
+        self._reconcile_smart_table_batch_events(work_requests)
         return succeeded
 
     def _reconcile_smart_table_batch_events(
@@ -3894,6 +4032,9 @@ class FirstTextLeadWorkspaceService:
 
         record_ids: dict[str, str] = {}
         fields_by_lead: dict[str, dict[str, object]] = {}
+        has_system_key = (
+            self._smart_table_adapter.get_schema().get_field(SYSTEM_LEAD_ID_FIELD) is not None
+        )
         with self._session_factory.begin() as session:
             for request in requests:
                 event, message = self._load_event_and_message(session, request.outbox_event_id)
@@ -3917,13 +4058,45 @@ class FirstTextLeadWorkspaceService:
                     {
                         **DEFAULT_SMART_TABLE_FIELD_VALUES,
                         **self._enum_snapshots.source_defaults(),
-                        **lead.field_values,
                         **request.fields,
+                        **lead.field_values,
+                        **({"线索名称": lead.standard_company_name}
+                           if lead.standard_company_name and lead.company_verification_status in {
+                               "tyc_verified", "user_confirmed_unverified",
+                           } else {}),
                         "提交状态": "未提交",
                         "创建人": request.sales_user_id,
                         "负责人": request.sales_user_id,
-                        SYSTEM_LEAD_ID_FIELD: lead.id,
+                        **({"AI待确认": list(dict.fromkeys((
+                            *request.pending_confirmation_fields,
+                            *(request.ai_patch.pending_confirmation_fields
+                              if request.ai_patch is not None else ()),
+                        )))} if request.pending_confirmation_fields or (
+                            request.ai_patch is not None
+                            and request.ai_patch.pending_confirmation_fields
+                        ) else {}),
+                        **({SYSTEM_LEAD_ID_FIELD: lead.id} if has_system_key else {}),
                     }
+                )
+                # 所有解析与补充素材已在后台保存；首次批量新增同时包含最终固定模板备注。
+                pending_names = set(request.pending_confirmation_fields)
+                system_defaults = set(session.scalars(select(LeadFieldProvenance.field_name).where(
+                    LeadFieldProvenance.lead_id == lead.id,
+                    LeadFieldProvenance.is_system_default.is_(True),
+                )))
+                source_texts = session.scalars(
+                    select(IncomingMessage.normalized_text).join(
+                        LeadMessageResolution,
+                        LeadMessageResolution.message_id == IncomingMessage.message_id,
+                    ).where(LeadMessageResolution.lead_id == lead.id).order_by(
+                        IncomingMessage.received_at, IncomingMessage.sequence,
+                    )
+                ).unique().all()
+                fields_by_lead[lead.id]["备注"] = RemarksBuilder().build(
+                    {name: value for name, value in fields_by_lead[lead.id].items()
+                     if name not in pending_names and name not in system_defaults},
+                    lead.enrichment_values,
+                    original_message="\n\n".join(value for value in source_texts if value),
                 )
 
         # 已本地关联的行无需远端查找；其余先按稳定键回查，防止重放新增操作。
@@ -3959,6 +4132,22 @@ class FirstTextLeadWorkspaceService:
                 if len(created_records) != len(pending_requests):
                     raise ValueError("智能表格批量新增返回记录数不匹配")
             except Exception as create_error:
+                if (
+                    len(pending_requests) == 1
+                    and isinstance(create_error, SmartTableWriteVerificationError)
+                    and create_error.remote_record_id is not None
+                    and pending_requests[0].ai_patch is not None
+                ):
+                    # 已获创建 ACK 的远端行即使回读失败也必须冻结，禁止再次 add。
+                    request = pending_requests[0]
+                    assert request.ai_patch is not None
+                    self._mark_ai_review_failed(AIReviewRequest(
+                        source_message_id=self._source_message_id(request.outbox_event_id),
+                        sales_user_id=request.sales_user_id, lead_id=request.lead_id,
+                        outbox_event_id=request.outbox_event_id, patch=request.ai_patch,
+                        creates_lead=request.creates_lead, segment_index=request.segment_index,
+                    ), create_error)
+                    return {}
                 # add 响应不明时仅按稳定键回查；下一次重试也会先执行同一回查。
                 failure_error = create_error
                 recovered_records: dict[str, SmartTableRecord] = {}
@@ -3991,7 +4180,7 @@ class FirstTextLeadWorkspaceService:
                     return {}
             else:
                 self._persist_multi_smart_table_record_ids(
-                    pending_requests, created_records
+                    pending_requests, created_records, created_fields=fields_by_lead
                 )
                 # 仅复用本次 add 的核实响应；回查恢复到的旧行仍由 T09 再读一次。
                 return created_records
@@ -4009,9 +4198,17 @@ class FirstTextLeadWorkspaceService:
         """
         if not requests:
             return {}
-        records = self._smart_table_adapter.find_records_by_field_values(
-            SYSTEM_LEAD_ID_FIELD, tuple(request.lead_id for request in requests)
+        has_system_key = (
+            self._smart_table_adapter.get_schema().get_field(SYSTEM_LEAD_ID_FIELD) is not None
         )
+        field_name = SYSTEM_LEAD_ID_FIELD if has_system_key else "线索名称"
+        values = tuple(
+            request.lead_id if has_system_key else str(request.fields.get("线索名称") or "")
+            for request in requests
+        )
+        if any(not value for value in values):
+            raise ValueError("批量建行必须先完成公司名称解析")
+        records = self._smart_table_adapter.find_records_by_field_values(field_name, values)
         return self._index_multi_smart_table_records(records, requests)
 
     def _index_multi_smart_table_records(
@@ -4027,11 +4224,27 @@ class FirstTextLeadWorkspaceService:
         副作用：无。
         """
         expected = {request.lead_id: request.sales_user_id for request in requests}
+        by_company_owner = {
+            (str(request.fields.get("线索名称") or ""), request.sales_user_id): request.lead_id
+            for request in requests
+        }
         indexed: dict[str, SmartTableRecord] = {}
+        has_system_key = (
+            self._smart_table_adapter.get_schema().get_field(SYSTEM_LEAD_ID_FIELD) is not None
+        )
         for record in records:
             lead_id = record.fields.get(SYSTEM_LEAD_ID_FIELD)
             if not isinstance(lead_id, str) or lead_id not in expected:
-                raise ValueError("智能表格批量新增响应缺少有效系统线索 ID")
+                if has_system_key:
+                    raise ValueError("智能表格批量新增响应缺少有效系统线索 ID")
+                # 管理员未配置系统列时，仍按正式业务键“公司名称 + 负责人”核实归属。
+                lead_id = by_company_owner.get((
+                    str(record.fields.get("线索名称") or ""),
+                    str(record.fields.get("负责人") or ""),
+                ))
+                if lead_id is None:
+                    # 同名但其他销售的记录可能同时命中服务端查询，不得关联到当前批次。
+                    continue
             if lead_id in indexed or record.fields.get("负责人") != expected[lead_id]:
                 raise ValueError("智能表格批量新增响应关联不唯一或负责人不匹配")
             if not record.record_id:
@@ -4043,6 +4256,8 @@ class FirstTextLeadWorkspaceService:
         self,
         requests: tuple[MultiLeadSyncRequest, ...],
         records_by_lead_id: Mapping[str, SmartTableRecord],
+        *,
+        created_fields: Mapping[str, Mapping[str, object]] | None = None,
     ) -> None:
         """将批量回查或新增确认的远端记录标识原子写回每条线索。
 
@@ -4070,6 +4285,35 @@ class FirstTextLeadWorkspaceService:
                     raise ValueError("智能表格同步事实已关联不同的远端记录")
                 lead.smart_table_record_id = record.record_id
                 sync.smart_table_record_id = record.record_id
+                if created_fields is not None:
+                    # 只有本轮 add 已通过远端核实的字段才建立已同步基线，回查旧行不能伪造基线。
+                    sources = {source.field_name: source for source in session.scalars(
+                        select(LeadFieldProvenance).where(
+                            LeadFieldProvenance.lead_id == lead.id
+                        ).order_by(LeadFieldProvenance.id)
+                    )}
+                    values = dict(lead.field_values)
+                    for name in created_fields[lead.id]:
+                        if name in {SYSTEM_LEAD_ID_FIELD, "创建人", "负责人"}:
+                            continue
+                        if name not in values and name not in request.fields and name != "备注":
+                            continue
+                        if name not in record.fields:
+                            continue
+                        value = record.fields[name]
+                        values[name] = value
+                        source = sources.get(name)
+                        if source is None:
+                            session.add(LeadFieldProvenance(
+                                lead_id=lead.id, source_message_id=sync.source_message_id,
+                                field_name=name, value=serialize_field_value(value),
+                                last_ai_synced_value=serialize_field_value(value),
+                            ))
+                        else:
+                            # 核验后的首写值同时替换旧候选，防止 T09 把公司标准名回退成简称。
+                            source.value = serialize_field_value(value)
+                            source.last_ai_synced_value = serialize_field_value(value)
+                    lead.field_values = values
                 if sync.status != "succeeded":
                     # 批次建行确认后仍保留队列状态，直到 T09 完成后再移出可恢复队列。
                     if sync.status != "batch_pending":
@@ -5182,7 +5426,7 @@ class FirstTextLeadWorkspaceService:
         """以机器人身份新建销售可见表格记录，并持久化同步成功或失败事实。
 
         参数：sales_user_id 为当前有效 actor；fields 为确定性提取字段；
-        lead_id、事件和分段标识用于回写；bypass_batch 仅供批次 Worker 完成单条回退；
+        lead_id、事件和分段标识用于回写；bypass_batch 供批次收尾和旧单行恢复使用；
         initial_record 为本轮批量新增响应中已核实的对应记录快照；complete_sync 表示该 Lead 的
         持久化批次是否已处理完全部来源消息补丁。
         返回值：包含表格记录标识的创建结果、批次排队结论，或表格失败结论。

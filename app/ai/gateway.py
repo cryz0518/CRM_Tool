@@ -411,6 +411,9 @@ class AIGateway:
         if match is None:
             return analysis
         company_name = match.group(1).strip()
+        # 明确的匿名或待确认占位名称不能提升为真实公司身份。
+        if company_name.startswith(("某未确认", "未知", "未确认", "待确认", "不详")):
+            return analysis
         field_name = next(
             (
                 name

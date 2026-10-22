@@ -228,6 +228,119 @@ def test_sequential_messages_refresh_enum_snapshot_after_ttl_expiry(
     assert len(adapter.get_records()) == 2
 
 
+def test_free_text_companies_are_resolved_before_one_cross_message_batch(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """自由文本先完成天眼查并持久化名称，无系统线索列时也只批量新增一次。"""
+    names = ("坤易智能", "上海臻臣化妆品有限公司", "巴可（苏州）医疗科技有限公司")
+    standards = ("常州利坤易智能科技有限公司", *names[1:])
+    schema = build_required_smart_table_schema()
+    adapter = MockSmartTableAdapter(schema=replace(
+        schema, fields=tuple(field for field in schema.fields if field.name != "系统线索ID"),
+    ))
+    tyc = MockTYCAdapter({
+        name: QCCLookupResult.matched(QCCCandidate(standard, f"tyc-{index}"))
+        for index, (name, standard) in enumerate(zip(names, standards, strict=True))
+    })
+    provider = MockLLMProvider([
+        json.dumps({
+            "intent": "NEW_LEAD", "customer_reference": {"company": name},
+            "crm_fields": {"线索名称": name}, "confidence_by_field": {"线索名称": 0.95},
+            "enrichment": {}, "conflicts": [], "warnings": [],
+        }, ensure_ascii=False)
+        for name in names
+    ])
+    service = FirstTextLeadWorkspaceService(
+        session_factory, adapter, ai_gateway=AIGateway(provider),
+        company_lead_service=CompanyLeadService(session_factory, adapter, tyc),
+    )
+    service._smart_table_lead_batch_wait_seconds = 60
+    service._smart_table_lead_batch_size = 5
+    event_ids = [persist_outbox_text(
+        session_factory, message_id=f"resolved-batch-{index}", sales_user_id="batch-sales",
+        text=f"{name}，咨询智能设备", sequence=index + 1,
+    ) for index, name in enumerate(names)]
+
+    # 在等待窗口内消费所有消息；外部表格不应出现未经天眼查核验的简称行。
+    with patch.object(tyc, "lookup", wraps=tyc.lookup) as lookup, patch.object(
+        adapter, "create_records", wraps=adapter.create_records
+    ) as batch_create, patch.object(
+        adapter, "update_record", wraps=adapter.update_record
+    ) as update:
+        service.consume(event_ids[0])
+        assert lookup.call_count == 3
+        assert adapter.get_records() == []
+        with session_factory() as session:
+            leads = list(session.scalars(select(Lead).order_by(Lead.created_at)))
+            assert [lead.field_values["线索名称"] for lead in leads] == list(standards)
+        with session_factory.begin() as session:
+            # 只有最早一条满一分钟时，也应一并写入其余已完成的线索。
+            oldest = session.scalar(select(SmartTableSync).order_by(SmartTableSync.id))
+            oldest.created_at = datetime.now(UTC) - timedelta(seconds=61)
+        assert service.flush_smart_table_batch() == 3
+        assert batch_create.call_count == 1
+        assert [row["线索名称"] for row in batch_create.call_args.args[0]] == list(standards)
+        assert update.call_count == 0
+        assert lookup.call_count == 3
+
+
+@pytest.mark.parametrize("remote_created", [False, True], ids=["before-write", "lost-response"])
+def test_batch_network_failure_keeps_parsed_company_and_recovers_without_duplicate(
+    session_factory: sessionmaker[Session], remote_created: bool,
+) -> None:
+    """模拟 893101：名称先保存，丢失成功响应时按公司与销售回查同一行。"""
+    name = "巴可（苏州）医疗科技有限公司"
+    schema = build_required_smart_table_schema()
+    adapter = MockSmartTableAdapter(schema=replace(
+        schema, fields=tuple(field for field in schema.fields if field.name != "系统线索ID"),
+    ))
+    gateway = AIGateway(MockLLMProvider([json.dumps({
+        "intent": "NEW_LEAD", "customer_reference": {}, "crm_fields": {},
+        "confidence_by_field": {}, "enrichment": {}, "conflicts": [], "warnings": [],
+    })]))
+    service = FirstTextLeadWorkspaceService(
+        session_factory, adapter, ai_gateway=gateway,
+        company_lead_service=CompanyLeadService(session_factory, adapter, MockTYCAdapter()),
+    )
+    service._smart_table_lead_batch_wait_seconds = 60
+    event_id = persist_outbox_text(
+        session_factory, message_id="batch-network", sales_user_id="batch-sales",
+        text=name + "，咨询医疗机器人",
+    )
+    result = service.consume(event_id)
+    with session_factory() as session:
+        lead = session.get(Lead, result.lead_id)
+        assert lead.field_values["线索名称"] == name
+        assert lead.smart_table_record_id is None
+    create = adapter.create_records
+
+    def lose_response(records, *, actor):
+        """按参数决定服务端是否已建行，再返回相同的网络失败。"""
+        if remote_created:
+            create(records, actor=actor)
+        try:
+            raise WecomCliProcessError(
+                "模拟网络连接中断", error_code="network_error", external_error_code=893101,
+            )
+        except WecomCliProcessError as cause:
+            raise WecomCliTransportError("新增结果待核实") from cause
+
+    service._smart_table_lead_batch_wait_seconds = 0
+    with patch.object(adapter, "create_records", side_effect=lose_response) as add:
+        assert service.flush_smart_table_batch() == int(remote_created)
+        assert add.call_count == 1
+    with session_factory() as session:
+        lead = session.get(Lead, result.lead_id)
+        assert lead.field_values["线索名称"] == name
+        assert bool(lead.smart_table_record_id) == remote_created
+    assert len(adapter.get_records()) == int(remote_created)
+    if not remote_created:
+        # 重试只恢复持久化补丁，不能再次调用模型或天眼查重新解析。
+        assert service.consume(event_id).status is LeadProcessingStatus.CREATED
+        assert len(gateway._provider.requests) == 1
+        assert len(adapter.get_records()) == 1
+
+
 def test_batch_pending_message_checkpoint_allows_same_salesperson_to_continue(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -265,6 +378,19 @@ def test_batch_pending_message_checkpoint_allows_same_salesperson_to_continue(
     assert [event.status for event in events] == ["succeeded", "succeeded"]
     assert all(sync.status == "succeeded" for sync in syncs)
     assert len(adapter.get_records()) == 2
+
+
+@pytest.fixture
+def single_record_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """定向覆盖已保留的单行恢复路径；默认批量策略由独立批次回归覆盖。"""
+    original = FirstTextLeadWorkspaceService._sync_ai_review
+
+    def sync_without_queue(service, request, **kwargs):
+        """把恢复用例直接送入已有行的 T09 路径，不改变生产批量配置。"""
+        kwargs["defer_batch"] = False
+        return original(service, request, **kwargs)
+
+    monkeypatch.setattr(FirstTextLeadWorkspaceService, "_sync_ai_review", sync_without_queue)
 
 
 @pytest.fixture
@@ -835,6 +961,7 @@ def test_authorized_sales_text_creates_a_personal_review_record(
         "创建人": "sales-1",
         "负责人": "sales-1",
         "提交状态": "未提交",
+        "系统线索ID": result.lead_id,
         "备注": (
             "基本信息：长广溪智造；城市、主要产品、年销售额、所属行业未提供。\n"
             "线索需求：未提供。\n"
@@ -876,6 +1003,7 @@ def test_authorized_sales_text_creates_a_personal_review_record(
     }
     assert {source.field_name for source in provenance} == {
         "线索名称",
+        "线索来源",
         "联系人",
         "工艺",
         "备注",
@@ -1595,7 +1723,9 @@ def test_remark_failure_after_record_creation_recovers_without_sticking(
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     service = FirstTextLeadWorkspaceService(session_factory, adapter)
 
-    with patch.object(adapter, "update_record", side_effect=ConnectionError("temporary")):
+    # 首次完整批量写入无需 update；在其后的 T09 收尾边界注入故障。
+    with patch("app.leads.service.LeadReviewService.sync_ai_patch",
+               side_effect=ConnectionError("temporary")):
         failed = service.consume(event_id)
     retried = service.consume(event_id)
 
@@ -1679,6 +1809,7 @@ def test_ai_review_transport_failure_retries_same_patch_before_leaving_partial_r
 
 def test_later_message_recovers_pending_fields_after_first_smart_table_patch_fails(
     session_factory: sessionmaker[Session],
+    single_record_recovery: None,
 ) -> None:
     """验证首条字段补丁失败后，后续补充仍会恢复同一 Lead 的全部字段。"""
     first_event_id = persist_outbox_text(
@@ -1877,6 +2008,7 @@ def test_same_lead_three_messages_create_once_and_merge_incremental_fields(
 
 def test_verification_pending_retries_same_patch_from_remote_record(
     session_factory: sessionmaker[Session],
+    single_record_recovery: None,
 ) -> None:
     """验证 ACK 后核实等待会重读同一行，并避免重复更新或新建。"""
     event_id = persist_outbox_text(
@@ -2046,6 +2178,7 @@ def test_ai_create_verification_failure_persists_acknowledged_record_id_and_neve
 )
 def test_bound_ai_review_failure_respects_retry_budget_and_preserves_record(
     session_factory: sessionmaker[Session],
+    single_record_recovery: None,
     error: Exception,
     attempt_limit: int,
     failure_category: str,
@@ -2618,6 +2751,7 @@ def test_new_company_update_intent_starts_new_lead_and_follow_up_uses_new_contex
 
 def test_new_lead_context_is_pinned_before_smart_table_failure_and_follow_up_uses_it(
     session_factory: sessionmaker[Session],
+    single_record_recovery: None,
 ) -> None:
     """验证新线索表格失败后仍固定业务归属，后续补充不会回到旧上下文。
 
@@ -4693,7 +4827,8 @@ def test_ai_review_and_deterministic_success_share_one_notice_and_replay_does_no
 
 
 def test_ai_review_patch_failure_does_not_issue_first_success_notice(
-    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch,
+    single_record_recovery: None,
 ) -> None:
     """验证 AI 审核字段补丁失败时保留可恢复同步事实且不发行首次链接。"""
     configure_first_success_notice(monkeypatch)

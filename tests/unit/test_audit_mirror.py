@@ -1142,7 +1142,8 @@ def test_audit_scanner_dispatches_pending_and_due_retries_only(
         session_factory, monkeypatch, now=now, batch_size=10
     )
     assert tasks.consume_pending_audit_mirrors.run() == 5
-    assert dispatched == [[ids[8], ids[6], ids[4], ids[2], ids[0]]]
+    # 新消息优先于历史重试；重试任务之间仍按原退避时间排序。
+    assert dispatched == [[ids[0], ids[8], ids[6], ids[4], ids[2]]]
 
 
 def test_audit_scanner_applies_batch_limit_before_dispatch(

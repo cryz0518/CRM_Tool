@@ -527,6 +527,14 @@ def test_remote_640027_is_terminal_and_persists_only_safe_field_names(
     original_update = adapter.update_record
     service = FirstTextLeadWorkspaceService(session_factory, adapter)
     update_calls = 0
+    original_create = service._create_smart_table_record
+
+    def create_without_batch(*args, **kwargs):
+        """定向覆盖旧单行建档后的参数拒绝恢复，批量路径由独立用例验证。"""
+        kwargs["bypass_batch"] = True
+        return original_create(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_create_smart_table_record", create_without_batch)
 
     def reject_parameter(*_args: object, **_kwargs: object) -> object:
         """模拟不可重试的远端参数错误，拒绝正文只存在于模拟调用栈。"""
