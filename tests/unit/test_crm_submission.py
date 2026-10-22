@@ -253,6 +253,12 @@ def test_create_uses_stable_lead_key_and_current_smart_table_values(
     assert second.succeeded == 0
     assert crm.submit_calls == 1 and crm.search_calls == 1 and crm.calls == 1
     assert crm.payloads[0]["name"] == "人工最终公司"
+    entry_time = crm.payloads[0]["entryTime"]
+    assert isinstance(entry_time, str)
+    assert datetime.strptime(entry_time, "%Y-%m-%d %H:%M").strftime("%Y-%m-%d %H:%M") == entry_time
+    updated = service.submit(SubmissionCommand("提交我的更新", "sales-1", "message-12"))
+    assert updated.updated == 1 and crm.submit_calls == 2
+    assert crm.submit_payloads[1]["entryTime"] == entry_time
     assert adapter.get_records()[0].fields["提交状态"] == "已提交"
     with session_factory() as session:
         sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
@@ -5675,13 +5681,14 @@ def test_submission_missing_table_url_logs_configuration_and_never_records_sent_
         )
 
 
-def test_capture_metadata_never_changes_crm_payload_or_submission_preview() -> None:
-    """录入时间不进入 CRM 载荷，也不扩展提交确认十字段。"""
+def test_entry_time_maps_to_crm_without_expanding_submission_preview() -> None:
+    """录入时间按 CRM 契约提交，同时不扩展提交确认十字段。"""
     from app.crm.payload import CrmPayloadBuilder
     from app.wecom_bot.actions import SUBMISSION_PREVIEW_FIELDS
 
     builder = CrmPayloadBuilder()
     fields = {"线索名称": "元数据测试公司", "业务线": "协作机器人"}
-    assert builder.build(fields) == builder.build({**fields, "录入时间": "2026-10-09 10:20:30"})
+    payload = builder.build({**fields, "录入时间": "2026/10/09 10:20:30"})
+    assert payload["entryTime"] == "2026-10-09 10:20"
     assert "录入时间" not in SUBMISSION_PREVIEW_FIELDS
     assert len(SUBMISSION_PREVIEW_FIELDS) == 10

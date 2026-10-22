@@ -1222,6 +1222,7 @@ class CrmSubmissionService:
             payload = self._canonical_payload(
                 reconciled.fields,
                 tyc_customer_id=self._reliable_tyc_customer_id(lead, reconciled.fields),
+                fallback_entry_time=self._as_utc(lead.created_at),
             )
         except CrmEnumMappingError as error:
             # 新增合法表格选项不能越过 CRM 字典边界；保存待更新状态，不调用远端接口。
@@ -1511,6 +1512,7 @@ class CrmSubmissionService:
             canonical_payload = self._canonical_payload(
                 reconciled.fields,
                 tyc_customer_id=self._reliable_tyc_customer_id(lead, reconciled.fields),
+                fallback_entry_time=self._as_utc(lead.created_at),
             )
         except CrmEnumMappingError as error:
             # 只返回当前字段缺映射提示，既不改为其他也不把 option ID 当成 CRM ID。
@@ -2345,16 +2347,25 @@ class CrmSubmissionService:
         return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
     def _canonical_payload(
-        self, fields: dict[str, object], *, tyc_customer_id: str | None = None
+        self,
+        fields: dict[str, object],
+        *,
+        tyc_customer_id: str | None = None,
+        fallback_entry_time: datetime,
     ) -> dict[str, object]:
         """构造稳定的 CRM 英文键快照并排除智能表格审核元数据。
 
-        参数：fields 为提交前回读的中文智能表格字段；tyc_customer_id 为天眼查客户标识。
+        参数：fields 为提交前回读的中文智能表格字段；tyc_customer_id 为天眼查客户标识；
+        fallback_entry_time 为表格系统录入时间缺失时使用的稳定 Lead 创建时间。
         返回值：可直接冻结、哈希和发送给 CRM Adapter 的英文键 payload。
         异常：字段枚举、日期或备注不符合 CRM 契约时抛出 CrmPayloadError。
         副作用：无，不调用外部系统。
         """
-        return self._crm_payload_builder.build(fields, tyc_customer_id=tyc_customer_id)
+        # 表格系统时间缺失时回退到固定的 Lead 创建时间，避免重提时 payload 时间漂移。
+        payload_fields = dict(fields)
+        if not payload_fields.get("录入时间"):
+            payload_fields["录入时间"] = payload_fields.get("创建时间") or fallback_entry_time
+        return self._crm_payload_builder.build(payload_fields, tyc_customer_id=tyc_customer_id)
 
     @staticmethod
     def _reliable_tyc_customer_id(
