@@ -2117,6 +2117,10 @@ class CrmSubmissionService:
                     "failed_pending_review" if unfinished.status == "failed_pending_review"
                     else "processing"
                 )
+            if sync.operation == "update" and sync.attempts > 0 and lease_expired:
+                # 过期更新租约可能仍有旧 Worker 在途；自动接管不能并发重放未知覆盖。
+                self._mark_unknown_crm_outcome(session, sync, sales_user_id)
+                return "failed_pending_review"
             if sync.attempts >= self._crm_create_retry_count and not is_unknown_outcome_recovery:
                 # 传输失败达到自动重试上限只能确认“外部结果未知”，不得结算废弃请求。
                 self._mark_unknown_crm_outcome(session, sync, sales_user_id)
