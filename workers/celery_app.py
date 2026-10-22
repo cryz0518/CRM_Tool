@@ -29,7 +29,11 @@ def build_beat_schedule(settings: Settings) -> dict[str, dict[str, object]]:
         },
         "flush-pending-smart-table-lead-batches": {
             "task": "workers.flush_pending_smart_table_lead_batches",
-            "schedule": settings.smart_table_lead_batch_wait_seconds,
+            # 定时频率用于尽快发现达到数量阈值的批次，最长等待时间仍由 Worker 查询控制。
+            "schedule": min(
+                settings.lead_outbox_poll_seconds,
+                max(1, settings.smart_table_lead_batch_wait_seconds),
+            ),
         },
         "consume-pending-wecom-actions": {
             "task": "workers.consume_pending_wecom_actions",

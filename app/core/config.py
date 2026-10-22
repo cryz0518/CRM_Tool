@@ -63,8 +63,8 @@ class Settings(BaseSettings):
     lead_first_success_link_enabled: bool = True
     lead_smart_table_url: str | None = None
     audit_mirror_batch_size: int = 10
-    smart_table_lead_batch_size: int = Field(default=10, ge=2, le=100)
-    smart_table_lead_batch_wait_seconds: int = Field(default=2, ge=0, le=60)
+    smart_table_lead_batch_size: int = Field(default=5, ge=2, le=100)
+    smart_table_lead_batch_wait_seconds: int = Field(default=60, ge=0, le=60)
     smart_table_readiness_cache_seconds: int = 30
     smart_table_enum_cache_seconds: int = 300
     lead_processing_timeout_seconds: int = 300
