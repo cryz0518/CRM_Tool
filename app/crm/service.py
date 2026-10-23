@@ -889,9 +889,23 @@ class CrmSubmissionService:
                 else {}
             )
             sync_statuses = {}
+            if leads:
+                # 同一批候选一次读取最新 CRM create 状态，避免按 Lead 逐条查询。
+                for sync in session.scalars(
+                    select(CrmSyncRecord)
+                    .where(
+                        CrmSyncRecord.lead_id.in_(tuple(lead.id for lead in leads)),
+                        CrmSyncRecord.operation == "create",
+                    )
+                    .order_by(
+                        CrmSyncRecord.lead_id,
+                        CrmSyncRecord.generation.desc().nullslast(),
+                        CrmSyncRecord.id.desc(),
+                    )
+                ):
+                    sync_statuses.setdefault(sync.lead_id, sync.status)
             for lead in leads:
-                sync = latest_crm_create_sync(session, lead.id)
-                sync_statuses[lead.id] = sync.status if sync is not None else None
+                sync_statuses.setdefault(lead.id, None)
         if query_submission_status is not None:
             # 日期命令直接按负责人、状态与目标日期回读目标行，避免拼接整批 record_id。
             queried_records = self._smart_table_adapter.get_records(
@@ -953,14 +967,18 @@ class CrmSubmissionService:
                     continue
             # 筛选以当前 Smart Table 快照为准；候选只保留名称，字段快照不进入确认通知。
             company_name = snapshot_fields.get("线索名称") or lead.standard_company_name
-            if isinstance(company_name, str) and company_name.strip():
-                candidates.append(
-                    SubmissionCandidate(
-                        lead.id,
-                        company_name.strip(),
-                        lead.smart_table_owner_user_id,
-                    )
+            display_name = (
+                company_name.strip()
+                if isinstance(company_name, str) and company_name.strip()
+                else "线索名称待完善"
+            )
+            candidates.append(
+                SubmissionCandidate(
+                    lead.id,
+                    display_name,
+                    lead.smart_table_owner_user_id,
                 )
+            )
         return tuple(candidates)
 
     def submit_selected(
@@ -1072,17 +1090,69 @@ class CrmSubmissionService:
             selected_record_ids[lead_id] for lead_id in valid_ids if lead_id in selected_record_ids
         }
         snapshot_by_record_id: dict[str, SmartTableRecord] = {}
+        preflight_outcomes: dict[str, CreateSubmissionOutcome] = {}
+        snapshot_read_failed = False
         if requested_record_ids:
             try:
                 for record in self._smart_table_adapter.get_records(requested_record_ids):
                     if record.record_id in requested_record_ids:
                         snapshot_by_record_id[record.record_id] = record
             except Exception as error:
-                # 批量快照失败时逐条读取回退；单条依赖故障仍只影响对应线索。
+                # 批量快照失败时停止这批表格读取，避免退化为逐条 CLI 查询并放大限流。
+                snapshot_read_failed = True
+                failure_category = classify_task_failure(error).value
+                failure_code = getattr(error, "error_code", None)
+                if not isinstance(failure_code, str):
+                    external_code = getattr(error, "external_error_code", None)
+                    failure_code = str(external_code) if type(external_code) is int else None
+                if failure_category == "transient":
+                    reason_code = (
+                        "wecom_smart_table_retryable"
+                        if failure_code in {"rate_limited", "network_error"}
+                        else "pre_crm_transient_failure"
+                    )
+                else:
+                    reason_code = "smart_table_snapshot_failed"
                 _LOGGER.warning(
-                    "crm_submission_batch_snapshot_failed failure=%s",
+                    "crm_submission_batch_snapshot_failed failure=%s category=%s code=%s requested_count=%s",
                     safe_failure_summary(error),
+                    failure_category,
+                    failure_code,
+                    len(requested_record_ids),
                 )
+                for lead_id in valid_ids:
+                    if lead_id in selected_record_ids:
+                        preflight_outcomes[lead_id] = _create_outcome(
+                            "failed_pending_review",
+                            reason_code=reason_code,
+                            failure_category=failure_category,
+                            adapter_category=(
+                                "transport" if failure_category == "transient" else None
+                            ),
+                            failure_code=failure_code,
+                        )
+            if (
+                not snapshot_read_failed
+                and len(snapshot_by_record_id) != len(requested_record_ids)
+            ):
+                _LOGGER.warning(
+                    "crm_submission_batch_snapshot_incomplete requested_count=%s returned_count=%s",
+                    len(requested_record_ids),
+                    len(snapshot_by_record_id),
+                )
+            # 批量响应未包含的行也不回退单条读取；本轮保守停止并允许重新提交。
+            missing_record_ids = requested_record_ids - set(snapshot_by_record_id)
+            for lead_id, record_id in selected_record_ids.items():
+                if lead_id in valid_ids and record_id in missing_record_ids:
+                    preflight_outcomes.setdefault(
+                        lead_id,
+                        _create_outcome(
+                            "failed_pending_review",
+                            reason_code="wecom_smart_table_retryable",
+                            failure_category="transient",
+                            adapter_category="transport",
+                        ),
+                    )
         invalid_outcomes = {
             lead_id: _create_outcome(
                 "not_submitted",
@@ -1096,6 +1166,10 @@ class CrmSubmissionService:
             if lead_id not in valid_ids
         }
         for lead_id, outcome in invalid_outcomes.items():
+            if on_item_result is not None:
+                item = _append_create_result(SubmissionBatchResult(), lead_id, outcome).items[0]
+                on_item_result(item)
+        for lead_id, outcome in preflight_outcomes.items():
             if on_item_result is not None:
                 item = _append_create_result(SubmissionBatchResult(), lead_id, outcome).items[0]
                 on_item_result(item)
@@ -1113,15 +1187,21 @@ class CrmSubmissionService:
                 snapshot_by_record_id.get(selected_record_ids.get(lead_id, "")),
             )
             for lead_id in selected
-            if lead_id in valid_ids
+            if lead_id in valid_ids and lead_id not in preflight_outcomes
         ]
-        outcomes = self._submit_create_batch(
-            submissions,
-            on_item_result=on_item_result,
+        outcomes = (
+            self._submit_create_batch(submissions, on_item_result=on_item_result)
+            if submissions
+            else {}
         )
         result = SubmissionBatchResult()
         for lead_id in selected:
-            outcome = outcomes[lead_id] if lead_id in outcomes else invalid_outcomes[lead_id]
+            if lead_id in outcomes:
+                outcome = outcomes[lead_id]
+            elif lead_id in preflight_outcomes:
+                outcome = preflight_outcomes[lead_id]
+            else:
+                outcome = invalid_outcomes[lead_id]
             result = _append_create_result(result, lead_id, outcome)
         return result
 
@@ -1570,9 +1650,11 @@ class CrmSubmissionService:
         ):
             # 复核卡片时必须以此刻重读的表格录入日为准，越界项目不应显示为待完善。
             return _create_outcome("not_submitted")
-        allowed_submission_statuses = {"未提交"}
-        if command.text == _ABANDONED_COMMAND:
-            allowed_submission_statuses.add("放弃提交")
+        allowed_submission_statuses = (
+            {"放弃提交"}
+            if command.text == _ABANDONED_COMMAND
+            else {None, "", "未提交"}
+        )
         if reconciled.fields.get("提交状态") not in allowed_submission_statuses:
             # Final Snapshot 已显示该记录并非未提交，保留逐 Lead 结果且不调用 CRM。
             return _create_outcome("not_submitted")
@@ -2529,10 +2611,10 @@ class CrmSubmissionService:
     def _is_unsubmitted_smart_table_record(
         self, lead: Lead, *, snapshot: Mapping[str, SmartTableRecord] | None = None
     ) -> bool:
-        """读取智能表格当前提交状态，确认批量提交只处理“未提交”记录。
+        """读取智能表格当前提交状态，确认批量提交只处理未提交或空状态记录。
 
         参数：lead 为后台线索；snapshot 为本次批量操作已读取的表格快照，可避免重复 CLI 调用。
-        返回值：记录存在且当前状态为未提交时返回 True。
+        返回值：记录存在且当前状态为未提交或空值时返回 True。
         异常：表格读取失败时由适配器抛出。
         副作用：snapshot 缺失时读取一次远端记录，不修改数据。
         """
@@ -2546,7 +2628,7 @@ class CrmSubmissionService:
         return (
             record is not None
             and record.fields.get("负责人") == lead.smart_table_owner_user_id
-            and record.fields.get("提交状态") == "未提交"
+            and record.fields.get("提交状态") in (None, "", "未提交")
         )
 
     @staticmethod

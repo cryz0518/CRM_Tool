@@ -1325,7 +1325,7 @@ class WecomActionService:
             "crm_duplicate_search_failed", "crm_update_incomplete", "crm_update_retrying",
             "crm_update_failed_pending_review", "company_identity_change_pending_review",
             "crm_enum_mapping_missing", "crm_outcome_unknown", "wecom_smart_table_retryable",
-            "pre_crm_transient_failure", "crm_followed_up",
+            "pre_crm_transient_failure", "smart_table_snapshot_failed", "crm_followed_up",
         }
         if not items or len(items) > 20:
             raise ValueError("逐条提交结果数量非法")

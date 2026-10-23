@@ -115,7 +115,7 @@ class MockSmartTableAdapter:
         """返回按创建顺序保存的全部记录、指定记录或负责人范围快照。
 
         参数：record_ids 和负责人过滤最多提供一种；显示名模拟服务端预筛；提交状态和日期
-        仅在负责人范围内筛选，缺少日期的行保留给来源消息回退。
+        仅在负责人范围内筛选，“未提交”也包含空状态，缺少日期的行保留给来源消息回退。
         返回：当前请求范围内的内存记录快照列表。
         异常：同时提供两种过滤集合时抛出 ValueError。
         副作用：无；只从内存记录集中筛选。
@@ -149,7 +149,10 @@ class MockSmartTableAdapter:
                     == names_by_owner.get(record.fields.get("负责人"))
                 )
                 and (
-                    submission_status is None or record.fields.get("提交状态") == submission_status
+                    submission_status is None
+                    or record.fields.get("提交状态") == submission_status
+                    or submission_status == "未提交"
+                    and record.fields.get("提交状态") in (None, "")
                 )
                 and (
                     capture_date is None
