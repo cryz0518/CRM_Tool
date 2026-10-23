@@ -21,6 +21,8 @@ class SmartTableFieldType(StrEnum):
     ATTACHMENT = "ATTACHMENT"
     LOCATION = "LOCATION"
     MEMBER = "MEMBER"
+    # 允许子表包含关联字段；关联单元格由 CLI 原样读取，业务层不主动构造其写入值。
+    REFERENCE = "REFERENCE"
 
 
 @dataclass(frozen=True)

@@ -406,14 +406,18 @@ class CrmSubmissionService:
         返回值：本轮认领候选数；并发下候选可能已由其他 Worker 完成。
         异常：数据库读写错误向 Celery 传播；单条 CRM 错误由同步状态机保存。
         副作用：按配置上限并发重用已冻结 payload 与幂等键调用 CRM，并登记最终结果通知；
-        SQLite 保持串行。
+        批次收尾后按持久化成功状态批量回写表格，SQLite 保持串行。
         """
         if limit <= 0:
             raise ValueError("CRM 重试扫描数量必须大于 0")
         current_time = utc_now()
         with self._session_factory() as session:
             due_syncs = session.execute(
-                select(CrmSyncRecord.id, CrmSyncRecord.submitting_sales_user_id)
+                select(
+                    CrmSyncRecord.id,
+                    CrmSyncRecord.submitting_sales_user_id,
+                    CrmSyncRecord.lead_id,
+                )
                 .where(
                     CrmSyncRecord.operation == "create",
                     or_(
@@ -435,30 +439,41 @@ class CrmSubmissionService:
             return 0
         bind = self._session_factory.kw.get("bind")
         max_workers = min(self._crm_submission_max_concurrency, len(due_syncs))
-        if len(due_syncs) == 1 or (
-            bind is not None and getattr(getattr(bind, "dialect", None), "name", None) == "sqlite"
-        ):
-            # 单条不启动线程；SQLite 开发库串行写入，避免共享连接争用。
-            for sync_id, sales_user_id in due_syncs:
-                self._claim_and_call(sync_id, sales_user_id, notify_retry_result=True)
-        else:
-            # 每条仍独立认领和提交，状态机通过行锁、租约 fencing 与幂等键防止重复写入。
-            with ThreadPoolExecutor(
-                max_workers=max_workers,
-                thread_name_prefix="crm-retry",
-            ) as executor:
-                futures = [
-                    executor.submit(
-                        self._claim_and_call,
+        try:
+            if len(due_syncs) == 1 or (
+                bind is not None and getattr(getattr(bind, "dialect", None), "name", None) == "sqlite"
+            ):
+                # 单条不启动线程；SQLite 开发库串行写入，避免共享连接争用。
+                for sync_id, sales_user_id, _ in due_syncs:
+                    self._claim_and_call(
                         sync_id,
                         sales_user_id,
                         notify_retry_result=True,
+                        defer_smart_table_submission_status=True,
                     )
-                    for sync_id, sales_user_id in due_syncs
-                ]
-                # CRM 单条错误已由状态机收敛；数据库异常仍传播给 Celery 重试任务。
-                for future in as_completed(futures):
-                    future.result()
+            else:
+                # 每条仍独立认领和提交，成功状态统一留给批次收尾回写。
+                with ThreadPoolExecutor(
+                    max_workers=max_workers,
+                    thread_name_prefix="crm-retry",
+                ) as executor:
+                    futures = [
+                        executor.submit(
+                            self._claim_and_call,
+                            sync_id,
+                            sales_user_id,
+                            notify_retry_result=True,
+                            defer_smart_table_submission_status=True,
+                        )
+                        for sync_id, sales_user_id, _ in due_syncs
+                    ]
+                    # CRM 单条错误已由状态机收敛；数据库异常仍传播给 Celery 重试任务。
+                    for future in as_completed(futures):
+                        future.result()
+        finally:
+            self._write_back_batch_submission_status(
+                tuple(dict.fromkeys(lead_id for _, _, lead_id in due_syncs))
+            )
         return len(due_syncs)
 
     def _resolve_crm_owner(
@@ -536,59 +551,71 @@ class CrmSubmissionService:
         on_item_result 为可选的逐条结果持久化回调。
         返回值：按线索 ID 索引的独立提交结果。
         异常：回调异常向调用方传播；单条提交流程的未捕获异常被收敛为待人工检查。
-        副作用：最多按 CRM_SUBMISSION_MAX_CONCURRENCY 并发调用已冻结的单条提交流程。
+        副作用：并发调用已冻结的单条 CRM 流程，收尾时查询持久化成功状态并批量回写表格。
         """
         outcomes: dict[str, CreateSubmissionOutcome] = {}
         if not submissions:
             return outcomes
         bind = self._session_factory.kw.get("bind")
         max_workers = min(self._crm_submission_max_concurrency, len(submissions))
-        if len(submissions) == 1 or (
-            bind is not None and getattr(getattr(bind, "dialect", None), "name", None) == "sqlite"
-        ):
-            # 单条不启动线程；SQLite 开发库也串行写入，避免共享连接争用。
-            for lead_id, command, record in submissions:
-                try:
-                    outcome = self._submit_create(lead_id, command, initial_record=record)
-                except Exception as error:
-                    _LOGGER.warning(
-                        "crm_batch_submission_item_failed",
-                        extra={"lead_id": lead_id, "failure": safe_failure_summary(error)},
-                    )
-                    outcome = _create_outcome("failed_pending_review")
-                outcomes[lead_id] = outcome
-                if on_item_result is not None:
-                    item = _append_create_result(SubmissionBatchResult(), lead_id, outcome).items[0]
-                    on_item_result(item)
-            return outcomes
-        # 表格快照由调用方先批量读取；每条 CRM 操作仍使用原有幂等键与独立持久化状态。
-        with ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="crm-submit",
-        ) as executor:
-            futures = {
-                executor.submit(
-                    self._submit_create,
-                    lead_id,
-                    command,
-                    initial_record=record,
-                ): lead_id
-                for lead_id, command, record in submissions
-            }
-            for future in as_completed(futures):
-                lead_id = futures[future]
-                try:
-                    outcome = future.result()
-                except Exception as error:
-                    _LOGGER.warning(
-                        "crm_batch_submission_item_failed",
-                        extra={"lead_id": lead_id, "failure": safe_failure_summary(error)},
-                    )
-                    outcome = _create_outcome("failed_pending_review")
-                outcomes[lead_id] = outcome
-                if on_item_result is not None:
-                    item = _append_create_result(SubmissionBatchResult(), lead_id, outcome).items[0]
-                    on_item_result(item)
+        try:
+            if len(submissions) == 1 or (
+                bind is not None and getattr(getattr(bind, "dialect", None), "name", None) == "sqlite"
+            ):
+                # 单条不启动线程；SQLite 开发库也串行写入，避免共享连接争用。
+                for lead_id, command, record in submissions:
+                    try:
+                        outcome = self._submit_create(
+                            lead_id,
+                            command,
+                            initial_record=record,
+                            defer_smart_table_submission_status=True,
+                        )
+                    except Exception as error:
+                        _LOGGER.warning(
+                            "crm_batch_submission_item_failed",
+                            extra={"lead_id": lead_id, "failure": safe_failure_summary(error)},
+                        )
+                        outcome = _create_outcome("failed_pending_review")
+                    outcomes[lead_id] = outcome
+                    if on_item_result is not None:
+                        item = _append_create_result(SubmissionBatchResult(), lead_id, outcome).items[0]
+                        on_item_result(item)
+            else:
+                # 每条 CRM 操作保留独立冻结状态，所有成功项的表格状态留到批次结束统一更新。
+                with ThreadPoolExecutor(
+                    max_workers=max_workers,
+                    thread_name_prefix="crm-submit",
+                ) as executor:
+                    futures = {
+                        executor.submit(
+                            self._submit_create,
+                            lead_id,
+                            command,
+                            initial_record=record,
+                            defer_smart_table_submission_status=True,
+                        ): lead_id
+                        for lead_id, command, record in submissions
+                    }
+                    for future in as_completed(futures):
+                        lead_id = futures[future]
+                        try:
+                            outcome = future.result()
+                        except Exception as error:
+                            _LOGGER.warning(
+                                "crm_batch_submission_item_failed",
+                                extra={"lead_id": lead_id, "failure": safe_failure_summary(error)},
+                            )
+                            outcome = _create_outcome("failed_pending_review")
+                        outcomes[lead_id] = outcome
+                        if on_item_result is not None:
+                            item = _append_create_result(SubmissionBatchResult(), lead_id, outcome).items[0]
+                            on_item_result(item)
+        finally:
+            # 回调异常也不能漏掉已经持久化成功的 CRM 记录。
+            self._write_back_batch_submission_status(
+                tuple(lead_id for lead_id, _, _ in submissions)
+            )
         return outcomes
 
     def submit(self, command: SubmissionCommand) -> SubmissionBatchResult:
@@ -1344,17 +1371,23 @@ class CrmSubmissionService:
         command: SubmissionCommand,
         *,
         initial_record: SmartTableRecord | None = None,
+        defer_smart_table_submission_status: bool = False,
     ) -> CreateSubmissionOutcome:
         """隔离统一 CRM 提交异常，并判断是否能安全重试前置依赖。
 
         参数：lead_id 为待提交线索；command 为固定提交命令事实；initial_record 为本次请求内的
-        批量快照。
+        批量快照；defer_smart_table_submission_status 表示将表格状态留给外层批次统一回写。
         返回值：单条提交结果；外部暂态故障以可安全重试的审核结果返回。
         异常：业务异常转换为受控结果；状态查询异常按不可安全重试处理。
         副作用：写入提交审计或 CRM 同步状态。
         """
         try:
-            return self._submit_create_once(lead_id, command, initial_record=initial_record)
+            return self._submit_create_once(
+                lead_id,
+                command,
+                initial_record=initial_record,
+                defer_smart_table_submission_status=defer_smart_table_submission_status,
+            )
         except Exception as error:
             failure_category = classify_task_failure(error)
             safe_before_crm = False
@@ -1398,11 +1431,12 @@ class CrmSubmissionService:
         command: SubmissionCommand,
         *,
         initial_record: SmartTableRecord | None = None,
+        defer_smart_table_submission_status: bool = False,
     ) -> CreateSubmissionOutcome:
         """冻结首次提交快照并调用 CRM 统一线索接口。
 
         参数：lead_id 为待提交线索；command 为固定提交命令事实；initial_record 为当前请求内的
-        目标记录快照。
+        目标记录快照；defer_smart_table_submission_status 表示将表格状态留给外层批次统一回写。
         返回值：单条提交结果；创建或跟进由 CRM 内部处理。
         异常：智能表格或数据库异常按既有同步状态转换并记录审计。
         副作用：读取最终表格快照，写入冻结 CRM 同步记录并调用统一提交接口。
@@ -1466,7 +1500,11 @@ class CrmSubmissionService:
                 if existing.status == "awaiting_duplicate_confirmation":
                     # 旧版本只完成过查重；将同一冻结操作交给新接口，无需再让销售判断。
                     return _create_outcome(
-                        self._claim_and_call(existing.id, command.sales_user_id)
+                        self._claim_and_call(
+                            existing.id,
+                            command.sales_user_id,
+                            defer_smart_table_submission_status=defer_smart_table_submission_status,
+                        )
                     )
                 if existing.status == "abandoned" and command.text == _ABANDONED_COMMAND:
                     # 只有专用“重新提交放弃线索”命令允许重开服务端放弃事实。
@@ -1474,7 +1512,11 @@ class CrmSubmissionService:
                 else:
                     # retry 必须使用现有冻结快照，绝不重新读表替换 payload。
                     return _create_outcome(
-                        self._claim_and_call(existing.id, command.sales_user_id)
+                        self._claim_and_call(
+                            existing.id,
+                            command.sales_user_id,
+                            defer_smart_table_submission_status=defer_smart_table_submission_status,
+                        )
                     )
 
         # 卡片回调已批量读取选中记录；只复用本次请求内与目标 ID 一致的快照。
@@ -1813,7 +1855,13 @@ class CrmSubmissionService:
                     duplicate_result.crm_lead_owner_user_id,
                 ),
             )
-        return _create_outcome(self._claim_and_call(sync_id, command.sales_user_id))
+        return _create_outcome(
+            self._claim_and_call(
+                sync_id,
+                command.sales_user_id,
+                defer_smart_table_submission_status=defer_smart_table_submission_status,
+            )
+        )
 
     def resolve_duplicate_confirmation(
         self,
@@ -1837,6 +1885,7 @@ class CrmSubmissionService:
         """
         selected = set(selected_lead_ids)
         selected_sync_ids: list[int] = []
+        submitted_lead_ids: list[str] = []
         abandoned_lead_ids: list[str] = []
         remaining = 0
         owner_scope = owner_scope_user_ids or (sales_user_id,)
@@ -1947,6 +1996,7 @@ class CrmSubmissionService:
                 sync.status = "pending"
                 sync.response_summary = None
                 selected_sync_ids.append(sync.id)
+                submitted_lead_ids.append(lead.id)
                 self._record_audit_for_sync(
                     session, sync, sales_user_id, "crm_duplicate_update_confirmed"
                 )
@@ -1959,18 +2009,25 @@ class CrmSubmissionService:
         submitted = 0
         failed = 0
         failure_reasons: list[str] = []
-        for sync_id in selected_sync_ids:
-            state = self._claim_and_call(sync_id, sales_user_id)
-            if state == "succeeded":
-                submitted += 1
-            else:
-                failed += 1
-                # 销售只看到受控分类说明，不透传 CRM 响应、客户数据或凭据。
-                with self._session_factory() as session:
-                    sync = session.get(CrmSyncRecord, sync_id)
-                    reason = self._duplicate_failure_reason(sync)
-                if reason not in failure_reasons:
-                    failure_reasons.append(reason)
+        try:
+            for sync_id in selected_sync_ids:
+                state = self._claim_and_call(
+                    sync_id,
+                    sales_user_id,
+                    defer_smart_table_submission_status=True,
+                )
+                if state == "succeeded":
+                    submitted += 1
+                else:
+                    failed += 1
+                    # 销售只看到受控分类说明，不透传 CRM 响应、客户数据或凭据。
+                    with self._session_factory() as session:
+                        sync = session.get(CrmSyncRecord, sync_id)
+                        reason = self._duplicate_failure_reason(sync)
+                    if reason not in failure_reasons:
+                        failure_reasons.append(reason)
+        finally:
+            self._write_back_batch_submission_status(tuple(submitted_lead_ids))
         return DuplicateConfirmationResult(
             submitted=submitted,
             remaining=remaining,
@@ -2074,9 +2131,14 @@ class CrmSubmissionService:
         )
 
     def _claim_and_call(
-        self, sync_id: int, sales_user_id: str, *, notify_retry_result: bool = False
+        self,
+        sync_id: int,
+        sales_user_id: str,
+        *,
+        notify_retry_result: bool = False,
+        defer_smart_table_submission_status: bool = False,
     ) -> str:
-        """原子认领 pending/retrying 同步记录后调用 CRM，并持久化独立结果。"""
+        """原子认领同步记录并持久化 CRM 结果；批量调用时延后表格状态更新。"""
         claim_started_at: datetime
         claim_attempts: int
         completed_lead_id: str | None = None
@@ -2300,7 +2362,7 @@ class CrmSubmissionService:
             self._record_audit_for_sync(session, sync, sales_user_id, event_type)
             if notify_retry_result:
                 self._enqueue_crm_retry_result_notification(session, sync)
-        if completed_lead_id is not None:
+        if completed_lead_id is not None and not defer_smart_table_submission_status:
             try:
                 # CRM 成功事实已提交后再更新审核表状态，避免远端成功被表格慢调用锁住。
                 self._set_smart_table_submission_status(completed_lead_id, "已提交")
@@ -2344,6 +2406,59 @@ class CrmSubmissionService:
             lead = session.get(Lead, lead_id)
             if lead is not None:
                 lead.field_values = {**lead.field_values, "提交状态": status}
+
+    def _write_back_batch_submission_status(self, lead_ids: tuple[str, ...]) -> None:
+        """查询本批最新 CRM 状态，仅批量回写已成功线索的智能表格提交状态。
+
+        参数：lead_ids 为本批提交目标。
+        返回值：无。
+        异常：不向提交调用方传播；查询、智能表格或后台快照回写错误会记录告警。
+        副作用：最多调用一次智能表格批量更新，并同步本地 Lead 字段快照。
+        """
+        if not lead_ids:
+            return
+        try:
+            with self._session_factory() as session:
+                rows = session.execute(
+                    select(
+                        CrmSyncRecord.lead_id,
+                        CrmSyncRecord.status,
+                        Lead.smart_table_record_id,
+                    )
+                    .join(Lead, Lead.id == CrmSyncRecord.lead_id)
+                    .where(
+                        CrmSyncRecord.lead_id.in_(lead_ids),
+                        CrmSyncRecord.operation.in_(("create", "update")),
+                    )
+                    .order_by(CrmSyncRecord.lead_id, CrmSyncRecord.id.desc())
+                ).all()
+            latest: dict[str, tuple[str, str | None]] = {}
+            for lead_id, sync_status, record_id in rows:
+                latest.setdefault(lead_id, (sync_status, record_id))
+            successful = [
+                (lead_id, record_id)
+                for lead_id, (sync_status, record_id) in latest.items()
+                if sync_status == "succeeded" and record_id
+            ]
+            if not successful:
+                return
+            self._smart_table_adapter.update_records(
+                [(record_id, {"提交状态": "已提交"}) for _, record_id in successful]
+            )
+            with self._session_factory.begin() as session:
+                for lead_id, _ in successful:
+                    lead = session.get(Lead, lead_id)
+                    if lead is not None:
+                        lead.field_values = {**lead.field_values, "提交状态": "已提交"}
+        except Exception as error:
+            # 表格投影失败不能回滚 CRM 成功事实，也不能逐条重放批量写入。
+            _LOGGER.warning(
+                "smart_table_batch_submission_status_update_failed",
+                extra={
+                    "lead_count": len(lead_ids),
+                    "error_type": type(error).__name__,
+                },
+            )
 
     @staticmethod
     def _as_utc(value: datetime) -> datetime:

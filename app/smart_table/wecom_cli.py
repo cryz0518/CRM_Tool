@@ -58,6 +58,7 @@ _FIELD_TYPES = {
     "attachment": SmartTableFieldType.ATTACHMENT,
     "location": SmartTableFieldType.LOCATION,
     "user": SmartTableFieldType.MEMBER,
+    "reference": SmartTableFieldType.REFERENCE,
 }
 _RECENT_WRITE_VISIBILITY_SECONDS = 30.0
 _WRITE_VERIFICATION_DELAYS = (0.0, 0.3, 1.0, 2.0)
@@ -187,13 +188,15 @@ class WecomCliSmartTableAdapter:
         timeout_seconds: float = 120.0,
         retry_count: int = 1,
         require_owner_field: bool = True,
+        include_entry_time: bool = True,
         runner: CliRunner | None = None,
     ) -> None:
         """初始化固定文档、子表和可替换的 CLI 执行入口。
 
         参数：doc_id、sheet_id 为管理员配置的目标表标识；sheet_title 为完整查询接口使用的子表名称；
         两个 sales 参数仅接受管理员已核验的权限快照；require_owner_field 控制机器人是否必须
-        写入“负责人”；command、timeout_seconds、retry_count 控制 CLI 调用；runner 供测试替换。
+        写入“负责人”；include_entry_time 控制记录回读是否查询“录入时间”；command、timeout_seconds、
+        retry_count 控制 CLI 调用；runner 供测试替换。
         异常：标识为空或重试次数为负数时抛出 SmartTableAdapterConfigurationError。
         副作用：不访问网络，仅保存不可变配置。
         """
@@ -213,6 +216,7 @@ class WecomCliSmartTableAdapter:
         self._timeout_seconds = timeout_seconds
         self._retry_count = retry_count
         self._require_owner_field = require_owner_field
+        self._include_entry_time = include_entry_time
         self._runner = runner or self._run_subprocess
         self._pace_cli_calls = runner is None
         self._rate_limit_redis: Any = (
@@ -591,6 +595,101 @@ class WecomCliSmartTableAdapter:
             record_id, fields_to_verify, schema, operation="update"
         )
 
+    def update_records(
+        self, records: Sequence[tuple[str, Mapping[str, object]]]
+    ) -> list[SmartTableRecord]:
+        """一次批量更新多条记录，并通过批量回读核实写入结果。
+
+        参数：records 为记录标识与增量字段补丁组成的序列。
+        返回值：按输入顺序排列且经远端核实的记录快照。
+        异常：记录缺失、CLI 写入失败或有限核实窗口后仍有字段不匹配时抛出异常。
+        副作用：先批量确认记录存在，再发起一次批量更新及有限次批量只读核实。
+        """
+        if not records:
+            return []
+        if len(records) > 2000:
+            raise ValueError("智能表格单次批量更新最多支持 2000 条记录")
+        record_ids = [record_id for record_id, _ in records]
+        if any(not isinstance(record_id, str) or not record_id for record_id in record_ids) or len(
+            set(record_ids)
+        ) != len(record_ids):
+            raise ValueError("智能表格批量更新需要非空且不重复的记录标识")
+
+        schema = self.get_schema()
+        existing_ids = {
+            record.record_id for record in self.get_records(record_ids=record_ids)
+        }
+        missing_ids = [record_id for record_id in record_ids if record_id not in existing_ids]
+        if missing_ids:
+            raise SmartTableRecordNotFoundError(f"智能表格记录不存在：{missing_ids[0]}")
+
+        cli_records: list[dict[str, object]] = []
+        fields_to_verify: list[Mapping[str, object]] = []
+        for record_id, fields in records:
+            cli_fields = self._to_cli_fields(fields, schema)
+            expected_fields = {
+                name: value
+                for name, value in fields.items()
+                if (field := schema.get_field(name)) is not None and field.name in cli_fields
+            }
+            unmapped_fields = set(fields) - set(expected_fields)
+            if unmapped_fields:
+                raise SmartTableAdapterConfigurationError(
+                    f"智能表格批量更新字段不存在或不可写：{sorted(unmapped_fields)}"
+                )
+            cli_records.append({"record_id": record_id, "values": cli_fields})
+            fields_to_verify.append(expected_fields)
+        planned_fields = sorted(
+            {
+                field.name.removeprefix("*")
+                for _, fields in records
+                for name in fields
+                if (field := schema.get_field(name)) is not None
+            }
+        )
+        logger.info("wecom_cli_batch_write_planned", extra={"planned_fields": planned_fields})
+        self._call("records", "update", {"records": cli_records})
+
+        mismatched_fields: tuple[str, ...] = ()
+        mismatched_record_id: str | None = None
+        for delay in _WRITE_VERIFICATION_DELAYS:
+            if delay:
+                time.sleep(delay)
+            try:
+                remote_records = self.get_records(record_ids=record_ids)
+            except RetryableTaskFailure as error:
+                logger.error(
+                    "wecom_cli_batch_update_verification_read_failed",
+                    extra={"error_code": getattr(error, "error_code", type(error).__name__)},
+                )
+                continue
+            by_id = {record.record_id: record for record in remote_records}
+            mismatched_fields = ()
+            mismatched_record_id = None
+            for (record_id, _), expected_fields in zip(records, fields_to_verify, strict=True):
+                remote_record = by_id.get(record_id)
+                current_mismatches = (
+                    self._mismatched_write_fields(expected_fields, remote_record, schema)
+                    if remote_record is not None
+                    else tuple(expected_fields) or ("record_id",)
+                )
+                if current_mismatches:
+                    mismatched_fields = current_mismatches
+                    mismatched_record_id = record_id
+                    break
+            if mismatched_record_id is None:
+                for record in remote_records:
+                    self._remember_written_record(record.record_id, record.fields)
+                return [by_id[record_id] for record_id in record_ids]
+
+        logger.error(
+            "wecom_cli_batch_update_verification_failed",
+            extra={"missing_or_mismatched_fields": list(mismatched_fields)},
+        )
+        raise SmartTableWriteVerificationError(
+            mismatched_fields, remote_record_id=mismatched_record_id
+        )
+
     def _verify_remote_write(
         self,
         record_id: str,
@@ -828,7 +927,10 @@ class WecomCliSmartTableAdapter:
                     for record_id in chunk
                 )
                 sql = self._build_query_sql(
-                    schema, where=where, limit=len(chunk), include_entry_time=True
+                    schema,
+                    where=where,
+                    limit=len(chunk),
+                    include_entry_time=self._include_entry_time,
                 )
                 records.extend(
                     self._parse_query_record(row, schema) for row in self._query_rows(sql)
