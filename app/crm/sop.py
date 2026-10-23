@@ -14,7 +14,7 @@ import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from app.crm.adapter import CRMCreateResult, CRMSearchResult
+from app.crm.adapter import CRMCreateResult
 
 DuplicateEntityType = Literal["lead", "customer", "dealer", "unknown"]
 # SOP 文档只提供一条线索类型示例；使用其 SHA-256 精确匹配，源文案不进入代码库。
@@ -111,64 +111,6 @@ class SopCRMAdapter:
             proxy=proxy.strip() if proxy and proxy.strip() else None,
         )
         self._owns_client = client is None
-
-    def search_by_company_name(
-        self, payload: Mapping[str, object] | str
-    ) -> tuple[CRMSearchResult, ...]:
-        """按 canonical payload 的 name/businessLine/tycCustomerId 查重。"""
-        canonical = {"name": payload} if isinstance(payload, str) else dict(payload)
-        data = self._call("crm_check_lead_duplicate", canonical)
-        result = data.get("result")
-        if result == 0:
-            return ()
-        lead_id = data.get("leadId")
-        # 只接受明确返回的 CRM Lead ID；其他重复对象或缺少 ID 都转人工处理。
-        if lead_id is None:
-            raise SopCRMError(
-                "CRM duplicate target unavailable",
-                category="duplicate_target_unavailable",
-                sub_code="duplicate_detected_without_lead_id",
-                duplicate_entity_type=_classify_duplicate_entity_message(data.get("message")),
-            )
-        return (CRMSearchResult(str(lead_id), None, "CRM duplicate"),)
-
-    def create_lead(
-        self,
-        payload: Mapping[str, object],
-        *,
-        idempotency_key: str,
-        crm_user_id: str,
-    ) -> CRMCreateResult:
-        """创建 CRM 线索，并在边界注入冻结 CRM 用户身份。"""
-        body = dict(payload)
-        body["headerId"] = crm_user_id
-        data = self._call("crm_create_lead", body)
-        lead_id = data.get("id", data.get("leadId", data))
-        if isinstance(lead_id, Mapping):
-            lead_id = lead_id.get("id")
-        if lead_id is None:
-            raise SopCRMError("CRM create response missing lead id")
-        return CRMCreateResult(str(lead_id), crm_user_id, "CRM create succeeded")
-
-    def update_lead(
-        self,
-        crm_lead_id: str,
-        payload: Mapping[str, object],
-        *,
-        idempotency_key: str,
-        crm_user_id: str,
-    ) -> CRMCreateResult:
-        """更新冻结 CRM 线索，不改变既有负责人语义。"""
-        body = dict(payload)
-        body["id"] = crm_lead_id
-        body["headerId"] = crm_user_id
-        data = self._call("crm_update_lead", body)
-        # 无明确布尔结果时不能证明远端拒绝，更不能自动再次覆盖。
-        if type(data.get("success")) is not bool:
-            raise SopCRMError("CRM update result unknown", category="malformed_response")
-        if data.get("success") is False:
-            raise SopCRMError("CRM update rejected")
-        return CRMCreateResult(crm_lead_id, None, "CRM update succeeded")
 
     def submit_lead(
         self,
@@ -320,13 +262,8 @@ class SopCRMAdapter:
                 http_status=status,
             )
         data = payload.get("data")
-        # 修改接口返回 Boolean；空值或未知响应不能被当作远端成功。
-        if method == "crm_update_lead" and type(data) is bool:
-            return {"success": data}
         if isinstance(data, Mapping):
             return data
-        if method == "crm_create_lead" and data not in (None, ""):
-            return {"id": data}
         raise SopCRMError(
             "CRM response missing data", category="malformed_response", http_status=status
         )
