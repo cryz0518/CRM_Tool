@@ -48,7 +48,6 @@ from app.smart_table.adapter import SmartTableActor
 from app.smart_table.mock import MockSmartTableAdapter
 from app.smart_table.registry import build_required_smart_table_schema
 from app.wecom_bot.actions import (
-    CARD_EVENT_KEY_CRM_BATCH_SELECT_ALL,
     CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
     CARD_EVENT_KEY_CRM_COMPANY_CONFIRM,
     CARD_EVENT_KEY_CRM_DUPLICATE_CONTINUE,
@@ -905,20 +904,19 @@ def test_batch_submission_card_allows_multi_selection() -> None:
             },
         ],
         selection_key=CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
+        select_all_option_id="all-task-batch-candidates",
     )
 
     assert card["checkbox"]["mode"] == 1  # type: ignore[index]
     assert card["submit_button"]["key"] == CARD_EVENT_KEY_CRM_BATCH_SUBMISSION  # type: ignore[index]
     options = card["checkbox"]["option_list"]  # type: ignore[index]
-    assert len(options) == 2
+    assert len(options) == 3
     assert [option["text"] for option in options] == [  # type: ignore[index]
+        "全选本页（2条）",
         "1. 候选一",
         "2. 候选二",
     ]
-    assert card["action_menu"] == {
-        "desc": "批量操作",
-        "action_list": [{"text": "全选本页", "key": CARD_EVENT_KEY_CRM_BATCH_SELECT_ALL}],
-    }
+    assert "action_menu" not in card
 
 
 def test_batch_markdown_and_checkbox_share_frozen_page_order() -> None:
@@ -1080,11 +1078,11 @@ def test_unregistered_actor_cannot_issue_cross_owner_crm_action(
 def test_batch_submission_action_freezes_page_for_more_than_one_page(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证一页 20 条候选仍可由服务端动作独立冻结。"""
+    """验证一页 19 条候选加全选选项可由服务端动作独立冻结。"""
 
     _authorize(session_factory)
     candidates = tuple(
-        {"lead_id": f"lead-{index}", "company_name": f"公司{index}"} for index in range(20)
+        {"lead_id": f"lead-{index}", "company_name": f"公司{index}"} for index in range(19)
     )
     action = _service(session_factory).issue_batch_submission_action(
         actor_user_id="sales-a",
@@ -1134,45 +1132,37 @@ def test_batch_callback_accepts_only_selected_frozen_subset(
 def test_batch_callback_expands_select_all_to_frozen_page(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证全选菜单先勾选服务端冻结的当前页，再等待用户确认提交。"""
+    """验证选择“全选本页”选项后只提交服务端冻结的当前页。"""
 
     lead_ids = _seed_batch_leads(session_factory)
     service = _service(session_factory)
     action = _issue_today_action(service, lead_ids, message_id="message-select-all")
-    frame = _batch_frame_for_action(action, (), msgid="provider-select-all")
-    card_event = frame["body"]["event"]["template_card_event"]  # type: ignore[index]
-    card_event["event_key"] = CARD_EVENT_KEY_CRM_BATCH_SELECT_ALL  # type: ignore[index]
+    select_all_option_id = action.context["select_all_option_id"]
+    assert isinstance(select_all_option_id, str)
+    frame = _batch_frame_for_action(
+        action, (select_all_option_id,), msgid="provider-select-all"
+    )
     claim = service.claim_callback(frame)
 
-    assert claim.code == "select_all"
+    assert claim.code == "claimed"
     assert claim.should_update_card is True
-    with session_factory() as session:
-        stored = session.get(WecomAction, action.id)
-        assert stored is not None
-        assert stored.status == "pending"
-        assert "selected_lead_ids" not in stored.context
-        assert session.scalars(select(WecomActionOutbox)).all() == []
-    card_options = claim.response_card()["checkbox"]["option_list"]  # type: ignore[index]
-    assert [option["is_checked"] for option in card_options] == [  # type: ignore[index]
-        True,
-        True,
-        True,
-    ]
-    assert claim.response_card()["checkbox"]["disable"] is False  # type: ignore[index]
-
-    submit = service.claim_callback(
-        _batch_frame_for_action(action, lead_ids, msgid="provider-select-all-confirm")
-    )
-    assert submit.code == "claimed"
     with session_factory() as session:
         stored = session.get(WecomAction, action.id)
         assert stored is not None
         assert stored.context["selected_lead_ids"] == list(lead_ids)
         assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
+    card_options = claim.response_card()["checkbox"]["option_list"]  # type: ignore[index]
+    assert [option["is_checked"] for option in card_options] == [  # type: ignore[index]
+        True,
+        True,
+        True,
+        True,
+    ]
+    assert claim.response_card()["checkbox"]["disable"] is True  # type: ignore[index]
 
 
-def test_batch_submission_card_shows_twenty_leads_and_separate_select_all_action() -> None:
-    """验证二十条候选均可展示，全选本页作为单独操作而非线索选项。"""
+def test_batch_submission_card_shows_select_all_within_twenty_option_limit() -> None:
+    """验证全选入口与十九条线索共同遵守投票卡二十项上限。"""
 
     card = build_action_card(
         task_id="task-batch-select-all-limit",
@@ -1181,17 +1171,20 @@ def test_batch_submission_card_shows_twenty_leads_and_separate_select_all_action
         description="选择线索后确认提交",
         selection_options=[
             {"lead_id": f"lead-{index}", "company_name": f"候选{index}"}
-            for index in range(20)
+            for index in range(19)
         ],
         selection_key=CARD_EVENT_KEY_CRM_BATCH_SUBMISSION,
+        select_all_option_id="all-task-batch-select-all",
     )
 
     options = card["checkbox"]["option_list"]  # type: ignore[index]
     assert len(options) == 20
     assert [option["id"] for option in options] == [
-        f"lead-{index}" for index in range(20)
+        "all-task-batch-select-all",
+        *[f"lead-{index}" for index in range(19)],
     ]  # type: ignore[index]
-    assert card["action_menu"]["action_list"][0]["text"] == "全选本页"  # type: ignore[index]
+    assert options[0]["text"] == "全选本页（19条）"  # type: ignore[index]
+    assert "action_menu" not in card
 
 
 def test_batch_callback_accepts_temporary_unsubmitted_candidate(
@@ -2047,12 +2040,17 @@ def test_batch_callback_freezes_original_vote_card_and_ignores_client_names(
     assert card["task_id"] == action.task_id
     assert card["main_title"] == {
         "title": "选择要提交的线索",
-        "desc": "请勾选需要提交的线索，点击右上角“全选本页”可选择全部线索",
+        "desc": "勾选“全选本页”可一次选择全部线索，也可逐条勾选后确认提交",
     }
     assert card["checkbox"] == {
         "question_key": "crm_submission_candidates",
         "mode": 1,
         "option_list": [
+            {
+                "id": action.context["select_all_option_id"],
+                "text": "全选本页（2条）",
+                "is_checked": False,
+            },
             {"id": "lead-a", "text": "1. 冻结公司A", "is_checked": False},
             {"id": "lead-b", "text": "2. 冻结公司B", "is_checked": True},
         ],

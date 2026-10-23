@@ -3508,7 +3508,7 @@ def test_company_preview_contains_match_still_requires_confirmation_card(
 
 @pytest.mark.parametrize(
     "candidate_count, expected_pages",
-    [(0, 0), (1, 1), (19, 1), (20, 1), (21, 2), (39, 2), (40, 2), (41, 3), (61, 4)],
+    [(0, 0), (1, 1), (19, 1), (20, 2), (21, 2), (39, 3), (40, 3), (41, 3), (61, 4)],
 )
 def test_batch_submission_issues_server_frozen_pages(
     session_factory: sessionmaker[Session],
@@ -3516,7 +3516,7 @@ def test_batch_submission_issues_server_frozen_pages(
     candidate_count: int,
     expected_pages: int,
 ) -> None:
-    """验证独立全选操作不占候选选项，每页最多冻结 20 条线索。"""
+    """验证全选入口占一个选项后，每页最多冻结 19 条线索。"""
     import app.crm.commands as crm_commands
 
     settings = get_settings().model_copy(
@@ -3575,10 +3575,13 @@ def test_batch_submission_issues_server_frozen_pages(
     if candidate_count:
         ordered_actions = sorted(actions, key=lambda action: int(action.context["page"]))
         assert [len(action.context["candidate_leads"]) for action in ordered_actions] == [
-            min(20, max(0, candidate_count - index * 20))
+            min(19, max(0, candidate_count - index * 19))
             for index in range(expected_pages)
         ]
-        assert all("select_all_option_id" not in action.context for action in actions)
+        assert all(
+            action.context["select_all_option_id"] == f"all-{action.target_id[:24]}"
+            for action in actions
+        )
     if expected_pages > 1:
         assert "张候选卡" in reply
 
@@ -3664,11 +3667,12 @@ def test_batch_submission_sends_names_only_markdown_before_selection_card(
     assert "提交状态" not in markdown
     assert "缺少：职务" not in markdown
     assert "AI待确认" not in markdown
-    assert [option["id"] for option in options] == [
+    assert options[0]["text"] == "全选本页（2条）"
+    assert [option["id"] for option in options[1:]] == [
         "batch-detail-lead-0",
         "batch-detail-lead-1",
     ]
-    assert [option["text"] for option in options] == [
+    assert [option["text"] for option in options[1:]] == [
         "1. 冻结公司-0",
         "2. 冻结公司-1",
     ]
