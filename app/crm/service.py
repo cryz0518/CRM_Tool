@@ -161,6 +161,7 @@ class SubmissionCandidate:
     lead_id: str
     company_name: str
     owner_user_id: str | None = None
+    record: SmartTableRecord | None = None
 
 
 @dataclass(frozen=True)
@@ -341,6 +342,7 @@ def _append_update_result(
         "retrying": "crm_update_retrying",
         "company_identity_review": "company_identity_change_pending_review",
         "failed_pending_review": "crm_update_failed_pending_review",
+        "smart_table_read_failed": "wecom_smart_table_retryable",
     }.get(status)
     item = SubmissionItemResult(lead_id, item_status, reason_code)
     return replace(
@@ -348,7 +350,8 @@ def _append_update_result(
         retrying=result.retrying + (status == "retrying"),
         incomplete=result.incomplete + (status in {"incomplete", "enum_mapping_missing"}),
         processing=result.processing + (status == "processing"),
-        failed_pending_review=result.failed_pending_review + (status == "failed_pending_review"),
+        failed_pending_review=result.failed_pending_review
+        + (status in {"failed_pending_review", "smart_table_read_failed"}),
         updated=result.updated + (status == "succeeded"),
         followed_up=result.followed_up + (status == "followed_up"),
         unchanged=result.unchanged + (status == "unchanged"),
@@ -653,10 +656,16 @@ class CrmSubmissionService:
             )
         return outcomes
 
-    def submit(self, command: SubmissionCommand) -> SubmissionBatchResult:
+    def submit(
+        self,
+        command: SubmissionCommand,
+        *,
+        initial_records: Mapping[str, SmartTableRecord] | None = None,
+    ) -> SubmissionBatchResult:
         """解析固定命令并逐条提交本人待处理线索，保持批次部分成功。
 
-        参数：command 为机器人已可靠接收的文本命令和提交销售身份。
+        参数：command 为机器人已可靠接收的文本命令和提交销售身份；
+        initial_records 为指定线索命令阶段已批量读取的表格快照。
         返回值：成功、待完善和外部失败的汇总；更新命令明确标记未实现。
         异常：命令不支持或 actor 不存在/已停用时抛出 ValueError，避免 LLM 推断权限。
         副作用：可能创建或重试一个冻结的 CRM Sync Record，并调用 CRM 统一提交接口。
@@ -677,6 +686,7 @@ class CrmSubmissionService:
             raise ValueError("目标线索只能用于指定线索提交命令")
 
         target_missing = False
+        target_record_id: str | None = None
         with self._session_factory() as session:
             if command.text == "提交指定线索":
                 if command.target_lead_id is None:
@@ -690,6 +700,7 @@ class CrmSubmissionService:
                 )
                 target_missing = target is None
                 candidate_ids = [target.id] if target is not None else []
+                target_record_id = target.smart_table_record_id if target is not None else None
             else:
                 candidates = session.scalars(
                     select(Lead).where(
@@ -709,10 +720,66 @@ class CrmSubmissionService:
                 command.target_lead_id or "",
                 _create_outcome("not_submitted", reason_code="candidate_state_changed"),
             )
+        initial_record = (
+            (initial_records or {}).get(target_record_id or "")
+            if command.text == "提交指定线索"
+            else None
+        )
+        if command.text == "提交指定线索" and initial_records is None and target_record_id:
+            # 直接调用服务时没有上游缓存，仅批量读取这个指定目标一次。
+            try:
+                initial_record = next(
+                    (
+                        record
+                        for record in self._smart_table_adapter.get_records((target_record_id,))
+                        if record.record_id == target_record_id
+                    ),
+                    None,
+                )
+            except Exception as error:
+                failure_category = classify_task_failure(error).value
+                failure_code = getattr(error, "error_code", None)
+                if not isinstance(failure_code, str):
+                    external_code = getattr(error, "external_error_code", None)
+                    failure_code = str(external_code) if type(external_code) is int else None
+                return _append_create_result(
+                    SubmissionBatchResult(),
+                    command.target_lead_id or "",
+                    _create_outcome(
+                        "failed_pending_review",
+                        reason_code=(
+                            "wecom_smart_table_retryable"
+                            if failure_code in {"rate_limited", "network_error"}
+                            else "smart_table_snapshot_failed"
+                        ),
+                        failure_category=failure_category,
+                        adapter_category=(
+                            "transport" if failure_category == "transient" else None
+                        ),
+                        failure_code=failure_code,
+                    ),
+                )
+        if command.text == "提交指定线索" and (
+            initial_record is None or initial_record.record_id != target_record_id
+        ):
+            return _append_create_result(
+                SubmissionBatchResult(),
+                command.target_lead_id or "",
+                _create_outcome(
+                    "failed_pending_review",
+                    reason_code="wecom_smart_table_retryable",
+                    failure_category="transient",
+                    adapter_category="transport",
+                ),
+            )
         result = SubmissionBatchResult()
         for lead_id in candidate_ids:
             # 每条独立执行；任何一条失败都不得影响后续候选。
-            outcome = self._submit_create(lead_id, command)
+            outcome = self._submit_create(
+                lead_id,
+                command,
+                initial_record=initial_record,
+            )
             result = _append_create_result(result, lead_id, outcome)
         return result
 
@@ -813,6 +880,7 @@ class CrmSubmissionService:
         owner_scope_user_ids: tuple[str, ...] | None = None,
         target_capture_date: date | None = None,
         owner_display_names: Mapping[str, str] | None = None,
+        smart_table_records: Sequence[SmartTableRecord] | None = None,
     ) -> tuple[SubmissionCandidate, ...]:
         """列出操作人获准在机器人卡片中选择的线索，不调用 CRM。
 
@@ -820,7 +888,7 @@ class CrmSubmissionService:
         已获跨员工提交权限的调用指定负责人范围；owner_display_names 仅用于服务端负责人预筛。
         返回值：只包含指定负责人范围与实时表格状态符合卡片条件的候选。
         异常：actor 不存在/已停用、权限不足或命令不支持时抛出 ValueError。
-        副作用：只读取数据库及智能表格，不改变 Lead 生命周期。
+        副作用：只读取数据库及智能表格，不改变 Lead 生命周期；提供已有表格快照时不再查询智能表格。
         """
         if command_text not in {
             _TODAY_COMMAND,
@@ -906,7 +974,10 @@ class CrmSubmissionService:
                     sync_statuses.setdefault(sync.lead_id, sync.status)
             for lead in leads:
                 sync_statuses.setdefault(lead.id, None)
-        if query_submission_status is not None:
+        if smart_table_records is not None:
+            # 命令入口已批量读取并补齐本地映射，候选筛选复用同一份快照。
+            queried_records = list(smart_table_records)
+        elif query_submission_status is not None:
             # 日期命令直接按负责人、状态与目标日期回读目标行，避免拼接整批 record_id。
             queried_records = self._smart_table_adapter.get_records(
                 owner_user_ids=owner_user_ids,
@@ -929,7 +1000,10 @@ class CrmSubmissionService:
         for lead in leads:
             sync_status = sync_statuses[lead.id]
             record = smart_table_snapshot.get(lead.smart_table_record_id or "")
-            snapshot_fields = record.fields if record is not None else lead.field_values
+            if record is None:
+                # 没有本次查询快照的表格行不能进入候选，也不能在回调阶段逐条补读。
+                continue
+            snapshot_fields = record.fields
             if command_text == _ABANDONED_COMMAND:
                 if lead.lifecycle_state != "pending_create" or sync_status != "abandoned":
                     continue
@@ -977,6 +1051,7 @@ class CrmSubmissionService:
                     lead.id,
                     display_name,
                     lead.smart_table_owner_user_id,
+                    record,
                 )
             )
         return tuple(candidates)
@@ -986,6 +1061,7 @@ class CrmSubmissionService:
         command: SubmissionCommand,
         selected_lead_ids: tuple[str, ...],
         *,
+        initial_records: Mapping[str, SmartTableRecord] | None = None,
         on_item_result: Callable[[SubmissionItemResult], None] | None = None,
     ) -> SubmissionBatchResult:
         """提交卡片勾选的线索，并在服务端重新校验候选归属和状态。
@@ -994,8 +1070,8 @@ class CrmSubmissionService:
         返回值：与普通批量提交相同的部分成功汇总。
         异常：actor 不存在/已停用或命令不支持时抛出 ValueError；结果回调异常向调用方传播。
         副作用：每个 callback 已接受的目标均得到结果；仅仍有效的目标调用首次提交流程，
-        先按负责人权限重新校验候选状态，再对选中记录批量读取一次并在本请求内复用快照；
-        单条处理结束后可选地持久化该条结果。
+        按负责人权限重新校验候选状态；动作调用传入提交指令阶段快照后不再读取智能表格，
+        直接调用且未传快照时只对勾选记录执行一次批量读取。单条处理结束后可选地持久化结果。
         """
         if command.text not in {
             _TODAY_COMMAND,
@@ -1085,40 +1161,30 @@ class CrmSubmissionService:
                 ):
                     # 日期范围在批量读取到表格当前快照后校验，不能用可能过期的数据库字段提前排除。
                     valid_ids.add(lead_id)
-        # 回调只批量读取仍有效的勾选记录；快照仅在当前请求内复用，不跨请求缓存。
+        # 卡片回调只复用发送提交指令时冻结的快照，不再次读取智能表格。
         requested_record_ids = {
             selected_record_ids[lead_id] for lead_id in valid_ids if lead_id in selected_record_ids
         }
         snapshot_by_record_id: dict[str, SmartTableRecord] = {}
         preflight_outcomes: dict[str, CreateSubmissionOutcome] = {}
         snapshot_read_failed = False
-        if requested_record_ids:
+        if initial_records is None and requested_record_ids:
+            # 非卡片调用没有提交指令阶段缓存时最多批量读取一次；卡片路径始终传入缓存。
             try:
                 for record in self._smart_table_adapter.get_records(requested_record_ids):
                     if record.record_id in requested_record_ids:
                         snapshot_by_record_id[record.record_id] = record
             except Exception as error:
-                # 批量快照失败时停止这批表格读取，避免退化为逐条 CLI 查询并放大限流。
                 snapshot_read_failed = True
                 failure_category = classify_task_failure(error).value
                 failure_code = getattr(error, "error_code", None)
                 if not isinstance(failure_code, str):
                     external_code = getattr(error, "external_error_code", None)
                     failure_code = str(external_code) if type(external_code) is int else None
-                if failure_category == "transient":
-                    reason_code = (
-                        "wecom_smart_table_retryable"
-                        if failure_code in {"rate_limited", "network_error"}
-                        else "pre_crm_transient_failure"
-                    )
-                else:
-                    reason_code = "smart_table_snapshot_failed"
-                _LOGGER.warning(
-                    "crm_submission_batch_snapshot_failed failure=%s category=%s code=%s requested_count=%s",
-                    safe_failure_summary(error),
-                    failure_category,
-                    failure_code,
-                    len(requested_record_ids),
+                reason_code = (
+                    "wecom_smart_table_retryable"
+                    if failure_code in {"rate_limited", "network_error"}
+                    else "smart_table_snapshot_failed"
                 )
                 for lead_id in valid_ids:
                     if lead_id in selected_record_ids:
@@ -1131,16 +1197,22 @@ class CrmSubmissionService:
                             ),
                             failure_code=failure_code,
                         )
-            if (
-                not snapshot_read_failed
-                and len(snapshot_by_record_id) != len(requested_record_ids)
+        elif initial_records is not None:
+            snapshot_by_record_id = {
+                record_id: record
+                for record_id, record in initial_records.items()
+                if record_id == record.record_id
+            }
+        if requested_record_ids:
+            if not snapshot_read_failed and not requested_record_ids.issubset(
+                snapshot_by_record_id
             ):
                 _LOGGER.warning(
-                    "crm_submission_batch_snapshot_incomplete requested_count=%s returned_count=%s",
+                    "crm_submission_frozen_snapshot_incomplete requested_count=%s cached_count=%s",
                     len(requested_record_ids),
-                    len(snapshot_by_record_id),
+                    len(requested_record_ids & set(snapshot_by_record_id)),
                 )
-            # 批量响应未包含的行也不回退单条读取；本轮保守停止并允许重新提交。
+            # 缺失的冻结行不回退查询；本轮保守停止并允许销售重新发送提交指令。
             missing_record_ids = requested_record_ids - set(snapshot_by_record_id)
             for lead_id, record_id in selected_record_ids.items():
                 if lead_id in valid_ids and record_id in missing_record_ids:
@@ -1232,14 +1304,18 @@ class CrmSubmissionService:
                 and self._unfinished_update(session, lead.id) is None
             }
         smart_table_snapshot: dict[str, SmartTableRecord] = {}
+        snapshot_read_failed = False
         if record_ids:
             try:
+                requested_record_ids = set(record_ids)
                 smart_table_snapshot = {
                     record.record_id: record
                     for record in self._smart_table_adapter.get_records(record_ids)
+                    if record.record_id in requested_record_ids
                 }
             except Exception as error:
-                # 整批回读失败时逐条按记录 ID 重读，避免一个表格故障中止整个更新批次。
+                # 整批读取失败后不逐条重试，避免放大限流并保持每次指令至多一次查询。
+                snapshot_read_failed = True
                 _LOGGER.warning(
                     "crm_update_batch_snapshot_failed failure=%s",
                     safe_failure_summary(error),
@@ -1248,11 +1324,15 @@ class CrmSubmissionService:
 
         def submit_one(lead: Lead) -> tuple[str, str]:
             """独立提交一条已同步线索，并将未预期异常收敛为待人工核对。"""
+            record = smart_table_snapshot.get(lead.smart_table_record_id or "")
+            if snapshot_read_failed or record is None:
+                # 批量查询失败或未返回该行时停止当前记录，不退化为单行 CLI/API 查询。
+                return lead.id, "smart_table_read_failed"
             try:
                 outcome = self._submit_update(
                     lead.id,
                     command,
-                    initial_record=smart_table_snapshot.get(lead.smart_table_record_id or ""),
+                    initial_record=record,
                 )
             except Exception as error:
                 # 某条最终快照或 CRM 异常只影响本条；未知结果进入人工核对，不自动重复覆盖。
@@ -1301,15 +1381,15 @@ class CrmSubmissionService:
         lead_id: str,
         command: SubmissionCommand,
         *,
-        initial_record: SmartTableRecord | None = None,
+        initial_record: SmartTableRecord,
     ) -> str:
-        """重读已同步线索，冻结更新快照并通过 CRM 统一接口提交。
+        """复用批量读取的已同步线索快照，冻结更新操作并通过 CRM 统一接口提交。
 
         参数：lead_id 为目标线索；command 为提交命令；initial_record 为本批负责人范围内
-        已读取的目标快照；动作前仍按记录标识读取最新行，缺失时同样逐条读取。
+        已读取的目标快照。
         返回值：标准 CRM 更新状态或业务校验结果。
         异常：智能表格和数据库故障传播；CRM 传输结果由同步记录认领器处理。
-        副作用：读取目标表格记录、更新人工编辑审计，并可能调用 CRM。
+        副作用：更新人工编辑审计，并可能调用 CRM；不读取智能表格。
         """
         with self._session_factory() as session:
             lead = session.get(Lead, lead_id)
@@ -1332,16 +1412,13 @@ class CrmSubmissionService:
             robot_submission_confirmation_available=self._robot_submission_confirmation_available,
         )
         if (
-            initial_record is not None
-            and initial_record.record_id == lead.smart_table_record_id
-            and initial_record.fields.get("负责人") != command.sales_user_id
+            initial_record.record_id != lead.smart_table_record_id
+            or initial_record.fields.get("负责人") != command.sales_user_id
         ):
-            # 负责人范围快照已显示转交，直接拒绝该项，避免再读取范围外记录。
+            # 冻结快照中的记录标识或负责人不匹配时拒绝，不查询其他行补偿。
             return "incomplete"
-        # 批量发现快照可能过期；对当前负责人逐条读取一次，并只 reconcile 这份最新快照。
-        current_record = self._read_smart_table_record(lead.smart_table_record_id or "")
-        if current_record is None:
-            raise ValueError("智能表格记录不存在")
+        # 用户已在发出指令前确认；本批使用同一条指令触发的批量快照。
+        current_record = initial_record
         with self._session_factory.begin() as session:
             # 表格读取后可能立即转交；锁内复核负责人和记录标识后再采纳该快照。
             current_lead = session.scalar(
@@ -1634,7 +1711,18 @@ class CrmSubmissionService:
                         )
                     )
 
-        # 卡片回调已批量读取选中记录；只复用本次请求内与目标 ID 一致的快照。
+        if (
+            initial_record is None
+            or initial_record.record_id != lead.smart_table_record_id
+        ):
+            # 新建 CRM 同步前必须有命令阶段快照；缺失时停止，不按记录逐条补读。
+            return _create_outcome(
+                "failed_pending_review",
+                reason_code="wecom_smart_table_retryable",
+                failure_category="transient",
+                adapter_category="transport",
+            )
+        # 复用提交指令阶段批量读取的记录；只接受与目标 ID 一致的快照。
         reconciled = LeadReviewService(
             self._session_factory,
             self._smart_table_adapter,
@@ -1648,7 +1736,7 @@ class CrmSubmissionService:
             table_fields=reconciled.fields,
             prefer_table_date=True,
         ):
-            # 复核卡片时必须以此刻重读的表格录入日为准，越界项目不应显示为待完善。
+            # 按提交阶段快照核对表格录入日，越界项目不进入 CRM。
             return _create_outcome("not_submitted")
         allowed_submission_statuses = (
             {"放弃提交"}

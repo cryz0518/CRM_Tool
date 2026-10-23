@@ -29,6 +29,7 @@ from app.messaging.models import (
     utc_now,
 )
 from app.smart_table.adapter import SmartTableAdapter
+from app.smart_table.models import SmartTableRecord
 
 logger = logging.getLogger(__name__)
 
@@ -782,6 +783,7 @@ class WecomActionService:
             now = utc_now()
             if _as_utc(now) >= _as_utc(action.expires_at):
                 _transition_action(action, WecomActionStatus.EXPIRED.value)
+                _discard_candidate_snapshots(action)
                 action.processed_at = now
                 action.result_code = "expired"
                 action.result_summary = "卡片已过期，请重新发起操作"
@@ -1110,6 +1112,7 @@ class WecomActionService:
                     else WecomActionOutboxStatus.FAILED.value
                 )
                 _transition_action(action, terminal_status)
+                _discard_candidate_snapshots(action)
                 action.processed_at = now
                 action.processing_lease_expires_at = None
                 action.result_code = (
@@ -1142,6 +1145,7 @@ class WecomActionService:
                 authorization = session.get(SalesAuthorization, action.bound_actor_wecom_user_id)
                 if authorization is None or not authorization.is_active:
                     _transition_action(action, WecomActionStatus.DENIED.value)
+                    _discard_candidate_snapshots(action)
                     action.processed_at = now
                     action.result_code = "actor_inactive"
                     action.result_summary = "操作人不存在或已停用，未执行该动作"
@@ -1710,6 +1714,7 @@ class WecomActionService:
         request_message_id: str,
         command_text: str,
         candidates: tuple[dict[str, str], ...],
+        candidate_snapshots: tuple[dict[str, object], ...] | None = None,
         preview_markdown_chunks: Sequence[str] | None = None,
         defer_delivery: bool = False,
         page: int = 1,
@@ -1720,7 +1725,8 @@ class WecomActionService:
         """发行批量提交候选卡，负责人范围只保存在服务端动作上下文。
 
         参数：actor_user_id 为销售身份；request_message_id 为命令消息；command_text 为固定命令；
-        candidates 仅含服务端线索标识和展示名称；每页最多 19 条，另占一个选项展示全选入口。
+        candidates 仅含服务端线索标识和展示名称；
+        candidate_snapshots 为命令阶段批量读取的服务端快照；每页最多 19 条，另占全选入口。
         preview_markdown_chunks 为同一页 Smart Table 快照的完整 Markdown 分片。
         返回值：已持久化的候选选择动作。
         异常：候选数据、卡片能力或权限不满足时抛出异常。
@@ -1729,6 +1735,8 @@ class WecomActionService:
 
         if not candidates or len(candidates) > 19 or page < 1 or page_count < page:
             raise ValueError("批量提交候选数量非法")
+        if candidate_snapshots is not None:
+            _validate_candidate_snapshot_ids(candidates, candidate_snapshots)
         if command_text == CROSS_OWNER_SUBMISSION_COMMAND:
             if (
                 not owner_scope_user_ids
@@ -1753,6 +1761,12 @@ class WecomActionService:
             "command_text": command_text,
             "request_message_id": request_message_id,
             "candidate_leads": [dict(item) for item in candidates],
+            # 动作只保留当前候选页的快照，回调无需再次访问智能表格。
+            **(
+                {"candidate_snapshots": [dict(item) for item in candidate_snapshots]}
+                if candidate_snapshots is not None
+                else {}
+            ),
             # 投票卡最多 20 个选项，预留一项让全选入口在卡片正文中直接可见。
             "select_all_option_id": f"{_BATCH_SELECT_ALL_OPTION_PREFIX}{target_id[:24]}",
             "page": page,
@@ -1788,18 +1802,25 @@ class WecomActionService:
         request_message_id: str,
         company_name: str,
         field_values: Mapping[str, object],
+        candidate_snapshot: dict[str, object] | None = None,
         display_text: str | None = None,
         defer_delivery: bool = False,
     ) -> WecomAction:
         """发行单条公司线索的十字段提交确认卡。
 
         参数：lead_id 为服务端线索标识；field_values 为本次查表得到的展示快照；
+        candidate_snapshot 为命令阶段批量查询的服务端整行快照；
         display_text 为由该快照生成的安全冻结展示名。
         返回值：已持久化的服务端动作。
         异常：卡片能力、权限或展示值不合法时抛出异常。
         副作用：只写入确认动作和待发送卡片，不调用 CRM。
         """
 
+        if candidate_snapshot is not None:
+            _validate_candidate_snapshot_ids(
+                ({"lead_id": lead_id},),
+                (candidate_snapshot,),
+            )
         return self.issue_action(
             actor_user_id=actor_user_id,
             action_type=ACTION_TYPE_CRM_COMPANY_CONFIRMATION,
@@ -1808,6 +1829,11 @@ class WecomActionService:
             expected_action_key=CARD_EVENT_KEY_CRM_COMPANY_CONFIRM,
             context={
                 "request_message_id": request_message_id,
+                **(
+                    {"candidate_snapshots": [candidate_snapshot]}
+                    if candidate_snapshot is not None
+                    else {}
+                ),
                 **({"display_text": display_text} if display_text is not None else {}),
             },
             title="确认提交线索",
@@ -1824,13 +1850,15 @@ class WecomActionService:
         request_message_id: str,
         company_name: str,
         candidates: tuple[dict[str, str], ...],
+        candidate_snapshots: tuple[dict[str, object], ...] | None = None,
         contains_match: bool = False,
         preview_markdown_chunks: Sequence[str] | None = None,
         defer_delivery: bool = False,
     ) -> WecomAction:
         """发行精确或包含匹配候选选择卡，禁止客户端自行指定目标线索。
 
-        参数：candidates 仅含服务端 Lead 标识和展示名称；contains_match 表示候选来自包含匹配。
+        参数：candidates 仅含服务端 Lead 标识和展示名称；candidate_snapshots 为命令阶段整行快照；
+        contains_match 表示候选来自包含匹配。
         返回值：已持久化的服务端动作。
         异常：候选为空或动作参数不合法时抛出异常。
         副作用：只写入候选确认卡，不调用 CRM。
@@ -1838,6 +1866,8 @@ class WecomActionService:
 
         if not candidates:
             raise ValueError("候选确认卡不能为空")
+        if candidate_snapshots is not None:
+            _validate_candidate_snapshot_ids(candidates, candidate_snapshots)
         target_id = hashlib.sha256(
             f"crm-company-candidates:{request_message_id}:{company_name}".encode()
         ).hexdigest()
@@ -1854,6 +1884,11 @@ class WecomActionService:
             context={
                 "request_message_id": request_message_id,
                 "candidate_leads": [dict(item) for item in candidates],
+                **(
+                    {"candidate_snapshots": [dict(item) for item in candidate_snapshots]}
+                    if candidate_snapshots is not None
+                    else {}
+                ),
                 "card_description": description,
             },
             title="选择要提交的线索",
@@ -1969,6 +2004,7 @@ class WecomActionService:
                 # 旧 Worker 只能丢弃自己的晚到结果，不能覆盖 takeover 或 terminal 结果。
                 return ActionExecutionResult("stale_claim", "Worker claim 已失效", False)
             _transition_action(action, status)
+            _discard_candidate_snapshots(action)
             action.processed_at = utc_now()
             action.processing_lease_expires_at = None
             action.result_code = result_code
@@ -2088,6 +2124,7 @@ class WecomActionService:
             delivery.processed_at = now
             return CallbackClaimResult(code, action.task_id, action.id, summary, False)
         _transition_action(action, WecomActionStatus.DENIED.value)
+        _discard_candidate_snapshots(action)
         action.processed_at = now
         action.result_code = code
         action.result_summary = summary
@@ -2414,6 +2451,7 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
         "reason",
         "duplicate_leads",
         "candidate_leads",
+        "candidate_snapshots",
         "owner_scope_user_ids",
         "target_capture_date",
         "page",
@@ -2528,6 +2566,45 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
                     candidate["display_text"] = _redact_text(item["display_text"], 128)
                 safe_candidates.append(candidate)
             safe[key] = safe_candidates
+        elif key == "candidate_snapshots" and isinstance(value, list) and 0 < len(value) <= 20:
+            safe_snapshots: list[dict[str, object]] = []
+            seen_lead_ids: set[str] = set()
+            seen_record_ids: set[str] = set()
+            for item in value:
+                if (
+                    not isinstance(item, dict)
+                    or set(item) != {"lead_id", "record_id", "fields", "member_names"}
+                    or not all(isinstance(item.get(name), str) for name in ("lead_id", "record_id"))
+                    or _ID_PATTERN.fullmatch(item["lead_id"]) is None
+                    or _ID_PATTERN.fullmatch(item["record_id"]) is None
+                    or item["lead_id"] in seen_lead_ids
+                    or item["record_id"] in seen_record_ids
+                    or not isinstance(item["fields"], dict)
+                    or not isinstance(item["member_names"], dict)
+                    or any(
+                        not isinstance(name, str) or not 0 < len(name) <= 128
+                        for name in item["fields"]
+                    )
+                    or any(
+                        not isinstance(name, str)
+                        or not 0 < len(name) <= 128
+                        or not isinstance(member_name, str)
+                        or len(member_name) > 512
+                        for name, member_name in item["member_names"].items()
+                    )
+                ):
+                    raise ValueError("批量提交快照 context 非法")
+                try:
+                    # 快照只进入服务端动作 JSON，不发送到卡片；JSON round-trip 拒绝不可序列化值。
+                    normalized = json.loads(
+                        json.dumps(item, ensure_ascii=False, allow_nan=False)
+                    )
+                except (TypeError, ValueError) as error:
+                    raise ValueError("批量提交快照包含非法字段值") from error
+                safe_snapshots.append(normalized)
+                seen_lead_ids.add(item["lead_id"])
+                seen_record_ids.add(item["record_id"])
+            safe[key] = safe_snapshots
         elif key == "owner_scope_user_ids" and value is None:
             safe[key] = None
         elif key == "target_capture_date" and value is None:
@@ -2548,6 +2625,79 @@ def _safe_context(context: Mapping[str, object]) -> dict[str, object]:
         else:
             raise ValueError("动作 context 值类型非法")
     return safe
+
+
+def _validate_candidate_snapshot_ids(
+    candidates: Sequence[Mapping[str, object]],
+    candidate_snapshots: Sequence[Mapping[str, object]],
+) -> None:
+    """校验候选线索与表格快照一一对应，避免提交时跨线索复用数据。
+
+    参数：candidates 为动作内冻结的候选；candidate_snapshots 为同批表格快照。
+    返回值：无。
+    异常：标识缺失、重复、数量不符或集合不同则抛出 ValueError。
+    副作用：无。
+    """
+    candidate_ids = [item.get("lead_id") for item in candidates]
+    snapshot_ids = [item.get("lead_id") for item in candidate_snapshots]
+    if (
+        not candidates
+        or len(candidates) != len(candidate_snapshots)
+        or any(not isinstance(lead_id, str) for lead_id in candidate_ids)
+        or any(not isinstance(lead_id, str) for lead_id in snapshot_ids)
+    ):
+        raise ValueError("提交候选与首次查询快照数量或标识非法")
+    candidate_ids = [lead_id for lead_id in candidate_ids if isinstance(lead_id, str)]
+    snapshot_ids = [lead_id for lead_id in snapshot_ids if isinstance(lead_id, str)]
+    if (
+        len(set(candidate_ids)) != len(candidate_ids)
+        or len(set(snapshot_ids)) != len(snapshot_ids)
+        or set(candidate_ids) != set(snapshot_ids)
+    ):
+        raise ValueError("提交候选与首次查询快照不匹配")
+
+
+def _context_smart_table_records(
+    value: object,
+    candidate_leads: object,
+) -> dict[str, SmartTableRecord]:
+    """从服务端动作 context 恢复并校验提交指令阶段的表格快照。
+
+    参数：value 为已持久化快照列表；candidate_leads 为同一动作冻结的候选列表。
+    返回值：以智能表格 record_id 为键的快照映射。
+    异常：快照缺失、重复或与候选不匹配时抛出 ValueError；不访问外部接口。
+    副作用：无。
+    """
+    if not isinstance(value, list) or not isinstance(candidate_leads, list):
+        raise ValueError("提交动作缺少首次查询快照")
+    candidate_ids = {
+        item.get("lead_id")
+        for item in candidate_leads
+        if isinstance(item, dict) and isinstance(item.get("lead_id"), str)
+    }
+    records: dict[str, SmartTableRecord] = {}
+    snapshot_lead_ids: set[str] = set()
+    for item in value:
+        if (
+            not isinstance(item, dict)
+            or not all(isinstance(item.get(name), str) for name in ("lead_id", "record_id"))
+            or not isinstance(item.get("fields"), dict)
+            or not isinstance(item.get("member_names"), dict)
+        ):
+            raise ValueError("批量提交动作快照格式非法")
+        lead_id = item["lead_id"]
+        record_id = item["record_id"]
+        if lead_id in snapshot_lead_ids or record_id in records:
+            raise ValueError("批量提交动作快照存在重复记录")
+        records[record_id] = SmartTableRecord(
+            record_id=record_id,
+            fields=item["fields"],
+            member_names=item["member_names"],
+        )
+        snapshot_lead_ids.add(lead_id)
+    if not records or snapshot_lead_ids != candidate_ids:
+        raise ValueError("批量提交动作快照与候选不匹配")
+    return records
 
 
 def _context_lead_ids(value: object) -> tuple[str, ...]:
@@ -2798,6 +2948,20 @@ def _transition_action(action: WecomAction, new_status: str) -> None:
     action.status = new_status
 
 
+def _discard_candidate_snapshots(action: WecomAction) -> None:
+    """动作离开可执行状态后删除临时表格快照，缩短客户字段留存时间。
+
+    参数：action 为已过期、拒绝或完成执行的服务端动作。
+    返回值：无。
+    异常：无。
+    副作用：从动作 JSON context 移除仅供确认回调用的候选快照。
+    """
+    if "candidate_snapshots" in action.context:
+        action.context = {
+            key: value for key, value in action.context.items() if key != "candidate_snapshots"
+        }
+
+
 def _as_utc(value: datetime) -> datetime:
     """把数据库可能返回的朴素时间解释为 UTC。
 
@@ -3046,6 +3210,10 @@ class DeterministicWecomActionExecutor:
                 target_capture_date = date.fromordinal(raw_capture_date)
             except (ValueError, OverflowError) as error:
                 raise ValueError("批量提交动作日期范围非法") from error
+        candidate_leads = action.context.get("candidate_leads")
+        initial_records = _context_smart_table_records(
+            action.context.get("candidate_snapshots"), candidate_leads
+        )
         if self._action_service is not None:
             self._action_service.begin_domain_operation(action.id, action.claim_token)
         service = CrmSubmissionService(
@@ -3083,9 +3251,9 @@ class DeterministicWecomActionExecutor:
                 target_capture_date=target_capture_date,
             ),
             tuple(selected),
+            initial_records=initial_records,
             on_item_result=persist_item_result,
         )
-        candidate_leads = action.context.get("candidate_leads")
         labels: dict[str, str] = {}
         if isinstance(candidate_leads, list):
             # 最终名称只来自服务端冻结候选，绝不读取 callback 注入的展示文本。
@@ -3110,7 +3278,7 @@ class DeterministicWecomActionExecutor:
         )
 
     def _confirm_company_submission(self, action: ActionSnapshot) -> tuple[str, str]:
-        """重读智能表格后复用 CRM 提交服务执行单条公司线索提交。"""
+        """复用提交指令阶段快照，通过 CRM 提交服务执行单条公司线索提交。"""
 
         from app.crm.commands import format_submission_reply
         from app.crm.service import CrmSubmissionService, SubmissionCommand
@@ -3119,6 +3287,12 @@ class DeterministicWecomActionExecutor:
         target_lead_id = action.context.get("selected_lead_id", action.target_id)
         if not isinstance(request_message_id, str) or not isinstance(target_lead_id, str):
             raise ValueError("公司提交确认动作 context 不完整")
+        candidate_leads = action.context.get("candidate_leads")
+        if candidate_leads is None:
+            candidate_leads = [{"lead_id": target_lead_id}]
+        initial_records = _context_smart_table_records(
+            action.context.get("candidate_snapshots"), candidate_leads
+        )
         if self._action_service is not None:
             self._action_service.begin_domain_operation(action.id, action.claim_token)
         result = CrmSubmissionService(
@@ -3132,7 +3306,8 @@ class DeterministicWecomActionExecutor:
                 action.bound_actor_wecom_user_id,
                 request_message_id,
                 target_lead_id=target_lead_id,
-            )
+            ),
+            initial_records=initial_records,
         )
         if self._action_service is not None:
             self._action_service.record_submission_results(

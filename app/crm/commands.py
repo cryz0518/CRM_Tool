@@ -589,9 +589,12 @@ def prepare_batch_submission_selection(
         crm_adapter,
         robot_submission_confirmation_available=get_settings().wecom_card_callback_ready(),
     )
+    smart_table_records: tuple[SmartTableRecord, ...] | None = None
     if command.text in {"提交今天的线索", "提交我所有线索", CROSS_OWNER_SUBMISSION_COMMAND}:
         # 批量提交先补齐负责人范围内的未提交表格行，包括人工录入且未关联消息的行。
-        _link_unsubmitted_smart_table_records(session_factory, smart_table_adapter, command)
+        smart_table_records = _link_unsubmitted_smart_table_records(
+            session_factory, smart_table_adapter, command
+        )
     candidates = service.list_submission_candidates(
         command.text,
         command.sales_user_id,
@@ -604,6 +607,7 @@ def prepare_batch_submission_selection(
             and command.target_owner_name
             else None
         ),
+        smart_table_records=smart_table_records,
     )
     if not candidates:
         if command.text == "帮我提交放弃提交的线索":
@@ -628,6 +632,18 @@ def prepare_batch_submission_selection(
                 }
                 for item in page
             )
+            page_snapshots = tuple(
+                {
+                    "lead_id": item.lead_id,
+                    "record_id": item.record.record_id,
+                    "fields": dict(item.record.fields),
+                    "member_names": dict(item.record.member_names),
+                }
+                for item in page
+                if item.record is not None
+            )
+            if len(page_snapshots) != len(page_candidates):
+                raise ValueError("提交候选缺少首次批量查询快照")
             page_owner_scope = tuple(
                 dict.fromkeys(
                     item.owner_user_id for item in page if isinstance(item.owner_user_id, str)
@@ -640,6 +656,7 @@ def prepare_batch_submission_selection(
                 request_message_id=command.request_message_id,
                 command_text=command.text,
                 candidates=page_candidates,
+                candidate_snapshots=page_snapshots,
                 preview_markdown_chunks=build_batch_submission_markdown(
                     page_candidates,
                     page=page_number,
@@ -726,12 +743,12 @@ def _link_unsubmitted_smart_table_records(
     session_factory: sessionmaker[Session],
     smart_table_adapter: SmartTableAdapter,
     command: SubmissionCommand,
-) -> None:
+) -> tuple[SmartTableRecord, ...]:
     """为批量候选补齐负责人范围内仍未提交的表格行映射。
 
     参数：session_factory 为数据库会话工厂；smart_table_adapter 为真实表格边界；
     command 提供操作者、负责人范围、目标日期和审计消息标识。
-    返回值：无。
+    返回值：负责人范围内本次批量读取的表格快照，供候选筛选和提交回调复用。
     异常：表格协议、数据库或授权错误向调用方传播；不调用 CRM。
     副作用：仅按稳定 record_id 新增缺失 Lead 和绑定审计事实，不覆盖已有 Lead。
     """
@@ -742,7 +759,7 @@ def _link_unsubmitted_smart_table_records(
         if not owner_user_ids or (
             cross_owner_date and (len(owner_user_ids) != 1 or not command.target_owner_name)
         ):
-            return
+            return ()
         owner_names = (
             {owner_user_ids[0]: command.target_owner_name}
             if cross_owner_date and command.target_owner_name
@@ -759,11 +776,11 @@ def _link_unsubmitted_smart_table_records(
     capture_date = command.target_capture_date if cross_owner_date else None
     if command.text == "提交今天的线索":
         capture_date = datetime.now(ZoneInfo("Asia/Shanghai")).date()
-    # 日期命令将负责人、未提交状态和上海自然日合并进同一条服务端查询。
+    # 先按负责人和未提交状态做服务端筛选；日期命令再合并上海自然日条件。
     records = smart_table_adapter.get_records(
         owner_user_ids=owner_user_ids,
         owner_display_names=owner_names,
-        submission_status="未提交" if capture_date is not None else None,
+        submission_status="未提交",
         capture_date=capture_date,
     )
     day_messages: list[IncomingMessage] = []
@@ -1002,6 +1019,7 @@ def _link_unsubmitted_smart_table_records(
                     },
                 )
             )
+    return tuple(records)
 
 
 def prepare_company_submission_preview(
@@ -1096,12 +1114,22 @@ def prepare_company_submission_preview(
             }
             for index, (record, lead) in enumerate(eligible, start=1)
         )
+        candidate_snapshots = tuple(
+            {
+                "lead_id": lead.id,
+                "record_id": record.record_id,
+                "fields": dict(record.fields),
+                "member_names": dict(record.member_names),
+            }
+            for record, lead in eligible
+        )
         try:
             action_service.issue_company_candidate_confirmation_action(
                 actor_user_id=command.sales_user_id,
                 request_message_id=command.request_message_id,
                 company_name=company_name,
                 candidates=candidates,
+                candidate_snapshots=candidate_snapshots,
                 contains_match=contains_match,
                 preview_markdown_chunks=build_batch_submission_markdown(
                     tuple(
@@ -1133,6 +1161,12 @@ def prepare_company_submission_preview(
             company_name=str(record.fields.get("线索名称") or company_name),
             display_text=_company_submission_display_text(record.fields, lead),
             field_values=display_fields,
+            candidate_snapshot={
+                "lead_id": lead.id,
+                "record_id": record.record_id,
+                "fields": dict(record.fields),
+                "member_names": dict(record.member_names),
+            },
             defer_delivery=True,
         )
     except CardCapabilityUnavailable:
@@ -1719,7 +1753,9 @@ def format_submission_reply(
             "企微智能表格暂时限流或网络异常，本次未发起 CRM 提交，请稍后重新提交"
         ),
         "pre_crm_transient_failure": "提交前依赖暂时不可用，本次未发起 CRM 提交，请稍后重新提交",
-        "smart_table_snapshot_failed": "企微智能表格读取失败，本次未发起 CRM 提交，请检查表格权限或系统配置后重试",
+        "smart_table_snapshot_failed": (
+            "企微智能表格读取失败，本次未发起 CRM 提交，请检查表格权限或系统配置后重试"
+        ),
         "crm_create_retrying": "CRM 提交暂时失败，系统将自动重试",
         "crm_create_failed_pending_review": "CRM 提交失败，需要人工处理",
         "crm_followed_up": "CRM 中已存在该线索，已进行跟进",

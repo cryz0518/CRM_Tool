@@ -8,6 +8,7 @@ import json
 from collections.abc import Generator, Mapping
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -286,10 +287,19 @@ def _batch_frame_for_action(
 
 
 def _issue_today_action(
-    service: WecomActionService, lead_ids: tuple[str, ...], *, message_id: str
+    service: WecomActionService,
+    lead_ids: tuple[str, ...],
+    *,
+    message_id: str,
+    adapter: MockSmartTableAdapter | None = None,
 ) -> WecomAction:
     """发行由服务端冻结目标的 TODAY 候选动作。"""
 
+    snapshots = (
+        _candidate_snapshots_for_leads(service._session_factory, adapter, lead_ids)
+        if adapter is not None
+        else None
+    )
     return service.issue_batch_submission_action(
         actor_user_id="sales-a",
         request_message_id=message_id,
@@ -298,7 +308,48 @@ def _issue_today_action(
             {"lead_id": lead_id, "company_name": f"TODAY测试公司-{index}"}
             for index, lead_id in enumerate(lead_ids)
         ),
+        candidate_snapshots=snapshots,
     )
+
+
+def _candidate_snapshots_for_leads(
+    session_factory: sessionmaker[Session],
+    adapter: MockSmartTableAdapter,
+    lead_ids: tuple[str, ...],
+) -> tuple[dict[str, object], ...]:
+    """为动作测试读取一次候选快照，模拟提交指令阶段的批量查询。
+
+    参数：session_factory、adapter 与目标 lead_ids。
+    返回值：按线索 ID 对应的服务端记录快照。
+    异常：任一已提供线索缺少记录映射时抛出 AssertionError。
+    副作用：对 Mock 智能表格执行一次批量读取。
+    """
+    with session_factory() as session:
+        leads = list(session.scalars(select(Lead).where(Lead.id.in_(lead_ids))))
+    record_ids = tuple(
+        dict.fromkeys(
+            lead.smart_table_record_id
+            for lead in leads
+            if lead.smart_table_record_id is not None
+        )
+    )
+    records_by_id = {
+        record.record_id: record for record in adapter.get_records(record_ids=record_ids)
+    }
+    snapshots = tuple(
+        {
+            "lead_id": lead.id,
+            "record_id": record.record_id,
+            "fields": dict(record.fields),
+            "member_names": dict(record.member_names),
+        }
+        for lead in leads
+        if lead.smart_table_record_id is not None
+        and (record := records_by_id.get(lead.smart_table_record_id)) is not None
+    )
+    if len(snapshots) != len(lead_ids):
+        raise AssertionError("测试线索缺少批量快照")
+    return snapshots
 
 
 def _seed_reassignment_case(session_factory: sessionmaker[Session]) -> str:
@@ -1308,7 +1359,9 @@ def test_today_callback_claim_executor_submits_only_selected_lead(
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_ids = _seed_today_submission_leads(session_factory, adapter)
     action_service = _service(session_factory)
-    action = _issue_today_action(action_service, lead_ids, message_id="today-selection")
+    action = _issue_today_action(
+        action_service, lead_ids, message_id="today-selection", adapter=adapter
+    )
     claim = action_service.claim_callback(
         _batch_frame_for_action(action, (lead_ids[0],), msgid="today-provider-1")
     )
@@ -1331,6 +1384,11 @@ def test_today_callback_claim_executor_submits_only_selected_lead(
     assert checkbox["disable"] is True  # type: ignore[index]
     assert checkbox["option_list"] == [  # type: ignore[index]
         {
+            "id": action.context["select_all_option_id"],
+            "text": "全选本页（2条）",
+            "is_checked": False,
+        },
+        {
             "id": lead_ids[0],
             "text": "1. TODAY测试公司-0",
             "is_checked": True,
@@ -1345,7 +1403,7 @@ def test_today_callback_claim_executor_submits_only_selected_lead(
     assert execution.executed is True
     replay_execution = action_service.execute_action(action.id, executor)
     assert replay_execution.executed is False
-    assert crm.search_calls == 1 and crm.submit_calls == 1 and crm.calls == 1
+    assert crm.search_calls == 0 and crm.submit_calls == 1 and crm.calls == 1
     assert crm.update_calls == 0
     assert [payload["name"] for payload in crm.payloads] == ["TODAY测试公司-0"]
     with session_factory() as session:
@@ -1381,12 +1439,17 @@ def test_follow_up_result_is_persisted_for_all_confirmation_modes(
             company_name="TODAY测试公司-0",
             display_text="TODAY测试公司-0｜王工",
             field_values={"线索名称": "TODAY测试公司-0"},
+            candidate_snapshot=_candidate_snapshots_for_leads(
+                session_factory, adapter, tuple(lead_ids)
+            )[0],
         )
         claim = action_service.claim_callback(
             _frame_for_action(action, msgid="follow-up-company-provider")
         )
     else:
-        action = _issue_today_action(action_service, lead_ids, message_id=message_id)
+        action = _issue_today_action(
+            action_service, lead_ids, message_id=message_id, adapter=adapter
+        )
         claim = action_service.claim_callback(
             _batch_frame_for_action(
                 action, (lead_ids[0],), msgid="follow-up-batch-provider"
@@ -1454,7 +1517,12 @@ def test_follow_up_response_message_never_enters_result_notification(
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_ids = _seed_today_submission_leads(session_factory, adapter)
     action_service = _service(session_factory)
-    action = _issue_today_action(action_service, lead_ids, message_id="duplicate-message-safe")
+    action = _issue_today_action(
+        action_service,
+        lead_ids,
+        message_id="duplicate-message-safe",
+        adapter=adapter,
+    )
     claim = action_service.claim_callback(
         _batch_frame_for_action(action, (lead_ids[0],), msgid="duplicate-message-safe-1")
     )
@@ -1480,7 +1548,7 @@ def test_follow_up_response_message_never_enters_result_notification(
 
     assert claim.code == "claimed"
     assert execution.executed is True
-    assert crm.submit_calls == 1 and crm.search_calls == 1 and crm.calls == 0
+    assert crm.submit_calls == 1 and crm.search_calls == 0 and crm.calls == 0
     with session_factory() as session:
         notifications = session.scalars(
             select(NotificationRecord).where(
@@ -1518,6 +1586,7 @@ def test_today_callback_defers_temporary_lifecycle_to_worker_revalidation(
 
 def test_incomplete_submission_results_are_fenced_and_persisted_on_action(
     session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """验证批量动作只持久化安全逐条结果，且使用当前 claim token fencing。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
@@ -1525,7 +1594,14 @@ def test_incomplete_submission_results_are_fenced_and_persisted_on_action(
     record = next(iter(adapter.get_records()))
     adapter.update_record(record.record_id, {"业务线": ""})
     action_service = _service(session_factory)
-    action = _issue_today_action(action_service, lead_ids, message_id="fenced-incomplete-results")
+    action = _issue_today_action(
+        action_service,
+        lead_ids,
+        message_id="fenced-incomplete-results",
+        adapter=adapter,
+    )
+    callback_reads = Mock(wraps=adapter.get_records)
+    monkeypatch.setattr(adapter, "get_records", callback_reads)
     claim = action_service.claim_callback(
         _batch_frame_for_action(action, lead_ids, msgid="fenced-incomplete-provider")
     )
@@ -1537,6 +1613,7 @@ def test_incomplete_submission_results_are_fenced_and_persisted_on_action(
     assert claim.code == "claimed"
     assert execution.executed is True
     assert crm.search_calls == 0 and crm.calls == 0
+    assert callback_reads.call_count == 0
     with session_factory() as session:
         saved = session.get(WecomAction, action.id)
         outbox = session.scalar(
@@ -1595,6 +1672,9 @@ def test_unique_company_temporary_incomplete_is_confirmable_and_result_persisted
         company_name="TODAY测试公司-0",
         display_text="TODAY测试公司-0｜王工｜日期",
         field_values={"线索名称": "TODAY测试公司-0"},
+        candidate_snapshot=_candidate_snapshots_for_leads(
+            session_factory, adapter, (lead_ids[0],)
+        )[0],
     )
     claim = action_service.claim_callback(
         _frame_for_action(action, msgid="single-incomplete-provider")
@@ -1644,6 +1724,9 @@ def test_multiple_company_candidates_keep_incomplete_temporary_selectable(
                 "company_name": "候选公司二",
                 "display_text": "候选公司二｜王工",
             },
+        ),
+        candidate_snapshots=_candidate_snapshots_for_leads(
+            session_factory, adapter, tuple(lead_ids)
         ),
     )
     claim = action_service.claim_callback(
@@ -2279,6 +2362,9 @@ def test_company_submission_result_uses_frozen_label_and_safe_reason(
         company_name="服务端快照公司",
         display_text=frozen_label,
         field_values={"线索名称": "服务端快照公司"},
+        candidate_snapshot=_candidate_snapshots_for_leads(
+            session_factory, adapter, (lead_id,)
+        )[0],
     )
     frame = _frame_for_action(action, msgid="company-safe-result-provider")
     frame["body"]["event"]["template_card_event"]["company_name"] = "客户端注入名称"  # type: ignore[index]
@@ -2317,7 +2403,7 @@ def test_company_submission_result_uses_frozen_label_and_safe_reason(
     assert f"{frozen_label}：CRM 中已存在该线索，已进行跟进" in execution.summary
     assert "客户端注入名称" not in execution.summary
     assert "PRIVATE RAW SOP MESSAGE" not in execution.summary
-    assert crm.submit_calls == 1 and crm.search_calls == 1 and crm.calls == 0
+    assert crm.submit_calls == 1 and crm.search_calls == 0 and crm.calls == 0
     with session_factory() as session:
         assert len(session.scalars(select(WecomActionOutbox)).all()) == 1
 
@@ -2361,6 +2447,9 @@ def test_company_candidate_submission_executes_only_selected_lead_and_uses_froze
             }
             for index, lead_id in enumerate(lead_ids, start=1)
         ),
+        candidate_snapshots=_candidate_snapshots_for_leads(
+            session_factory, adapter, tuple(lead_ids)
+        ),
     )
     frame = _batch_frame_for_action(
         action, (lead_ids[1],), msgid="company-candidate-result-provider"
@@ -2386,7 +2475,7 @@ def test_company_candidate_submission_executes_only_selected_lead_and_uses_froze
     assert "CRM 提交结果（已选择 1 条）" in execution.summary
     assert f"{labels[1]}" in execution.summary
     assert "客户端注入名称" not in execution.summary
-    assert crm.search_calls == 1 and crm.submit_calls == 1 and crm.calls == 1
+    assert crm.search_calls == 0 and crm.submit_calls == 1 and crm.calls == 1
     assert crm.update_calls == 0
     assert [payload["name"] for payload in crm.payloads] == ["TODAY测试公司-1"]
     with session_factory() as session:
