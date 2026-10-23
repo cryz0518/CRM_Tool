@@ -13,7 +13,7 @@ from enum import StrEnum
 from typing import NotRequired, TypedDict
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -400,13 +400,13 @@ class CrmSubmissionService:
         )
 
     def retry_due_creates(self, *, limit: int = 20) -> int:
-        """处理已到期的 CRM create 重试及失效租约恢复。
+        """处理 CRM create 重试，并恢复已成功但未回填的表格提交状态。
 
         参数：limit 为本轮最多扫描的同步记录数，必须为正整数。
         返回值：本轮认领候选数；并发下候选可能已由其他 Worker 完成。
         异常：数据库读写错误向 Celery 传播；单条 CRM 错误由同步状态机保存。
         副作用：按配置上限并发重用已冻结 payload 与幂等键调用 CRM，并登记最终结果通知；
-        批次收尾后按持久化成功状态批量回写表格，SQLite 保持串行。
+        同时仅按持久化成功状态批量回写表格，不会因回填重放 CRM 请求。
         """
         if limit <= 0:
             raise ValueError("CRM 重试扫描数量必须大于 0")
@@ -435,7 +435,31 @@ class CrmSubmissionService:
                 .order_by(CrmSyncRecord.next_retry_at, CrmSyncRecord.id)
                 .limit(limit)
             ).all()
+            # 最新 CRM 同步已成功、本地投影仍未标记已提交的记录需要补偿回写。
+            latest_sync_id = (
+                select(func.max(CrmSyncRecord.id))
+                .where(
+                    CrmSyncRecord.lead_id == Lead.id,
+                    CrmSyncRecord.operation.in_("create", "update"),
+                )
+                .correlate(Lead)
+                .scalar_subquery()
+            )
+            submission_status = Lead.field_values["提交状态"].as_string()
+            pending_writeback_lead_ids = session.execute(
+                select(Lead.id)
+                .join(CrmSyncRecord, CrmSyncRecord.id == latest_sync_id)
+                .where(
+                    CrmSyncRecord.status == "succeeded",
+                    Lead.smart_table_record_id.is_not(None),
+                    or_(submission_status.is_(None), submission_status != "已提交"),
+                )
+                .order_by(CrmSyncRecord.id)
+                .limit(limit)
+            ).scalars().all()
         if not due_syncs:
+            # 没有 CRM 重试时仍执行一次纯表格状态回填恢复。
+            self._write_back_batch_submission_status(tuple(pending_writeback_lead_ids))
             return 0
         bind = self._session_factory.kw.get("bind")
         max_workers = min(self._crm_submission_max_concurrency, len(due_syncs))
@@ -472,8 +496,13 @@ class CrmSubmissionService:
                     for future in as_completed(futures):
                         future.result()
         finally:
+            # 补偿本批成功结果，并处理之前遗留的表格状态投影。
             self._write_back_batch_submission_status(
-                tuple(dict.fromkeys(lead_id for _, _, lead_id in due_syncs))
+                tuple(
+                    dict.fromkeys(
+                        [*pending_writeback_lead_ids, *(lead_id for _, _, lead_id in due_syncs)]
+                    )
+                )
             )
         return len(due_syncs)
 
@@ -2299,7 +2328,7 @@ class CrmSubmissionService:
     def _write_back_batch_submission_status(self, lead_ids: tuple[str, ...]) -> None:
         """查询本批最新 CRM 状态，仅批量回写已成功线索的智能表格提交状态。
 
-        参数：lead_ids 为本批提交目标。
+        参数：lead_ids 为本轮提交目标或待恢复状态回填的线索。
         返回值：无。
         异常：不向提交调用方传播；查询、智能表格或后台快照回写错误会记录告警。
         副作用：最多调用一次智能表格批量更新，并同步本地 Lead 字段快照。
