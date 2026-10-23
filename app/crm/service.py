@@ -440,7 +440,7 @@ class CrmSubmissionService:
                 select(func.max(CrmSyncRecord.id))
                 .where(
                     CrmSyncRecord.lead_id == Lead.id,
-                    CrmSyncRecord.operation.in_("create", "update"),
+                    CrmSyncRecord.operation.in_(("create", "update")),
                 )
                 .correlate(Lead)
                 .scalar_subquery()
