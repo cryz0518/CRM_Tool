@@ -150,3 +150,15 @@ class SmartTableAdapter(Protocol):
         副作用：修改目标记录的传入字段。
         """
         ...
+
+    def update_records(
+        self, records: Sequence[tuple[str, Mapping[str, object]]]
+    ) -> list[SmartTableRecord]:
+        """通过一次批量请求增量更新多条记录。
+
+        参数：records 为记录标识与字段补丁组成的序列。
+        返回值：按输入顺序排列且经适配器确认的记录快照。
+        异常：记录缺失、无权限或底层批量写入失败时由具体适配器抛出。
+        副作用：仅修改各记录明确提供的字段。
+        """
+        ...

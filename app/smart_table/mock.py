@@ -275,6 +275,21 @@ class MockSmartTableAdapter:
         self._records[record_id] = updated_record
         return updated_record
 
+    def update_records(
+        self, records: Sequence[tuple[str, Mapping[str, object]]]
+    ) -> list[SmartTableRecord]:
+        """使用 Mock 单条更新规则处理批量字段补丁。
+
+        参数：records 为记录标识与字段补丁组成的序列。
+        返回值：按输入顺序排列的更新后记录快照。
+        异常：单条记录缺失或字段校验失败时向调用方传播。
+        副作用：逐条修改 Mock 内存记录。
+        """
+        return [
+            self.update_record(record_id, fields)
+            for record_id, fields in records
+        ]
+
     def delete_record(self, _record_id: str, *, actor: SmartTableActor) -> None:
         """记录并拒绝物理删除调用，供 T14 断言逻辑废弃不删除审核表行。
 

@@ -75,6 +75,8 @@ def get_smart_table_audit_adapter() -> SmartTableAdapter:
             sheet_id=settings.wecom_audit_sheet_id,
             sheet_title=settings.wecom_audit_sheet_title,
             require_owner_field=False,
+            # 审计子表没有主线索表的“录入时间”列，写后核验不能查询该字段。
+            include_entry_time=False,
             command=settings.wecom_cli_command,
             timeout_seconds=settings.wecom_cli_timeout_seconds,
             retry_count=settings.wecom_cli_retry_count,

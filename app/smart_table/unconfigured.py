@@ -126,3 +126,14 @@ class UnconfiguredSmartTableAdapter:
         异常：始终抛出 SmartTableAdapterConfigurationError。
         """
         self._raise_not_configured()
+
+    def update_records(
+        self, records: Sequence[tuple[str, Mapping[str, object]]]
+    ) -> list[SmartTableRecord]:
+        """尝试批量更新记录，但未配置时明确失败。
+
+        参数：records 为记录标识与字段补丁组成的序列。
+        异常：始终抛出 SmartTableAdapterConfigurationError。
+        副作用：阻止调用方误以为批量表格更新已执行。
+        """
+        self._raise_not_configured()
