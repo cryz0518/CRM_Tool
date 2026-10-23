@@ -234,6 +234,17 @@ class DeterministicFirstTextLeadExtractor:
         "业务线": "业务线",
         "备注": "备注",
     }
+    _english_company_legal_suffix = re.compile(
+        r"\b(?:JSC|LLC|LTD\.?|LIMITED|INC\.?|INCORPORATED|CORP\.?|CORPORATION|PLC|GMBH|"
+        r"PTE(?:\s+LTD\.?)?|PTY(?:\s+LTD\.?)?)\s*[.,;:\"'’)]*$",
+        re.IGNORECASE,
+    )
+    _english_job_title = re.compile(
+        r"\b(?:director|manager|engineer|owner|president|founder|chief|ceo|cto|cfo|coo|"
+        r"vice president|vp|head|lead|supervisor|officer|consultant|specialist|executive|"
+        r"administrator|procurement|sales|marketing)\b",
+        re.IGNORECASE,
+    )
 
     def __init__(self, process_options: tuple[str, ...] = ()) -> None:
         """注入当前合法工艺；返回无，仅保存选项，身份提示解析不需要访问外部表格。"""
@@ -274,6 +285,10 @@ class DeterministicFirstTextLeadExtractor:
             if field_name is not None and separator and normalized_value:
                 fields[field_name] = normalized_value
 
+        # 仅在英文名片同时出现法定公司后缀和联系方式时补充解析，避免把普通英文聊天猜成线索。
+        for field_name, value in self._extract_english_business_card_fields(text).items():
+            fields.setdefault(field_name, value)
+
         # 需求只映射已注册的工艺枚举，不以自由文本虚构 CRM 字段值。
         demand = next(
             (
@@ -289,6 +304,81 @@ class DeterministicFirstTextLeadExtractor:
             # 智能表格工艺是多选，单个工艺也按列表写入，避免后续类型漂移。
             fields["工艺"] = matched_processes
 
+        return fields
+
+    @classmethod
+    def _extract_english_business_card_fields(cls, text: str) -> dict[str, str]:
+        """从高置信度英文名片版式提取身份字段，不调用模型或外部服务。
+
+        参数：text 为已持久化的消息文本。
+        返回值：仅当文本同时含公司法定后缀与联系方式时返回可核验字段，否则返回空字典。
+        异常：无。
+        副作用：无；只读取当前消息。
+        """
+        lines = [
+            line
+            for raw_line in text.splitlines()
+            if (line := raw_line.strip().rstrip("\\").strip())
+        ]
+        if not lines:
+            return {}
+
+        email_match = re.search(
+            r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])",
+            text,
+            re.IGNORECASE,
+        )
+        phone = next(
+            (
+                line
+                for line in lines
+                if re.fullmatch(r"\+?\d[\d\s().-]*\d", line)
+                and 7 <= len(re.sub(r"\D", "", line)) <= 15
+            ),
+            None,
+        )
+        company_index = next(
+            (
+                index
+                for index in range(len(lines) - 1, -1, -1)
+                if cls._english_company_legal_suffix.search(lines[index])
+            ),
+            None,
+        )
+        if company_index is None or (email_match is None and phone is None):
+            return {}
+
+        company_name = lines[company_index]
+        # 名片常把全大写公司主体与括号国家、JSC 等法律后缀分成相邻两行。
+        if (
+            company_index > 0
+            and lines[company_index].startswith(("(", "（"))
+            and lines[company_index - 1].isupper()
+            and any(character.isalpha() for character in lines[company_index - 1])
+        ):
+            company_name = f"{lines[company_index - 1]} {company_name}"
+
+        fields = {"线索名称": company_name}
+        if email_match is not None:
+            fields["邮箱"] = email_match.group(0)
+        if phone is not None:
+            fields["手机"] = phone
+
+        # 名片联系人与职务只有在首两行符合“多人名 + 职务词”时才一起落字段。
+        if len(lines) > 1:
+            name_parts = lines[0].split()
+            name_is_plausible = (
+                2 <= len(name_parts) <= 5
+                and all(
+                    part[0].isalpha()
+                    and part[0].isupper()
+                    and all(character.isalpha() or character in ".'’‑-" for character in part)
+                    for part in name_parts
+                )
+            )
+            if name_is_plausible and cls._english_job_title.search(lines[1]):
+                fields["联系人"] = lines[0]
+                fields["职务"] = lines[1]
         return fields
 
     @staticmethod

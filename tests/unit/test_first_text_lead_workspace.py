@@ -2946,6 +2946,71 @@ def test_free_form_company_contact_phone_message_is_not_unassigned(
     assert resolution.status == "assigned"
 
 
+def test_english_business_card_message_gets_a_lead_id_when_ai_misses_it(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证英文结构化名片在模型漏识别时仍通过确定性解析完成消息归属。"""
+    text = (
+        "MINH ANH NGUYEN\\\n"
+        "Director\\\n"
+        "+84 900 123 456\\\n"
+        "contact@example.vn\\\n"
+        "No. 19, Example Building,\\\n"
+        "Thanh Tri District, Ha Noi\\\n"
+        "ACME INDUSTRIES\\\n"
+        '(VIETNAM) "", JSC\\\n'
+        "Above All"
+    )
+    event_id = persist_outbox_text(
+        session_factory,
+        message_id="message-english-business-card",
+        sales_user_id="sales-english",
+        text=text,
+    )
+    provider = MockLLMProvider(
+        [
+            json.dumps(
+                {
+                    "intent": "IGNORE",
+                    "customer_reference": {},
+                    "crm_fields": {},
+                    "enrichment": {},
+                    "confidence_by_field": {},
+                    "conflicts": [],
+                    "warnings": [],
+                }
+            )
+        ]
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    company_service = CompanyLeadService(session_factory, adapter, MockTYCAdapter())
+
+    result = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        ai_gateway=AIGateway(provider),
+        company_lead_service=company_service,
+    ).consume(event_id)
+
+    assert result.lead_id is not None
+    with session_factory() as session:
+        resolution = session.scalar(
+            select(LeadMessageResolution).where(
+                LeadMessageResolution.message_id == "message-english-business-card"
+            )
+        )
+        lead = session.get(Lead, result.lead_id)
+    assert resolution is not None and resolution.status == "assigned"
+    assert resolution.lead_id == result.lead_id
+    assert lead is not None
+    assert lead.field_values["线索名称"] == 'ACME INDUSTRIES (VIETNAM) "", JSC'
+    assert lead.field_values["联系人"] == "MINH ANH NGUYEN"
+    assert lead.field_values["职务"] == "Director"
+    assert lead.field_values["手机"] == "+84 900 123 456"
+    assert lead.field_values["邮箱"] == "contact@example.vn"
+    assert lead.company_region == "foreign"
+
+
 def test_ai_semantic_segments_create_independent_resolutions(
     session_factory: sessionmaker[Session],
 ) -> None:
