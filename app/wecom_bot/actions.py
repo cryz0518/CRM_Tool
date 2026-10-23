@@ -3085,16 +3085,6 @@ class DeterministicWecomActionExecutor:
             tuple(selected),
             on_item_result=persist_item_result,
         )
-        if result.duplicate_confirmations and self._action_service is not None:
-            self._action_service.issue_duplicate_confirmation_action(
-                actor_user_id=action.bound_actor_wecom_user_id,
-                request_message_id=request_message_id,
-                duplicates=result.duplicate_confirmations,
-                owner_scope_user_ids=(
-                    tuple(owner_scope) if isinstance(owner_scope, list) else None
-                ),
-                target_capture_date=target_capture_date,
-            )
         candidate_leads = action.context.get("candidate_leads")
         labels: dict[str, str] = {}
         if isinstance(candidate_leads, list):
@@ -3157,12 +3147,6 @@ class DeterministicWecomActionExecutor:
                     }
                     for item in result.items
                 ),
-            )
-        if result.duplicate_confirmations and self._action_service is not None:
-            self._action_service.issue_duplicate_confirmation_action(
-                actor_user_id=action.bound_actor_wecom_user_id,
-                request_message_id=request_message_id,
-                duplicates=result.duplicate_confirmations,
             )
         # 唯一候选与多候选都只采用发卡时持久化的服务端标签，不读取 callback 展示字段。
         labels: dict[str, str] = {}
