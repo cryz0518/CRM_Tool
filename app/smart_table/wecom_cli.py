@@ -884,10 +884,18 @@ class WecomCliSmartTableAdapter:
                 status_field = schema.get_field("提交状态")
                 if status_field is None:
                     raise SmartTableAdapterConfigurationError("提交状态服务端筛选缺少提交状态字段")
-                conditions.append(
-                    f"{self._quote_sql_identifier(status_field.name)} = "
-                    f"{self._quote_sql_string_literal(submission_status)}"
-                )
+                status_identifier = self._quote_sql_identifier(status_field.name)
+                if submission_status == "未提交":
+                    # 人工录入行的状态可能为空；无成功标记的行仍可进入提交候选。
+                    conditions.append(
+                        f"({status_identifier} = {self._quote_sql_string_literal(submission_status)} "
+                        f"OR {status_identifier} IS NULL OR {status_identifier} = '')"
+                    )
+                else:
+                    conditions.append(
+                        f"{status_identifier} = "
+                        f"{self._quote_sql_string_literal(submission_status)}"
+                    )
             if capture_date is not None:
                 entry_time = self._quote_sql_identifier("录入时间")
                 entry_time_value = f"NULLIF({entry_time}, '')"
@@ -911,7 +919,10 @@ class WecomCliSmartTableAdapter:
                 for record in records
                 if record.fields.get("负责人") in allowed_owners
                 and (
-                    submission_status is None or record.fields.get("提交状态") == submission_status
+                    submission_status is None
+                    or record.fields.get("提交状态") == submission_status
+                    or submission_status == "未提交"
+                    and record.fields.get("提交状态") in (None, "")
                 )
             ]
         if submission_status is not None or capture_date is not None:

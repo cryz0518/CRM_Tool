@@ -785,6 +785,14 @@ def _link_unsubmitted_smart_table_records(
                 )
             )
     with session_factory.begin() as session:
+        record_ids = tuple(record.record_id for record in records)
+        linked_record_ids = set(
+            session.scalars(
+                select(Lead.smart_table_record_id).where(
+                    Lead.smart_table_record_id.in_(record_ids)
+                )
+            )
+        ) if record_ids else set()
         # 锁定负责人范围内尚未绑定表格记录的待提交 Lead，避免人工行再造同公司副本。
         day_leads = list(
             session.scalars(
@@ -826,7 +834,7 @@ def _link_unsubmitted_smart_table_records(
                 )
                 if (
                     record.fields.get("负责人") not in owner_user_ids
-                    or record.fields.get("提交状态") != "未提交"
+                    or record.fields.get("提交状态") not in (None, "", "未提交")
                     or not isinstance(company_name, str)
                     or not company_name.strip()
                     or not original_message
@@ -862,21 +870,22 @@ def _link_unsubmitted_smart_table_records(
                     message_id = matching_messages[0].message_id
                     source_matches[record.record_id] = message_id
                     source_match_counts[message_id] = source_match_counts.get(message_id, 0) + 1
-        # 只补负责人范围内状态明确为未提交的记录，不把同名行或已提交行混入候选。
+        # 只补负责人范围内未提交或空状态记录，不把已提交行混入候选。
         for record in records:
             record_owner_id = record.fields.get("负责人")
             if (
                 record_owner_id not in owner_user_ids
-                or record.fields.get("提交状态") != "未提交"
+                or record.fields.get("提交状态") not in (None, "", "未提交")
             ):
                 continue
-            if session.scalar(
-                select(Lead.id).where(Lead.smart_table_record_id == record.record_id)
-            ) is not None:
+            if record.record_id in linked_record_ids:
                 continue
-            company_name = record.fields.get("线索名称")
-            if not isinstance(company_name, str) or not company_name.strip():
+            company_name_value = record.fields.get("线索名称")
+            if company_name_value is not None and not isinstance(company_name_value, str):
                 continue
+            company_name = (
+                company_name_value.strip() if isinstance(company_name_value, str) else None
+            )
             source_message_id: str | None = None
             row_date = CrmSubmissionService._parse_capture_date(
                 record.fields.get("录入时间") or record.fields.get("创建时间")
@@ -897,7 +906,8 @@ def _link_unsubmitted_smart_table_records(
                 matching_leads = [
                     lead
                     for lead in day_leads
-                    if lead.smart_table_record_id is None
+                    if company_name is not None
+                    and lead.smart_table_record_id is None
                     and lead.source_message_id == source_message_id
                     and lead.smart_table_owner_user_id == record_owner_id
                     and lead.lifecycle_state in {"pending_create", "temporary"}
@@ -919,7 +929,8 @@ def _link_unsubmitted_smart_table_records(
                 matching_source_leads = [
                     lead
                     for lead in source_leads
-                    if lead.smart_table_record_id is None
+                    if company_name is not None
+                    and lead.smart_table_record_id is None
                     and (
                         lead.standard_company_name == company_name
                         or lead.field_values.get("线索名称") == company_name
@@ -937,7 +948,8 @@ def _link_unsubmitted_smart_table_records(
                 matching_leads = [
                     lead
                     for lead in day_leads
-                    if lead.smart_table_owner_user_id == record_owner_id
+                    if company_name is not None
+                    and lead.smart_table_owner_user_id == record_owner_id
                     and (
                         lead.standard_company_name == company_name
                         or lead.field_values.get("线索名称") == company_name
@@ -969,6 +981,7 @@ def _link_unsubmitted_smart_table_records(
             )
             if linked is not None:
                 linked_count += 1
+                linked_record_ids.add(record.record_id)
                 if all(lead.id != linked.id for lead in day_leads):
                     day_leads.append(linked)
         if linked_count and session.scalar(
@@ -1015,7 +1028,11 @@ def prepare_company_submission_preview(
     if not records:
         return "未找到该公司名称的线索，请确认智能表格中的线索名称后重试。"
     # 指定线索候选必须仍是未提交；字段完整性不在预览阶段筛除。
-    records = [record for record in records if record.fields.get("提交状态") == "未提交"]
+    records = [
+        record
+        for record in records
+        if record.fields.get("提交状态") in (None, "", "未提交")
+    ]
     if not records:
         return "已找到该公司记录，但当前没有可提交的未提交线索。"
 
@@ -1225,15 +1242,20 @@ def _link_existing_smart_table_record(
     """把负责人范围内的既有表格记录安全登记为待提交 Lead。
 
     参数：session 为当前事务；record 为智能表格快照；command 提供当前销售和审计消息。
-    返回值：新建或已存在的 Lead；负责人不匹配或公司名无效时返回 None。
+    返回值：新建或已存在的 Lead；负责人不匹配或公司名类型异常时返回 None。
     异常：数据库约束异常向调用方传播；不调用外部 CRM。
     副作用：写入一条 pending_create Lead；write_audit 为 True 时追加绑定审计事件。
     """
     expected_owner_id = owner_user_id or command.sales_user_id
     owner = record.fields.get("负责人")
-    company_name = record.fields.get("线索名称")
-    if owner != expected_owner_id or not isinstance(company_name, str) or not company_name:
+    company_name_value = record.fields.get("线索名称")
+    if owner != expected_owner_id or (
+        company_name_value is not None and not isinstance(company_name_value, str)
+    ):
         return None
+    company_name = (
+        company_name_value.strip() if isinstance(company_name_value, str) else None
+    )
     existing = session.scalar(
         select(Lead).where(Lead.smart_table_record_id == record.record_id).with_for_update()
     )
@@ -1265,6 +1287,7 @@ def _link_existing_smart_table_record(
                 raise
     # 只按稳定表格记录标识绑定，不按名称猜测或把另一条 Lead 强行合并进来。
     field_values = {name: value for name, value in record.fields.items() if value is not None}
+    # 表格中的人工空名行先建立映射，最终 CRM 必填校验会将其拦截为待完善。
     lead = Lead(
         id=new_lead_id(),
         source_message_id=source_message_id,
@@ -1273,10 +1296,12 @@ def _link_existing_smart_table_record(
         smart_table_record_id=record.record_id,
         lifecycle_state="pending_create",
         field_values=field_values,
-        standard_company_name=company_name,
+        standard_company_name=company_name or None,
         company_region="unknown",
-        company_verification_status="user_confirmed_unverified",
-        company_confirmed_by_user=True,
+        company_verification_status=(
+            "user_confirmed_unverified" if company_name else "incomplete_company"
+        ),
+        company_confirmed_by_user=bool(company_name),
     )
     session.add(lead)
     if write_audit:
@@ -1694,6 +1719,7 @@ def format_submission_reply(
             "企微智能表格暂时限流或网络异常，本次未发起 CRM 提交，请稍后重新提交"
         ),
         "pre_crm_transient_failure": "提交前依赖暂时不可用，本次未发起 CRM 提交，请稍后重新提交",
+        "smart_table_snapshot_failed": "企微智能表格读取失败，本次未发起 CRM 提交，请检查表格权限或系统配置后重试",
         "crm_create_retrying": "CRM 提交暂时失败，系统将自动重试",
         "crm_create_failed_pending_review": "CRM 提交失败，需要人工处理",
         "crm_followed_up": "CRM 中已存在该线索，已进行跟进",
