@@ -522,21 +522,25 @@ class LeadReviewService:
         *,
         initial_record: SmartTableRecord | None = None,
     ) -> SubmissionReconcileResult:
-        """重读表格、落实 T09 人工编辑并返回不含审核元数据的最终快照。
+        """基于传入或新读的表格快照落实 T09 人工编辑并返回最终快照。
 
-        参数：lead_id 为准备首次 CRM 创建的线索标识；initial_record 为批量回调的新鲜整表快照，
-        记录标识不匹配时会重新读取目标行。
+        参数：lead_id 为准备首次 CRM 创建的线索标识；initial_record 为提交指令阶段读取的表格快照。
+        提交批次传入该值后不会重新查询，记录标识不匹配时安全失败。
         返回值：当前表格的业务字段和仍会阻塞 CRM minimum 的待确认字段。
         异常：线索或表格记录缺失时抛出 ValueError；适配器错误向调用方传播。
         副作用：发现人工编辑时更新 provenance、AI待确认 和审计记录。
         """
         record, lead = self._read_record_for_lead(lead_id, initial_record=initial_record)
         protected = self._reconcile_user_edits(lead, record.fields, lead.source_message_id)
-        # 若本轮移除了 AI待确认，必须再读一次，最终快照不能携带旧审核元数据。
-        if protected:
-            record, _ = self._read_record_for_lead(lead_id)
+        # 同步后的 AI待确认 值由本地快照确定，不再为了确认写入结果额外回读。
         pending = self._confirmation_names(record.fields.get(AI_CONFIRMATION_FIELD))
         pending.difference_update(protected)
+        if protected:
+            record = SmartTableRecord(
+                record_id=record.record_id,
+                fields={**record.fields, AI_CONFIRMATION_FIELD: sorted(pending)},
+                member_names=record.member_names,
+            )
         fields = {
             name: value for name, value in record.fields.items() if name != AI_CONFIRMATION_FIELD
         }
@@ -699,7 +703,7 @@ class LeadReviewService:
         参数：lead_id 为目标线索标识；initial_record 为可复用的批量快照。
         返回值：智能表格记录和脱离会话的 Lead 事实。
         异常：线索或记录定位缺失、表格负责人与后台负责人不一致时抛出 ValueError。
-        副作用：读取数据库；没有匹配的批量快照时读取智能表格单行。
+        副作用：读取数据库；没有提供快照时读取智能表格单行，提供了错误快照时安全失败。
         """
         with self._session_factory() as session:
             lead = self._require_lead(session, lead_id)

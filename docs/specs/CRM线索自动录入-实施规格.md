@@ -123,7 +123,7 @@
 - 消息路由采用三段式：精确提交命令走 deterministic fast path；submission-like 自由文本走 AI Intent Router（例如“请把我所有能提交的线索都提交一下”应识别为 `SUBMIT_ALL`）；普通客户信息和补充消息直接进入 Lead pipeline。Intent Router 只确定工作流意图，目标线索、授权和 CRM 写入仍由服务端确定性校验及批量候选卡确认。
 - CRM 写操作支持“提交今天的线索”“提交我所有线索”“帮我提交放弃提交的线索”“提交我的更新”；批量命令先发行候选卡，销售不能手动修改“提交状态”。
 - `pending_create` 项目级最小必填为公司/线索名称、业务线、手机号/电话/邮箱至少一种。CRM Adapter 仍要执行 CRM 接口自身硬性校验，且其实际要求优先。
-- 提交前必须重新读取智能表格，构造 Final Snapshot 与规范化 CRM Payload，处理人工编辑、公司状态、枚举、格式、地点和必填校验。批量提交始终部分成功。
+- 销售发送提交指令前自行核对智能表格；系统收到指令后按候选范围一次批量读取，构造 Final Snapshot 与规范化 CRM Payload，处理人工编辑、公司状态、枚举、格式、地点和必填校验。候选卡回调复用该快照，不再回读；批量读取失败不得退化为逐条查询。批量提交始终部分成功。
 - “提交我的更新”仅分页读取当前 Smart Table Owner 的已同步记录。由统一 Payload Builder 规范化并比较当前 CRM Payload 与 Last Successful CRM Snapshot；AI待确认、内部状态、置信度、字段排序及标准化后等价的空值不构成更新。
 - T12 首次 CRM create 的幂等键为 Lead 级稳定键 `crm:create:{lead_id}`；一个 CRM Sync Record 表示该逻辑 create 及其所有 retry。规范最终快照哈希只保存实际提交事实，不参与 create 幂等键；timeout/transport error 后复用原记录、原键和原 payload，绝不重读表格替换 payload 再 create。T13 的 update 幂等契约另行定义。
 - CRM Sync Record 至少保存幂等键、表格记录、操作、快照哈希、CRM lead ID、提交销售、CRM 负责人（可取得时）、状态、尝试次数、响应摘要、创建与完成时间。

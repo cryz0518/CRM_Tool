@@ -20,4 +20,13 @@ def submit_today_via_selection(
 
     command = SubmissionCommand("提交今天的线索", sales_user_id, request_message_id)
     candidates = service.list_submission_candidates(command.text, command.sales_user_id)
-    return service.submit_selected(command, tuple(candidate.lead_id for candidate in candidates))
+    snapshots = {
+        candidate.record.record_id: candidate.record
+        for candidate in candidates
+        if candidate.record is not None
+    }
+    return service.submit_selected(
+        command,
+        tuple(candidate.lead_id for candidate in candidates),
+        initial_records=snapshots,
+    )
