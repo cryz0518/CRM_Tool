@@ -5,6 +5,7 @@ log
 backups
 .git
 .codegraph
+.deploy/
 .mypy_cache
 .pytest_cache
 .ruff_cache

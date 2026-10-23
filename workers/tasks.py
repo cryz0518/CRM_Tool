@@ -892,12 +892,12 @@ def schedule_daily_unsubmitted_lead_reminders() -> int:
 
 @celery_app.task(name="workers.retry_pending_crm_submissions")  # type: ignore[untyped-decorator]
 def retry_pending_crm_submissions() -> int:
-    """扫描到期 CRM create 重试并通过现有服务写入结果通知。
+    """扫描到期 CRM create 重试，并恢复成功记录的智能表格提交状态。
 
     参数：无。
     返回值：本轮扫描的到期同步记录数。
     异常：数据库或适配器初始化错误向 Celery 传播；单条 CRM 失败由服务持久化处理。
-    副作用：重用冻结请求调用 CRM；最终结果进入企微通知 Outbox。
+    副作用：按持久化状态重用冻结请求调用 CRM；成功状态回填仅调用智能表格，不重放 CRM。
     """
     engine, factory = _session_factory()
     try:
