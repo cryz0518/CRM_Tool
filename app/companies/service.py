@@ -157,6 +157,14 @@ class CompanyRegionResolver:
         ) or re.search(rf"总部(?:位于|设在|坐落于|注册于|在)(?:{countries})", message_text):
             return CompanyRegion.FOREIGN
         english_countries = "|".join(re.escape(country) for country in self._foreign_countries_en)
+        # 公司法定名中括号包裹的国家明确指向公司主体，不等同于英文名称风格猜测。
+        company_name = evidence.company_name or ""
+        if re.search(
+            rf"[（(]\s*(?:{english_countries})\s*[）)]",
+            company_name,
+            flags=re.IGNORECASE,
+        ):
+            return CompanyRegion.FOREIGN
         if re.search(
             rf"\b(?:company|customer|headquarters|subsidiary|factory)\b[^.;!?]{{0,60}}"
             rf"\b(?:based in|located in|registered in|in)\s+(?:{english_countries})\b",

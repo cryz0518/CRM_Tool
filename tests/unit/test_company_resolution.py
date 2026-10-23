@@ -158,6 +158,19 @@ def test_foreign_company_name_alone_does_not_prove_foreign_region() -> None:
     assert CompanyRegionResolver().resolve(evidence) is CompanyRegion.UNKNOWN
 
 
+def test_country_in_foreign_company_legal_name_and_address_proves_foreign_region() -> None:
+    """验证法定名称中的国家和同一客户的境外地址可以共同确认国外地域。"""
+    evidence = CompanyRegionEvidence(
+        message_text=(
+            "No. 19, Example Building, Thanh Tri District, Ha Noi\n"
+            "ACME INDUSTRIES\n(VIETNAM), JSC"
+        ),
+        company_name="ACME INDUSTRIES (VIETNAM), JSC",
+    )
+
+    assert CompanyRegionResolver().resolve(evidence) is CompanyRegion.FOREIGN
+
+
 def test_missing_company_creates_temporary_lead_until_a_verified_name_is_available(
     session_factory: sessionmaker[Session],
 ) -> None:
