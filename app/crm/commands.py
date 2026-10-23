@@ -616,8 +616,8 @@ def prepare_batch_submission_selection(
         card_callback_ready=get_settings().wecom_card_callback_ready(),
     )
     try:
-        # 全选是独立菜单操作，不占用选择项；每张卡可展示平台允许的 20 条线索。
-        page_size = 20
+        # 投票卡选项上限为 20，保留一项给可见的全选入口。
+        page_size = 19
         pages = [
             candidates[start : start + page_size] for start in range(0, len(candidates), page_size)
         ]

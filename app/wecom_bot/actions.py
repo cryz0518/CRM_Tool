@@ -960,8 +960,9 @@ class WecomActionService:
                     )
                 )
                 card_selected_option_ids = (
-                    candidate_ids
-                    if select_all_option_id is not None and select_all_option_id in selected
+                    (*candidate_ids, select_all_option_id)
+                    if isinstance(select_all_option_id, str)
+                    and select_all_option_id in selected
                     else callback.selected_option_ids
                 )
                 frozen_card_update = _freeze_vote_card_update(action, card_selected_option_ids)
@@ -1719,14 +1720,14 @@ class WecomActionService:
         """发行批量提交候选卡，负责人范围只保存在服务端动作上下文。
 
         参数：actor_user_id 为销售身份；request_message_id 为命令消息；command_text 为固定命令；
-        candidates 仅含服务端线索标识和展示名称；每页最多 20 条，另提供独立的全选操作。
+        candidates 仅含服务端线索标识和展示名称；每页最多 19 条，另占一个选项展示全选入口。
         preview_markdown_chunks 为同一页 Smart Table 快照的完整 Markdown 分片。
         返回值：已持久化的候选选择动作。
         异常：候选数据、卡片能力或权限不满足时抛出异常。
         副作用：写入动作、卡片通知和发送 outbox，不调用 CRM。
         """
 
-        if not candidates or len(candidates) > 20 or page < 1 or page_count < page:
+        if not candidates or len(candidates) > 19 or page < 1 or page_count < page:
             raise ValueError("批量提交候选数量非法")
         if command_text == CROSS_OWNER_SUBMISSION_COMMAND:
             if (
@@ -1752,6 +1753,8 @@ class WecomActionService:
             "command_text": command_text,
             "request_message_id": request_message_id,
             "candidate_leads": [dict(item) for item in candidates],
+            # 投票卡最多 20 个选项，预留一项让全选入口在卡片正文中直接可见。
+            "select_all_option_id": f"{_BATCH_SELECT_ALL_OPTION_PREFIX}{target_id[:24]}",
             "page": page,
             "page_count": page_count,
             "owner_scope_user_ids": (
@@ -2110,7 +2113,7 @@ def _batch_submission_card_copy(
     """
     title = "重新提交放弃线索" if "放弃提交" in command_text else "选择要提交的线索"
     page_suffix = f"（第 {page}/{page_count} 批）" if page_count > 1 else ""
-    description = "请勾选需要提交的线索，点击右上角“全选本页”可选择全部线索" + page_suffix
+    description = "勾选“全选本页”可一次选择全部线索，也可逐条勾选后确认提交" + page_suffix
     return title + page_suffix, description
 
 
@@ -2204,15 +2207,7 @@ def build_action_card(
         else:
             submit_text = "继续提交"
         payload["submit_button"] = {"text": submit_text, "key": submit_key}
-        if selection_key == CARD_EVENT_KEY_CRM_BATCH_SUBMISSION:
-            # 投票卡仅支持一个底部提交按钮，全选操作放入右上角 action_menu。
-            payload["action_menu"] = {
-                "desc": "批量操作",
-                "action_list": [
-                    {"text": "全选本页", "key": CARD_EVENT_KEY_CRM_BATCH_SELECT_ALL}
-                ],
-            }
-        elif selection_options is None:
+        if selection_key != CARD_EVENT_KEY_CRM_BATCH_SUBMISSION and selection_options is None:
             payload["action_menu"] = {
                 "desc": "重复线索处理",
                 "action_list": [{"text": "停止提交", "key": CARD_EVENT_KEY_CRM_DUPLICATE_STOP}],
