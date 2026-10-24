@@ -538,9 +538,23 @@ class CrmSubmissionService:
             )
             if record is not None:
                 # 后台负责人和当前表格负责人不一致时，不读取或映射他人的成员身份。
-                if record.fields.get("负责人") != lead.smart_table_owner_user_id:
-                    return None
+                record_owner_id = record.fields.get("负责人")
                 member_names = getattr(record, "member_names", {})
+                inferred_owner_name = (
+                    member_names.get("负责人")
+                    if isinstance(member_names, Mapping)
+                    else None
+                )
+                owner_matches = record_owner_id == lead.smart_table_owner_user_id
+                if not owner_matches:
+                    # 空负责人快照仅在候选阶段经唯一消息匹配后才会附带可信姓名。
+                    owner_matches = (
+                        record_owner_id in (None, "")
+                        and isinstance(inferred_owner_name, str)
+                        and bool(inferred_owner_name.strip())
+                    )
+                if not owner_matches:
+                    return None
                 if isinstance(member_names, Mapping):
                     candidate = member_names.get("负责人")
                     if isinstance(candidate, str) and candidate.strip():
@@ -1016,7 +1030,8 @@ class CrmSubmissionService:
                 if sync_status in {"succeeded", "abandoned"}:
                     continue
                 if not self._is_unsubmitted_smart_table_record(
-                    lead, snapshot=smart_table_snapshot
+                    lead,
+                    snapshot=smart_table_snapshot,
                 ):
                     continue
             else:
@@ -1035,7 +1050,13 @@ class CrmSubmissionService:
                 if sync_status in {"succeeded", "abandoned"}:
                     continue
                 if not self._is_unsubmitted_smart_table_record(
-                    lead, snapshot=smart_table_snapshot
+                    lead,
+                    snapshot=smart_table_snapshot,
+                    expected_owner_name=(
+                        query_owner_names.get(lead.smart_table_owner_user_id)
+                        if target_capture_date is not None and len(owner_user_ids) == 1
+                        else None
+                    ),
                 ):
                     continue
             # 筛选以当前 Smart Table 快照为准；候选只保留名称，字段快照不进入确认通知。
@@ -2693,11 +2714,16 @@ class CrmSubmissionService:
         return CrmSubmissionService._shanghai_date(parsed_datetime)
 
     def _is_unsubmitted_smart_table_record(
-        self, lead: Lead, *, snapshot: Mapping[str, SmartTableRecord] | None = None
+        self,
+        lead: Lead,
+        *,
+        snapshot: Mapping[str, SmartTableRecord] | None = None,
+        expected_owner_name: str | None = None,
     ) -> bool:
         """读取智能表格当前提交状态，确认批量提交只处理未提交或空状态记录。
 
-        参数：lead 为后台线索；snapshot 为本次批量操作已读取的表格快照，可避免重复 CLI 调用。
+        参数：lead 为后台线索；snapshot 为本次批量操作已读取的表格快照，可避免重复 CLI 调用；
+        expected_owner_name 只由日期命令为唯一匹配的空负责人行提供。
         返回值：记录存在且当前状态为未提交或空值时返回 True。
         异常：表格读取失败时由适配器抛出。
         副作用：snapshot 缺失时读取一次远端记录，不修改数据。
@@ -2709,11 +2735,18 @@ class CrmSubmissionService:
             if snapshot is not None
             else self._read_smart_table_record(lead.smart_table_record_id)
         )
-        return (
-            record is not None
-            and record.fields.get("负责人") == lead.smart_table_owner_user_id
-            and record.fields.get("提交状态") in (None, "", "未提交")
-        )
+        if record is None:
+            return False
+        record_owner_id = record.fields.get("负责人")
+        owner_matches = record_owner_id == lead.smart_table_owner_user_id
+        if not owner_matches and expected_owner_name:
+            owner_matches = (
+                record_owner_id in (None, "")
+                and isinstance(expected_owner_name, str)
+                and bool(expected_owner_name.strip())
+                and record.member_names.get("负责人") == expected_owner_name
+            )
+        return owner_matches and record.fields.get("提交状态") in (None, "", "未提交")
 
     @staticmethod
     def _is_create_candidate(
@@ -3224,19 +3257,33 @@ class CrmSubmissionService:
             )
         )
         if existing is None:
-            session.add(
-                BusinessAuditEvent(
-                    message_id=sync.request_message_id,
-                    sales_user_id=sales_user_id,
-                    event_type=event_type,
-                    details={
-                        "lead_id": sync.lead_id,
-                        "record_id": sync.smart_table_record_id,
-                        "crm_sync_record_id": str(sync.id),
-                        **(details or {}),
-                    },
-                )
-            )
+            try:
+                # 并发线索可能共用一条请求消息；唯一审计事件冲突不能回滚 CRM 成功事实。
+                with session.begin_nested():
+                    session.add(
+                        BusinessAuditEvent(
+                            message_id=sync.request_message_id,
+                            sales_user_id=sales_user_id,
+                            event_type=event_type,
+                            details={
+                                "lead_id": sync.lead_id,
+                                "record_id": sync.smart_table_record_id,
+                                "crm_sync_record_id": str(sync.id),
+                                **(details or {}),
+                            },
+                        )
+                    )
+                    session.flush()
+            except IntegrityError:
+                # 仅吞掉同一审计键的并发重复；外键等其它完整性错误继续失败。
+                if session.scalar(
+                    select(BusinessAuditEvent.id).where(
+                        BusinessAuditEvent.message_id == sync.request_message_id,
+                        BusinessAuditEvent.event_type == event_type,
+                    )
+                ) is None:
+                    raise
+                return
             _LOGGER.info(
                 "crm_submission_event=%s message_id=%s lead_id=%s record_id=%s "
                 "crm_sync_record_id=%s",

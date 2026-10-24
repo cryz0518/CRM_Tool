@@ -874,11 +874,17 @@ class WecomCliSmartTableAdapter:
             if owner_field is None:
                 raise SmartTableAdapterConfigurationError("负责人范围查询缺少负责人字段")
             # 当前服务端未按 user filter_spec 返回记录，改用姓名预筛再严格核对 user_id。
+            owner_identifier = self._quote_sql_identifier(owner_field.name)
             owner_where = " OR ".join(
-                f"{self._quote_sql_identifier(owner_field.name)} LIKE "
+                f"{owner_identifier} LIKE "
                 f"{self._quote_sql_string_literal('%' + name + '%')}"
                 for name in owner_display_names.values()
             )
+            if capture_date is not None:
+                # 日期查询允许业务层核对负责人为空的人工行，其他查询仍严格按负责人隔离。
+                owner_where = (
+                    f"({owner_where} OR {owner_identifier} IS NULL OR {owner_identifier} = '')"
+                )
             conditions = [f"({owner_where})"]
             if submission_status is not None:
                 status_field = schema.get_field("提交状态")
@@ -917,7 +923,13 @@ class WecomCliSmartTableAdapter:
             return [
                 record
                 for record in records
-                if record.fields.get("负责人") in allowed_owners
+                if (
+                    record.fields.get("负责人") in allowed_owners
+                    or (
+                        capture_date is not None
+                        and record.fields.get("负责人") in (None, "")
+                    )
+                )
                 and (
                     submission_status is None
                     or record.fields.get("提交状态") == submission_status

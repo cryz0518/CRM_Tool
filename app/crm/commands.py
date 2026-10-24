@@ -754,6 +754,11 @@ def _link_unsubmitted_smart_table_records(
     """
     cross_owner = command.text == CROSS_OWNER_SUBMISSION_COMMAND
     cross_owner_date = cross_owner and command.target_capture_date is not None
+    allow_unassigned_owner = (
+        cross_owner_date
+        and len(command.owner_scope_user_ids or ()) == 1
+        and bool(command.target_owner_name)
+    )
     if cross_owner:
         owner_user_ids = command.owner_scope_user_ids or ()
         if not owner_user_ids or (
@@ -839,8 +844,9 @@ def _link_unsubmitted_smart_table_records(
         linked_count = 0
         source_matches: dict[str, str] = {}
         source_match_counts: dict[str, int] = {}
+        verified_unassigned_record_ids: set[str] = set()
         if capture_date is not None:
-            # 没有表格录入日期时，才通过原始消息全文唯一匹配来源日期。
+            # 无负责人行必须通过目标销售当天唯一的公司名消息确定归属。
             for record in records:
                 company_name = record.fields.get("线索名称")
                 remark = record.fields.get("备注")
@@ -849,19 +855,30 @@ def _link_unsubmitted_smart_table_records(
                     if isinstance(remark, str) and "原始消息：" in remark
                     else None
                 )
+                record_owner_id = record.fields.get("负责人")
+                unassigned_owner = record_owner_id in (None, "")
+                row_date = CrmSubmissionService._parse_capture_date(
+                    record.fields.get("录入时间") or record.fields.get("创建时间")
+                )
                 if (
-                    record.fields.get("负责人") not in owner_user_ids
-                    or record.fields.get("提交状态") not in (None, "", "未提交")
+                    record_owner_id not in owner_user_ids
+                    and not (allow_unassigned_owner and unassigned_owner)
+                ) or (
+                    record.fields.get("提交状态") not in (None, "", "未提交")
+                    or row_date is not None and row_date != capture_date
+                    or row_date is not None and not unassigned_owner
                     or not isinstance(company_name, str)
                     or not company_name.strip()
-                    or not original_message
                 ):
+                    continue
+                if original_message is None and not unassigned_owner:
+                    # 有负责人且没有表格日期时，历史行仍须提供完整原始消息才能回链。
                     continue
                 normalized_name = company_name.strip()
                 matching_messages = []
                 for message in day_messages:
-                    # 公司名不能区分跨日重名；要求表格原始消息与目标日来源消息完全一致。
-                    if original_message != (message.normalized_text or "").strip():
+                    message_text = (message.normalized_text or "").strip()
+                    if original_message is not None and original_message != message_text:
                         continue
                     first_line = next(
                         (
@@ -871,7 +888,7 @@ def _link_unsubmitted_smart_table_records(
                         ),
                         "",
                     )
-                    # 名称后的首字符必须是边界，避免把更长的另一个公司名当成命中。
+                    # 公司名必须位于消息首行并有边界，避免把较长公司名当成目标公司。
                     has_name_prefix = (
                         first_line[: len(normalized_name)].casefold()
                         == normalized_name.casefold()
@@ -890,8 +907,16 @@ def _link_unsubmitted_smart_table_records(
         # 只补负责人范围内未提交或空状态记录，不把已提交行混入候选。
         for record in records:
             record_owner_id = record.fields.get("负责人")
+            unassigned_owner = record_owner_id in (None, "")
+            effective_owner_id = (
+                record_owner_id
+                if record_owner_id in owner_user_ids
+                else owner_user_ids[0]
+                if allow_unassigned_owner and unassigned_owner
+                else None
+            )
             if (
-                record_owner_id not in owner_user_ids
+                effective_owner_id is None
                 or record.fields.get("提交状态") not in (None, "", "未提交")
             ):
                 continue
@@ -908,10 +933,10 @@ def _link_unsubmitted_smart_table_records(
                 record.fields.get("录入时间") or record.fields.get("创建时间")
             )
             if capture_date is not None:
-                # 表格时间可以直接证明手工行日期；无时间时仍要求原始消息唯一匹配。
+                # 无负责人行即使有表格日期，也必须由目标负责人的唯一原始消息认领。
                 if row_date is not None and row_date != capture_date:
                     continue
-                if row_date is None:
+                if unassigned_owner or row_date is None:
                     source_message_id = source_matches.get(record.record_id)
                     if (
                         source_message_id is None
@@ -926,7 +951,7 @@ def _link_unsubmitted_smart_table_records(
                     if company_name is not None
                     and lead.smart_table_record_id is None
                     and lead.source_message_id == source_message_id
-                    and lead.smart_table_owner_user_id == record_owner_id
+                    and lead.smart_table_owner_user_id == effective_owner_id
                     and lead.lifecycle_state in {"pending_create", "temporary"}
                     and (
                         lead.standard_company_name == company_name
@@ -936,6 +961,8 @@ def _link_unsubmitted_smart_table_records(
                 if len(matching_leads) == 1:
                     matching_leads[0].smart_table_record_id = record.record_id
                     linked_count += 1
+                    if unassigned_owner:
+                        verified_unassigned_record_ids.add(record.record_id)
                     continue
                 if len(matching_leads) > 1:
                     continue
@@ -956,6 +983,8 @@ def _link_unsubmitted_smart_table_records(
                 if len(matching_source_leads) == 1:
                     matching_source_leads[0].smart_table_record_id = record.record_id
                     linked_count += 1
+                    if unassigned_owner:
+                        verified_unassigned_record_ids.add(record.record_id)
                     continue
                 if source_leads:
                     # 同一消息已有其他 Lead 时不猜测分段，也不制造来源唯一键冲突。
@@ -966,7 +995,7 @@ def _link_unsubmitted_smart_table_records(
                     lead
                     for lead in day_leads
                     if company_name is not None
-                    and lead.smart_table_owner_user_id == record_owner_id
+                    and lead.smart_table_owner_user_id == effective_owner_id
                     and (
                         lead.standard_company_name == company_name
                         or lead.field_values.get("线索名称") == company_name
@@ -992,13 +1021,16 @@ def _link_unsubmitted_smart_table_records(
                 session,
                 record,
                 command,
-                owner_user_id=record_owner_id,
+                owner_user_id=effective_owner_id,
                 source_message_id=source_message_id,
+                allow_unassigned_owner=unassigned_owner and source_message_id is not None,
                 write_audit=False,
             )
             if linked is not None:
                 linked_count += 1
                 linked_record_ids.add(record.record_id)
+                if unassigned_owner:
+                    verified_unassigned_record_ids.add(record.record_id)
                 if all(lead.id != linked.id for lead in day_leads):
                     day_leads.append(linked)
         if linked_count and session.scalar(
@@ -1019,7 +1051,18 @@ def _link_unsubmitted_smart_table_records(
                     },
                 )
             )
-    return tuple(records)
+    return tuple(
+        replace(
+            record,
+            member_names={
+                **record.member_names,
+                "负责人": command.target_owner_name or "",
+            },
+        )
+        if record.record_id in verified_unassigned_record_ids
+        else record
+        for record in records
+    )
 
 
 def prepare_company_submission_preview(
@@ -1271,11 +1314,13 @@ def _link_existing_smart_table_record(
     *,
     owner_user_id: str | None = None,
     source_message_id: str | None = None,
+    allow_unassigned_owner: bool = False,
     write_audit: bool = True,
 ) -> Lead | None:
     """把负责人范围内的既有表格记录安全登记为待提交 Lead。
 
-    参数：session 为当前事务；record 为智能表格快照；command 提供当前销售和审计消息。
+    参数：session 为当前事务；record 为智能表格快照；command 提供当前销售和审计消息；
+    allow_unassigned_owner 仅供日期命令在目标销售原始消息唯一匹配后绑定空负责人行。
     返回值：新建或已存在的 Lead；负责人不匹配或公司名类型异常时返回 None。
     异常：数据库约束异常向调用方传播；不调用外部 CRM。
     副作用：写入一条 pending_create Lead；write_audit 为 True 时追加绑定审计事件。
@@ -1283,7 +1328,12 @@ def _link_existing_smart_table_record(
     expected_owner_id = owner_user_id or command.sales_user_id
     owner = record.fields.get("负责人")
     company_name_value = record.fields.get("线索名称")
-    if owner != expected_owner_id or (
+    owner_matches = owner == expected_owner_id or (
+        allow_unassigned_owner
+        and owner in (None, "")
+        and source_message_id is not None
+    )
+    if not owner_matches or (
         company_name_value is not None and not isinstance(company_name_value, str)
     ):
         return None
@@ -1298,6 +1348,11 @@ def _link_existing_smart_table_record(
             existing.smart_table_owner_user_id == expected_owner_id
             and existing.lifecycle_state in {"pending_create", "temporary"}
         ):
+            if (
+                allow_unassigned_owner
+                and existing.source_message_id not in (None, source_message_id)
+            ):
+                return None
             if existing.source_message_id is None and source_message_id is not None:
                 existing.source_message_id = source_message_id
             return existing
