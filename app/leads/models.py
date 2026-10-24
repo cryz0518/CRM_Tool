@@ -38,8 +38,8 @@ def new_lead_id() -> str:
 def serialize_field_value(value: object) -> str:
     """将智能表格字段值保存为字段来源表可接受的文本。
 
-    参数：value 为字符串或工艺多选列表等业务字段值。
-    返回值：字符串原样返回；列表以无空格 JSON 保存，便于精确恢复多选顺序和值。
+    参数：value 为字符串或工艺多选、地区定位等结构化业务字段值。
+    返回值：字符串原样返回；其他 JSON 值以紧凑 JSON 保存。
     异常：无法 JSON 序列化的值向调用方抛出 TypeError。
     副作用：无。
     """
@@ -66,14 +66,26 @@ def deserialize_field_value(value: str | None) -> object:
 
 
 def field_values_equal(left: object, right: object) -> bool:
-    """比较当前表格值与来源基线，兼容多选列表和旧文本基线。
+    """比较当前表格值与来源基线，兼容空值、结构化字段和旧文本基线。
 
     参数：left、right 为当前值与字段来源值。
     返回值：语义值相等时为 True。
     异常：无。
     副作用：无。
     """
-    return left == deserialize_field_value(right) if isinstance(right, str) else left == right
+    if not isinstance(right, str):
+        return left == right
+    if left == right or left == deserialize_field_value(right):
+        return True
+    # 空定位在来源表中保存为 JSON null/空容器，企微读回可能统一返回 None。
+    if left in (None, "", [], {}) and right in {"null", "[]", "{}"}:
+        return True
+    if right.startswith("{"):
+        try:
+            return left == json.loads(right)
+        except json.JSONDecodeError:
+            return False
+    return False
 
 
 class Lead(Base):

@@ -30,7 +30,6 @@ from app.leads.models import (
     LeadDiscardRequest,
     latest_crm_create_sync,
 )
-from app.leads.review import LeadReviewService
 from app.messaging.models import (
     BusinessAuditEvent,
     IncomingMessage,
@@ -1388,8 +1387,8 @@ class CrmSubmissionService:
         参数：lead_id 为目标线索；command 为提交命令；initial_record 为本批负责人范围内
         已读取的目标快照。
         返回值：标准 CRM 更新状态或业务校验结果。
-        异常：智能表格和数据库故障传播；CRM 传输结果由同步记录认领器处理。
-        副作用：更新人工编辑审计，并可能调用 CRM；不读取智能表格。
+        异常：数据库故障传播；CRM 传输结果由同步记录认领器处理。
+        副作用：持久化 CRM 同步事实并调用 CRM；不读取或写入智能表格。
         """
         with self._session_factory() as session:
             lead = session.get(Lead, lead_id)
@@ -1406,11 +1405,6 @@ class CrmSubmissionService:
             unfinished = self._unfinished_update(session, lead_id)
             if unfinished is not None:
                 return self._claim_and_call(unfinished.id, command.sales_user_id)
-        review_service = LeadReviewService(
-            self._session_factory,
-            self._smart_table_adapter,
-            robot_submission_confirmation_available=self._robot_submission_confirmation_available,
-        )
         if (
             initial_record.record_id != lead.smart_table_record_id
             or initial_record.fields.get("负责人") != command.sales_user_id
@@ -1433,14 +1427,16 @@ class CrmSubmissionService:
                 != current_lead.smart_table_owner_user_id
             ):
                 return "incomplete"
-        reconciled = review_service.reconcile_submission(
-            lead_id, initial_record=current_record
-        )
+        snapshot_fields = {
+            name: value
+            for name, value in current_record.fields.items()
+            if name != "AI待确认"
+        }
         previous = dict(latest.canonical_payload)
         try:
             payload = self._canonical_payload(
-                reconciled.fields,
-                tyc_customer_id=self._reliable_tyc_customer_id(lead, reconciled.fields),
+                snapshot_fields,
+                tyc_customer_id=self._reliable_tyc_customer_id(lead, snapshot_fields),
                 fallback_entry_time=self._as_utc(lead.created_at),
             )
         except CrmEnumMappingError as error:
@@ -1514,7 +1510,7 @@ class CrmSubmissionService:
                     "failed_pending_review" if unfinished.status == "failed_pending_review"
                     else "processing"
                 )
-            crm_user_id = self._resolve_crm_owner(lead, initial_record=reconciled.record)
+            crm_user_id = self._resolve_crm_owner(lead, initial_record=current_record)
             if crm_user_id is None:
                 return self._record_mapping_missing(
                     session, lead, command, payload, snapshot_hash, "update"
@@ -1631,7 +1627,7 @@ class CrmSubmissionService:
         目标记录快照；defer_smart_table_submission_status 表示将表格状态留给外层批次统一回写。
         返回值：单条提交结果；创建或跟进由 CRM 内部处理。
         异常：智能表格或数据库异常按既有同步状态转换并记录审计。
-        副作用：读取最终表格快照，写入冻结 CRM 同步记录并调用统一提交接口。
+        副作用：只使用提交指令阶段快照，写入冻结 CRM 同步记录并调用统一提交接口。
         """
         allow_non_today_target = (
             command.text
@@ -1722,18 +1718,18 @@ class CrmSubmissionService:
                 failure_category="transient",
                 adapter_category="transport",
             )
-        # 复用提交指令阶段批量读取的记录；只接受与目标 ID 一致的快照。
-        reconciled = LeadReviewService(
-            self._session_factory,
-            self._smart_table_adapter,
-            robot_submission_confirmation_available=self._robot_submission_confirmation_available,
-        ).reconcile_submission(lead_id, initial_record=initial_record)
+        # 复用提交指令阶段批量读取的原始快照，不在 CRM 提交前协调或写回审核元数据。
+        snapshot_fields = {
+            name: value
+            for name, value in initial_record.fields.items()
+            if name != "AI待确认"
+        }
         if command.target_capture_date is not None and not self._is_capture_date_owned_candidate(
             lead,
             command.owner_scope_user_ids or (),
             command.target_capture_date,
             source_message.received_at if source_message is not None else None,
-            table_fields=reconciled.fields,
+            table_fields=snapshot_fields,
             prefer_table_date=True,
         ):
             # 按提交阶段快照核对表格录入日，越界项目不进入 CRM。
@@ -1743,11 +1739,11 @@ class CrmSubmissionService:
             if command.text == _ABANDONED_COMMAND
             else {None, "", "未提交"}
         )
-        if reconciled.fields.get("提交状态") not in allowed_submission_statuses:
+        if snapshot_fields.get("提交状态") not in allowed_submission_statuses:
             # Final Snapshot 已显示该记录并非未提交，保留逐 Lead 结果且不调用 CRM。
             return _create_outcome("not_submitted")
-        missing_business = self._missing_business_fields(reconciled.fields)
-        missing_minimum = self._missing_crm_minimum(reconciled.fields)
+        missing_business = self._missing_business_fields(snapshot_fields)
+        missing_minimum = self._missing_crm_minimum(snapshot_fields)
         if missing_business:
             # 八项业务完整度仍用于明确审核反馈，不能被 CRM minimum 偷换定义。
             self._audit(command, "crm_business_fields_incomplete")
@@ -1757,8 +1753,8 @@ class CrmSubmissionService:
 
         try:
             canonical_payload = self._canonical_payload(
-                reconciled.fields,
-                tyc_customer_id=self._reliable_tyc_customer_id(lead, reconciled.fields),
+                snapshot_fields,
+                tyc_customer_id=self._reliable_tyc_customer_id(lead, snapshot_fields),
                 fallback_entry_time=self._as_utc(lead.created_at),
             )
         except CrmEnumMappingError as error:
@@ -1783,7 +1779,7 @@ class CrmSubmissionService:
         snapshot_hash = self._snapshot_hash(canonical_payload)
 
         # 映射缺失必须在任何 CRM 请求前阻断；智能表格成员名称沿用本次已回读快照。
-        crm_user_id = self._resolve_crm_owner(lead, initial_record=reconciled.record)
+        crm_user_id = self._resolve_crm_owner(lead, initial_record=initial_record)
         if crm_user_id is None:
             with self._session_factory.begin() as session:
                 current_lead = session.get(Lead, lead_id)
@@ -1845,7 +1841,7 @@ class CrmSubmissionService:
                         command.owner_scope_user_ids or (),
                         command.target_capture_date,
                         source_message.received_at if source_message is not None else None,
-                        table_fields=reconciled.fields,
+                        table_fields=snapshot_fields,
                         prefer_table_date=True,
                     )
                 ):
@@ -1866,7 +1862,7 @@ class CrmSubmissionService:
                     return _create_outcome(
                         "failed_pending_review", reason_code="crm_outcome_unknown"
                     )
-                crm_user_id = self._resolve_crm_owner(lead, initial_record=reconciled.record)
+                crm_user_id = self._resolve_crm_owner(lead, initial_record=initial_record)
                 if crm_user_id is None:
                     return _create_outcome(
                         self._record_mapping_missing(
@@ -2562,7 +2558,7 @@ class CrmSubmissionService:
     ) -> dict[str, object]:
         """构造稳定的 CRM 英文键快照并排除智能表格审核元数据。
 
-        参数：fields 为提交前回读的中文智能表格字段；tyc_customer_id 为天眼查客户标识；
+        参数：fields 为提交指令阶段批量读取的中文智能表格字段；tyc_customer_id 为天眼查客户标识；
         fallback_entry_time 为表格系统录入时间缺失时使用的稳定 Lead 创建时间。
         返回值：可直接冻结、哈希和发送给 CRM Adapter 的英文键 payload。
         异常：字段枚举、日期或备注不符合 CRM 契约时抛出 CrmPayloadError。
