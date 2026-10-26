@@ -95,13 +95,14 @@ class LeadAnalysis(BaseModel):
 
 
 class SubmissionIntent(BaseModel):
-    """约束模型只识别 CRM 提交意图，不承载 CRM 写入参数。"""
+    """约束模型识别 CRM 提交意图及智能表格筛选日期，不承载 CRM 写入参数。"""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
     intent: Literal[
         "LEAD_CAPTURE",
         "SUBMIT_TODAY",
+        "SUBMIT_DATE",
         "SUBMIT_ALL",
         "SUBMIT_SINGLE",
         "SUBMIT_ABANDONED",
@@ -110,6 +111,7 @@ class SubmissionIntent(BaseModel):
         "UNKNOWN",
     ]
     company_name: str | None = None
+    capture_date: str | None = None
 
 
 @dataclass(frozen=True)

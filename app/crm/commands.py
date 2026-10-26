@@ -82,7 +82,10 @@ _SUBMISSION_COMMAND_ALIASES = {
     "帮我提交我的更新": "提交我的更新",
     "提交更新": "提交我的更新",
 }
-_INQUIRY_MARKERS = ("吗", "了吗", "是否", "有没有", "是不是", "能否", "可以吗", "?", "？")
+_INQUIRY_MARKERS = (
+    "吗", "了吗", "是否", "有没有", "是不是", "能否", "可以吗", "怎么", "如何", "为什么",
+    "查询", "?", "？",
+)
 _NEGATIVE_SUBMISSION_MARKERS = (
     "不要",
     "别",
@@ -252,38 +255,22 @@ def _valid_calendar_date(year: int, month: int, day: int) -> bool:
 
 
 def looks_like_submission_intent(text: str) -> bool:
-    """判断消息是否值得交给模型做提交意图分类。
+    """用低成本动作词筛出需要模型理解的提交表达，不判断目标或授权。
 
     参数：text 为销售消息正文。
-    返回值：含提交动作且同时出现线索范围、更新或公司定位词时返回 True。
+    返回值：出现提交动作词时返回 True；是否为有效提交请求由模型和安全校验判断。
     异常：无。
     副作用：无；仅作异步分类前置筛选，不授权任何 CRM 操作。
     """
     candidate = text.strip()
-    return "提交" in candidate and any(
-        marker in candidate
-        for marker in (
-            "线索",
-            "更新",
-            "今天",
-            "所有",
-            "全部",
-            "放弃",
-            "这条",
-            "这家公司",
-            "公司",
-            "企业",
-            "重新提交",
-            "待完善",
-        )
-    )
+    return "提交" in candidate
 
 
 def is_explicit_submission_request(text: str) -> bool:
-    """判断文本是否明确要求执行提交动作，而不是询问提交状态。
+    """拦截疑问、否定文本并确认存在提交动作词，语义判断由 AI 分类器负责。
 
     参数：text 为销售原始消息文本。
-    返回值：存在提交动作且没有明显疑问结构时返回 True。
+    返回值：没有疑问/否定且出现“提交”时返回 True；这不是权限或目标校验。
     异常：无。
     副作用：无，不调用模型或外部系统。
     """
@@ -293,21 +280,8 @@ def is_explicit_submission_request(text: str) -> bool:
     # 否定或取消表达优先于模型意图，防止“不要提交”进入任何 CRM 工作流。
     if any(marker in candidate for marker in _NEGATIVE_SUBMISSION_MARKERS):
         return False
-    return "提交" in candidate and any(
-        marker in candidate
-        for marker in (
-            "线索",
-            "更新",
-            "今天",
-            "所有",
-            "全部",
-            "放弃",
-            "这条",
-            "这家公司",
-            "重新提交",
-            "待完善",
-        )
-    )
+    # 否定/疑问仍由上方安全检查拦截；其他自然说法交给 AI 判断是否为执行请求。
+    return "提交" in candidate
 
 
 def consume_submission_command(
@@ -316,11 +290,12 @@ def consume_submission_command(
     crm_adapter: CRMAdapter | None,
     outbox_event_id: int,
     command_text: str | None = None,
+    target_capture_date: date | None = None,
 ) -> str:
     """消费一条已认领命令 Outbox，并返回不含敏感数据的销售汇总文本。
 
-    参数：前三项为业务依赖，outbox_event_id 为现有可靠消息事件标识；command_text 为可选的
-    模型意图归一化命令，仅允许映射到既有安全命令集合。
+    参数：前三项为业务依赖，outbox_event_id 为可靠消息事件标识；command_text 为模型归一化命令，
+    target_capture_date 为经结构校验的智能表格筛选日期。
     返回值：可安全发送给当前销售的确定性中文汇总。
     异常：消息或事件事实缺失时抛出 ValueError；业务依赖异常被转换为可靠重试状态。
     副作用：调用 T12 submission service，写入脱敏通知，并结束或重试本命令事件。
@@ -348,7 +323,11 @@ def consume_submission_command(
             sales_user_id=message.sales_user_id,
             request_message_id=message.message_id,
             target_owner_name=cross_owner_request[0] if cross_owner_request else None,
-            target_capture_date=cross_owner_request[1] if cross_owner_request else None,
+            target_capture_date=(
+                target_capture_date
+                if target_capture_date is not None
+                else cross_owner_request[1] if cross_owner_request else None
+            ),
         )
     company_name = (
         None

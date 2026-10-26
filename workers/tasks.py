@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import cast
 from uuid import uuid4
 
@@ -727,6 +727,11 @@ def consume_lead_outbox_event(
                     None if company_request else get_crm_adapter(),
                     outbox_event_id,
                     command_text=command_text,
+                    target_capture_date=(
+                        date.fromisoformat(intent.capture_date)
+                        if intent.intent == "SUBMIT_DATE" and intent.capture_date
+                        else None
+                    ),
                 )
         if _is_wecom_action_command(factory, outbox_event_id):
             with factory() as session:
@@ -988,7 +993,7 @@ def _is_submission_intent(session_factory: sessionmaker[Session], outbox_event_i
 
 
 def _submission_command_text(intent: SubmissionIntent) -> str | None:
-    """把受限提交意图转换为既有内部命令，不接受模型生成的业务参数。
+    """把受限提交意图转换为既有安全工作流命令，日期筛选值由调用方单独传递。
 
     参数：intent 为 AI 已校验的结构化意图。
     返回值：内部命令文本；录入或未知意图返回 None。
@@ -997,6 +1002,8 @@ def _submission_command_text(intent: SubmissionIntent) -> str | None:
     """
     command_by_intent = {
         "SUBMIT_TODAY": "提交今天的线索",
+        # 单日请求复用全部线索选择流程，筛选日期随动作上下文冻结。
+        "SUBMIT_DATE": "提交我所有线索",
         "SUBMIT_ALL": "提交我所有线索",
         "SUBMIT_ABANDONED": "帮我提交放弃提交的线索",
         "SUBMIT_UPDATES": "提交我的更新",
