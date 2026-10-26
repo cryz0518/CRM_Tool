@@ -233,8 +233,13 @@ class MockSmartTableAdapter:
             if member_names is not None
             else ({"负责人": str(fields["负责人"])} if fields.get("负责人") else {})
         )
+        record_fields = dict(fields)
+        # Mock 模拟智能表格系统维护的只读录入时间；调用方不能通过 fields 指定该值。
+        record_fields.setdefault(
+            "录入时间", datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()
+        )
         record = SmartTableRecord(
-            record_id=record_id, fields=dict(fields), member_names=resolved_member_names
+            record_id=record_id, fields=record_fields, member_names=resolved_member_names
         )
         self._records[record_id] = record
         return record
