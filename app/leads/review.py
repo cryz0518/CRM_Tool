@@ -702,8 +702,8 @@ class LeadReviewService:
 
         参数：lead_id 为目标线索标识；initial_record 为可复用的批量快照。
         返回值：智能表格记录和脱离会话的 Lead 事实。
-        异常：线索或记录定位缺失、表格负责人与后台负责人不一致时抛出 ValueError。
-        副作用：读取数据库；没有提供快照时读取智能表格单行，提供了错误快照时安全失败。
+        异常：线索或记录定位缺失、记录标识不一致时抛出 ValueError。
+        副作用：读取数据库；没有提供快照时读取智能表格单行并校验负责人，提交快照直接采用表格当前负责人。
         """
         with self._session_factory() as session:
             lead = self._require_lead(session, lead_id)
@@ -721,7 +721,7 @@ class LeadReviewService:
             raise ValueError(f"智能表格记录不存在：{record_id}")
         if record.record_id != record_id:
             raise ValueError(f"智能表格记录标识不一致：{record_id}")
-        if record.fields.get("负责人") != lead.smart_table_owner_user_id:
+        if initial_record is None and record.fields.get("负责人") != lead.smart_table_owner_user_id:
             raise ValueError("智能表格负责人已变化，请先完成线索转交核对")
         return record, lead
 

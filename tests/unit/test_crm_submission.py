@@ -520,6 +520,7 @@ def test_crm_create_batch_respects_concurrency_limit_and_returns_each_result(
         "bind",
         SimpleNamespace(dialect=SimpleNamespace(name="postgresql")),
     )
+    monkeypatch.setattr(service, "_write_back_batch_submission_status", lambda _lead_ids: None)
     lock = Lock()
     active = 0
     maximum_active = 0
@@ -559,26 +560,29 @@ def test_crm_create_batch_respects_concurrency_limit_and_returns_each_result(
 def test_all_submission_does_not_reopen_abandoned_sync_after_table_tampering(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证销售手动改写提交状态不能重新打开服务端已放弃事实。"""
+    """验证表格状态被手动改回未提交后，CRM 已放弃的同步仍不能重开。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
-    _lead(session_factory, adapter)
+    lead_id = _lead(session_factory, adapter)
     record = adapter.get_records()[0]
-    crm = MockCRMAdapter(
-        search_results={
-            "人工最终公司": (CRMSearchResult("crm-existing", "crm-owner", "CRM 已有线索"),)
-        }
-    )
+    crm = MockCRMAdapter()
     service = CrmSubmissionService(session_factory, adapter, crm)
 
     first = submit_today_via_selection(service, "sales-1", "message-abandoned")
-    service.resolve_duplicate_confirmation(
-        "message-abandoned", "sales-1", continue_submission=False
-    )
-    assert first.duplicate_confirmations
+    assert first.succeeded == 1
+    with session_factory.begin() as session:
+        sync = session.scalar(
+            select(CrmSyncRecord).where(
+                CrmSyncRecord.lead_id == lead_id,
+                CrmSyncRecord.operation == "create",
+            )
+        )
+        assert sync is not None
+        sync.status = "abandoned"
     adapter.update_record(record.record_id, {"提交状态": "未提交"})
+    assert service.list_submission_candidates("提交我所有线索", "sales-1") == ()
     with pytest.raises(ValueError, match="批量提交必须通过"):
         service.submit(SubmissionCommand("提交我所有线索", "sales-1", "message-reopened"))
-    assert crm.search_calls == 1 and crm.calls == 0
+    assert crm.search_calls == 0 and crm.calls == 1
 
 
 def test_all_submission_does_not_turn_submitted_record_into_update(
@@ -1237,7 +1241,7 @@ def test_sales_authorization_crm_mapping_is_not_required_when_owner_directory_ma
 
     assert result.succeeded == 1
     assert result.mapping_missing == 0
-    assert crm.search_calls == 1
+    assert crm.search_calls == 0
     assert crm.calls == 1
     assert crm.crm_user_ids == ["crm-1"]
     with session_factory() as session:
@@ -1344,7 +1348,7 @@ def test_targeted_company_submission_reuses_service_for_one_lead(
 def test_targeted_company_submission_accepts_complete_temporary_lead(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证单条确认卡的 temporary 目标按当前完整快照进入 CRM 查重。"""
+    """验证单条确认卡的 temporary 目标按当前完整快照调用 CRM 统一提交接口。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     target_id = _lead(session_factory, adapter)
     with session_factory.begin() as session:
@@ -1363,7 +1367,7 @@ def test_targeted_company_submission_accepts_complete_temporary_lead(
     )
 
     assert result.succeeded == 1
-    assert crm.search_calls == 1
+    assert crm.search_calls == 0
     assert crm.calls == 1
 
 
@@ -1441,7 +1445,7 @@ def test_incomplete_retry_reloads_table_and_never_recreates_successful_lead(
     assert len(third.items) == 1
     assert third.items[0].status is SubmissionItemStatus.NOT_SUBMITTED
     assert third.items[0].reason_code == "already_submitted"
-    assert crm.search_calls == 1 and crm.calls == 1
+    assert crm.search_calls == 0 and crm.calls == 1
     assert bulk_read.call_count == 2
     assert [call.args[0] for call in bulk_read.call_args_list] == [
         {record.record_id},
@@ -2168,13 +2172,17 @@ def test_batch_candidates_read_only_linked_records_for_requested_owner_scope(
         *,
         owner_user_ids: tuple[str, ...] | None = None,
         owner_display_names: Mapping[str, str] | None = None,
+        submission_status: str | None = None,
+        capture_date: date | None = None,
     ) -> list[SmartTableRecord]:
-        """记录候选回读使用的安全负责人范围。"""
+        """记录候选回读使用的负责人、状态和日期筛选条件。"""
         calls.append((record_ids, owner_user_ids))
         return original_get_records(
             record_ids,
             owner_user_ids=owner_user_ids,
             owner_display_names=owner_display_names,
+            submission_status=submission_status,
+            capture_date=capture_date,
         )
 
     monkeypatch.setattr(adapter, "get_records", capture_get_records)
@@ -2183,7 +2191,7 @@ def test_batch_candidates_read_only_linked_records_for_requested_owner_scope(
     ).list_submission_candidates("提交我所有线索", "sales-1")
 
     assert tuple(candidate.lead_id for candidate in candidates) == (lead_id,)
-    assert calls == [((record_id,), None)]
+    assert calls == [(None, ("sales-1",))]
 
 
 def test_today_three_candidates_process_complete_and_incomplete_independently(
@@ -2304,17 +2312,17 @@ def test_today_submission_promotes_temporary_lead_from_complete_table_snapshot(
     assert result.succeeded == 1
     assert crm.calls == 1
     assert crm.crm_user_ids == ["crm-1"]
-    assert crm.search_calls == 1
+    assert crm.search_calls == 0
     assert crm.calls == 1
     with session_factory() as session:
         lead_after_submit = session.get(Lead, lead_id)
     assert lead_after_submit is not None and lead_after_submit.lifecycle_state == "synced"
 
 
-def test_selected_candidate_invalidated_before_worker_revalidation_returns_item(
+def test_backend_owner_change_does_not_override_table_candidate(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证 callback 已接受的线索转移负责人后，逐条返回未提交且不调用 CRM。"""
+    """验证 CRM 候选负责人以冻结的智能表格行决定，不受后台 owner 变化影响。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter)
     service = CrmSubmissionService(session_factory, adapter, MockCRMAdapter())
@@ -2332,10 +2340,9 @@ def test_selected_candidate_invalidated_before_worker_revalidation_returns_item(
     )
 
     assert len(result.items) == 1
-    assert result.items[0].status is SubmissionItemStatus.NOT_SUBMITTED
-    assert result.items[0].reason_code == "candidate_state_changed"
-    assert result.not_submitted == 1
-    assert crm.search_calls == 0 and crm.calls == 0
+    assert result.items[0].status is SubmissionItemStatus.CREATED
+    assert result.succeeded == 1
+    assert crm.search_calls == 0 and crm.calls == 1
 
 
 def test_abandoned_card_after_owner_transfer_does_not_read_new_owners_record(
@@ -2398,7 +2405,7 @@ def test_today_submission_processes_only_card_selected_candidate(
 
     assert tuple(item.lead_id for item in candidates) == (lead_id,)
     assert result.succeeded == 1
-    assert crm.search_calls == 1
+    assert crm.search_calls == 0
     assert crm.calls == 1
 
 
@@ -2409,7 +2416,9 @@ def test_authorized_operator_can_submit_selected_other_owner_lead(
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter)
     source_record = adapter.get_records()[0]
-    target_fields = dict(source_record.fields)
+    target_fields = {
+        name: value for name, value in source_record.fields.items() if name != "录入时间"
+    }
     target_fields["负责人"] = "sales-2"
     owner_record = adapter.create_record(
         target_fields,
@@ -3168,11 +3177,17 @@ def test_cross_owner_duplicate_confirmation_rechecks_current_table_day(
 def test_cross_owner_date_candidates_and_callback_recheck_current_date_scope(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """验证指定日候选只包含未提交记录，并在回调时重新核对日期。"""
+    """验证日期只从表格录入时间筛选，callback 复用命令阶段冻结快照。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter, message_id="dated-cross-owner-lead")
     record = adapter.get_records()[0]
     adapter.update_record(record.record_id, {"负责人": "sales-2"})
+    owned_record = adapter.get_record(record.record_id)
+    assert owned_record is not None
+    adapter._records[record.record_id] = replace(
+        owned_record,
+        fields={**owned_record.fields, "录入时间": "2026-10-13T19:45:00+08:00"},
+    )
     with session_factory.begin() as session:
         lead = session.get(Lead, lead_id)
         assert lead is not None
@@ -3204,17 +3219,18 @@ def test_cross_owner_date_candidates_and_callback_recheck_current_date_scope(
     )
     historical_record = adapter.get_records()[1]
     adapter.update_record(historical_record.record_id, {"负责人": "sales-2"})
+    historical_record = adapter.get_record(historical_record.record_id)
+    assert historical_record is not None
+    adapter._records[historical_record.record_id] = replace(
+        historical_record,
+        fields={**historical_record.fields, "录入时间": "2026-10-13T19:45:00+08:00"},
+    )
     with session_factory.begin() as session:
         historical_lead = session.get(Lead, historical_lead_id)
         assert historical_lead is not None
         historical_lead.source_message_id = None
         historical_lead.smart_table_owner_user_id = "sales-2"
         historical_lead.created_at = datetime(2026, 10, 13, 16, tzinfo=UTC)
-        historical_lead.field_values = {
-            **historical_lead.field_values,
-            # 智能表格原生录入时间是上海本地时间文本，不含 UTC 时区后缀。
-            "录入时间": "2026-10-13 19:45:00",
-        }
 
     submitted_lead_id = _lead(
         session_factory,
@@ -3245,8 +3261,19 @@ def test_cross_owner_date_candidates_and_callback_recheck_current_date_scope(
         target_capture_date=date(2026, 10, 13),
     )
     assert {candidate.lead_id for candidate in candidates} == {lead_id, historical_lead_id}
+    frozen_records = {
+        candidate.record.record_id: candidate.record
+        for candidate in candidates
+        if candidate.record is not None
+    }
 
-    # 模拟候选卡发送后来源消息被改到另一天；回调不能提交旧冻结候选。
+    # 候选卡发送后表格被改日；实际 callback 复用原快照，不重新读表。
+    current_record = adapter.get_record(record.record_id)
+    assert current_record is not None
+    adapter._records[record.record_id] = replace(
+        current_record,
+        fields={**current_record.fields, "录入时间": "2026-10-14T00:15:00+08:00"},
+    )
     with session_factory.begin() as session:
         source_message = session.get(IncomingMessage, "dated-cross-owner-lead")
         assert source_message is not None
@@ -3260,9 +3287,10 @@ def test_cross_owner_date_candidates_and_callback_recheck_current_date_scope(
             target_capture_date=date(2026, 10, 13),
         ),
         (lead_id,),
+        initial_records=frozen_records,
     )
-    assert result.not_submitted == 1
-    assert crm.search_calls == crm.calls == 0
+    assert result.succeeded == 1
+    assert crm.search_calls == 0 and crm.calls == 1
 
     with session_factory.begin() as session:
         operator = session.get(SalesAuthorization, "operator")
@@ -3281,8 +3309,10 @@ def test_cross_owner_date_candidates_and_callback_recheck_current_date_scope(
             target_capture_date=date(2026, 10, 13),
         ),
         (historical_lead_id,),
+        initial_records=frozen_records,
     )
-    assert authorized_result.not_submitted == 0
+    assert authorized_result.succeeded == 1
+    assert crm.calls == 2
     # 系统管理员标记本身不能代替专用跨员工提交授权。
     with session_factory.begin() as session:
         operator = session.get(SalesAuthorization, "operator")
@@ -3305,6 +3335,7 @@ def test_cross_owner_date_candidates_and_callback_recheck_current_date_scope(
             target_capture_date=date(2026, 10, 13),
         ),
         (historical_lead_id,),
+        initial_records=frozen_records,
     )
     assert denied_admin_only.not_submitted == 1
 
@@ -3754,7 +3785,7 @@ def test_company_preview_links_existing_owner_record_into_local_lead(
         lead = session.scalar(select(Lead).where(Lead.smart_table_record_id == record.record_id))
         audit = session.scalar(
             select(BusinessAuditEvent).where(
-                BusinessAuditEvent.event_type == "smart_table_existing_lead_linked"
+                BusinessAuditEvent.event_type == "smart_table_existing_leads_linked"
             )
         )
     assert lead is not None
@@ -4398,7 +4429,7 @@ def test_ai_pending_confirmation_does_not_block_when_core_values_present(
 
     second = submit_today_via_selection(service, "sales-1", "message-12")
     assert second.incomplete == 0
-    assert len(second.duplicate_confirmations) == 1
+    assert second.succeeded == 1
     assert crm.calls == 1
 
 
@@ -4816,7 +4847,7 @@ def test_t13_audit_and_logs_keep_identity_metadata_without_sensitive_payload(
     assert "crm_create_succeeded" in event_types
     assert "crm_global_identity_activated" in event_types
     assert activated is not None
-    assert crm.search_calls == 1
+    assert crm.search_calls == 0
     logged = caplog.text
     for sensitive in ("13800000000", "人工最终备注", "crm-1", "payload", "secret"):
         assert sensitive not in logged.lower()
@@ -5030,10 +5061,10 @@ def test_cross_owner_create_rechecks_frozen_owner_scope_under_lead_lock(
         ) is None
 
 
-def test_update_rechecks_owner_after_record_read_before_crm_write(
+def test_update_uses_table_snapshot_after_backend_owner_changes(
     session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """验证回读之后发生负责人转交时，旧负责人不能继续提交 CRM 更新。"""
+    """验证后台 owner 在批量读取后变化时，更新仍以表格负责人快照为准。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter)
     crm = MockCRMAdapter()
@@ -5044,8 +5075,8 @@ def test_update_rechecks_owner_after_record_read_before_crm_write(
     original_get_records = adapter.get_records
     reads = 0
 
-    def transfer_after_refresh(record_ids=None, *, owner_user_ids=None, owner_display_names=None):
-        """在最终单条回读后转交负责人，模拟并发转交窗口。"""
+    def transfer_after_batch(record_ids=None, *, owner_user_ids=None, owner_display_names=None):
+        """在命令阶段批量读取后修改后台 owner，证明它不控制 CRM 候选。"""
         nonlocal reads
         records = original_get_records(
             record_ids,
@@ -5053,26 +5084,27 @@ def test_update_rechecks_owner_after_record_read_before_crm_write(
             owner_display_names=owner_display_names,
         )
         reads += 1
-        if reads == 2:
+        if reads == 1:
             with session_factory.begin() as session:
                 lead = session.get(Lead, lead_id)
                 assert lead is not None
                 lead.smart_table_owner_user_id = "sales-2"
         return records
 
-    monkeypatch.setattr(adapter, "get_records", transfer_after_refresh)
+    monkeypatch.setattr(adapter, "get_records", transfer_after_batch)
 
     result = service.submit(SubmissionCommand("提交我的更新", "sales-1", "owner-race-update"))
 
-    assert result.incomplete == 1
-    assert crm.submit_calls == 1
+    assert result.updated == 1
+    assert crm.submit_calls == 2
+    assert reads == 1
     with session_factory() as session:
         updates = session.scalars(
             select(CrmSyncRecord).where(
                 CrmSyncRecord.lead_id == lead_id, CrmSyncRecord.operation == "update"
             )
         ).all()
-    assert updates == []
+    assert len(updates) == 1 and updates[0].status == "succeeded"
 
 
 def test_update_batch_read_failure_does_not_fall_back_to_per_record_reads(
@@ -5107,7 +5139,7 @@ def test_update_batch_read_failure_does_not_fall_back_to_per_record_reads(
     ):
         """让整批读取失败，验证业务层不再对每条记录逐个补读。"""
         requested = set(record_ids or ())
-        if len(requested) > 1:
+        if owner_user_ids is not None or len(requested) > 1:
             batch_reads(
                 record_ids,
                 owner_user_ids=owner_user_ids,
@@ -5257,7 +5289,7 @@ def test_historical_company_identity_does_not_bypass_crm_duplicate_search(
     with session_factory() as session:
         identity = session.get(CrmCompanyIdentity, "公司 X")
     assert identity is not None and identity.state == "reserving"
-    assert crm.search_calls == 1
+    assert crm.search_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -5293,7 +5325,7 @@ def test_active_company_identity_only_validates_current_crm_duplicate(
         "active-identity-check",
     )
 
-    assert crm.search_calls == 1
+    assert crm.search_calls == 0
     assert crm.calls == 0 and crm.update_calls == 0
     if expected_status == "duplicate":
         assert len(result.duplicate_confirmations) == 1
