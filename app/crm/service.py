@@ -910,8 +910,9 @@ class CrmSubmissionService:
     ) -> tuple[SubmissionCandidate, ...]:
         """直接按一次批量读取的智能表格快照生成 CRM 候选，不以后台 Lead 字段筛选。
 
-        参数：command_text 为精确命令；sales_user_id 为操作人；owner_scope_user_ids 仅供
-        已获跨员工提交权限的调用指定负责人范围；smart_table_records 为已读快照。
+        参数：command_text 为规范命令；sales_user_id 为操作人；owner_scope_user_ids 仅供
+        已获跨员工提交权限的调用指定负责人范围；target_capture_date 为可选表格日期筛选；
+        smart_table_records 为已读快照。
         返回值：负责人、日期和提交状态符合当前表格值的候选。
         异常：actor 不存在/已停用、权限不足或命令不支持时抛出 ValueError。
         副作用：只读取数据库及智能表格，不改变 Lead 生命周期；提供已有表格快照时不再查询智能表格。
@@ -926,8 +927,11 @@ class CrmSubmissionService:
         cross_owner = command_text == CROSS_OWNER_SUBMISSION_COMMAND
         if cross_owner != (owner_scope_user_ids is not None):
             raise ValueError("跨员工提交负责人范围缺失或不适用于当前命令")
-        if target_capture_date is not None and not cross_owner:
-            raise ValueError("按日期跨员工提交只能用于跨员工候选")
+        if target_capture_date is not None and command_text not in {
+            _ALL_COMMAND,
+            CROSS_OWNER_SUBMISSION_COMMAND,
+        }:
+            raise ValueError("按日期筛选只适用于全部线索或授权范围候选")
         owner_user_ids = owner_scope_user_ids or (sales_user_id,)
         capture_date = target_capture_date
         if command_text == _TODAY_COMMAND:

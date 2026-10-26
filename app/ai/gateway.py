@@ -7,8 +7,9 @@ import logging
 import re
 import time
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
@@ -579,7 +580,7 @@ class AIGateway:
         return tuple(prepared)
 
     def classify_submission_intent(self, text: str) -> SubmissionIntent:
-        """用结构化模型识别消息工作流意图，不生成任何 CRM 业务参数。
+        """用结构化模型识别提交意图和表格筛选日期，不生成 CRM 业务参数。
 
         参数：text 为已持久化的销售消息，可为普通线索文本或提交请求。
         返回值：受限的结构化意图；结构不合法时返回 UNKNOWN。
@@ -587,26 +588,31 @@ class AIGateway:
         副作用：调用一次 LLM，不执行 CRM、数据库或智能表格写操作。
         """
         safe_text = _SENSITIVE_PATTERN.sub("[已遮蔽敏感号码]", text)
+        # 相对日期必须以业务时区为准，不能让模型自行猜测当前日期。
+        business_date = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
         schema = SubmissionIntent.model_json_schema()
         request = LLMRequest(
             messages=(
                 {
                     "role": "system",
                     "content": (
-                        "只做销售消息意图分类，不提取线索字段，不调用任何工具。"
-                        "只能返回 JSON：intent 必须是 LEAD_CAPTURE、SUBMIT_TODAY、"
+                        "只判断销售是否明确要求机器人执行 CRM 提交，不提取线索字段，不调用工具。"
+                        "按语义理解自然说法，不要求匹配固定命令句式；只有明确的正向执行请求才能分类为提交。"
+                        "询问提交规则或状态、否定或取消、陈述已经提交、转述客户要求或普通线索消息，"
+                        "不得分类为提交意图；无法确定时返回 UNKNOWN。"
+                        "只能返回 JSON：intent 必须是 LEAD_CAPTURE、SUBMIT_TODAY、SUBMIT_DATE、"
                         "SUBMIT_ALL、SUBMIT_SINGLE、SUBMIT_ABANDONED、SUBMIT_UPDATES、"
                         "SUBMIT_RETRY_INCOMPLETE 或 UNKNOWN。"
-                        "‘提交今天/今天的线索’归类 SUBMIT_TODAY；‘提交所有/全部/我的所有线索’归类 "
-                        "SUBMIT_ALL；‘提交放弃提交/放弃的线索’归类 SUBMIT_ABANDONED；"
-                        "‘提交更新/我的更新’归类 SUBMIT_UPDATES；明确提交某一家公司归类 "
-                        "SUBMIT_SINGLE 并只填写 company_name。‘重新提交’、‘重新提交待完善的线索’、"
-                        "‘上次没完善的再提交’归类 SUBMIT_RETRY_INCOMPLETE；"
-                        "放弃提交专用表达优先归类 "
-                        "SUBMIT_ABANDONED，CRM 更新表达优先归类 SUBMIT_UPDATES。"
-                        "录入客户资料属于 LEAD_CAPTURE；"
-                        "普通客户信息即使包含‘今天’或‘提交方案’也归类 LEAD_CAPTURE。"
-                        "无法确定时返回 UNKNOWN。必须符合 JSON Schema："
+                        f"当前业务日期（Asia/Shanghai）为 {business_date}。"
+                        "提交今天的线索归类 SUBMIT_TODAY；提交用户全部可提交线索归类 SUBMIT_ALL；"
+                        "提交某个明确采集日期的线索归类 SUBMIT_DATE，并仅填写 capture_date（YYYY-MM-DD），"
+                        "相对日期按当前业务日期换算；当天请求仍使用 SUBMIT_TODAY。"
+                        "提交某一家公司归类 SUBMIT_SINGLE 并仅填写 company_name；"
+                        "放弃提交的线索归类 SUBMIT_ABANDONED；提交更新归类 SUBMIT_UPDATES；"
+                        "重提待完善线索归类 SUBMIT_RETRY_INCOMPLETE。"
+                        "未明确给出单一日期、或表达日期区间而当前筛选不支持时返回 UNKNOWN。"
+                        "所有非 SUBMIT_DATE 意图的 capture_date 必须为 null；"
+                        "录入客户资料归类 LEAD_CAPTURE。必须符合 JSON Schema："
                         f"{json.dumps(schema, ensure_ascii=False)}"
                     ),
                 },
@@ -620,11 +626,22 @@ class AIGateway:
         except (ValidationError, ValueError, TypeError):
             logger.warning("submission_intent_invalid_structure")
             return SubmissionIntent(intent="UNKNOWN")
-        if intent.intent != "SUBMIT_SINGLE":
-            if intent.company_name is not None:
+        if intent.intent == "SUBMIT_DATE":
+            # 仅允许模型给出合法 ISO 单日；日期区间或格式不明时安全降级为 UNKNOWN。
+            if intent.company_name is not None or intent.capture_date is None:
+                return SubmissionIntent(intent="UNKNOWN")
+            try:
+                capture_date = date.fromisoformat(intent.capture_date)
+            except ValueError:
+                return SubmissionIntent(intent="UNKNOWN")
+            if capture_date.isoformat() != intent.capture_date:
                 return SubmissionIntent(intent="UNKNOWN")
             return intent
-        if intent.company_name is None:
+        if intent.intent != "SUBMIT_SINGLE":
+            if intent.company_name is not None or intent.capture_date is not None:
+                return SubmissionIntent(intent="UNKNOWN")
+            return intent
+        if intent.company_name is None or intent.capture_date is not None:
             return SubmissionIntent(intent="UNKNOWN")
         company_name = intent.company_name.strip()
         if (

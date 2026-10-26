@@ -1724,10 +1724,11 @@ class WecomActionService:
     ) -> WecomAction:
         """发行批量提交候选卡，负责人范围只保存在服务端动作上下文。
 
-        参数：actor_user_id 为销售身份；request_message_id 为命令消息；command_text 为固定命令；
+        参数：actor_user_id 为销售身份；request_message_id 为命令消息；command_text 为规范命令；
         candidates 仅含服务端线索标识和展示名称；
         candidate_snapshots 为命令阶段批量读取的服务端快照；每页最多 19 条，另占全选入口。
-        preview_markdown_chunks 为同一页 Smart Table 快照的完整 Markdown 分片。
+        preview_markdown_chunks 为同一页 Smart Table 快照的完整 Markdown 分片；
+        target_capture_date 为普通全部线索或授权跨员工候选的单日筛选条件。
         返回值：已持久化的候选选择动作。
         异常：候选数据、卡片能力或权限不满足时抛出异常。
         副作用：写入动作、卡片通知和发送 outbox，不调用 CRM。
@@ -1751,8 +1752,8 @@ class WecomActionService:
                 raise ValueError("跨员工候选日期格式非法")
         elif owner_scope_user_ids is not None:
             raise ValueError("普通批量候选不能携带跨员工负责人范围")
-        elif target_capture_date is not None:
-            raise ValueError("普通批量候选不能携带跨员工日期")
+        elif target_capture_date is not None and command_text != "提交我所有线索":
+            raise ValueError("普通批量候选仅允许全部线索命令携带筛选日期")
         target_id = hashlib.sha256(
             f"crm-batch-submission:{request_message_id}:{command_text}:page:{page}".encode()
         ).hexdigest()
@@ -3203,7 +3204,10 @@ class DeterministicWecomActionExecutor:
             raise ValueError("普通批量提交动作包含非法负责人范围")
         if raw_capture_date is None:
             target_capture_date = None
-        elif command_text != CROSS_OWNER_SUBMISSION_COMMAND or type(raw_capture_date) is not int:
+        elif (
+            command_text not in {CROSS_OWNER_SUBMISSION_COMMAND, "提交我所有线索"}
+            or type(raw_capture_date) is not int
+        ):
             raise ValueError("批量提交动作日期范围非法")
         else:
             try:
