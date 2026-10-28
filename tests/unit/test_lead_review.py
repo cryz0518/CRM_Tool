@@ -160,6 +160,31 @@ def test_new_record_snapshot_skips_pre_read_and_still_updates_business_fields(
     assert updated_record.fields["工艺"] == ["上下料"]
 
 
+def test_review_owner_check_uses_directory_userid_for_callback_identity(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证审核读取时将数据库回调身份映射为表格通讯录 userid。
+
+    参数：session_factory 提供线索、消息和字段来源的隔离数据库。
+    返回值：无。
+    异常：负责人身份空间比较错误或字段补丁未写入时由 pytest 报告。
+    副作用：创建 Mock 表格记录并执行一次 AI 审核补丁。
+    """
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead_with_record(session_factory, adapter)
+    record = next(iter(adapter.get_records()))
+    adapter.update_record(record.record_id, {"负责人": "directory-sales-1"})
+    adapter.resolve_member_user_id = lambda _user_id: "directory-sales-1"
+
+    result = LeadReviewService(session_factory, adapter).sync_ai_patch(
+        lead_id,
+        "message-9",
+        _patch(fields={"工艺": ["上下料"]}),
+    )
+
+    assert "工艺" in result.updated_fields
+
+
 def test_sync_rechecks_user_edit_and_only_writes_safe_medium_confidence_field(
     session_factory: sessionmaker[Session],
 ) -> None:

@@ -172,6 +172,26 @@ class SmartTableOwnerTransferService:
             return SmartTableOwnerTransferResult(operation_id, snapshot.lead_id, "processing")
 
         try:
+            old_owner_table_id = self._smart_table.resolve_member_user_id(snapshot.old_owner)
+            new_owner_table_id = self._smart_table.resolve_member_user_id(snapshot.new_owner)
+        except Exception as exc:
+            summary = self._safe_summary(exc)
+            self._mark_pending_recovery(
+                operation_id,
+                remote_update_state="unknown",
+                permission_state="pending",
+                failure_code="member_identity_resolution_failed",
+                failure_summary=summary,
+            )
+            return SmartTableOwnerTransferResult(
+                operation_id,
+                snapshot.lead_id,
+                "pending_recovery",
+                "member_identity_resolution_failed",
+                summary,
+            )
+
+        try:
             record = self._smart_table.get_record(snapshot.record_id)
         except Exception as exc:
             summary = self._safe_summary(exc)
@@ -200,11 +220,11 @@ class SmartTableOwnerTransferService:
             )
 
         remote_owner = record.fields.get("负责人")
-        if remote_owner == snapshot.new_owner:
+        if remote_owner == new_owner_table_id:
             # 读取到目标负责人即冻结远端成功事实，再进行权限验证和本地收敛。
             self._mark_remote_succeeded(operation_id)
             return self._verify_and_finalize(snapshot, request_id)
-        if remote_owner != snapshot.old_owner:
+        if remote_owner != old_owner_table_id:
             summary = "远端负责人既不是原负责人也不是目标负责人"
             self._mark_pending_recovery(
                 operation_id,
@@ -350,8 +370,11 @@ class SmartTableOwnerTransferService:
         """验证 A/B 权限后再收敛本地 owner/context。"""
 
         try:
+            # 权限核验面向智能表格人员字段，因此使用通讯录中的表格 userid。
+            old_owner_table_id = self._smart_table.resolve_member_user_id(snapshot.old_owner)
+            new_owner_table_id = self._smart_table.resolve_member_user_id(snapshot.new_owner)
             verification = self._permission_verifier.verify_owner_transfer(
-                snapshot.record_id, snapshot.old_owner, snapshot.new_owner
+                snapshot.record_id, old_owner_table_id, new_owner_table_id
             )
         except SmartTablePermissionVerificationUnavailable as exc:
             summary = self._safe_summary(exc)

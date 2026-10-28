@@ -42,6 +42,16 @@ class SmartTableAdapterConfigurationError(PermanentTaskFailure):
 class SmartTableAdapter(Protocol):
     """隔离企业微信 CLI/API 的稳定智能表格读写契约。"""
 
+    def resolve_member_user_id(self, user_id: str) -> str:
+        """把消息回调中的成员标识转换为智能表格可用的通讯录 userid。
+
+        参数：user_id 为业务层收到或保存的企微成员标识。
+        返回值：经通讯录确认、可用于智能表格人员字段的 userid。
+        异常：成员无法唯一解析时由具体适配器抛出异常。
+        副作用：真实适配器可能执行只读通讯录查询。
+        """
+        ...
+
     def get_schema(self) -> SmartTableSchema:
         """读取管理员维护的字段、类型和枚举结构。
 

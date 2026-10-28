@@ -19,22 +19,49 @@ from app.smart_table.models import SmartTableRecord
 class FakeAdminCreateTable:
     """记录管理员创建的完整最小字段集合。"""
 
-    def __init__(self) -> None:
-        """初始化调用记录。"""
+    def __init__(self, member_ids: dict[str, str] | None = None) -> None:
+        """初始化管理员创建用的远端记录和通讯录映射。
 
+        参数：member_ids 为业务用户标识到表格 userid 的可选测试映射。
+        返回值：无。
+        异常：无。
+        副作用：初始化内存记录和创建调用计数。
+        """
+
+        self._member_ids = member_ids or {}
         self.calls: list[tuple[dict[str, object], object]] = []
         self.records: dict[str, SmartTableRecord] = {}
         self.raise_after_create = False
         self.definite_failures = 0
 
+    def resolve_member_user_id(self, user_id: str) -> str:
+        """将测试业务身份转换为智能表格成员标识。
+
+        参数：user_id 为后台保存的业务成员标识。
+        返回值：测试通讯录映射后的 userid；未配置映射时原样返回。
+        异常：无。
+        副作用：无。
+        """
+        return self._member_ids.get(user_id, user_id)
+
     def create_record(self, fields: dict[str, object], *, actor: object) -> SmartTableRecord:
-        """返回远端创建快照。"""
+        """模拟创建记录并将人员字段写成表格通讯录 userid。
+
+        参数：fields 为待写入业务字段；actor 为调用主体。
+        返回值：新建记录的表格快照。
+        异常：字段包含系统时间列时由断言报告。
+        副作用：向内存记录集新增一条记录并记录创建请求。
+        """
 
         assert not {"创建时间", "录入时间"}.intersection(fields)
         self.calls.append((dict(fields), actor))
+        table_fields = dict(fields)
+        for name in ("创建人", "负责人"):
+            if isinstance(table_fields.get(name), str):
+                table_fields[name] = self.resolve_member_user_id(str(table_fields[name]))
         record = SmartTableRecord(
             record_id=f"record-admin-{len(self.calls)}",
-            fields={**fields, "创建时间": "2026-10-09 10:20"},
+            fields={**table_fields, "创建时间": "2026-10-09 10:20"},
         )
         self.records[record.record_id] = record
         if self.definite_failures:
@@ -189,9 +216,15 @@ def test_admin_create_requires_reason_and_authorized_target(
 def test_admin_create_unknown_remote_result_reconciles_without_duplicate_create(
     session_factory: sessionmaker[Session], seeded_admin: None
 ) -> None:
-    """远端已创建但响应未知时，重复 request 先核验事实而不再次 create。"""
+    """远端人员字段已用通讯录 userid 时，恢复可证明记录且不会重复新增。
 
-    table = FakeAdminCreateTable()
+    参数：session_factory 提供隔离数据库；seeded_admin 初始化管理员与销售。
+    返回值：无。
+    异常：恢复状态、远端负责人或创建调用次数不符时由 pytest 报告。
+    副作用：模拟一次结果未知的创建，随后只读核验已有记录。
+    """
+
+    table = FakeAdminCreateTable({"sales-owner": "directory-owner"})
     table.raise_after_create = True
     service = AdminLeadCreationService(session_factory, table)
     first = service.create(
@@ -220,6 +253,7 @@ def test_admin_create_unknown_remote_result_reconciles_without_duplicate_create(
     )
     assert second.status == "succeeded"
     assert len(table.calls) == 1
+    assert next(iter(table.records.values())).fields["负责人"] == "directory-owner"
 
 
 def test_admin_create_definite_remote_failure_can_retry_safely(
