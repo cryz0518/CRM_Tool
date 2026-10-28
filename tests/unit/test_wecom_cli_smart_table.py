@@ -2738,12 +2738,13 @@ def test_owner_range_query_preserves_native_entry_time_for_date_selection() -> N
 
 
 @pytest.mark.parametrize("owner_name", [None, "杨康鑫"])
+@pytest.mark.parametrize("directory_name", ["杨康鑫(杨康鑫)", "杨康鑫（阿里）"])
 def test_owner_range_filter_resolves_callback_id_before_exact_member_check(
-    owner_name: str | None,
+    owner_name: str | None, directory_name: str,
 ) -> None:
     """验证负责人筛选先映射回调身份再与表格人员字段精确匹配。
 
-    参数：无。
+    参数：owner_name 模拟可缺失的后台姓名；directory_name 模拟含花名的通讯录姓名。
     返回值：无。
     异常：记录查询结果、负责人字段或通讯录查询次数不符时由 pytest 报告。
     副作用：通过 FakeCli 模拟通讯录查询和智能表格 records query。
@@ -2780,7 +2781,7 @@ def test_owner_range_filter_resolves_callback_id_before_exact_member_check(
         ],
         member_search_responses={
             callback_id: {
-                "users": [{"userid": table_user_id, "name": "杨康鑫"}]
+                "users": [{"userid": table_user_id, "name": directory_name}]
             }
         },
     )
@@ -2796,21 +2797,25 @@ def test_owner_range_filter_resolves_callback_id_before_exact_member_check(
     assert [record.record_id for record in records] == ["record-1"]
     assert records[0].fields["负责人"] == table_user_id
     assert len(fake_cli.member_search_calls) == 1
+    # 表格显示本名；通讯录的“本名(花名)”只能用于解析身份，不能原样作为筛选文本。
+    sql = fake_cli.calls[0][fake_cli.calls[0].index("--sql") + 1]
+    assert '`负责人` LIKE "%杨康鑫%"' in sql
 
 
 @pytest.mark.parametrize("matched_id", ["document-user-id", "another-user-id"])
+@pytest.mark.parametrize("empty_response", [{"users": []}, {"users_count": 0}])
 def test_directory_userid_uses_known_name_only_when_exact_identity_matches(
-    matched_id: str,
+    matched_id: str, empty_response: dict[str, object],
 ) -> None:
     """验证已知通讯录标识可按姓名回查，并拒绝同名但不同身份的结果。
 
-    参数：matched_id 为姓名搜索返回的成员标识。
+    参数：matched_id 为姓名搜索返回的成员标识；empty_response 覆盖 CLI 两种空结果格式。
     返回值：无；匹配标识应可复用，其他标识应抛出协议异常。
     异常：断言失败由 pytest 报告。
     副作用：仅通过 FakeCli 模拟两次通讯录查询。
     """
     fake_cli = FakeCli([], member_search_responses={
-        "document-user-id": {"users": []},
+        "document-user-id": empty_response,
         "杨康鑫": {"users": [{"userid": matched_id, "name": "杨康鑫"}]},
     })
     adapter = _adapter(fake_cli)
