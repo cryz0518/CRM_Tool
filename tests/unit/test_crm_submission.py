@@ -2163,7 +2163,6 @@ def test_batch_candidates_read_only_linked_records_for_requested_owner_scope(
     """验证批量候选只按负责人线索已绑定的记录标识一次回读。"""
     adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
     lead_id = _lead(session_factory, adapter)
-    record_id = adapter.get_records()[0].record_id
     original_get_records = adapter.get_records
     calls: list[tuple[Collection[str] | None, tuple[str, ...] | None]] = []
 
@@ -2192,6 +2191,44 @@ def test_batch_candidates_read_only_linked_records_for_requested_owner_scope(
 
     assert tuple(candidate.lead_id for candidate in candidates) == (lead_id,)
     assert calls == [(None, ("sales-1",))]
+
+
+def test_callback_identity_without_name_reuses_snapshot_for_candidate_and_submission(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证回调无姓名且表格人员标识不同时，候选和确认提交仍认领同一发送者。
+
+    参数：session_factory 为隔离数据库；monkeypatch 注入通讯录身份转换。
+    返回值：无；候选应包含当前线索，冻结快照应成功提交一次。
+    异常：断言失败由 pytest 报告。
+    副作用：仅修改测试数据库、内存表格并调用 Mock CRM。
+    """
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    record = adapter.get_records()[0]
+    snapshot = SmartTableRecord(
+        record_id=record.record_id,
+        fields={**record.fields, "负责人": "directory-sales-1"},
+        member_names={"负责人": "sales-1"},
+    )
+    monkeypatch.setattr(
+        adapter, "resolve_member_user_id",
+        lambda user_id, display_name=None: (
+            "directory-sales-1" if user_id == "sales-1" else user_id
+        ),
+    )
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    candidates = service.list_submission_candidates(
+        "提交我所有线索", "sales-1", smart_table_records=(snapshot,),
+    )
+    assert tuple(candidate.lead_id for candidate in candidates) == (lead_id,)
+    result = service.submit_selected(
+        SubmissionCommand("提交我所有线索", "sales-1", "identity-submit"),
+        (lead_id,), initial_records={snapshot.record_id: snapshot},
+    )
+    assert result.succeeded == 1
+    assert crm.calls == 1
 
 
 def test_today_three_candidates_process_complete_and_incomplete_independently(

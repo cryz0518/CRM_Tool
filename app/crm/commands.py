@@ -7,7 +7,7 @@ import logging
 import re
 from collections.abc import Mapping
 from dataclasses import asdict, replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
@@ -781,7 +781,9 @@ def _link_unsubmitted_smart_table_records(
     for record in records:
         if record.fields.get("提交状态") not in expected_statuses:
             continue
-        owner_user_id = _table_owner_user_id(record, owner_user_ids, owner_names)
+        owner_user_id = _table_owner_user_id(
+            record, owner_user_ids, owner_names, smart_table_adapter
+        )
         if owner_user_id is None:
             continue
         if capture_date is not None and CrmSubmissionService._parse_capture_date(
@@ -957,6 +959,7 @@ def prepare_company_submission_preview(
                     record,
                     (command.sales_user_id,),
                     owner_names,
+                    smart_table_adapter,
                 )
                 != command.sales_user_id
             ):
