@@ -1625,6 +1625,10 @@ def test_member_fields_resolve_callback_id_to_document_userid_once() -> None:
     ]
     assert len(fake_cli.member_search_calls) == 1
 
+    # 已由通讯录确认的表格标识可在后续校验中复用，不能再次拿它当搜索关键词。
+    assert adapter.resolve_member_user_id(table_user_id) == table_user_id
+    assert len(fake_cli.member_search_calls) == 1
+
 
 def test_member_identity_resolution_fails_closed_on_ambiguous_directory_result() -> None:
     """验证通讯录返回多个候选时不会写入未经确认的人员身份。
@@ -2733,7 +2737,10 @@ def test_owner_range_query_preserves_native_entry_time_for_date_selection() -> N
     assert 'DATE_FORMAT(`录入时间`, "%Y-%m-%d %H:%i:%s") AS `录入时间`' in sql
 
 
-def test_owner_range_filter_resolves_callback_id_before_exact_member_check() -> None:
+@pytest.mark.parametrize("owner_name", [None, "杨康鑫"])
+def test_owner_range_filter_resolves_callback_id_before_exact_member_check(
+    owner_name: str | None,
+) -> None:
     """验证负责人筛选先映射回调身份再与表格人员字段精确匹配。
 
     参数：无。
@@ -2782,13 +2789,37 @@ def test_owner_range_filter_resolves_callback_id_before_exact_member_check() -> 
 
     records = adapter.get_records(
         owner_user_ids=(callback_id,),
-        owner_display_names={callback_id: "杨康鑫"},
+        owner_display_names={callback_id: owner_name} if owner_name else None,
         submission_status="未提交",
     )
 
     assert [record.record_id for record in records] == ["record-1"]
     assert records[0].fields["负责人"] == table_user_id
     assert len(fake_cli.member_search_calls) == 1
+
+
+@pytest.mark.parametrize("matched_id", ["document-user-id", "another-user-id"])
+def test_directory_userid_uses_known_name_only_when_exact_identity_matches(
+    matched_id: str,
+) -> None:
+    """验证已知通讯录标识可按姓名回查，并拒绝同名但不同身份的结果。
+
+    参数：matched_id 为姓名搜索返回的成员标识。
+    返回值：无；匹配标识应可复用，其他标识应抛出协议异常。
+    异常：断言失败由 pytest 报告。
+    副作用：仅通过 FakeCli 模拟两次通讯录查询。
+    """
+    fake_cli = FakeCli([], member_search_responses={
+        "document-user-id": {"users": []},
+        "杨康鑫": {"users": [{"userid": matched_id, "name": "杨康鑫"}]},
+    })
+    adapter = _adapter(fake_cli)
+    if matched_id == "document-user-id":
+        assert adapter.resolve_member_user_id("document-user-id", "杨康鑫") == matched_id
+    else:
+        with pytest.raises(WecomCliProtocolError, match="身份"):
+            adapter.resolve_member_user_id("document-user-id", "杨康鑫")
+    assert len(fake_cli.member_search_calls) == 2
 
 
 def test_record_id_query_preserves_native_entry_time_for_date_selection() -> None:

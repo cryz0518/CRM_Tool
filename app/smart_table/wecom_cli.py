@@ -221,6 +221,7 @@ class WecomCliSmartTableAdapter:
         self._pace_cli_calls = runner is None
         # 只缓存本进程已通过通讯录唯一确认的成员映射，失败结果不缓存。
         self._member_user_id_cache: dict[str, str] = {}
+        self._member_name_cache: dict[str, str] = {}
         self._rate_limit_redis: Any = (
             Redis.from_url(
                 get_settings().redis_url,
@@ -403,7 +404,7 @@ class WecomCliSmartTableAdapter:
             raise ValueError("记录标识与负责人范围不能同时过滤")
         if owner_names is not None and (
             owners is None
-            or set(owner_names) != set(owners)
+            or not set(owner_names).issubset(owners)
             or any(not name for name in owner_names.values())
         ):
             raise ValueError("负责人显示名必须与负责人 user_id 一一对应")
@@ -411,12 +412,17 @@ class WecomCliSmartTableAdapter:
             return []
         if owners is not None:
             source_owners = owners
-            owners = tuple(self.resolve_member_user_id(user_id) for user_id in source_owners)
+            owners = tuple(
+                self.resolve_member_user_id(user_id, (owner_names or {}).get(user_id))
+                for user_id in source_owners
+            )
             if len(set(owners)) != len(owners):
                 raise SmartTableAdapterConfigurationError("多个回调身份映射到了同一表格负责人")
-            if owner_names is not None:
+            if owner_names is not None or scoped_filters:
+                # 新回调没有姓名时直接复用刚确认的通讯录姓名，避免依赖后台预登记。
                 owner_names = {
-                    resolved_id: owner_names[source_id]
+                    resolved_id: (owner_names or {}).get(source_id)
+                    or self._member_name_cache[resolved_id]
                     for source_id, resolved_id in zip(source_owners, owners, strict=True)
                 }
         if scoped_filters and (owners is None or owner_names is None):
@@ -444,13 +450,13 @@ class WecomCliSmartTableAdapter:
             )
         return [self._parse_record(item, schema) for item in self._list_pages("records")]
 
-    def resolve_member_user_id(self, user_id: str) -> str:
+    def resolve_member_user_id(self, user_id: str, display_name: str | None = None) -> str:
         """通过已授权通讯录把回调成员标识转换为表格可接受的 userid。
 
-        参数：user_id 为消息回调中保存的企微成员标识。
+        参数：user_id 为回调或通讯录成员标识；display_name 仅用于回查已知通讯录标识。
         返回值：通讯录搜索得到的唯一成员 userid。
         异常：通讯录查询失败、结果截断、成员缺失或命中不唯一时抛出协议异常。
-        副作用：调用一次只读 wecom-cli 通讯录查询；成功映射仅在当前适配器实例缓存。
+        副作用：只读查询通讯录；已知标识无法直接搜索时可按姓名再核验一次；成功结果进程内缓存。
         """
         if not isinstance(user_id, str) or not user_id.strip():
             raise ValueError("智能表格成员标识不能为空")
@@ -459,43 +465,49 @@ class WecomCliSmartTableAdapter:
         if cached is not None:
             return cached
 
-        # Worker 持有已授权 CLI；机器人容器不做通讯录查询，也不把回调 ID 猜成表格 userid。
-        response = self._run_cli((
-            self._command,
-            "contact",
-            "users",
-            "search",
-            "--json",
-            json.dumps(
-                {"keywords": [source_id], "search_mode": "list"},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
-        ))
-        self._raise_for_error(response)
-        users = response.get("users")
-        if response.get("hint") or not isinstance(users, list):
-            raise WecomCliProtocolError("企微通讯录结果不完整，不能确认智能表格成员身份")
-
-        matches: dict[str, str] = {}
-        for user in users:
-            if not isinstance(user, Mapping):
-                raise WecomCliProtocolError("企微通讯录成员结构无效")
-            member_id, name = user.get("userid"), user.get("name")
-            if (
-                not isinstance(member_id, str)
-                or not member_id.strip()
-                or not isinstance(name, str)
-                or not name.strip()
-            ):
-                raise WecomCliProtocolError("企微通讯录成员缺少 userid 或姓名")
-            matches[member_id.strip()] = name.strip()
-        if len(matches) != 1:
-            raise WecomCliProtocolError("企微通讯录未返回唯一智能表格成员")
-
-        resolved_id = next(iter(matches))
-        self._member_user_id_cache[source_id] = resolved_id
-        return resolved_id
+        keywords = [source_id]
+        if display_name and display_name.strip() != source_id:
+            keywords.append(display_name.strip())
+        for keyword in keywords:
+            # 完整结果才能证明身份唯一；姓名兜底只接受与已知标识完全相同的成员。
+            response = self._run_cli((
+                self._command, "contact", "users", "search", "--json",
+                json.dumps(
+                    {"keywords": [keyword], "search_mode": "list"},
+                    ensure_ascii=False, separators=(",", ":"),
+                ),
+            ))
+            self._raise_for_error(response)
+            users = response.get("users")
+            if response.get("hint") or not isinstance(users, list):
+                raise WecomCliProtocolError("企微通讯录结果不完整，不能确认智能表格成员身份")
+            matches: dict[str, str] = {}
+            for user in users:
+                if not isinstance(user, Mapping):
+                    raise WecomCliProtocolError("企微通讯录成员结构无效")
+                member_id, name = user.get("userid"), user.get("name")
+                if (
+                    not isinstance(member_id, str) or not member_id.strip()
+                    or not isinstance(name, str) or not name.strip()
+                ):
+                    raise WecomCliProtocolError("企微通讯录成员缺少 userid 或姓名")
+                matches[member_id.strip()] = name.strip()
+            if not matches:
+                continue
+            if source_id in matches:
+                resolved_id = source_id
+            elif keyword != source_id:
+                raise WecomCliProtocolError("通讯录姓名对应成员与已知负责人身份不一致")
+            elif len(matches) == 1:
+                resolved_id = next(iter(matches))
+            else:
+                raise WecomCliProtocolError("企微通讯录未返回唯一智能表格成员")
+            # 同时记住输入和已确认标识，避免后续校验再次搜索不可检索的表格标识。
+            self._member_user_id_cache[source_id] = resolved_id
+            self._member_user_id_cache[resolved_id] = resolved_id
+            self._member_name_cache[resolved_id] = matches[resolved_id]
+            return resolved_id
+        raise WecomCliProtocolError("企微通讯录未返回唯一智能表格成员")
 
     def create_record(
         self,

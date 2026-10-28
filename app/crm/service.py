@@ -365,19 +365,30 @@ def _table_owner_user_id(
     record: SmartTableRecord,
     owner_user_ids: Collection[str],
     owner_display_names: Mapping[str, str],
+    smart_table_adapter: SmartTableAdapter,
 ) -> str | None:
     """仅从当前智能表格行解析负责人企微 ID，拒绝不唯一的姓名匹配。
 
     参数：record 为当前提交快照；owner_user_ids 为本次允许的负责人范围；
-    owner_display_names 为这些负责人的通讯录显示名。
+    owner_display_names 为这些负责人的通讯录显示名；smart_table_adapter 统一成员标识空间。
     返回值：表格负责人对应的唯一企微 ID；缺失、越界或姓名歧义时返回 None。
-    异常：无；不完整或非文本的表格成员值按无法识别处理。
-    副作用：无，仅读取当前快照。
+    异常：通讯录身份无法确认时传播适配器异常；不完整成员值按无法识别处理。
+    副作用：必要时只读查询通讯录，复用适配器缓存，不回读智能表格。
     """
     allowed_ids = set(owner_user_ids)
     raw_owner = record.fields.get("负责人")
     if isinstance(raw_owner, str) and raw_owner in allowed_ids:
         return raw_owner
+    if isinstance(raw_owner, str) and raw_owner:
+        # 保持业务身份不变，仅在比较时转换，卡片回调同样复用冻结快照。
+        identity_matches = {
+            user_id for user_id in allowed_ids
+            if smart_table_adapter.resolve_member_user_id(
+                user_id, owner_display_names.get(user_id)
+            ) == raw_owner
+        }
+        if identity_matches:
+            return next(iter(identity_matches)) if len(identity_matches) == 1 else None
     member_names = record.member_names if isinstance(record.member_names, Mapping) else {}
     names = {
         value.strip()
@@ -857,7 +868,7 @@ class CrmSubmissionService:
             if (
                 record is not None
                 and _table_owner_user_id(
-                    record, (command.sales_user_id,), owner_display_names
+                    record, (command.sales_user_id,), owner_display_names, self._smart_table_adapter
                 )
                 == command.sales_user_id
                 and record.fields.get("提交状态") in (None, "", "未提交")
@@ -996,7 +1007,7 @@ class CrmSubmissionService:
         for record in queried_records:
             # 负责人、日期和提交状态均从表格当前行决定；Lead 仅承载 CRM 同步幂等状态。
             owner_user_id = _table_owner_user_id(
-                record, owner_user_ids, query_owner_names
+                record, owner_user_ids, query_owner_names, self._smart_table_adapter
             )
             if owner_user_id is None:
                 continue
@@ -1199,7 +1210,9 @@ class CrmSubmissionService:
             record = snapshot_by_record_id.get(record_id or "")
             if record is None:
                 continue
-            if _table_owner_user_id(record, allowed_owner_ids, query_owner_names) is None:
+            if _table_owner_user_id(
+                record, allowed_owner_ids, query_owner_names, self._smart_table_adapter
+            ) is None:
                 valid_ids.remove(lead_id)
                 continue
             allowed_statuses = (
@@ -1332,7 +1345,7 @@ class CrmSubmissionService:
             record.record_id: record
             for record in queried_records
             if _table_owner_user_id(
-                record, (command.sales_user_id,), owner_display_names
+                record, (command.sales_user_id,), owner_display_names, self._smart_table_adapter
             )
             == command.sales_user_id
         }
@@ -1451,7 +1464,8 @@ class CrmSubmissionService:
         if (
             initial_record.record_id != lead.smart_table_record_id
             or _table_owner_user_id(
-                initial_record, (command.sales_user_id,), owner_display_names
+                initial_record, (command.sales_user_id,), owner_display_names,
+                self._smart_table_adapter,
             )
             != command.sales_user_id
         ):
@@ -1468,7 +1482,8 @@ class CrmSubmissionService:
                 current_lead is None
                 or current_lead.smart_table_record_id != current_record.record_id
                 or _table_owner_user_id(
-                    current_record, (command.sales_user_id,), owner_display_names
+                    current_record, (command.sales_user_id,), owner_display_names,
+                    self._smart_table_adapter,
                 )
                 != command.sales_user_id
             ):
@@ -1547,7 +1562,8 @@ class CrmSubmissionService:
                 lead is None
                 or lead.smart_table_record_id != current_record.record_id
                 or _table_owner_user_id(
-                    current_record, (command.sales_user_id,), owner_display_names
+                    current_record, (command.sales_user_id,), owner_display_names,
+                    self._smart_table_adapter,
                 )
                 != command.sales_user_id
             ):
@@ -1767,7 +1783,7 @@ class CrmSubmissionService:
             if name != "AI待确认"
         }
         if _table_owner_user_id(
-            initial_record, owner_user_ids, owner_display_names
+            initial_record, owner_user_ids, owner_display_names, self._smart_table_adapter
         ) is None:
             # CRM 负责人和提交权限只能从本次表格快照解析。
             return _create_outcome("not_submitted")
@@ -1875,7 +1891,10 @@ class CrmSubmissionService:
                 if lead is None or lead.smart_table_record_id != initial_record.record_id:
                     return _create_outcome("not_submitted")
                 if (
-                    _table_owner_user_id(initial_record, owner_user_ids, owner_display_names) is None
+                    _table_owner_user_id(
+                        initial_record, owner_user_ids, owner_display_names,
+                        self._smart_table_adapter,
+                    ) is None
                     or initial_record.fields.get("提交状态") not in allowed_submission_statuses
                     or expected_capture_date is not None
                     and self._parse_capture_date(

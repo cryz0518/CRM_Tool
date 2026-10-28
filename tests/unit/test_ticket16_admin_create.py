@@ -34,7 +34,7 @@ class FakeAdminCreateTable:
         self.raise_after_create = False
         self.definite_failures = 0
 
-    def resolve_member_user_id(self, user_id: str) -> str:
+    def resolve_member_user_id(self, user_id: str, display_name: str | None = None) -> str:
         """将测试业务身份转换为智能表格成员标识。
 
         参数：user_id 为后台保存的业务成员标识。

@@ -46,10 +46,10 @@ class MockSmartTableAdapter:
         self._next_record_number = 1
         self.delete_calls = 0
 
-    def resolve_member_user_id(self, user_id: str) -> str:
+    def resolve_member_user_id(self, user_id: str, display_name: str | None = None) -> str:
         """在 Mock 中保留输入标识，模拟已规范化的成员身份。
 
-        参数：user_id 为业务层成员标识。
+        参数：user_id 为业务层成员标识；display_name 仅供真实适配器查询，Mock 忽略。
         返回值：原样返回非空成员标识。
         异常：标识为空时抛出 ValueError。
         副作用：无。
