@@ -425,6 +425,11 @@ class WecomCliSmartTableAdapter:
                     or self._member_name_cache[resolved_id]
                     for source_id, resolved_id in zip(source_owners, owners, strict=True)
                 }
+                # 表格可能只显示本名；姓名仅作预筛，最终归属仍由成员标识精确校验。
+                for owner_id, name in owner_names.items():
+                    combined = re.fullmatch(r"(.+?)[(（]([^()（）]+)[)）]", name.strip())
+                    if combined is not None:
+                        owner_names[owner_id] = combined.group(1).strip()
         if scoped_filters and (owners is None or owner_names is None):
             raise SmartTableAdapterConfigurationError(
                 "提交状态/日期服务端筛选需要负责人 user_id 和显示名"
@@ -479,6 +484,9 @@ class WecomCliSmartTableAdapter:
             ))
             self._raise_for_error(response)
             users = response.get("users")
+            # CLI 未命中时省略 users，仅返回 users_count=0；仍允许按已知姓名核验身份。
+            if users is None and response.get("users_count") == 0:
+                users = []
             if response.get("hint") or not isinstance(users, list):
                 raise WecomCliProtocolError("企微通讯录结果不完整，不能确认智能表格成员身份")
             matches: dict[str, str] = {}
