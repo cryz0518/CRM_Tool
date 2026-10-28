@@ -219,6 +219,8 @@ class WecomCliSmartTableAdapter:
         self._include_entry_time = include_entry_time
         self._runner = runner or self._run_subprocess
         self._pace_cli_calls = runner is None
+        # 只缓存本进程已通过通讯录唯一确认的成员映射，失败结果不缓存。
+        self._member_user_id_cache: dict[str, str] = {}
         self._rate_limit_redis: Any = (
             Redis.from_url(
                 get_settings().redis_url,
@@ -407,6 +409,16 @@ class WecomCliSmartTableAdapter:
             raise ValueError("负责人显示名必须与负责人 user_id 一一对应")
         if requested == () or owners == ():
             return []
+        if owners is not None:
+            source_owners = owners
+            owners = tuple(self.resolve_member_user_id(user_id) for user_id in source_owners)
+            if len(set(owners)) != len(owners):
+                raise SmartTableAdapterConfigurationError("多个回调身份映射到了同一表格负责人")
+            if owner_names is not None:
+                owner_names = {
+                    resolved_id: owner_names[source_id]
+                    for source_id, resolved_id in zip(source_owners, owners, strict=True)
+                }
         if scoped_filters and (owners is None or owner_names is None):
             raise SmartTableAdapterConfigurationError(
                 "提交状态/日期服务端筛选需要负责人 user_id 和显示名"
@@ -431,6 +443,59 @@ class WecomCliSmartTableAdapter:
                 capture_date=capture_date,
             )
         return [self._parse_record(item, schema) for item in self._list_pages("records")]
+
+    def resolve_member_user_id(self, user_id: str) -> str:
+        """通过已授权通讯录把回调成员标识转换为表格可接受的 userid。
+
+        参数：user_id 为消息回调中保存的企微成员标识。
+        返回值：通讯录搜索得到的唯一成员 userid。
+        异常：通讯录查询失败、结果截断、成员缺失或命中不唯一时抛出协议异常。
+        副作用：调用一次只读 wecom-cli 通讯录查询；成功映射仅在当前适配器实例缓存。
+        """
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("智能表格成员标识不能为空")
+        source_id = user_id.strip()
+        cached = self._member_user_id_cache.get(source_id)
+        if cached is not None:
+            return cached
+
+        # Worker 持有已授权 CLI；机器人容器不做通讯录查询，也不把回调 ID 猜成表格 userid。
+        response = self._run_cli((
+            self._command,
+            "contact",
+            "users",
+            "search",
+            "--json",
+            json.dumps(
+                {"keywords": [source_id], "search_mode": "list"},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        ))
+        self._raise_for_error(response)
+        users = response.get("users")
+        if response.get("hint") or not isinstance(users, list):
+            raise WecomCliProtocolError("企微通讯录结果不完整，不能确认智能表格成员身份")
+
+        matches: dict[str, str] = {}
+        for user in users:
+            if not isinstance(user, Mapping):
+                raise WecomCliProtocolError("企微通讯录成员结构无效")
+            member_id, name = user.get("userid"), user.get("name")
+            if (
+                not isinstance(member_id, str)
+                or not member_id.strip()
+                or not isinstance(name, str)
+                or not name.strip()
+            ):
+                raise WecomCliProtocolError("企微通讯录成员缺少 userid 或姓名")
+            matches[member_id.strip()] = name.strip()
+        if len(matches) != 1:
+            raise WecomCliProtocolError("企微通讯录未返回唯一智能表格成员")
+
+        resolved_id = next(iter(matches))
+        self._member_user_id_cache[source_id] = resolved_id
+        return resolved_id
 
     def create_record(
         self,
@@ -894,7 +959,8 @@ class WecomCliSmartTableAdapter:
                 if submission_status == "未提交":
                     # 人工录入行的状态可能为空；无成功标记的行仍可进入提交候选。
                     conditions.append(
-                        f"({status_identifier} = {self._quote_sql_string_literal(submission_status)} "
+                        f"({status_identifier} = "
+                        f"{self._quote_sql_string_literal(submission_status)} "
                         f"OR {status_identifier} IS NULL OR {status_identifier} = '')"
                     )
                 else:
@@ -1941,8 +2007,8 @@ class WecomCliSmartTableAdapter:
         elif field.field_type is SmartTableFieldType.MEMBER:
             if not isinstance(value, str) or not value:
                 raise ValueError(f"MEMBER 字段必须传入非空 sales_user_id：{canonical_name}")
-            # CLI 的 CellUserValue 写入格式为数组；业务层只保留企业微信销售身份字符串。
-            cli_value = [{"userId": value}]
+            # 回调身份可能不是文档成员 userid，先用通讯录结果统一两种身份空间。
+            cli_value = [{"userId": self.resolve_member_user_id(value)}]
         elif field.field_type in {
             SmartTableFieldType.TEXT,
             SmartTableFieldType.LONG_TEXT,
