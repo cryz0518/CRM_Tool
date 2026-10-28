@@ -46,6 +46,18 @@ class MockSmartTableAdapter:
         self._next_record_number = 1
         self.delete_calls = 0
 
+    def resolve_member_user_id(self, user_id: str) -> str:
+        """在 Mock 中保留输入标识，模拟已规范化的成员身份。
+
+        参数：user_id 为业务层成员标识。
+        返回值：原样返回非空成员标识。
+        异常：标识为空时抛出 ValueError。
+        副作用：无。
+        """
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("智能表格成员标识不能为空")
+        return user_id
+
     @property
     def sales_can_create_records(self) -> bool:
         """返回当前 Mock 的销售新增权限，便于 PoC 和配置测试明确断言。"""

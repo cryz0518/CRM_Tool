@@ -4207,6 +4207,18 @@ class FirstTextLeadWorkspaceService:
             {lead_id: record.record_id for lead_id, record in existing_records.items()}
         )
 
+        # 恢复或复用已存在行时，只补人员字段中的空值；非空负责人可能代表人工转交。
+        existing_requests = tuple(request for request in requests if request.lead_id in record_ids)
+        if existing_requests:
+            try:
+                self._repair_multi_smart_table_members(existing_requests, record_ids)
+            except Exception as error:
+                self._record_multi_smart_table_batch_failure(existing_requests, error)
+                logger.exception(
+                    "smart_table_multi_lead_member_repair_failed",
+                    extra={"error_type": type(error).__name__},
+                )
+
         pending_requests = tuple(
             request for request in unlinked_requests if request.lead_id not in record_ids
         )
@@ -4256,6 +4268,23 @@ class FirstTextLeadWorkspaceService:
                         for lead_id, record in recovered_records.items()
                     }
                 )
+                if recovered_records:
+                    recovered_requests = tuple(
+                        request for request in pending_requests
+                        if request.lead_id in recovered_records
+                    )
+                    try:
+                        self._repair_multi_smart_table_members(
+                            recovered_requests, record_ids
+                        )
+                    except Exception as repair_error:
+                        self._record_multi_smart_table_batch_failure(
+                            recovered_requests, repair_error
+                        )
+                        logger.exception(
+                            "smart_table_multi_lead_recovered_member_repair_failed",
+                            extra={"error_type": type(repair_error).__name__},
+                        )
                 unresolved = tuple(
                     request
                     for request in pending_requests
@@ -4283,7 +4312,7 @@ class FirstTextLeadWorkspaceService:
 
         参数：requests 为要核对的线索集合。
         返回值：以后台 lead_id 为键的唯一远端记录映射；未找到的线索不返回。
-        异常：查询结果缺少稳定键、负责人不符或同一键命中多行时抛出 ValueError。
+        异常：查询结果缺少稳定键或同一键命中多行时抛出 ValueError。
         副作用：只读智能表格。
         """
         if not requests:
@@ -4299,23 +4328,36 @@ class FirstTextLeadWorkspaceService:
         if any(not value for value in values):
             raise ValueError("批量建行必须先完成公司名称解析")
         records = self._smart_table_adapter.find_records_by_field_values(field_name, values)
-        return self._index_multi_smart_table_records(records, requests)
+        return self._index_multi_smart_table_records(
+            records, requests, allow_existing_owner=True
+        )
 
     def _index_multi_smart_table_records(
         self,
         records: list[SmartTableRecord],
         requests: tuple[MultiLeadSyncRequest, ...],
+        *,
+        allow_existing_owner: bool = False,
     ) -> dict[str, SmartTableRecord]:
-        """校验批量新增响应中的稳定线索 ID、负责人及记录数量。
+        """校验批量新增响应中的稳定线索 ID 和负责人的通讯录映射。
 
-        参数：records 为适配器返回的远端快照；requests 为本次批量请求。
+        参数：records 为适配器返回的远端快照；requests 为本次批量请求；allow_existing_owner
+        仅允许带系统线索 ID 的回查结果保留当前非空负责人，以兼容管理员转交。
         返回值：以后台 lead_id 为键的远端记录映射，允许回查结果不完整。
-        异常：数量、键、负责人或唯一性不符时抛出 ValueError，调用方随后按键回查。
+        异常：稳定键、负责人或唯一性不符时抛出 ValueError，调用方随后按键回查。
         副作用：无。
         """
-        expected = {request.lead_id: request.sales_user_id for request in requests}
+        expected = {
+            request.lead_id: self._smart_table_adapter.resolve_member_user_id(
+                request.sales_user_id
+            )
+            for request in requests
+        }
         by_company_owner = {
-            (str(request.fields.get("线索名称") or ""), request.sales_user_id): request.lead_id
+            (
+                str(request.fields.get("线索名称") or ""),
+                expected[request.lead_id],
+            ): request.lead_id
             for request in requests
         }
         indexed: dict[str, SmartTableRecord] = {}
@@ -4333,14 +4375,75 @@ class FirstTextLeadWorkspaceService:
                     str(record.fields.get("负责人") or ""),
                 ))
                 if lead_id is None:
+                    # 无系统键时，空负责人行不能安全关联到某个销售的同名记录。
+                    company_name = str(record.fields.get("线索名称") or "")
+                    if not record.fields.get("负责人") and any(
+                        str(request.fields.get("线索名称") or "") == company_name
+                        for request in requests
+                    ):
+                        raise ValueError("无系统线索 ID 时无法安全关联负责人为空的同名记录")
                     # 同名但其他销售的记录可能同时命中服务端查询，不得关联到当前批次。
                     continue
-            if lead_id in indexed or record.fields.get("负责人") != expected[lead_id]:
+            actual_owner = record.fields.get("负责人")
+            owner_matches = (
+                actual_owner == expected[lead_id]
+                or allow_existing_owner and has_system_key
+            )
+            if lead_id in indexed or not owner_matches:
                 raise ValueError("智能表格批量新增响应关联不唯一或负责人不匹配")
             if not record.record_id:
                 raise ValueError("智能表格批量新增响应缺少记录标识")
             indexed[lead_id] = record
         return indexed
+
+    def _repair_multi_smart_table_members(
+        self,
+        requests: tuple[MultiLeadSyncRequest, ...],
+        record_ids: Mapping[str, str],
+    ) -> None:
+        """恢复批量新增时只补写入失败的创建人或负责人空值。
+
+        参数：requests 为已持久化远端记录标识的线索；record_ids 为线索到表格记录 ID 的映射。
+        返回值：无。
+        异常：批量更新失败或人员值未写入时抛出异常供同步队列重试。
+        副作用：最多批量读取一次，并只对创建人/负责人为空的记录执行一次批量更新。
+        """
+        relevant = tuple(request for request in requests if request.lead_id in record_ids)
+        if not relevant:
+            return
+        requested_ids = tuple(dict.fromkeys(record_ids[request.lead_id] for request in relevant))
+        remote_records = self._smart_table_adapter.get_records(record_ids=requested_ids)
+        records_by_id = {record.record_id: record for record in remote_records}
+        if set(records_by_id) != set(requested_ids):
+            # 已知 ACK 的记录可能尚不可见，交给原恢复路径继续核验，不能覆盖其失败原因。
+            return
+
+        patches: list[tuple[str, Mapping[str, object]]] = []
+        for request in relevant:
+            record = records_by_id[record_ids[request.lead_id]]
+            # 非空负责人可能已经由管理员转交，恢复流程不能覆盖该人工决定。
+            missing_members = {
+                name: request.sales_user_id
+                for name in ("创建人", "负责人")
+                if record.fields.get(name) in (None, "")
+            }
+            if missing_members:
+                patches.append((record.record_id, missing_members))
+        if not patches:
+            return
+
+        updated_records = self._smart_table_adapter.update_records(patches)
+        updated_by_id = {record.record_id: record for record in updated_records}
+        if set(updated_by_id) != {record_id for record_id, _ in patches}:
+            raise ValueError("批量恢复没有确认全部人员字段更新")
+        for record_id, fields in patches:
+            updated = updated_by_id[record_id]
+            if any(
+                updated.fields.get(name)
+                != self._smart_table_adapter.resolve_member_user_id(str(user_id))
+                for name, user_id in fields.items()
+            ):
+                raise ValueError("批量恢复后创建人或负责人仍为空")
 
     def _persist_multi_smart_table_record_ids(
         self,

@@ -721,7 +721,13 @@ class LeadReviewService:
             raise ValueError(f"智能表格记录不存在：{record_id}")
         if record.record_id != record_id:
             raise ValueError(f"智能表格记录标识不一致：{record_id}")
-        if initial_record is None and record.fields.get("负责人") != lead.smart_table_owner_user_id:
+        if (
+            initial_record is None
+            and record.fields.get("负责人")
+            != self._smart_table_adapter.resolve_member_user_id(
+                lead.smart_table_owner_user_id
+            )
+        ):
             raise ValueError("智能表格负责人已变化，请先完成线索转交核对")
         return record, lead
 

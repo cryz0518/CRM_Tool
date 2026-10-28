@@ -31,6 +31,16 @@ class UnconfiguredSmartTableAdapter:
             "需要部署真实 CLI/API 适配器或显式启用 Mock"
         )
 
+    def resolve_member_user_id(self, _user_id: str) -> str:
+        """拒绝在未配置时伪造智能表格成员身份。
+
+        参数：_user_id 为业务层成员标识。
+        返回值：不会返回。
+        异常：始终抛出 SmartTableAdapterConfigurationError。
+        副作用：阻止调用方把未经核验的标识写入人员字段。
+        """
+        self._raise_not_configured()
+
     def get_schema(self) -> SmartTableSchema:
         """尝试读取表结构，但未配置时明确失败。
 

@@ -287,12 +287,18 @@ class AdminLeadCreationService:
             company_name = lead.standard_company_name
 
         try:
+            # 恢复读取的是表格通讯录 userid，比较条件也必须使用同一身份空间。
+            table_owner_user_id = self._smart_table.resolve_member_user_id(
+                snapshot.owner_user_id
+            )
+            expected["创建人"] = table_owner_user_id
+            expected["负责人"] = table_owner_user_id
             if record_id is not None:
                 record = self._smart_table.get_record(record_id)
                 candidates = [] if record is None else [record]
             else:
                 candidates = self._smart_table.find_records(
-                    {"线索名称": company_name, "负责人": snapshot.owner_user_id}
+                    {"线索名称": company_name, "负责人": table_owner_user_id}
                 )
         except Exception as exc:
             summary = self._safe_summary(exc)

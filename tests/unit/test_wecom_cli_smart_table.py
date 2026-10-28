@@ -36,6 +36,7 @@ from app.smart_table.models import (
 from app.smart_table.wecom_cli import (
     SmartTableWriteVerificationError,
     WecomCliProcessError,
+    WecomCliProtocolError,
     WecomCliSmartTableAdapter,
     WecomCliSmartTableAdapterError,
     WecomCliTransportError,
@@ -45,24 +46,41 @@ from app.smart_table.wecom_cli import (
 class FakeCli:
     """按调用顺序提供固定 CLI JSON 响应，并保存请求参数。"""
 
-    def __init__(self, responses: list[Mapping[str, object] | BaseException]) -> None:
-        """初始化响应队列和空调用记录。
+    def __init__(
+        self,
+        responses: list[Mapping[str, object] | BaseException],
+        *,
+        member_search_responses: Mapping[str, Mapping[str, object]] | None = None,
+    ) -> None:
+        """初始化表格响应队列、通讯录结果和调用记录。
 
         参数：responses 为每次 CLI 调用的成功响应或待抛出的异常。
+        member_search_responses 为通讯录成员标识查询结果；未配置的查询模拟原样 userid。
         异常：无。
         副作用：保存可被测试断言的 CLI 参数序列。
         """
         self._responses = responses
+        self._member_search_responses = dict(member_search_responses or {})
         self.calls: list[Sequence[str]] = []
+        self.member_search_calls: list[Sequence[str]] = []
 
     def __call__(self, arguments: Sequence[str]) -> Mapping[str, object]:
-        """记录一次 CLI 调用并返回下一项预设响应。
+        """记录一次表格或通讯录 CLI 调用并返回对应预设响应。
 
         参数：arguments 为无 shell 的 CLI 参数序列。
         返回：预置 CLI JSON 响应。
         异常：队列耗尽或预置异常时抛出对应异常。
-        副作用：追加调用参数并消费一个队列项。
+        副作用：记录调用参数；表格请求消费响应队列，通讯录请求读取指定映射。
         """
+        if len(arguments) > 3 and tuple(arguments[1:4]) == ("contact", "users", "search"):
+            # 通讯录搜索在独立列表中记录，保持既有智能表格响应队列不变。
+            self.member_search_calls.append(arguments)
+            query = json.loads(arguments[-1])
+            source_id = query["keywords"][0]
+            return self._member_search_responses.get(
+                source_id,
+                {"users": [{"userid": source_id, "name": source_id}]},
+            )
         self.calls.append(arguments)
         response = self._responses.pop(0)
         if isinstance(response, BaseException):
@@ -1538,6 +1556,110 @@ def test_empty_multi_select_string_is_normalized_to_empty_list() -> None:
     assert value == []
 
 
+def test_member_fields_resolve_callback_id_to_document_userid_once() -> None:
+    """验证所有人员字段共用一次回调身份到表格 userid 的通讯录映射。
+
+    参数：无。
+    返回值：无。
+    异常：字段值、CLI 请求载荷或查询次数不符时由 pytest 报告。
+    副作用：通过 FakeCli 模拟通讯录读取、表格新增及写后核实。
+    """
+    callback_id = "callback-open-id"
+    table_user_id = "document-user-id"
+    schema = SmartTableSchema(
+        fields=tuple(
+            SmartTableField(name, name, SmartTableFieldType.MEMBER)
+            for name in ("创建人", "负责人", "操作人")
+        )
+    )
+    fake_cli = FakeCli(
+        [
+            {"errcode": 0, "records": [{"record_id": "record-1"}]},
+            {
+                "errcode": 0,
+                "values": [
+                    json.dumps(
+                        {
+                            "rows": [
+                                {
+                                    "RECORD_ID": "record-1",
+                                    "创建人": [{"id": table_user_id, "name": "杨康鑫"}],
+                                    "负责人": [{"id": table_user_id, "name": "杨康鑫"}],
+                                    "操作人": [{"id": table_user_id, "name": "杨康鑫"}],
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    )
+                ],
+            },
+        ],
+        member_search_responses={
+            callback_id: {
+                "errcode": 0,
+                "users": [{"userid": table_user_id, "name": "杨康鑫"}],
+            }
+        },
+    )
+    adapter = _adapter(fake_cli, sheet_title="系统审计日志")
+    adapter.get_schema = lambda: schema
+
+    records = adapter.create_records(
+        [{name: callback_id for name in ("创建人", "负责人", "操作人")}],
+        actor=SmartTableActor.ROBOT,
+    )
+
+    assert records[0].fields == {
+        "创建人": table_user_id,
+        "负责人": table_user_id,
+        "操作人": table_user_id,
+    }
+    assert _payload(fake_cli.calls[0])["records"] == [
+        {
+            "values": {
+                "创建人": [{"userId": table_user_id}],
+                "负责人": [{"userId": table_user_id}],
+                "操作人": [{"userId": table_user_id}],
+            }
+        }
+    ]
+    assert len(fake_cli.member_search_calls) == 1
+
+
+def test_member_identity_resolution_fails_closed_on_ambiguous_directory_result() -> None:
+    """验证通讯录返回多个候选时不会写入未经确认的人员身份。
+
+    参数：无。
+    返回值：无。
+    异常：不唯一结果未抛出协议错误或触发表格写入时由 pytest 报告。
+    副作用：仅通过 FakeCli 模拟通讯录搜索。
+    """
+    schema = SmartTableSchema(
+        fields=(SmartTableField("owner", "负责人", SmartTableFieldType.MEMBER),)
+    )
+    fake_cli = FakeCli(
+        [],
+        member_search_responses={
+            "callback-open-id": {
+                "users": [
+                    {"userid": "table-user-1", "name": "杨康鑫"},
+                    {"userid": "table-user-2", "name": "杨康鑫"},
+                ]
+            }
+        },
+    )
+    adapter = _adapter(fake_cli)
+    adapter.get_schema = lambda: schema
+
+    with pytest.raises(WecomCliProtocolError, match="唯一"):
+        adapter.create_records(
+            [{"负责人": "callback-open-id"}], actor=SmartTableActor.ROBOT
+        )
+
+    assert fake_cli.calls == []
+    assert len(fake_cli.member_search_calls) == 1
+
+
 def test_robot_requires_owner_and_sales_cannot_be_impersonated() -> None:
     """验证真实 CLI 适配器保留机器人新增和销售权限语义。
 
@@ -2609,6 +2731,64 @@ def test_owner_range_query_preserves_native_entry_time_for_date_selection() -> N
     assert records[0].fields["录入时间"] == "2026-10-13 10:00:00"
     sql = fake_cli.calls[0][fake_cli.calls[0].index("--sql") + 1]
     assert 'DATE_FORMAT(`录入时间`, "%Y-%m-%d %H:%i:%s") AS `录入时间`' in sql
+
+
+def test_owner_range_filter_resolves_callback_id_before_exact_member_check() -> None:
+    """验证负责人筛选先映射回调身份再与表格人员字段精确匹配。
+
+    参数：无。
+    返回值：无。
+    异常：记录查询结果、负责人字段或通讯录查询次数不符时由 pytest 报告。
+    副作用：通过 FakeCli 模拟通讯录查询和智能表格 records query。
+    """
+    callback_id = "callback-open-id"
+    table_user_id = "document-user-id"
+    schema = SmartTableSchema(
+        fields=(
+            SmartTableField("company", "线索名称", SmartTableFieldType.TEXT),
+            SmartTableField("owner", "负责人", SmartTableFieldType.MEMBER),
+            SmartTableField("status", "提交状态", SmartTableFieldType.SINGLE_SELECT),
+        )
+    )
+    fake_cli = FakeCli(
+        [
+            {
+                "errcode": 0,
+                "values": [
+                    json.dumps(
+                        {
+                            "rows": [
+                                {
+                                    "RECORD_ID": "record-1",
+                                    "线索名称": "弓望科技",
+                                    "负责人": [{"id": table_user_id, "name": "杨康鑫"}],
+                                    "提交状态": "未提交",
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    )
+                ],
+            }
+        ],
+        member_search_responses={
+            callback_id: {
+                "users": [{"userid": table_user_id, "name": "杨康鑫"}]
+            }
+        },
+    )
+    adapter = _adapter(fake_cli, sheet_title="CRM线索")
+    adapter.get_schema = lambda: schema
+
+    records = adapter.get_records(
+        owner_user_ids=(callback_id,),
+        owner_display_names={callback_id: "杨康鑫"},
+        submission_status="未提交",
+    )
+
+    assert [record.record_id for record in records] == ["record-1"]
+    assert records[0].fields["负责人"] == table_user_id
+    assert len(fake_cli.member_search_calls) == 1
 
 
 def test_record_id_query_preserves_native_entry_time_for_date_selection() -> None:

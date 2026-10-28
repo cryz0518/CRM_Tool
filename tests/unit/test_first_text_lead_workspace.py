@@ -341,6 +341,70 @@ def test_batch_network_failure_keeps_parsed_company_and_recovers_without_duplica
         assert len(adapter.get_records()) == 1
 
 
+def test_batch_recovery_restores_missing_creator_and_owner_without_overwriting_nonempty_values(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """验证批量建行恢复只补齐空人员字段且不覆盖已转交负责人。
+
+    参数：session_factory 提供隔离数据库。
+    返回值：无。
+    异常：表格恢复结果或持久化同步状态不符合预期时由 pytest 报告。
+    副作用：模拟批量新增结果不明、远端已建行但缺少创建人的场景。
+    """
+    schema = build_required_smart_table_schema()
+    adapter = MockSmartTableAdapter(schema=schema)
+    gateway = AIGateway(MockLLMProvider([json.dumps({
+        "intent": "NEW_LEAD", "customer_reference": {}, "crm_fields": {},
+        "confidence_by_field": {}, "enrichment": {}, "conflicts": [], "warnings": [],
+    })]))
+    service = FirstTextLeadWorkspaceService(
+        session_factory,
+        adapter,
+        ai_gateway=gateway,
+        company_lead_service=CompanyLeadService(
+            session_factory, adapter, MockTYCAdapter()
+        ),
+    )
+    service._smart_table_lead_batch_wait_seconds = 60
+    event_id = persist_outbox_text(
+        session_factory,
+        message_id="batch-member-recovery",
+        sales_user_id="callback-sales-id",
+        text="上海弓望科技有限公司，联系人刘冰怡，手机17601396691，非标自动化需求",
+    )
+    result = service.consume(event_id)
+    assert result.status is LeadProcessingStatus.BATCH_QUEUED
+    service._smart_table_lead_batch_wait_seconds = 0
+    create_records = adapter.create_records
+
+    def lose_response_after_missing_members(records, *, actor):
+        """模拟远端已建行但权限关键成员字段未落表的未知结果。"""
+        created = create_records(records, actor=actor)
+        for record in created:
+            adapter.update_record(
+                record.record_id, {"创建人": "", "负责人": "transferred-user"}
+            )
+        raise WecomCliTransportError("新增结果待核实")
+
+    with patch.object(
+        adapter, "create_records", side_effect=lose_response_after_missing_members
+    ) as add:
+        assert service.flush_smart_table_batch() == 1
+        assert add.call_count == 1
+
+    records = adapter.get_records()
+    assert len(records) == 1
+    assert records[0].fields["创建人"] == "callback-sales-id"
+    assert records[0].fields["负责人"] == "transferred-user"
+    with session_factory() as session:
+        lead = session.get(Lead, result.lead_id)
+        sync = session.scalar(
+            select(SmartTableSync).where(SmartTableSync.lead_id == result.lead_id)
+        )
+    assert lead is not None and lead.smart_table_record_id == records[0].record_id
+    assert sync is not None and sync.status == "succeeded"
+
+
 def test_batch_pending_message_checkpoint_allows_same_salesperson_to_continue(
     session_factory: sessionmaker[Session],
 ) -> None:

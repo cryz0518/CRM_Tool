@@ -29,21 +29,53 @@ from app.smart_table.permissions import (
 class FakeSmartTableAdapter:
     """只模拟表格边界，记录写入的字段补丁以便验证增量语义。"""
 
-    def __init__(self) -> None:
-        """初始化一条带旧负责人的表格记录。"""
+    def __init__(self, member_ids: dict[str, str] | None = None) -> None:
+        """初始化一条带旧负责人的表格记录和可选通讯录映射。
+
+        参数：member_ids 为业务用户标识到表格 userid 的测试映射。
+        返回值：无。
+        异常：无。
+        副作用：建立一条仅存在于内存中的 Mock 表格记录。
+        """
+        self._member_ids = member_ids or {}
         self.record = SmartTableRecord(
             record_id="record-1",
-            fields={"负责人": "sales-old", "创建人": "sales-old", "线索名称": "星海科技"},
+            fields={
+                "负责人": self.resolve_member_user_id("sales-old"),
+                "创建人": self.resolve_member_user_id("sales-old"),
+                "线索名称": "星海科技",
+            },
         )
         self.update_calls: list[tuple[str, dict[str, object]]] = []
 
+    def resolve_member_user_id(self, user_id: str) -> str:
+        """将测试业务身份转换为智能表格成员标识。
+
+        参数：user_id 为消息回调或后台保存的业务成员标识。
+        返回值：测试通讯录映射后的 userid；未配置映射时原样返回。
+        异常：无。
+        副作用：无。
+        """
+        return self._member_ids.get(user_id, user_id)
+
     def update_record(self, record_id: str, fields: dict[str, object]) -> SmartTableRecord:
-        """应用一次字段补丁并返回更新后的快照。"""
+        """应用一次字段补丁并按测试通讯录转换负责人。
+
+        参数：record_id 为目标记录标识；fields 为增量字段补丁。
+        返回值：更新后的表格记录快照。
+        异常：记录标识不是当前 Mock 记录时触发断言失败。
+        副作用：更新内存记录并追加一次调用记录。
+        """
         assert record_id == self.record.record_id
         self.update_calls.append((record_id, dict(fields)))
+        resolved_fields = dict(fields)
+        if isinstance(resolved_fields.get("负责人"), str):
+            resolved_fields["负责人"] = self.resolve_member_user_id(
+                str(resolved_fields["负责人"])
+            )
         self.record = SmartTableRecord(
             record_id=record_id,
-            fields={**self.record.fields, **fields},
+            fields={**self.record.fields, **resolved_fields},
         )
         return self.record
 
@@ -398,7 +430,13 @@ def test_transfer_rejects_same_company_target_before_remote_write(
 def test_transfer_reconcile_remote_target_does_not_update_again(
     session_factory: sessionmaker[Session], seeded_lead: str
 ) -> None:
-    """远端已是目标负责人时，reconcile 只验证权限并收敛本地事实。"""
+    """远端负责人和回调身份不同名时，reconcile 仍按通讯录 userid 收敛。
+
+    参数：session_factory 提供隔离数据库；seeded_lead 提供可转交线索。
+    返回值：无。
+    异常：远端状态、权限核验 ID 或本地 owner 不符时由 pytest 报告。
+    副作用：执行一次转交及一次只读恢复，不重复写入负责人。
+    """
 
     class UnavailableVerifier(FakePermissionVerifier):
         """首次转交时模拟权限验证尚不可用。"""
@@ -411,7 +449,9 @@ def test_transfer_reconcile_remote_target_does_not_update_again(
             del record_id, old_owner_user_id, new_owner_user_id
             raise SmartTablePermissionVerificationUnavailable("等待权限验证")
 
-    adapter = FakeSmartTableAdapter()
+    adapter = FakeSmartTableAdapter(
+        {"sales-old": "directory-old", "sales-new": "directory-new"}
+    )
     service = SmartTableOwnerTransferService(session_factory, adapter, UnavailableVerifier())
     first = service.transfer(
         lead_id=seeded_lead,
@@ -425,12 +465,28 @@ def test_transfer_reconcile_remote_target_does_not_update_again(
     assert first.status == "permission_verification_unavailable"
     assert len(adapter.update_calls) == 1
 
-    adapter.record = SmartTableRecord(
-        record_id="record-1",
-        fields={**adapter.record.fields, "负责人": "sales-new"},
-    )
+    class MappedPermissionVerifier(FakePermissionVerifier):
+        """验证权限核验也接收表格通讯录 userid。"""
+
+        def verify_owner_transfer(
+            self, record_id: str, old_owner_user_id: str, new_owner_user_id: str
+        ) -> SmartTablePermissionVerification:
+            """确认权限核验使用映射后的旧、新负责人 ID。
+
+            参数：record_id 为转交记录；其余为表格通讯录中的旧、新负责人 userid。
+            返回值：目标可见可编辑、原负责人不可见的权限结果。
+            异常：参数不是预期映射时由断言报告。
+            副作用：无。
+            """
+            assert (record_id, old_owner_user_id, new_owner_user_id) == (
+                "record-1",
+                "directory-old",
+                "directory-new",
+            )
+            return SmartTablePermissionVerification(True, True, False, False)
+
     result = SmartTableOwnerTransferService(
-        session_factory, adapter, FakePermissionVerifier()
+        session_factory, adapter, MappedPermissionVerifier()
     ).reconcile(
         operation_id=first.operation_id,
         operator_subject="admin-1",
@@ -441,6 +497,7 @@ def test_transfer_reconcile_remote_target_does_not_update_again(
     )
 
     assert result.status == "succeeded"
+    assert adapter.record.fields["负责人"] == "directory-new"
     assert len(adapter.update_calls) == 1
     with session_factory() as session:
         lead = session.get(Lead, seeded_lead)
