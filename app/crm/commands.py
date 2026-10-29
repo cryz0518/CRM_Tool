@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.crm.adapter import CRMAdapter
+from app.crm.authorization import can_submit_other_sales_leads
 from app.crm.service import (
     CROSS_OWNER_SUBMISSION_COMMAND,
     CreateSubmissionOutcome,
@@ -557,7 +558,7 @@ def prepare_batch_submission_selection(
         return "本次提交确认消息已登记，请在原确认卡中操作。"
     if command.text == CROSS_OWNER_SUBMISSION_COMMAND:
         scoped_command, scope_error = _resolve_cross_owner_submission_scope(
-            session_factory, command
+            session_factory, command, smart_table_adapter
         )
         if scope_error is not None:
             return scope_error
@@ -668,11 +669,13 @@ def prepare_batch_submission_selection(
 
 
 def _resolve_cross_owner_submission_scope(
-    session_factory: sessionmaker[Session], command: SubmissionCommand
+    session_factory: sessionmaker[Session], command: SubmissionCommand,
+    smart_table_adapter: SmartTableAdapter | None = None,
 ) -> tuple[SubmissionCommand | None, str | None]:
     """校验操作人权限并将姓名目标解析成服务端冻结的负责人 user_id 范围。
 
-    参数：session_factory 为数据库会话工厂；command 包含操作人和原始目标姓名。
+    参数：session_factory 为数据库会话工厂；command 包含操作人和原始目标姓名；
+    smart_table_adapter 复用当前流程已核验的通讯录身份映射。
     返回值：成功返回带冻结范围的命令；失败返回用户可读的拒绝原因。
     异常：数据库读取失败时传播 SQLAlchemy 异常。
     副作用：仅读取权限目录和线索。
@@ -688,7 +691,7 @@ def _resolve_cross_owner_submission_scope(
         # 操作人必须是启用成员且持有专用跨员工提交授权，不能由命令文本授予权限。
         if actor is None or not actor.is_active:
             return None, "当前企微账号未启用，不能提交 CRM 线索。"
-        if not actor.can_submit_other_sales_leads:
+        if not can_submit_other_sales_leads(session, actor, smart_table_adapter):
             return None, "当前账号没有跨员工 CRM 提交授权。"
         if target_name == _CROSS_OWNER_ALL_TARGET:
             # 将“所有员工”限制为数据库中已有线索的负责人，不把通配符传入提交服务。
