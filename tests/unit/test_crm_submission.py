@@ -12,6 +12,7 @@ from threading import Lock
 from time import sleep
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import create_engine, func, select
@@ -3393,6 +3394,183 @@ def test_crm_submission_cli_creates_actor_for_verified_wecom_member(
         assert authorization.crm_user_id is None
         assert authorization.can_submit_other_sales_leads is True
         assert authorization.updated_by == "crm_cross_owner_submission_cli"
+
+
+def _grant_split_identity_operator(
+    session_factory: sessionmaker[Session],
+    adapter: MockSmartTableAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Mock:
+    """模拟通讯录授权成员和无姓名的机器人回调发送者使用不同标识。"""
+    with session_factory.begin() as session:
+        grant_crm_submission_access(
+            session, WecomDirectoryMember("operator-member", "被授权员工")
+        )
+        session.add(SalesAuthorization(wecom_user_id="operator-callback", is_active=True))
+
+    def resolve_member(user_id: str, display_name: str | None = None) -> str:
+        """仅模拟已经由通讯录确认的身份映射，不按显示名授予权限。"""
+        return "operator-member" if user_id == "operator-callback" else user_id
+
+    resolver = Mock(side_effect=resolve_member)
+    monkeypatch.setattr(adapter, "resolve_member_user_id", resolver)
+    return resolver
+
+
+def test_cross_owner_split_identity_command_and_callback_keep_snapshot(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证真实授权命令产生的权限可用于不同身份的指令及卡片执行，且不再次回读表格。"""
+    import app.crm.commands as crm_commands
+    from app.wecom_bot.actions import ActionSnapshot, DeterministicWecomActionExecutor
+
+    settings = get_settings().model_copy(update={
+        "wecom_card_callback_enabled": True,
+        "wecom_card_transport_configured": True,
+        "wecom_card_callback_handler_configured": True,
+    })
+    monkeypatch.setattr(crm_commands, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        crm_commands, "resolve_wecom_member",
+        lambda *_args: WecomDirectoryMember("sales-1", "sales-1"),
+    )
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    _grant_split_identity_operator(session_factory, adapter, monkeypatch)
+    crm = MockCRMAdapter()
+    table_reads = Mock(wraps=adapter.get_records)
+    monkeypatch.setattr(adapter, "get_records", table_reads)
+
+    reply = prepare_batch_submission_selection(
+        session_factory, adapter, crm,
+        SubmissionCommand(
+            CROSS_OWNER_SUBMISSION_COMMAND, "operator-callback", "split-identity-request",
+            target_owner_name="sales-1",
+            target_capture_date=datetime.now(ZoneInfo("Asia/Shanghai")).date(),
+        ),
+    )
+    assert "已发送候选卡" in reply
+    assert crm.submit_calls == 0 and table_reads.call_count == 1
+    with session_factory() as session:
+        action = session.scalar(select(WecomAction))
+        assert action is not None
+        snapshot = ActionSnapshot(
+            action.id, action.action_type, action.bound_actor_wecom_user_id,
+            action.target_type, action.target_id,
+            {**action.context, "selected_lead_ids": [lead_id]}, "test-claim",
+        )
+    # 执行回调领域入口，覆盖 submit_selected、冻结提交及持锁权限复核。
+    code, summary = DeterministicWecomActionExecutor(session_factory, adapter, crm)(snapshot)
+    assert code == "crm_batch_submission_completed"
+    assert "新增/更新成功 1 条" in summary
+    assert crm.submit_calls == 1 and table_reads.call_count == 1
+    with session_factory() as session:
+        actor = session.get(SalesAuthorization, "operator-callback")
+        assert actor is not None and not actor.can_submit_other_sales_leads
+        sync = session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id))
+        assert sync is not None and sync.submitting_sales_user_id == "operator-callback"
+        assert session.get(SalesAuthorization, "operator-member").can_submit_other_sales_leads
+
+
+@pytest.mark.parametrize("revocation", ["permission", "member_inactive", "callback_inactive"])
+def test_cross_owner_split_identity_rechecks_revocation_after_preview(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch,
+    revocation: str,
+) -> None:
+    """验证卡片发出后撤权或停用任一身份都阻止 CRM，不将权限复制到回调账号。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    _grant_split_identity_operator(session_factory, adapter, monkeypatch)
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    candidates = service.list_submission_candidates(
+        CROSS_OWNER_SUBMISSION_COMMAND, "operator-callback", owner_scope_user_ids=("sales-1",),
+    )
+    assert tuple(candidate.lead_id for candidate in candidates) == (lead_id,)
+    with session_factory.begin() as session:
+        actor = session.get(
+            SalesAuthorization,
+            "operator-callback" if revocation == "callback_inactive" else "operator-member",
+        )
+        assert actor is not None
+        if revocation == "permission":
+            actor.can_submit_other_sales_leads = False
+        else:
+            actor.is_active = False
+    result = service.submit_selected(
+        SubmissionCommand(
+            CROSS_OWNER_SUBMISSION_COMMAND, "operator-callback", "split-revoked",
+            owner_scope_user_ids=("sales-1",),
+        ),
+        (lead_id,),
+        initial_records={candidate.record.record_id: candidate.record for candidate in candidates},
+    )
+    assert result.not_submitted == 1 and crm.submit_calls == 0
+    assert result.items[0].reason_code == "crm_cross_owner_submission_not_authorized"
+
+
+@pytest.mark.parametrize("resolution", ["unrelated-member", "unavailable"])
+def test_cross_owner_split_identity_never_grants_by_display_name(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch,
+    resolution: str,
+) -> None:
+    """验证同名不等于同一成员，映射不匹配或查询异常均不能继承授权。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    _lead(session_factory, adapter)
+    resolver = _grant_split_identity_operator(session_factory, adapter, monkeypatch)
+    with session_factory.begin() as session:
+        actor = session.get(SalesAuthorization, "operator-callback")
+        assert actor is not None
+        actor.display_name = "被授权员工"
+    resolver.side_effect = (
+        RuntimeError("directory unavailable") if resolution == "unavailable" else None
+    )
+    resolver.return_value = resolution
+    crm = MockCRMAdapter()
+    with pytest.raises(ValueError, match="跨员工 CRM 提交权限"):
+        CrmSubmissionService(session_factory, adapter, crm).list_submission_candidates(
+            CROSS_OWNER_SUBMISSION_COMMAND, "operator-callback",
+            owner_scope_user_ids=("sales-1",),
+        )
+    resolver.assert_called_once_with("operator-callback")
+    assert crm.submit_calls == 0
+
+
+def test_cross_owner_split_identity_rechecks_grant_under_lead_lock(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证生成 CRM 载荷后撤销通讯录授权，提交持锁复核仍能阻止外部调用。"""
+    adapter = MockSmartTableAdapter(schema=build_required_smart_table_schema())
+    lead_id = _lead(session_factory, adapter)
+    _grant_split_identity_operator(session_factory, adapter, monkeypatch)
+    crm = MockCRMAdapter()
+    service = CrmSubmissionService(session_factory, adapter, crm)
+    records = {record.record_id: record for record in adapter.get_records()}
+    original_hash = service._snapshot_hash
+    revocations = 0
+
+    def revoke_before_lock(payload: dict[str, object]) -> str:
+        """在普通权限校验后、最终锁内权限复核前撤销原始授权。"""
+        nonlocal revocations
+        with session_factory.begin() as session:
+            member = session.get(SalesAuthorization, "operator-member")
+            assert member is not None
+            member.can_submit_other_sales_leads = False
+        revocations += 1
+        return original_hash(payload)
+
+    monkeypatch.setattr(service, "_snapshot_hash", revoke_before_lock)
+    result = service.submit_selected(
+        SubmissionCommand(
+            CROSS_OWNER_SUBMISSION_COMMAND, "operator-callback", "split-lock-revocation",
+            owner_scope_user_ids=("sales-1",),
+        ),
+        (lead_id,), initial_records=records,
+    )
+    assert revocations == 1 and result.not_submitted == 1 and crm.submit_calls == 0
+    assert result.items[0].reason_code == "crm_cross_owner_submission_not_authorized"
+    with session_factory() as session:
+        assert session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id)) is None
 
 
 def test_company_preview_exactly_matches_table_and_does_not_call_crm(

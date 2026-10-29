@@ -21,6 +21,7 @@ from app.companies.models import CompanyVerificationStatus
 from app.core.config import get_settings
 from app.core.failures import classify_task_failure, safe_audit_text, safe_failure_summary
 from app.crm.adapter import CRMAdapter
+from app.crm.authorization import can_submit_other_sales_leads
 from app.crm.employee_directory import EmployeeDirectory, EmployeeDirectoryError
 from app.crm.payload import CrmEnumMappingError, CrmPayloadBuilder, CrmPayloadError
 from app.leads.models import (
@@ -953,7 +954,9 @@ class CrmSubmissionService:
             if cross_owner and (
                 authorization is None
                 or not authorization.is_active
-                or not self._can_submit_other_sales_leads(authorization)
+                or not can_submit_other_sales_leads(
+                    session, authorization, self._smart_table_adapter,
+                )
             ):
                 raise ValueError("当前账号没有跨员工 CRM 提交权限")
             if not query_owner_names:
@@ -1080,7 +1083,9 @@ class CrmSubmissionService:
             cross_owner_authorized = not cross_owner or (
                 authorization is not None
                 and authorization.is_active
-                and self._can_submit_other_sales_leads(authorization)
+                and can_submit_other_sales_leads(
+                    session, authorization, self._smart_table_adapter,
+                )
             )
             owner_user_ids = (
                 tuple(command.owner_scope_user_ids or ())
@@ -1702,7 +1707,9 @@ class CrmSubmissionService:
                 if (
                     authorization is None
                     or not authorization.is_active
-                    or not self._can_submit_other_sales_leads(authorization)
+                    or not can_submit_other_sales_leads(
+                        session, authorization, self._smart_table_adapter,
+                    )
                 ):
                     return _create_outcome(
                         "not_submitted",
@@ -1882,7 +1889,9 @@ class CrmSubmissionService:
                     if (
                         authorization is None
                         or not authorization.is_active
-                        or not self._can_submit_other_sales_leads(authorization)
+                        or not can_submit_other_sales_leads(
+                            session, authorization, self._smart_table_adapter, lock_member=True,
+                        )
                     ):
                         return _create_outcome(
                             "not_submitted",
@@ -2087,7 +2096,9 @@ class CrmSubmissionService:
                     not owner_scope_user_ids
                     or authorization is None
                     or not authorization.is_active
-                    or not authorization.can_submit_other_sales_leads
+                    or not can_submit_other_sales_leads(
+                        session, authorization, self._smart_table_adapter,
+                    )
                 ):
                     raise PermissionError("跨员工 CRM 提交权限已失效")
             statement = (
@@ -2733,17 +2744,6 @@ class CrmSubmissionService:
             # 智能表格系统录入时间是不带时区的上海本地时间，不能当作 UTC 再偏移八小时。
             return parsed_datetime.date()
         return CrmSubmissionService._shanghai_date(parsed_datetime)
-
-    @staticmethod
-    def _can_submit_other_sales_leads(authorization: SalesAuthorization) -> bool:
-        """判断当前 actor 是否持有跨员工 CRM 提交授权。
-
-        参数：authorization 为数据库中的当前企微员工授权记录。
-        返回值：持有专用跨员工提交权限时返回 True。
-        异常：无。
-        副作用：无，仅读取授权状态。
-        """
-        return authorization.can_submit_other_sales_leads
 
     @staticmethod
     def _last_successful_sync(session: Session, lead_id: str) -> CrmSyncRecord | None:
