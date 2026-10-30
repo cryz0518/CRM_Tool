@@ -2945,25 +2945,95 @@ def test_query_rejects_non_contract_text_cell_shapes() -> None:
         )
 
 
-def test_query_record_extracts_text_from_rich_url_in_long_text() -> None:
-    """验证智能表格备注中的富文本链接单元格仍可作为普通显示文本读取。"""
+def test_query_record_rejects_incomplete_rich_url_fragment() -> None:
+    """验证未投影为完整文本的链接对象不会被静默当成整段备注。"""
     schema = SmartTableSchema(
         fields=(SmartTableField("remark", "备注", SmartTableFieldType.LONG_TEXT),)
     )
 
-    record = _adapter(FakeCli([]))._parse_query_record(
-        {
-            "RECORD_ID": "record-1",
-            "备注": {
-                "text": "contact@example.com",
-                "type": "url",
-                "url": "mailto:contact@example.com",
+    with pytest.raises(WecomCliProtocolError, match="文本或单选字段类型"):
+        _adapter(FakeCli([]))._parse_query_record(
+            {
+                "RECORD_ID": "record-1",
+                "备注": {
+                    "text": "contact@example.com",
+                    "type": "url",
+                    "url": "mailto:contact@example.com",
+                },
             },
-        },
-        schema,
-    )
+            schema,
+        )
 
-    assert record.fields == {"备注": "contact@example.com"}
+
+@pytest.mark.parametrize("read_mode", ["single", "ids", "owner"])
+@pytest.mark.parametrize("field_type", [SmartTableFieldType.TEXT, SmartTableFieldType.LONG_TEXT])
+def test_query_preserves_full_rich_text_in_one_request(
+    read_mode: str, field_type: SmartTableFieldType,
+) -> None:
+    """复现 SQL 只返回首个链接的契约，验证单条、批量和按人查询均一次取回全文。"""
+    schema = SmartTableSchema(fields=(
+        SmartTableField("name", "线索名称", SmartTableFieldType.TEXT),
+        SmartTableField("remark", "*备注", field_type),
+        SmartTableField("owner", "负责人", SmartTableFieldType.MEMBER),
+        SmartTableField("status", "提交状态", SmartTableFieldType.SINGLE_SELECT),
+    ))
+    full_text = (
+        '基本信息：测试光学公司，提供视觉检测应用。\r\n'
+        '网址：www.example.com\n邮箱：contact@example.com\n'
+        '特殊要求：保留 JSON 文本 {"说明":"完整内容"} 和 Unicode 😀。'
+    )
+    calls: list[Sequence[str]] = []
+
+    def runner(arguments: Sequence[str]) -> Mapping[str, object]:
+        """按真实接口表现返回链接片段或经无损文本投影得到的全文。"""
+        if tuple(arguments[1:4]) == ("contact", "users", "search"):
+            return {"users": [{"userid": "sales-1", "name": "测试销售"}]}
+        calls.append(arguments)
+        sql = arguments[arguments.index("--sql") + 1]
+        projection = 'REPLACE(`*备注`, "\\n", "\\n") AS `*备注`'
+        remark = full_text if projection in sql else {
+            "text": "www.example.com", "type": "url", "url": "https://www.example.com",
+        }
+        row = {
+            "RECORD_ID": "record-1", "线索名称": "测试光学公司", "*备注": remark,
+            "负责人": [{"id": "sales-1", "name": "测试销售"}],
+            "提交状态": "未提交",
+            "录入时间": "2026-10-29 11:00:00",
+        }
+        return {"errcode": 0, "values": [json.dumps({"rows": [row]}, ensure_ascii=False)]}
+
+    adapter = WecomCliSmartTableAdapter(
+        doc_id="test-doc", sheet_id="test-sheet", sheet_title="CRM线索", runner=runner,
+    )
+    adapter.get_schema = lambda: schema
+    if read_mode == "single":
+        record = adapter.get_record("record-1")
+    elif read_mode == "ids":
+        record = adapter.get_records(record_ids=("record-1",))[0]
+    else:
+        record = adapter.get_records(
+            owner_user_ids=("sales-1",), owner_display_names={"sales-1": "测试销售"},
+            submission_status="未提交", capture_date=date(2026, 10, 29),
+        )[0]
+    assert record is not None and record.fields["备注"] == full_text
+    assert len(calls) == 1
+    sql = calls[0][calls[0].index("--sql") + 1]
+    assert 'REPLACE(`线索名称`, "\\n", "\\n") AS `线索名称`' in sql
+    if read_mode == "owner":
+        assert '`负责人` LIKE "%测试销售%"' in sql and '`提交状态` = "未提交"' in sql
+        assert 'DATE_FORMAT(NULLIF(`录入时间`, ' in sql
+    else:
+        assert 'RECORD_ID = "record-1"' in sql
+
+
+@pytest.mark.parametrize("value", [None, "", '["合法文本"]', "纯文本\n第二行", "www.example.com"])
+def test_query_text_projection_preserves_empty_and_literal_values(value: str | None) -> None:
+    """验证无损投影后的空值、JSON 外观文本、换行及纯网址保持原样。"""
+    schema = SmartTableSchema(fields=(SmartTableField("remark", "备注", SmartTableFieldType.TEXT),))
+    record = _adapter(FakeCli([]))._parse_query_record(
+        {"RECORD_ID": "record-1", "备注": value}, schema,
+    )
+    assert record.fields["备注"] == value
 
 
 def test_query_record_normalizes_sql_member_shape() -> None:
