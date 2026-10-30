@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from collections.abc import Collection, Generator, Mapping
+from collections.abc import Collection, Generator, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -3571,6 +3572,73 @@ def test_cross_owner_split_identity_rechecks_grant_under_lead_lock(
     assert result.items[0].reason_code == "crm_cross_owner_submission_not_authorized"
     with session_factory() as session:
         assert session.scalar(select(CrmSyncRecord).where(CrmSyncRecord.lead_id == lead_id)) is None
+
+
+def test_rich_text_submission_card_freezes_complete_query_result(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证完整富文本经真实 CLI 适配器进入卡片快照，回调仅复用该快照提交。"""
+    import app.crm.commands as crm_commands
+    from app.smart_table.wecom_cli import WecomCliSmartTableAdapter
+    from app.wecom_bot.actions import ActionSnapshot, DeterministicWecomActionExecutor
+
+    schema = build_required_smart_table_schema()
+    table = MockSmartTableAdapter(schema=schema)
+    lead_id = _lead(session_factory, table)
+    record = table.get_records()[0]
+    full_remark = (
+        "基本信息：测试光学公司，咨询视觉检测。\n"
+        "网址：www.example.com\n需求：检测外观缺陷。"
+    )
+    table.update_record(record.record_id, {"备注": full_remark})
+    calls: list[str] = []
+
+    def runner(arguments: Sequence[str]) -> Mapping[str, object]:
+        """按真实 SQL 接口契约区分链接片段和完整文本投影。"""
+        if tuple(arguments[1:4]) == ("contact", "users", "search"):
+            return {"users": [{"userid": "sales-1", "name": "sales-1"}]}
+        sql = arguments[arguments.index("--sql") + 1]
+        calls.append(sql)
+        fields = dict(record.fields)
+        fields["负责人"] = [{"id": "sales-1", "name": "sales-1"}]
+        fields["备注"] = full_remark if 'REPLACE(`备注`, "\\n", "\\n")' in sql else {
+            "text": "www.example.com", "type": "url", "url": "https://www.example.com",
+        }
+        return {"errcode": 0, "values": [json.dumps({
+            "rows": [{"RECORD_ID": record.record_id, **fields}],
+        }, ensure_ascii=False)]}
+
+    reader = WecomCliSmartTableAdapter(
+        doc_id="test-doc", sheet_id="test-sheet", sheet_title="CRM线索", runner=runner,
+    )
+    reader.get_schema = lambda: schema
+    settings = get_settings().model_copy(update={
+        "wecom_card_callback_enabled": True,
+        "wecom_card_transport_configured": True,
+        "wecom_card_callback_handler_configured": True,
+    })
+    monkeypatch.setattr(crm_commands, "get_settings", lambda: settings)
+    crm = MockCRMAdapter()
+    reply = prepare_batch_submission_selection(
+        session_factory, reader, crm,
+        SubmissionCommand("提交我所有线索", "sales-1", "rich-text-snapshot"),
+    )
+    assert "已发送候选卡" in reply and len(calls) == 1 and crm.submit_calls == 0
+    with session_factory() as session:
+        action = session.scalar(select(WecomAction))
+        assert action is not None
+        assert action.context["candidate_snapshots"][0]["fields"]["备注"] == full_remark
+        snapshot = ActionSnapshot(
+            action.id, action.action_type, action.bound_actor_wecom_user_id,
+            action.target_type, action.target_id,
+            {**action.context, "selected_lead_ids": [lead_id]}, "test-claim",
+        )
+    # 回调阶段即使表格备注发生变化，也只使用当次指令已经冻结的完整文本。
+    table.update_record(record.record_id, {"备注": "后续变更"})
+    monkeypatch.setattr(table, "get_records", Mock(side_effect=AssertionError("禁止回读候选")))
+    _, summary = DeterministicWecomActionExecutor(session_factory, table, crm)(snapshot)
+    assert "新增/更新成功 1 条" in summary and crm.submit_calls == 1
+    assert crm.submit_payloads[0]["remark"] == "【AI录入】" + full_remark
 
 
 def test_company_preview_exactly_matches_table_and_does_not_call_crm(

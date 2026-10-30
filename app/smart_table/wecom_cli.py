@@ -1106,6 +1106,9 @@ class WecomCliSmartTableAdapter:
                 columns.append(
                     f'DATE_FORMAT({quoted_name}, "%Y-%m-%d %H:%i:%s") AS {quoted_name}'
                 )
+            elif field.field_type in {SmartTableFieldType.TEXT, SmartTableFieldType.LONG_TEXT}:
+                # 直接选取富文本时 SQL 可能只返回首个超链接；幂等替换强制输出全文且保留换行。
+                columns.append(f'REPLACE({quoted_name}, "\\n", "\\n") AS {quoted_name}')
             else:
                 columns.append(quoted_name)
         if include_entry_time:
@@ -1267,13 +1270,7 @@ class WecomCliSmartTableAdapter:
             if raw is None and field.name.startswith("*"):
                 raw = row.get(field.name.removeprefix("*"))
             canonical_name = field.name.removeprefix("*")
-            # SQL query 已返回各字段的原生类型；普通文本即使像 JSON 也必须原样保留。
-            if (
-                isinstance(raw, Mapping)
-                and field.field_type in {SmartTableFieldType.TEXT, SmartTableFieldType.LONG_TEXT}
-            ):
-                # 智能表格会把备注中的网址/邮箱单元格返回为 CellValue，领域备注只保留显示文本。
-                raw = self._cell_text(raw)
+            # 文本投影必须返回完整字符串；链接对象仅能证明局部内容，不能当成整段备注。
             if raw is not None and field.field_type in {
                 SmartTableFieldType.TEXT,
                 SmartTableFieldType.LONG_TEXT,
